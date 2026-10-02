@@ -1,0 +1,882 @@
+#!/usr/bin/env python3
+"""cmux-fleet: one supervisor + N worker Codex sessions in cmux tabs, coordinated by a daemon.
+
+Every agent is an interactive ``codex`` TUI in its own cmux tab. The daemon never reads
+their screens: Codex's ``notify`` hook calls back into this file (``fleet.py notify``) at
+the end of every turn, and the daemon routes the reply through a private Redis instance
+that listens only on a Unix socket under /tmp (never localhost:6379).
+
+Subcommands
+  start     provision the private Redis + the control surface (must run inside cmux)
+  daemon    the coordinator loop (internal, spawned by ``start``)
+  task      submit a goal to the supervisor
+  status    task + per-agent state, context usage, inbox depth
+  stop      cancel the task, shut the daemon and its Redis down (tabs stay open)
+  chrome    run a vetted browser verb through the daemon (for sandboxed agents, optional)
+  notify    Codex notify hook (internal)
+  actor     exec codex for one agent (internal)
+"""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
+from cmux_fleet import handoff  # noqa: E402
+from cmux_fleet.handoff import read_usage  # noqa: E402
+
+SOCK_PREFIX = '/tmp/cmux-fleet-'
+SESSION = 'cmux-fleet'  # cmux registry name
+HOME = Path(os.environ.get('CMUX_FLEET_HOME') or (Path.home() / '.cmux-fleet'))
+LATEST = HOME / 'latest.json'
+SESSIONS = Path(os.environ.get('CODEX_HOME') or (Path.home() / '.codex')) / 'sessions'
+EVENTS, TASK, LOG, NAMES = 'fx:events', 'fx:task', 'fx:log', 'fx:names'
+# Sandboxed agents cannot drive the user's browser themselves (and must never be allowed
+# to kill it). If the operator supplies a broker script, the daemon runs these verbs for them.
+CHROME_VERBS = {'check', 'tabs', 'newtab', 'go', 'url', 'js'}
+THREAD_RE = r'[0-9a-f-]{36}'
+DEFAULTS = {'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 100000, 'stall_timeout': 1800,
+            'chrome_min_interval': 20, 'profile': 'fleet'}
+
+
+def load(path):
+    return json.loads(Path(path).read_text())
+
+
+def save(path, data):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(path).with_suffix('.tmp')
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+    os.replace(tmp, path)
+
+
+def connect(cfg):
+    import redis
+    sock = Path(cfg['redis_socket'])
+    if not sock.is_absolute() or not str(sock).startswith(SOCK_PREFIX):
+        raise ValueError('private cmux-fleet Unix socket required')
+    client = redis.Redis(unix_socket_path=str(sock), db=0, decode_responses=True,
+                         socket_connect_timeout=3, socket_timeout=5)
+    client.ping()  # Fail closed: never fall back to localhost:6379.
+    return client
+
+
+def agent_cwd(cfg, name):
+    run = Path(cfg['run'])
+    return run / 'agents' / name if name == 'supervisor' else run / 'workspace' / name
+
+
+def key(kind, name):
+    return 'fx:' + kind + ':' + name
+
+
+# ---------------------------------------------------------------- trust gate
+def validate_artifacts(artifacts):
+    if not isinstance(artifacts, list) or not artifacts:
+        raise ValueError('artifacts must be a non-empty list')
+    for item in artifacts:
+        if not isinstance(item, dict) or not isinstance(item.get('path'), str) or 'checks' in item:
+            raise ValueError('an artifact may only have path / min_chars / contains')
+        path = Path(item['path'])
+        if path.is_absolute() or '..' in path.parts or not path.parts:
+            raise ValueError('artifact path must stay inside the workspace')
+        minimum = item.get('min_chars', 1)
+        if type(minimum) is not int or not 1 <= minimum <= 8_000_000:
+            raise ValueError('invalid min_chars')
+        contains = item.get('contains', [])
+        if not isinstance(contains, list) or not all(isinstance(x, str) for x in contains):
+            raise ValueError('contains must be a list of literal strings')
+
+
+def check_artifacts(artifacts, root):
+    """Literal file checks only (exists / size / contains); returns failures (empty = pass)."""
+    root = Path(root).resolve()
+    failures = []
+    for item in artifacts:
+        path = (root / item['path']).resolve()
+        if not path.is_relative_to(root):
+            failures.append('outside workspace: ' + item['path'])
+        elif not path.is_file():
+            failures.append('artifact not written: ' + item['path'])
+        elif path.stat().st_size > 32_000_000:
+            failures.append('artifact too large to check: ' + item['path'])
+        else:
+            text = path.read_text(errors='replace')
+            if len(text) < item.get('min_chars', 1) or not all(c in text for c in item.get('contains', [])):
+                failures.append('artifact below requirements (length / required text): ' + item['path'])
+    return failures
+
+
+def parse_decision(text, workers, others_active):
+    decision = json.loads(text[text.index('{'):text.rindex('}') + 1])
+    if not isinstance(decision, dict) or 'checks' in decision:
+        raise ValueError('decision must be a JSON object and may not submit host commands (checks)')
+    if decision.get('status') not in ('RUNNING', 'COMPLETED', 'BLOCKED'):
+        raise ValueError('status must be RUNNING / COMPLETED / BLOCKED')
+    completion = decision.get('completion')
+    if isinstance(completion, bool) or not isinstance(completion, int) or not 0 <= completion <= 100:
+        raise ValueError('completion must be an integer 0-100')
+    dispatch = decision.setdefault('dispatch', [])
+    if not isinstance(dispatch, list):
+        raise ValueError('dispatch must be a list')
+    for item in dispatch:
+        if not isinstance(item, dict) or item.get('to') not in workers:
+            raise ValueError('dispatch.to must be one of ' + ', '.join(workers))
+        if not isinstance(item.get('instruction'), str) or len(item['instruction'].strip()) < 12:
+            raise ValueError('instruction must state the action and the expected output (>= 12 chars)')
+    if 'artifacts' in decision:
+        validate_artifacts(decision['artifacts'])
+    if decision['status'] == 'RUNNING' and not dispatch and not others_active:
+        raise ValueError('no worker is busy: RUNNING must dispatch at least one instruction')
+    return decision
+
+
+# ------------------------------------------------------------ codex rollouts
+def rollouts(thread, sessions=None):
+    base = sessions or SESSIONS
+    return sorted(base.glob('*/*/*/*' + thread + '*.jsonl'), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _meta(path):
+    with path.open() as f:
+        return json.loads(f.readline()).get('payload', {})
+
+
+def _is_subagent(meta):
+    return isinstance(meta.get('source'), dict) and 'subagent' in meta['source']
+
+
+def _tail(path, size):
+    with path.open('rb') as f:
+        f.seek(max(0, path.stat().st_size - size))
+        return f.read().decode('utf-8', 'replace').splitlines()
+
+
+def completed_turn(cwd, data, sessions=None):
+    """Codex also notifies for title-generation calls; require a real task_complete."""
+    thread = data.get('thread-id') or data.get('thread_id')
+    if not isinstance(thread, str) or not re.fullmatch(THREAD_RE, thread):
+        return False
+    text = (data.get('last-assistant-message') or data.get('last_assistant_message') or '').strip()
+    turn = data.get('turn-id') or data.get('turn_id')
+    for path in rollouts(thread, sessions):  # newest chunk of a resumed thread wins
+        try:
+            meta = _meta(path)
+            if _is_subagent(meta) or meta.get('cwd') != str(cwd):
+                continue
+            for line in reversed(_tail(path, 262144)):
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                payload = row.get('payload', {})
+                if row.get('type') == 'event_msg' and payload.get('type') == 'task_started':
+                    return False
+                if row.get('type') == 'event_msg' and payload.get('type') == 'task_complete':
+                    return ((payload.get('last_agent_message') or '').strip() == text
+                            and (not turn or payload.get('turn_id') == turn))
+            return False
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def active_children(thread, sessions=None):
+    """Native Codex subagents spawned by this thread that have not finished yet."""
+    base = sessions or SESSIONS
+    roots = rollouts(thread, base) if thread else []
+    if not roots:
+        return []
+    cutoff = getattr(roots[-1].stat(), 'st_birthtime', 0)
+    children = {}
+    for path in base.glob('*/*/*/*.jsonl'):
+        try:
+            if path.stat().st_mtime < cutoff:
+                continue
+            meta = _meta(path)
+            parent = meta.get('source', {}).get('subagent', {}).get('thread_spawn', {}).get('parent_thread_id')
+            if parent:
+                children.setdefault(parent, []).append((meta.get('id'), path))
+        except (OSError, ValueError, AttributeError):
+            continue
+    queue, busy, seen = [thread], [], set()
+    while queue:
+        parent = queue.pop()
+        if parent in seen:
+            continue
+        seen.add(parent)
+        for child, path in children.get(parent, []):
+            queue.append(child)
+            status = None
+            for line in reversed(_tail(path, 65536)):
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                kind = row.get('payload', {}).get('type')
+                if row.get('type') == 'event_msg' and kind in ('task_started', 'task_complete', 'turn_aborted'):
+                    status = kind
+                    break
+            if status not in ('task_complete', 'turn_aborted'):
+                busy.append(child)
+    return busy
+
+
+# ------------------------------------------------------------ actor side
+def notify(cfg_path, name, generation, payload, sessions=None):
+    """Codex notify hook. The generation is baked into argv at spawn, so a late callback
+    from a retired session keeps its old generation and is dropped as stale."""
+    data = json.loads(payload)
+    if data.get('type') != 'agent-turn-complete':
+        return False
+    cfg = load(cfg_path)
+    for _ in range(10):
+        if completed_turn(agent_cwd(cfg, name), data, sessions):
+            break
+        time.sleep(.2)
+    else:
+        return False  # title/auxiliary call, not a turn end
+    r = connect(cfg)
+    digest = hashlib.sha256((name + str(generation) + payload).encode()).hexdigest()
+    if not r.set('fx:seen:' + digest, '1', nx=True, ex=86400):
+        return False
+    r.rpush(EVENTS, json.dumps({'kind': 'turn', 'agent': name, 'generation': int(generation),
+                                'thread': data.get('thread-id') or data.get('thread_id'),
+                                'text': data.get('last-assistant-message') or data.get('last_assistant_message') or '',
+                                'at': time.time()}, ensure_ascii=False))
+    return True
+
+
+def actor_argv(cfg_path, cfg, name, generation, prompt):
+    callback = [cfg['python'], str(Path(__file__).resolve()), 'notify', str(cfg_path), name, str(generation)]
+    argv = [cfg.get('codex') or 'codex', '--profile', cfg.get('profile') or DEFAULTS['profile'],
+            # The hook-trust bypass is carried over from the original deployment (hooks configured in
+            # the profile); it is not needed for the notify callback itself.
+            '--no-alt-screen', '--dangerously-bypass-hook-trust',
+            '--sandbox', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true',
+            '-c', 'approval_policy="never"',
+            '-c', 'check_for_update_on_startup=false',  # the update dialog would eat the first paste
+            '-c', 'notify=' + json.dumps(callback),
+            '-c', 'developer_instructions=' + json.dumps(
+                'Your role, rules and reply format are in AGENTS.md in the current directory. Follow it.')]
+    if cfg.get('compact_limit'):
+        # The daemon rotates sessions at handoff_ratio before each delivery; Codex's own
+        # compaction is only a safety net for a single runaway turn.
+        argv += ['-c', 'model_auto_compact_token_limit=' + str(int(cfg['compact_limit']))]
+    return argv + [prompt]
+
+
+def actor(cfg_path, name, prompt):
+    cfg = load(cfg_path)
+    generation = int(connect(cfg).hget(key('agent', name), 'generation') or 0)
+    os.chdir(agent_cwd(cfg, name))
+    argv = actor_argv(cfg_path, cfg, name, generation, prompt)
+    os.execvp(argv[0], argv)
+
+
+# ------------------------------------------------------------ daemon
+class Fleet:
+    def __init__(self, cfg_path, r, mgr, sessions=None):
+        self.path = Path(cfg_path).resolve()
+        self.cfg = dict(DEFAULTS, **load(self.path))
+        self.run_dir = Path(self.cfg['run'])
+        self.r, self.mgr, self.sessions = r, mgr, sessions
+        self.workers = list(self.cfg['workers'])
+        self.names = ['supervisor'] + self.workers
+        self.stopping = False
+        self.next_liveness = 0
+        self.last_chrome = 0
+
+    # -- small helpers
+    def agent(self, name):
+        return self.r.hgetall(key('agent', name))
+
+    def setf(self, name, **fields):
+        self.r.hset(key('agent', name), mapping={k: str(v) for k, v in fields.items()})
+
+    def task(self):
+        return self.r.hgetall(TASK)
+
+    # Each handoff successor is named slot.generation (worker-1 -> worker-1.1 -> worker-1.2);
+    # the slot (redis key, cwd, notify argv) stays fixed so declared artifact paths survive.
+    def label(self, slot):
+        return self.agent(slot).get('label') or slot
+
+    def labels(self):
+        return [self.label(w) for w in self.workers]
+
+    def resolve(self, name):
+        return self.r.hget(NAMES, name) or name
+
+    def running(self):
+        return self.task().get('status') == 'running'
+
+    def log(self, kind, **data):
+        self.r.rpush(LOG, json.dumps(dict(time=time.time(), kind=kind, **data), ensure_ascii=False))
+        self.r.ltrim(LOG, -2000, -1)
+        print(time.strftime('%H:%M:%S'), kind, json.dumps(data, ensure_ascii=False)[:180], flush=True)
+
+    def queue(self, name, text):
+        self.r.rpush(key('inbox', name), text)
+
+    def workspace(self):
+        return self.run_dir / 'workspace'
+
+    def fleet_cmd(self):
+        return shlex.join([self.cfg['python'], str(Path(__file__).resolve()), 'chrome', '--config', str(self.path)])
+
+    # -- actors
+    def spawn(self, name, prompt):
+        cwd = agent_cwd(self.cfg, name)
+        cwd.mkdir(parents=True, exist_ok=True)
+        role = 'supervisor' if name == 'supervisor' else 'worker'
+        scope = (HERE / 'agents' / (role + '.md')).read_text()
+        scope = scope.replace('{{WORKSPACE}}', str(self.workspace())).replace('{{FLEET_CHROME}}', self.fleet_cmd())
+        (cwd / 'AGENTS.md').write_text(scope)
+        generation = int(self.agent(name).get('generation', 0))
+        self.setf(name, role=role, generation=generation, state='starting', thread='', pane='',
+                  busy_since=time.time())
+        prompt_file = self.run_dir / 'prompts' / (name + '-g' + str(generation) + '.md')
+        prompt_file.parent.mkdir(parents=True, exist_ok=True)
+        prompt_file.write_text(prompt)
+        result = self.mgr.spawn_interactive_cli(
+            window_name='fx-' + self.label(name), prompt_file=str(prompt_file), start_directory=str(cwd),
+            cli_command=shlex.join([self.cfg['python'], str(Path(__file__).resolve()), 'actor', str(self.path), name]),
+            output_file=str(self.run_dir / 'prompts' / (name + '-g' + str(generation) + '.terminal.log')),
+            auto_close=False, metadata={'type': role, 'cli_type': 'codex', 'profile': self.cfg['profile']},
+            env_vars={'PATH': os.environ.get('PATH', ''), 'CODEX_HOME': os.environ.get('CODEX_HOME')})
+        if not result.success:
+            raise RuntimeError('spawn failed: ' + name + ': ' + str(result.error))
+        self.setf(name, pane=result.pane_id)
+        self.log('spawn', agent=name, generation=generation, pane=result.pane_id)
+        return result.pane_id
+
+    def start_all(self):
+        for name in self.workers:
+            self.setf(name, label=name)
+            self.r.hset(NAMES, mapping={name: name})
+        for name in self.names:
+            self.spawn(name, 'You are fleet agent ' + name + '. Read AGENTS.md in the current directory first. '
+                             'There is no task yet: your final reply must be exactly READY.')
+        sup = self.agent('supervisor')['pane']
+        for name in self.workers:
+            self.mgr.place_right_of(self.agent(name)['pane'], sup)
+
+    # -- events
+    def handle(self, ev):
+        kind = ev.get('kind')
+        if kind == 'task':
+            try:
+                answer = {'status': 'accepted', 'task_id': self.submit(ev.get('spec'))}
+            except (ValueError, TypeError) as exc:
+                answer = {'status': 'rejected', 'reason': str(exc)}
+            self.r.set('fx:reply:' + ev['request_id'], json.dumps(answer, ensure_ascii=False), ex=86400)
+        elif kind == 'stop':
+            if self.running():
+                self.finish('cancelled', 'stopped by operator')
+            self.stopping = True
+            self.r.set('fx:reply:' + ev['request_id'], json.dumps({'status': 'accepted'}), ex=86400)
+        elif kind == 'chrome':
+            self.r.set('fx:reply:' + ev['request_id'], json.dumps(self.chrome(ev.get('argv')), ensure_ascii=False), ex=3600)
+        elif kind == 'turn':
+            self.on_turn(ev)
+
+    def chrome(self, argv):
+        script = self.cfg.get('chrome_script')
+        if not script:
+            return {'status': 'rejected', 'reason': 'browser broker disabled (start with --chrome-script)'}
+        if not isinstance(argv, list) or not argv or argv[0] not in CHROME_VERBS \
+                or not all(isinstance(a, str) for a in argv):
+            return {'status': 'rejected', 'reason': 'allowed verbs: ' + ' / '.join(sorted(CHROME_VERBS))}
+        if argv[0] == 'js':
+            if len(argv) != 3:
+                return {'status': 'rejected', 'reason': 'usage: js <tab-index> <script-file>'}
+            path = Path(argv[2]).resolve()
+            if not path.is_relative_to(self.run_dir.resolve()) or not path.is_file():
+                return {'status': 'rejected', 'reason': 'js script must be a file inside this run directory'}
+            argv = argv[:2] + [str(path)]
+        # Pace page actions here, not in the prompt: models do not honour "wait N seconds",
+        # and an unpaced night of page loads can get the operator's IP firewalled.
+        wait = self.last_chrome + float(self.cfg['chrome_min_interval']) - time.time()
+        if argv[0] != 'check' and wait > 0:
+            time.sleep(wait)
+        self.last_chrome = time.time()
+        try:
+            p = subprocess.run([script] + argv, capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            return {'status': 'error', 'rc': -1, 'out': 'browser broker timed out after 120 s'}
+        self.log('chrome', argv=argv[:2], rc=p.returncode)
+        return {'status': 'ok', 'rc': p.returncode, 'out': (p.stdout + p.stderr)[-200000:]}
+
+    def on_turn(self, ev):
+        name, info = ev.get('agent'), self.agent(ev.get('agent', ''))
+        if not info or ev.get('generation') != int(info.get('generation', 0)):
+            self.log('turn.stale', agent=name, generation=ev.get('generation'))
+            return
+        if ev.get('thread'):
+            self.setf(name, thread=ev['thread'])
+        if info.get('state') == 'handoff':
+            self.finish_rotation(name)
+            return
+        was = info.get('state')
+        self.setf(name, state='idle', stalls=0)
+        if was == 'starting':  # READY after spawn / takeover
+            self.log('ready', agent=name, generation=info.get('generation'))
+            return
+        text = ev.get('text', '')
+        if not text.strip() and info.get('last_msg'):
+            # Empty turn: the model backend dropped the request (seen with a local server
+            # under memory pressure). Re-deliver the same message after a backoff instead of
+            # spending a supervisor turn on it.
+            tries = int(info.get('empty_tries', 0)) + 1
+            self.log('turn.empty', agent=name, tries=tries)
+            if tries <= 3:
+                self.r.lpush(key('inbox', name), info['last_msg'])
+                self.setf(name, empty_tries=tries, retry_at=time.time() + 30 * tries)
+                return
+        self.setf(name, empty_tries=0)
+        self.r.rpush(key('replies', name), text[-4000:])
+        self.r.ltrim(key('replies', name), -5, -1)
+        if not self.running():
+            self.log('turn.outside_task', agent=name)
+            return
+        if name == 'supervisor':
+            self.on_supervisor(text)
+        else:
+            prev = info.get('prev_label')
+            self.report(name, text[-8000:], prev)
+            if prev:
+                self.setf(name, prev_label='')
+
+    def report(self, name, text, prev=None):
+        tag = '[' + self.label(name) + ' report' + (' (took over from ' + prev + ')' if prev else '') + ']'
+        self.queue('supervisor', tag + '\n' + text + '\n\nReply with the JSON format from AGENTS.md.')
+
+    def others_active(self):
+        return any(self.agent(w).get('state') != 'idle' or self.r.llen(key('inbox', w)) for w in self.workers)
+
+    def on_supervisor(self, text):
+        t = self.task()
+        try:
+            decision = parse_decision(text, self.labels() + list(self.r.hgetall(NAMES)), self.others_active())
+        except (ValueError, TypeError, KeyError) as exc:
+            bad = self.r.hincrby(TASK, 'bad_replies', 1)
+            if bad >= 3:
+                self.finish('blocked', 'supervisor gave no valid decision JSON three times in a row: ' + str(exc))
+            else:
+                self.queue('supervisor', 'Your reply is not a valid decision JSON (' + str(exc)
+                           + '). Resend one JSON object in the AGENTS.md format, nothing else.')
+            return
+        artifacts = json.loads(t.get('artifacts') or '[]')
+        artifacts += [a for a in decision.get('artifacts', []) if a not in artifacts]
+        self.r.hset(TASK, mapping={'bad_replies': 0, 'completion': decision['completion'],
+                                   'reason': decision.get('reason', ''),
+                                   'artifacts': json.dumps(artifacts, ensure_ascii=False)})
+        if decision['status'] == 'BLOCKED':
+            self.finish('blocked', decision.get('reason', 'needs a human'))
+            return
+        if decision['status'] == 'COMPLETED':
+            failures = (check_artifacts(artifacts, self.workspace()) if artifacts
+                        else ['no artifacts were declared, nothing to verify'])
+            if not failures:
+                self.finish('completed', decision.get('reason', 'artifacts verified'))
+                return
+            bounces = self.r.hincrby(TASK, 'bounces', 1)
+            if bounces >= 3:
+                self.finish('blocked', 'supervisor claimed completion three times without passing verification: '
+                            + '; '.join(failures))
+            else:
+                self.queue('supervisor', 'Independent verification failed, the task cannot end: ' + '; '.join(failures)
+                           + '\nDispatch corrective instructions to the workers (RUNNING + dispatch).')
+            return
+        for item in decision['dispatch']:
+            slot = self.resolve(item['to'])
+            self.queue(slot, '[Supervisor instruction ' + t.get('id', '') + '] ' + item['instruction'].strip()
+                       + '\nShared output directory: ' + str(self.workspace()) + ' (write only inside your own '
+                       'subdirectory ' + slot + '/). Reply in the AGENTS.md format when done.')
+        self.log('dispatch', count=len(decision['dispatch']), completion=decision['completion'])
+
+    def submit(self, spec):
+        if not isinstance(spec, dict) or not isinstance(spec.get('goal'), str) or not spec['goal'].strip():
+            raise ValueError('a task needs a goal')
+        if self.running():
+            raise ValueError('a task is already running; stop it or wait for it to finish')
+        if 'artifacts' in spec:
+            validate_artifacts(spec['artifacts'])
+        hours = spec.get('hours', 16)
+        if isinstance(hours, bool) or not isinstance(hours, (int, float)) or not 0 < hours < 1000:
+            raise ValueError('hours must be a positive number')
+        task_id = 'task-' + uuid.uuid4().hex[:10]
+        self.r.delete(TASK)
+        self.r.hset(TASK, mapping={'id': task_id, 'goal': spec['goal'], 'status': 'running', 'completion': 0,
+                                   'reason': '', 'deadline': time.time() + hours * 3600, 'bad_replies': 0,
+                                   'bounces': 0, 'artifacts': json.dumps(spec.get('artifacts', []), ensure_ascii=False)})
+        self.queue('supervisor', '[New task ' + task_id + '] Goal: ' + spec['goal']
+                   + '\nWorkers you can dispatch to: ' + ', '.join(self.labels())
+                   + '\nShared output directory: ' + str(self.workspace())
+                   + ' (artifact paths are relative to it, e.g. worker-1/report.md)'
+                   + '\nArtifacts pre-declared by the operator: ' + json.dumps(spec.get('artifacts', []), ensure_ascii=False)
+                   + '\nReply with the JSON format from AGENTS.md.')
+        self.log('task.submitted', task=task_id)
+        return task_id
+
+    def finish(self, status, reason):
+        self.r.hset(TASK, mapping={'status': status, 'reason': reason})
+        self.log('task.' + status, reason=reason)
+        for name in self.names:
+            self.r.delete(key('inbox', name))
+            pane = self.agent(name).get('pane')
+            if pane and self.agent(name).get('state') == 'busy':
+                # An aborted turn fires no notify, so mark idle here; tabs stay open.
+                self.mgr.send_key(pane, 'Escape')
+                self.setf(name, state='idle')
+
+    # -- delivery + rotation
+    def pump(self):
+        for name in self.names:
+            info = self.agent(name)
+            if (info.get('state') == 'idle' and self.r.llen(key('inbox', name))
+                    and time.time() >= float(info.get('retry_at') or 0)):
+                self.deliver(name)
+
+    def usage(self, name):
+        thread = self.agent(name).get('thread')
+        paths = rollouts(thread, self.sessions) if thread else []
+        if not paths:
+            return 0, 0
+        used, window = read_usage(str(paths[0]), int(self.cfg['window']))
+        self.setf(name, ctx_used=used, ctx_window=window)
+        return used, window
+
+    def deliver(self, name):
+        used, window = self.usage(name)
+        if window and used >= float(self.cfg['handoff_ratio']) * window:
+            if active_children(self.agent(name).get('thread'), self.sessions):
+                # Hold the message: never feed a near-full session while its subagents run.
+                self.log('rotate.deferred', agent=name, reason='native subagents still running')
+            else:
+                self.start_rotation(name, used, window)
+            return
+        text = self.r.lpop(key('inbox', name))
+        if not text:
+            return
+        self.setf(name, state='busy', busy_since=time.time())
+        if not self.mgr.send_prompt_to_idle(self.agent(name)['pane'], text):
+            self.r.lpush(key('inbox', name), text)
+            self.finish('blocked', 'delivery failed: ' + name)
+            return
+        self.setf(name, last_msg=text)
+        self.log('deliver', agent=name, text=text[:120])
+
+    def start_rotation(self, name, used, window):
+        info = self.agent(name)
+        hid = uuid.uuid4().hex[:10]
+        draft = agent_cwd(self.cfg, name) / '.handoff' / ('draft-' + hid + '.md')
+        draft.parent.mkdir(parents=True, exist_ok=True)
+        draft.write_text(handoff.partial_template())
+        self.setf(name, state='handoff', handoff_id=hid, handoff_draft=draft,
+                  handoff_mtime=draft.stat().st_mtime_ns,
+                  handoff_deadline=time.time() + float(self.cfg['handoff_timeout']))
+        self.log('rotate.start', agent=name, used=used, window=window, generation=info.get('generation'))
+        prompt = (handoff.DUMP_PROMPT.format(path=draft, used=used, window=window)
+                  + ' This is a same-task handoff: do not open windows, do not continue the task itself.')
+        if not self.mgr.send_prompt_to_idle(info['pane'], prompt):
+            self.finish_rotation(name, timed_out=True)
+
+    def skeleton(self, name, info):
+        t = self.task()
+        replies = self.r.lrange(key('replies', name), 0, -1)
+        pending = self.r.lrange(key('inbox', name), 0, 0)
+        return handoff.build_skeleton(
+            info['handoff_id'], SESSION, t.get('goal') or '(no task yet, standing by)',
+            done_lines=['recent reply: ' + ' '.join(x.split())[:600] for x in replies],
+            inprogress='none (handoff happens at an idle boundary)',
+            next_lines=['read this note, reply READY, then wait for the daemon to deliver the next message'
+                        + (' (pending: ' + ' '.join(pending[0].split())[:300] + ')' if pending else '')],
+            pending='none', task=t.get('id', ''), hop=int(info['generation']) + 1,
+            key_files=[str(self.workspace()), str(agent_cwd(self.cfg, name) / 'AGENTS.md')],
+            risks=['role ' + name + ' and task ' + t.get('id', 'none') + ' are unchanged',
+                   'anything the model claims as done must be checked against the artifacts'])
+
+    def finish_rotation(self, name, timed_out=False):
+        info = self.agent(name)
+        generation = int(info['generation'])
+        base = self.skeleton(name, info)
+        draft = Path(info['handoff_draft'])
+        out = self.run_dir / 'handoffs' / (name + '-g' + str(generation) + '-' + info['handoff_id'] + '.md')
+        out.parent.mkdir(parents=True, exist_ok=True)
+        source = 'skeleton'
+        if not timed_out and draft.exists() and draft.stat().st_mtime_ns > int(info['handoff_mtime']):
+            out.write_text(handoff.merge_partial(base, draft.read_text()))
+            source = 'model'
+            if not handoff.validate(str(out))[0]:
+                source = 'skeleton'
+        if source == 'skeleton':
+            out.write_text(base)  # never fail a rotation because the model did not write
+        old = info['pane']
+        history = self.mgr.archive_pane(old, str(out.with_suffix('.terminal.txt')),
+                                        'previous ' + self.label(name) + ' (read-only; q closes)')
+        if history and info.get('history'):
+            # Keep every past generation: stack the new record as a tab beside the older ones.
+            self.mgr.tab_into(history, info['history'])
+        if not self.mgr.kill_pane(old):
+            self.finish('blocked', 'could not close the old session, refusing to start a duplicate: ' + name)
+            return
+        self.setf(name, generation=generation + 1, history=history or '', handoff_id='')
+        prev = self.label(name)
+        if name != 'supervisor':
+            new = name + '.' + str(generation + 1)
+            self.setf(name, label=new, prev_label=prev)
+            self.r.hset(NAMES, mapping={new: name})  # old names keep routing to this slot
+        self.spawn(name, '[Same-task takeover] You are ' + self.label(name) + ' (taking over from ' + prev
+                   + '). Read the handoff note ' + str(out) + ' and continue from it. In this turn only read '
+                   'the note, do no task work, and make your final reply exactly READY.')
+        if history and self.mgr.place_below_archive(self.agent(name)['pane'], history, 'fx-' + self.label(name)):
+            self.mgr.grow_up(self.agent(name)['pane'])  # fold the records pane down to its tab strip
+        elif name != 'supervisor':
+            self.mgr.place_right_of(self.agent(name)['pane'], self.agent('supervisor').get('pane', ''))
+        self.log('rotate.done', agent=name, label=self.label(name), prev=prev, generation=generation + 1,
+                 handoff=str(out), source=source, timed_out=timed_out)
+
+    # -- stall watchdog
+    def last_activity(self, info):
+        """Newest of: when we handed the agent its message, and its rollout file's mtime."""
+        last = float(info.get('busy_since') or 0)
+        thread = info.get('thread')
+        paths = rollouts(thread, self.sessions) if thread else []
+        if paths:
+            last = max(last, paths[0].stat().st_mtime)
+        return last
+
+    def check_stalls(self, now):
+        limit = float(self.cfg['stall_timeout'])
+        if limit <= 0:
+            return
+        for name in self.names:
+            info = self.agent(name)
+            if info.get('state') not in ('busy', 'starting'):
+                continue
+            last = self.last_activity(info)
+            if not last or now - last < limit:
+                continue
+            self.on_stall(name, info, int(now - last))
+
+    def on_stall(self, name, info, idle_s):
+        stalls = int(info.get('stalls', 0)) + 1
+        self.log('agent.stalled', agent=name, state=info.get('state'), idle_s=idle_s, stalls=stalls)
+        self.mgr.send_key(info['pane'], 'Escape')  # abort the turn; an aborted turn fires no notify
+        self.setf(name, state='idle', stalls=stalls, busy_since=time.time())
+        if info.get('state') == 'starting':
+            if self.running():
+                self.finish('blocked', name + ' never became ready (' + str(idle_s) + ' s without activity)')
+            return
+        if not self.running():
+            return
+        minutes = str(idle_s // 60)
+        if name == 'supervisor':
+            if stalls >= 2 or not info.get('last_msg'):
+                self.finish('blocked', 'supervisor stalled twice (' + minutes + ' min without activity)')
+            else:
+                self.r.lpush(key('inbox', name), info['last_msg'])  # one retry of the same message
+        else:
+            self.report(name, 'STALLED: no activity for ' + minutes + ' min, its turn was aborted. The worker is '
+                        'idle again. Dispatch a smaller, concrete instruction, or reply BLOCKED if a human is needed.')
+
+    def tick(self):
+        now = time.time()
+        for name in self.names:
+            info = self.agent(name)
+            if info.get('state') == 'handoff' and now >= float(info.get('handoff_deadline', 0)):
+                self.finish_rotation(name, timed_out=True)
+        t = self.task()
+        if t.get('status') == 'running' and now >= float(t.get('deadline', 0)):
+            self.finish('budget_exhausted', 'time budget exhausted')
+        self.check_stalls(now)
+        if now >= self.next_liveness:
+            self.next_liveness = now + 30
+            for name in self.names:
+                pane = self.agent(name).get('pane')
+                if pane and self.mgr.get_pane_status(pane) is None:
+                    self.setf(name, state='dead')
+                    if self.running():
+                        self.finish('blocked', name + ' tab was closed')
+
+    def run(self):
+        self.mgr.get_or_create_session()
+        self.start_all()
+        while not self.stopping:
+            item = self.r.blpop(EVENTS, timeout=2)
+            if item:
+                try:
+                    self.handle(json.loads(item[1]))
+                except ValueError as exc:
+                    self.log('event.bad', error=str(exc))
+            self.pump()
+            self.tick()
+
+
+# ------------------------------------------------------------ operator CLI
+def daemon(cfg_path):
+    from cmux_fleet.cmux_manager import CmuxSessionManager
+    cfg = load(cfg_path)
+    with (Path(cfg['run']) / 'daemon.lock').open('a+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fleet = Fleet(cfg_path, connect(cfg), CmuxSessionManager(SESSION))
+
+        def stop(signum, frame):
+            fleet.stopping = True
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, stop)
+        try:
+            fleet.run()
+        finally:
+            try:
+                fleet.r.shutdown()
+            except Exception:
+                pass  # redis closes the socket while acknowledging shutdown
+
+
+def start(args):
+    from cmux_fleet.cmux_manager import CmuxSessionManager, cmux_available
+    if not cmux_available():
+        raise SystemExit('run this inside a cmux terminal: cmux only accepts processes started in its windows')
+    codex = args.codex or shutil.which('codex')
+    redis_server = args.redis_server or shutil.which('redis-server')
+    missing = [n for n, p in (('codex', codex), ('redis-server', redis_server)) if not p]
+    if missing:
+        raise SystemExit('not found on PATH: ' + ', '.join(missing) + ' (pass --codex / --redis-server)')
+    mgr = CmuxSessionManager(SESSION)
+    if mgr.session_exists():
+        raise SystemExit('cmux-fleet tabs already exist; run `stop` and close them with the ✕ first')
+    token = uuid.uuid4().hex[:8]
+    run = Path(args.runs_dir).expanduser() / ('fleet-' + time.strftime('%Y%m%d-%H%M%S-') + token)
+    (run / 'workspace').mkdir(parents=True)
+    cfg = {'run': str(run), 'redis_socket': SOCK_PREFIX + token + '.sock', 'python': sys.executable,
+           'workers': ['worker-' + str(i + 1) for i in range(max(1, args.workers))],
+           'profile': args.profile, 'codex': codex, 'redis_server': redis_server,
+           'handoff_ratio': args.handoff_ratio, 'handoff_timeout': args.handoff_timeout,
+           'window': args.window, 'stall_timeout': args.stall_timeout,
+           'compact_limit': args.compact_limit, 'chrome_script': args.chrome_script,
+           'chrome_min_interval': args.chrome_min_interval}
+    save(run / 'config.json', cfg)
+    subprocess.run([redis_server, '--port', '0', '--unixsocket', cfg['redis_socket'],
+                    '--unixsocketperm', '700', '--dir', str(run), '--dbfilename', 'fleet.rdb',
+                    '--appendonly', 'no', '--save', '60 1', '--daemonize', 'yes',
+                    '--pidfile', str(run / 'redis.pid'), '--logfile', str(run / 'redis.log')], check=True)
+    for _ in range(30):
+        try:
+            connect(cfg)
+            break
+        except Exception:
+            time.sleep(.1)
+    else:
+        raise SystemExit('private Redis did not become ready')
+    command = [cfg['python'], str(Path(__file__).resolve()), 'daemon', str(run / 'config.json')]
+    caffeinate = shutil.which('caffeinate')
+    if caffeinate:
+        command = [caffeinate, '-i'] + command
+    result = mgr.spawn_window('control', shlex.join(command), metadata={'type': 'daemon'}, start_directory=str(run))
+    if not result.success:
+        connect(cfg).shutdown()
+        raise SystemExit(result.error)
+    save(LATEST, dict(cfg, config=str(run / 'config.json')))
+    print('fleet started: supervisor + ' + str(len(cfg['workers'])) + ' worker(s) initialising. Run directory:', run)
+
+
+def request(cfg, event, wait=30):
+    import redis as redis_lib
+    r = connect(cfg)
+    event['request_id'] = uuid.uuid4().hex
+    r.rpush(EVENTS, json.dumps(event, ensure_ascii=False))
+    for _ in range(wait * 10):
+        try:
+            raw = r.get('fx:reply:' + event['request_id'])
+        except redis_lib.ConnectionError:
+            if event['kind'] == 'stop':  # the daemon shuts its private redis right after replying
+                return {'status': 'stopped'}
+            raise
+        if raw:
+            return json.loads(raw)
+        time.sleep(.1)
+    return {'status': 'pending', 'request_id': event['request_id']}
+
+
+def status(cfg):
+    r = connect(cfg)
+    print(json.dumps({'task': r.hgetall(TASK),
+                      'agents': {n: dict(r.hgetall(key('agent', n)), inbox=r.llen(key('inbox', n)))
+                                 for n in ['supervisor'] + cfg['workers']}}, ensure_ascii=False, indent=2))
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog='cmux-fleet', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest='cmd', required=True)
+    s = sub.add_parser('start', help='provision the private redis + cmux control surface (inside cmux)')
+    s.add_argument('--workers', type=int, default=1)
+    s.add_argument('--profile', default=DEFAULTS['profile'], help='codex config profile for every agent (default: fleet)')
+    s.add_argument('--codex', help='codex binary (default: first on PATH)')
+    s.add_argument('--redis-server', help='redis-server binary (default: first on PATH)')
+    s.add_argument('--runs-dir', default=str(HOME / 'runs'), help='where run directories are created')
+    s.add_argument('--handoff-ratio', type=float, default=DEFAULTS['handoff_ratio'],
+                   help='rotate a session once its context use reaches this share of the window')
+    s.add_argument('--handoff-timeout', type=float, default=DEFAULTS['handoff_timeout'],
+                   help='seconds to wait for the model to write its handoff before using the skeleton')
+    s.add_argument('--window', type=int, default=DEFAULTS['window'],
+                   help='context window fallback when the rollout has not reported one yet')
+    s.add_argument('--stall-timeout', type=float, default=DEFAULTS['stall_timeout'],
+                   help='seconds without rollout activity before a busy agent is treated as stalled (0 = off)')
+    s.add_argument('--compact-limit', type=int, help='codex model_auto_compact_token_limit (default: codex decides)')
+    s.add_argument('--chrome-script', help='optional browser broker script run by the daemon for sandboxed agents')
+    s.add_argument('--chrome-min-interval', type=float, default=DEFAULTS['chrome_min_interval'])
+    sub.add_parser('daemon', help='run the coordinator (internal)').add_argument('cfg')
+    t = sub.add_parser('task', help='submit a goal: JSON file or - for stdin ({"goal":..., "hours":..., "artifacts":[...]})')
+    t.add_argument('spec')
+    for name in ('status', 'stop'):
+        sub.add_parser(name).add_argument('--config', default=str(LATEST))
+    t.add_argument('--config', default=str(LATEST))
+    n = sub.add_parser('notify', help='codex notify hook (internal)')
+    for arg in ('cfg', 'agent', 'generation', 'payload'):
+        n.add_argument(arg)
+    c = sub.add_parser('chrome', help='run a vetted browser verb through the daemon (sandboxed agents)')
+    c.add_argument('--config', default=str(LATEST))
+    c.add_argument('argv', nargs=argparse.REMAINDER)
+    a = sub.add_parser('actor', help='exec codex for one agent (internal)')
+    for arg in ('cfg', 'agent', 'prompt'):
+        a.add_argument(arg)
+    args = p.parse_args(argv)
+    if args.cmd == 'start':
+        start(args)
+    elif args.cmd == 'daemon':
+        daemon(args.cfg)
+    elif args.cmd == 'notify':
+        notify(args.cfg, args.agent, args.generation, args.payload)
+    elif args.cmd == 'actor':
+        actor(args.cfg, args.agent, args.prompt)
+    else:
+        cfg = load(args.config)
+        if args.cmd == 'status':
+            status(cfg)
+        elif args.cmd == 'chrome':
+            ans = request(cfg, {'kind': 'chrome', 'argv': args.argv}, wait=150)
+            print(ans.get('out') or ans.get('reason') or json.dumps(ans, ensure_ascii=False))
+            sys.exit(ans.get('rc', 1) if ans.get('status') == 'ok' else 2)
+        elif args.cmd == 'stop':
+            print(json.dumps(request(cfg, {'kind': 'stop'}), ensure_ascii=False))
+        else:
+            spec = json.loads(sys.stdin.read() if args.spec == '-' else Path(args.spec).read_text())
+            print(json.dumps(request(cfg, {'kind': 'task', 'spec': spec}), ensure_ascii=False))
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,409 @@
+"""cmux backend: every agent lives in a cmux tab/split that the user can close with the ✕.
+
+cmux only accepts commands from processes started inside a cmux window, so the daemon
+must run in a cmux surface. Every call is scoped by workspace UUID (refs such as
+``surface:N`` renumber), and every destructive or typing call first checks that the
+surface is one this manager spawned. Ownership is kept in
+``~/.local/state/cmux-fleet/<session>.json``.
+
+Hard-won cmux facts (all measured, not documented):
+
+* ``send`` interprets ``\\n`` / ``\\t`` escapes, so verbatim text goes through
+  ``set-buffer`` + ``paste-buffer``.
+* Do **not** wrap pasted text in bracketed-paste markers (``ESC[200~`` ... ``ESC[201~``).
+  The Codex TUI treats the ESC as a bare Escape key and shows ``[200~`` literally in the
+  composer (verified on codex-cli 0.156.1). Codex's own paste-burst detection already
+  keeps a multi-line paste in the composer until the explicit Enter.
+* ``new-workspace --focus false`` still switches the user's view; select the previous
+  workspace back afterwards.
+* ``pipe-pane`` is a one-shot snapshot, not a stream. The final screen is saved when a
+  surface is closed; the real transcript is Codex's rollout file.
+* Wait for the shell prompt itself before typing into a new surface; "Last login" is
+  not enough.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import signal
+import subprocess
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional
+
+CMUX = os.environ.get('CMUX_BIN') or '/Applications/cmux.app/Contents/Resources/bin/cmux'
+STATE_DIR = Path(os.environ.get('CMUX_FLEET_STATE') or (Path.home() / '.local/state/cmux-fleet'))
+
+
+@dataclass
+class SpawnResult:
+    success: bool
+    pane_id: Optional[str] = None
+    window_name: Optional[str] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class PaneStatus:
+    pane_id: str
+    window_name: str
+    alive: bool
+    exit_code: Optional[int] = None
+    metadata: Dict[str, str] = field(default_factory=dict)
+
+
+def _run(*args: str) -> subprocess.CompletedProcess:
+    env = dict(os.environ, CMUX_QUIET='1')
+    return subprocess.run([CMUX, *args], capture_output=True, text=True, env=env)
+
+
+def cmux_available() -> bool:
+    try:
+        return _run('ping').stdout.strip() == 'PONG'
+    except OSError:
+        return False
+
+
+def kill_process_tree(pid: int, term_timeout: float = 3.0) -> None:
+    """SIGTERM a process and all its descendants, then SIGKILL whatever survives."""
+    pids: List[int] = []
+
+    def collect(parent: int) -> None:
+        try:
+            result = subprocess.run(['pgrep', '-P', str(parent)], capture_output=True, text=True)
+        except OSError:
+            result = None
+        if result and result.returncode == 0:
+            for child in result.stdout.splitlines():
+                try:
+                    collect(int(child))
+                except ValueError:
+                    continue
+        pids.append(parent)
+
+    collect(pid)
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + term_timeout
+    alive = pids
+    while alive and time.monotonic() < deadline:
+        time.sleep(0.05)
+        alive = []
+        for p in pids:
+            try:
+                os.kill(p, 0)
+            except ProcessLookupError:
+                continue
+            alive.append(p)
+    for p in alive:
+        try:
+            os.kill(p, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+class CmuxSessionManager:
+    """Agents in one cmux workspace; the daemon in a separate control workspace."""
+
+    def __init__(self, session_name: str = 'cmux-fleet', agents_title: str = 'Fleet agents',
+                 control_title: str = 'Fleet control'):
+        self.session_name = session_name
+        self.agents_title = agents_title
+        self.control_title = control_title
+        self.meta_path = STATE_DIR / (session_name + '.json')
+
+    # -- ownership registry -------------------------------------------------
+    def _meta(self) -> Dict:
+        try:
+            return json.loads(self.meta_path.read_text())
+        except (OSError, ValueError):
+            return {'workspace': None, 'control_workspace': None, 'surfaces': {}}
+
+    def _save_meta(self, meta: Dict) -> None:
+        self.meta_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.meta_path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+        tmp.replace(self.meta_path)
+
+    def _tag(self, sid: str, **info: str) -> None:
+        meta = self._meta()
+        meta['surfaces'].setdefault(sid, {}).update(info)
+        self._save_meta(meta)
+
+    def _surfaces(self, workspace: Optional[str]) -> Dict[str, Dict]:
+        """Live terminal surfaces of a workspace: {surface_id: {pane_id, tty, title}}."""
+        if not workspace:
+            return {}
+        p = _run('--json', '--id-format', 'uuids', 'tree', '--workspace', workspace)
+        if p.returncode:
+            return {}
+        found = {}
+        for window in json.loads(p.stdout).get('windows', []):
+            for ws in window.get('workspaces', []):
+                if ws.get('id') != workspace:
+                    continue
+                for pane in ws.get('panes', []):
+                    for s in pane.get('surfaces', []):
+                        found[s['id']] = {'pane_id': s.get('pane_id'), 'tty': s.get('tty'), 'title': s.get('title')}
+        return found
+
+    def _where(self, sid: str) -> Optional[str]:
+        """Workspace holding an owned, live surface; None if not ours or gone."""
+        meta = self._meta()
+        if sid not in meta['surfaces']:
+            return None
+        for ws in (meta.get('workspace'), meta.get('control_workspace')):
+            if sid in self._surfaces(ws):
+                return ws
+        return None
+
+    def owns(self, sid: str) -> bool:
+        return self._where(sid) is not None
+
+    # -- session ------------------------------------------------------------
+    def session_exists(self) -> bool:
+        meta = self._meta()
+        return bool(self._surfaces(meta.get('workspace')) or self._surfaces(meta.get('control_workspace')))
+
+    def get_or_create_session(self) -> bool:
+        return cmux_available()  # workspaces are created on first spawn
+
+    def _new_surface(self, control: bool = False) -> Optional[str]:
+        """A fresh shell tab in the agents workspace (created if closed) or the control one."""
+        meta = self._meta()
+        key = 'control_workspace' if control else 'workspace'
+        live = self._surfaces(meta.get(key))
+        if live:
+            anchor = next(iter(live.values()))['pane_id']
+            p = _run('--id-format', 'uuids', 'new-surface', '--workspace', meta[key],
+                     '--pane', anchor, '--focus', 'false')
+            parts = p.stdout.split()
+            if p.returncode or len(parts) < 2:
+                return None
+            return parts[1]
+        name = self.control_title if control else self.agents_title
+        before = _run('--id-format', 'uuids', 'current-workspace').stdout.strip()
+        p = _run('--id-format', 'uuids', 'new-workspace', '--name', name, '--focus', 'false')
+        if before:  # --focus false still switches the view; give the user their workspace back
+            _run('select-workspace', '--workspace', before)
+        if p.returncode:
+            return None
+        ref = p.stdout.split()[-1]  # prints a ref (workspace:N); pin the UUID right away
+        t = _run('--json', '--id-format', 'uuids', 'tree', '--workspace', ref)
+        if t.returncode:
+            return None
+        ids = [ws['id'] for w in json.loads(t.stdout).get('windows', []) for ws in w.get('workspaces', [])
+               if ws.get('title') == name]
+        if len(ids) != 1:
+            return None
+        ws = ids[0]
+        meta[key] = ws
+        self._save_meta(meta)
+        live = self._surfaces(ws)
+        return next(iter(live)) if live else None
+
+    def _type_command(self, sid: str, command: str) -> bool:
+        ws = self._where(sid)
+        if not ws:
+            return False
+        for _ in range(75):  # wait for the login shell prompt itself, not just "Last login"
+            screen = _run('read-screen', '--workspace', ws, '--surface', sid, '--lines', '5')
+            lines = [line.rstrip() for line in screen.stdout.splitlines() if line.strip()]
+            if screen.returncode == 0 and lines and lines[-1].endswith(('%', '$', '#')):
+                break
+            time.sleep(.2)
+        return self._paste(ws, sid, command)
+
+    def _paste(self, ws: str, sid: str, text: str) -> bool:
+        # Verbatim delivery; no bracketed-paste markers (see module docstring).
+        name = 'fleet-' + uuid.uuid4().hex
+        if _run('set-buffer', '--name', name, text).returncode:
+            return False
+        if _run('paste-buffer', '--name', name, '--workspace', ws, '--surface', sid).returncode:
+            return False
+        time.sleep(1)  # Codex paste-burst detection otherwise swallows the Enter.
+        return _run('send-key', '--workspace', ws, '--surface', sid, 'Enter').returncode == 0
+
+    def spawn_window(self, window_name: str, command: str, metadata: Optional[Dict[str, str]] = None,
+                     start_directory: Optional[str] = None) -> SpawnResult:
+        control = (metadata or {}).get('type') == 'daemon'
+        sid = self._new_surface(control=control)
+        if not sid:
+            return SpawnResult(success=False, error='cmux surface creation failed (run inside cmux)')
+        self._tag(sid, type=(metadata or {}).get('type', ''), label=window_name)
+        cwd = start_directory or '.'
+        if not self._type_command(sid, 'cd ' + shlex.quote(cwd) + ' && exec ' + command):
+            return SpawnResult(success=False, error='cmux command delivery failed')
+        self.rename(sid, window_name)
+        return SpawnResult(success=True, pane_id=sid, window_name=window_name)
+
+    def spawn_interactive_cli(self, window_name: str, cli_command: str, prompt_file: Optional[str] = None,
+                              output_file: Optional[str] = None, metadata: Optional[Dict[str, str]] = None,
+                              start_directory: Optional[str] = None, auto_close: bool = True,
+                              env_vars: Optional[Dict[str, str]] = None, **_) -> SpawnResult:
+        inner = cli_command
+        if prompt_file:
+            inner = f'{cli_command} "$(<{prompt_file})"'
+        if not auto_close:
+            inner = f'{inner}; exec {os.environ.get("SHELL") or "/bin/zsh"} -l'
+        env = ' '.join(shlex.quote(k + '=' + v) for k, v in (env_vars or {}).items() if v is not None)
+        command = ('env ' + env + ' ' if env else '') + 'bash -lc ' + shlex.quote(inner)
+        sid = self._new_surface()
+        if not sid:
+            return SpawnResult(success=False, error='cmux surface creation failed (run inside cmux)')
+        self._tag(sid, type=(metadata or {}).get('type', ''), label=window_name, output_file=output_file or '')
+        cwd = start_directory or '.'
+        if not self._type_command(sid, 'cd ' + shlex.quote(cwd) + ' && exec ' + command):
+            return SpawnResult(success=False, error='cmux command delivery failed')
+        self.rename(sid, window_name)
+        return SpawnResult(success=True, pane_id=sid, window_name=window_name)
+
+    # -- status / io ----------------------------------------------------------
+    def get_pane_status(self, pane_id: str) -> Optional[PaneStatus]:
+        if not self.owns(pane_id):
+            return None
+        info = self._meta()['surfaces'][pane_id]
+        return PaneStatus(pane_id=pane_id, window_name=info.get('label', ''), alive=True,
+                          metadata={k: v for k, v in info.items() if isinstance(v, str)})
+
+    def has_cli_process(self, pane_id: str) -> bool:
+        """A live surface may only contain a shell after its Codex process exits."""
+        ws = self._where(pane_id)
+        if not ws:
+            return False
+        tty = self._surfaces(ws)[pane_id].get('tty')
+        if not tty:
+            return False
+        result = subprocess.run(['ps', '-t', tty, '-o', 'comm='], capture_output=True, text=True)
+        return result.returncode == 0 and any(Path(line.strip()).name == 'codex' for line in result.stdout.splitlines())
+
+    def capture_output(self, pane_id: str, lines: int = 2000) -> str:
+        ws = self._where(pane_id)
+        if not ws:
+            return ''
+        p = _run('read-screen', '--workspace', ws, '--surface', pane_id, '--scrollback', '--lines', str(lines))
+        return p.stdout if p.returncode == 0 else ''
+
+    def send_prompt_to_idle(self, pane_id: str, text: str) -> bool:
+        ws = self._where(pane_id)
+        return bool(ws) and self._paste(ws, pane_id, text)
+
+    def send_key(self, pane_id: str, key: str) -> bool:
+        ws = self._where(pane_id)
+        return bool(ws) and _run('send-key', '--workspace', ws, '--surface', pane_id, key).returncode == 0
+
+    def rename(self, pane_id: str, label: str) -> None:
+        ws = self._where(pane_id)
+        if ws:
+            _run('rename-tab', '--workspace', ws, '--surface', pane_id, label)
+        self._tag(pane_id, label=label)
+
+    def focus(self, pane_id: str) -> bool:
+        ws = self._where(pane_id)
+        if not ws:
+            return False
+        _run('select-workspace', '--workspace', ws)
+        pane = self._surfaces(ws)[pane_id]['pane_id']
+        return _run('focus-pane', '--workspace', ws, '--pane', pane).returncode == 0
+
+    # -- lifecycle ------------------------------------------------------------
+    def kill_pane(self, pane_id: str) -> bool:
+        meta = self._meta()
+        if pane_id not in meta['surfaces']:
+            return False  # never touch a surface this fleet did not spawn
+        ws = self._where(pane_id)
+        if not ws:  # already closed (e.g. by the ✕)
+            meta['surfaces'].pop(pane_id)
+            self._save_meta(meta)
+            return True
+        info = self._surfaces(ws)[pane_id]
+        output_file = self._meta()['surfaces'][pane_id].get('output_file')
+        if output_file:  # cmux has no streaming pipe-pane; keep the final screen instead
+            with open(output_file, 'a', encoding='utf-8') as f:
+                f.write(self.capture_output(pane_id))
+        if info.get('tty'):
+            ps = subprocess.run(['ps', '-t', info['tty'], '-o', 'pid=,ppid='], capture_output=True, text=True)
+            rows = [line.split() for line in ps.stdout.splitlines() if line.strip()]
+            pids = {int(r[0]) for r in rows}
+            for pid, ppid in ((int(r[0]), int(r[1])) for r in rows):
+                if ppid not in pids:  # tree roots on this tty
+                    kill_process_tree(pid)
+        _run('close-surface', '--workspace', ws, '--surface', pane_id)
+        meta = self._meta()
+        meta['surfaces'].pop(pane_id, None)
+        self._save_meta(meta)
+        return pane_id not in self._surfaces(ws)
+
+    def place_right_of(self, pane_id: str, peer: str) -> bool:
+        """Put an agent in its own split to the right of its peer's pane."""
+        ws = self._where(pane_id)
+        if not ws or self._where(peer) != ws:
+            return False
+        live = self._surfaces(ws)
+        if live[pane_id]['pane_id'] != live[peer]['pane_id']:
+            return True  # already side by side
+        return _run('split-off', '--workspace', ws, '--surface', pane_id, 'right', '--focus', 'false').returncode == 0
+
+    def archive_pane(self, pane_id: str, snapshot: str, label: str) -> Optional[str]:
+        """Snapshot a retiring agent's screen into a read-only ``less`` surface."""
+        ws = self._where(pane_id)
+        if not ws:
+            return None
+        path = Path(snapshot).resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self.capture_output(pane_id, 100000), encoding='utf-8')
+        pane = self._surfaces(ws)[pane_id]['pane_id']
+        p = _run('--id-format', 'uuids', 'new-surface', '--workspace', ws, '--pane', pane, '--focus', 'false')
+        parts = p.stdout.split()
+        if p.returncode or len(parts) < 2:
+            return None
+        history = parts[1]
+        self._tag(history, type='handoff_archive', label=label, handoff_snapshot=str(path))
+        # LESSSECURE disables shell escapes/editing; this surface never hosts an agent.
+        if not self._type_command(history, 'LESSSECURE=1 exec less -+F -S +G ' + shlex.quote(str(path))):
+            return None
+        _run('split-off', '--workspace', ws, '--surface', history, 'down', '--focus', 'false')
+        self.rename(history, label)
+        return history
+
+    def place_below_archive(self, pane_id: str, history: str, label: str) -> bool:
+        ws = self._where(pane_id)
+        if not ws or self._where(history) != ws:
+            return False
+        if self._meta()['surfaces'][history].get('type') != 'handoff_archive':
+            return False
+        target = self._surfaces(ws)[history]['pane_id']
+        if _run('move-surface', '--workspace', ws, '--surface', pane_id, '--pane', target, '--focus', 'false').returncode:
+            return False
+        if _run('split-off', '--workspace', ws, '--surface', pane_id, 'down', '--focus', 'false').returncode:
+            return False
+        self.rename(pane_id, label)
+        return True
+
+    def tab_into(self, pane_id: str, peer: str) -> bool:
+        """Move a surface into the pane holding ``peer``, as another tab."""
+        ws = self._where(pane_id)
+        if not ws or self._where(peer) != ws:
+            return False
+        target = self._surfaces(ws)[peer]['pane_id']
+        return _run('move-surface', '--workspace', ws, '--surface', pane_id, '--pane', target,
+                    '--focus', 'false').returncode == 0
+
+    def grow_up(self, pane_id: str, amount: int = 4000) -> bool:
+        """Push this pane's top border up, collapsing the pane above to its minimum height."""
+        ws = self._where(pane_id)
+        if not ws:
+            return False
+        pane = self._surfaces(ws)[pane_id]['pane_id']
+        return _run('resize-pane', '--workspace', ws, '--pane', pane, '-U', '--amount', str(amount)).returncode == 0
+
+    def close_archive_pane(self, pane_id: str) -> bool:
+        if not self.owns(pane_id) or self._meta()['surfaces'][pane_id].get('type') != 'handoff_archive':
+            return False
+        return self.kill_pane(pane_id)
