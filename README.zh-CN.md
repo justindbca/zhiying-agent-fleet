@@ -22,12 +22,13 @@ daemon 独立于模型的自述做这几件事：
 
 ## 依赖
 
-- macOS + [cmux](https://cmux.dev) ≥ 0.64（daemon **必须在 cmux 终端里启动**，cmux 只接受它自己窗口里起的进程）。
-- [Codex CLI](https://github.com/openai/codex) ≥ 0.156（用到 `--dangerously-bypass-hook-trust`、`check_for_update_on_startup`）。
+- macOS + [cmux](https://cmux.dev) ≥ 0.64.25（用到 `new-surface --command`）。`start` 要**在 cmux 终端里跑**，或把 cmux 设置里 automation → socket control mode 从 `cmuxOnly` 改掉；默认 cmux 只接受它自己窗口里起的进程。
+- [Codex CLI](https://github.com/openai/codex) ≥ 0.156（独立文件的配置档、`check_for_update_on_startup`）。
   daemon 解析 Codex 的 rollout `.jsonl`（`token_count`、`task_complete`、子 agent 元数据），Codex 若改格式，请钉住能用的版本。
 - PATH 里有 `redis-server`（`brew install redis`）。每次运行自起一个实例，只监听 `/tmp` 下的 Unix 套接字，绝不碰 `localhost:6379`。
 - Python ≥ 3.9 和 `redis` 包。
 - 任何 Codex 能连的模型：OpenAI API、ChatGPT 登录、本地 OpenAI 兼容服务。上下文窗口从 rollout 读，不用配。
+- agent 跑在**隔离的 Codex home**（`--codex-home`，默认 `~/.cmux-fleet/codex-home`）：`auth.json` 和配置档文件从你的 `~/.codex` 软链过来，登录共享，但你的钩子、MCP、插件不会在 agent 里跑；每个 agent 目录的信任条目自动写入。
 
 ## 安装
 
@@ -36,13 +37,14 @@ git clone https://github.com/<you>/cmux-fleet && cd cmux-fleet
 pip install -e .
 ```
 
-给 agent 加一个 Codex 配置档（见 [`codex.config.example.toml`](codex.config.example.toml)）：
+给 agent 加一个 Codex 配置档。Codex ≥ 0.156 每个配置档是独立文件（见 [`codex.config.example.toml`](codex.config.example.toml)）：
 
 ```toml
-# ~/.codex/config.toml
-[profiles.fleet]
+# ~/.codex/fleet.config.toml   （用 `codex --profile fleet` 选中）
 model = "gpt-5.5"
 ```
+
+别的不用配：fleet 会给 agent 建一个独立的 Codex home，并自动替每个 agent 目录回答 Codex 的「信任此目录？」。
 
 ## 用法
 
@@ -57,7 +59,7 @@ cmux-fleet stop                     # 取消任务，关 daemon 和它的 redis�
 ```
 
 `start` 参数：`--profile`（Codex 配置档，默认 `fleet`）、`--codex` / `--redis-server`（二进制路径，默认 PATH 里第一个）、
-`--runs-dir`（默认 `~/.cmux-fleet/runs`）、`--handoff-ratio`、`--handoff-timeout`、`--stall-timeout`、
+`--runs-dir`（默认 `~/.cmux-fleet/runs`）、`--codex-home`（agent 的隔离 Codex home，默认 `~/.cmux-fleet/codex-home`）、`--handoff-ratio`、`--handoff-timeout`、`--stall-timeout`、
 `--window`（rollout 还没报窗口时的兜底值）、`--compact-limit`（Codex 自动压缩阈值，默认交给 Codex 决定）、`--chrome-script`（见下）。
 
 每次运行写在 `~/.cmux-fleet/runs/fleet-<时间>-<token>/`：`config.json`、`workspace/<worker>/`（worker 的 cwd，产物都在这）、
@@ -85,9 +87,18 @@ daemon 校验动词、把 `js` 文件限制在本次运行目录、给页面动�
 
 ## 测试状态
 
-- 本代码的前身（同一套 daemon 逻辑、中文提示词、固定一个本地模型）在 codex-cli 0.149–0.156 上跑过数小时任务，worker 自动交接连跑 5 代。
-- codex-cli 0.156.1 上在 cmux 里实测过粘贴链路（多行粘贴进编辑框、不加括号粘贴标记）和更新弹窗的行为。
-- 本仓库这个抽出来的、模型无关的版本**抽出后还没有端到端起过一次**（daemon + 三个真 Codex 标签）。25 个测试用内存 Redis、假 cmux 管理器和合成 rollout 文件跑 daemon 逻辑。第一次真跑若有提示词或 cmux 调用不对，请提 issue。
+- **在另一台干净的 Mac 上端到端跑通**（macOS 26.2、cmux 0.64.25、codex-cli 0.156.1、ChatGPT 登录的 GPT-6-Sol）：`start` → 两个 agent 7 秒 READY →
+  单步任务 40 秒完成并过产物校验 → 两步任务中监工触到轮换阈值、自己写了交接单、旧标签收成只读记录格、接班者继续把任务做完。
+  轮换、产物验收、更新弹窗压制、隔离的 Codex home 都在真盘跑过。
+- 单测 27 个：内存 Redis、假 cmux 管理器、合成 rollout 文件。
+- 还没真盘跑过：卡死看门（只有单测）、浏览器代办。
+
+## 真盘跑出来的坑（都已修）
+
+- 往刚起的登录 shell 里敲 1.5 KB 的长命令会被截断（行编辑器就位前 macOS 终端每行最多 1024 字节）。现在每次拉起先写一个短启动脚本，由 cmux 的 `--command` 执行。
+- Codex 的「Trust this folder?」按精确目录问，且不接受用 `-c` 注入信任表。fleet 现在给 agent 一个自己的 `CODEX_HOME`，逐 agent 写信任条目。
+- agent 跑在你个人的 Codex home 里会把你的钩子、MCP、插件一起带起来，一个失败的 Stop 钩子就卡住了 READY 回合。隔离 home 同时解决了这个，绕过钩子信任的旗标也去掉了。
+- 新会话底噪已超 `--handoff-ratio` 时会无限轮换（1% 测试阈值下十分钟换了 21 代）。现在新会话永不轮换，daemon 记 `rotate.impossible` 照常投递。
 
 ## 已知限制
 

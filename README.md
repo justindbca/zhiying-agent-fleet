@@ -45,10 +45,10 @@ What the daemon enforces, independently of what the models claim:
 
 ## Requirements
 
-- macOS with [cmux](https://cmux.dev) ≥ 0.64 (the daemon must be started **inside a cmux terminal**;
-  cmux only accepts commands from processes it started).
-- [Codex CLI](https://github.com/openai/codex) ≥ 0.156 (`--dangerously-bypass-hook-trust`,
-  `check_for_update_on_startup`). The daemon parses Codex's rollout `.jsonl` files (`token_count`,
+- macOS with [cmux](https://cmux.dev) ≥ 0.64.25 (`new-surface --command`). Run `start` **inside a cmux
+  terminal**, or set cmux's *automation → socket control mode* away from `cmuxOnly`; by default cmux
+  only accepts commands from processes it started.
+- [Codex CLI](https://github.com/openai/codex) ≥ 0.156 (per-file profiles, `check_for_update_on_startup`). The daemon parses Codex's rollout `.jsonl` files (`token_count`,
   `task_complete`, subagent metadata); if a Codex release changes that format, pin the version that
   works for you.
 - `redis-server` on PATH (`brew install redis`). Each run starts its own instance on a Unix socket under
@@ -56,6 +56,10 @@ What the daemon enforces, independently of what the models claim:
 - Python ≥ 3.9 and the `redis` package.
 - Any model Codex can talk to: OpenAI API, ChatGPT login, or a local OpenAI-compatible server. The
   daemon reads the context window from the rollout, so no window size has to be configured.
+- Agents run in an **isolated Codex home** (`--codex-home`, default `~/.cmux-fleet/codex-home`):
+  `auth.json` and the profile file are symlinked from your `~/.codex`, so the login is shared, but
+  your hooks, MCP servers and plugins do not run inside agents. Per-agent "trust this folder" entries
+  are written there automatically.
 
 ## Install
 
@@ -64,13 +68,16 @@ git clone https://github.com/<you>/cmux-fleet && cd cmux-fleet
 pip install -e .
 ```
 
-Add a Codex profile for the agents (see [`codex.config.example.toml`](codex.config.example.toml)):
+Add a Codex profile for the agents. Codex ≥ 0.156 keeps each profile in its own file
+(see [`codex.config.example.toml`](codex.config.example.toml)):
 
 ```toml
-# ~/.codex/config.toml
-[profiles.fleet]
+# ~/.codex/fleet.config.toml   (selected with `codex --profile fleet`)
 model = "gpt-5.5"
 ```
+
+Nothing else: the fleet creates its own Codex home for the agents and answers Codex's
+"trust this folder?" prompt for each agent directory itself.
 
 ## Use
 
@@ -87,7 +94,8 @@ cmux-fleet stop                                 # cancel, shut the daemon and it
 ```
 
 `start` options: `--profile` (Codex profile, default `fleet`), `--codex` / `--redis-server` (binaries,
-default: first on PATH), `--runs-dir` (default `~/.cmux-fleet/runs`), `--handoff-ratio`,
+default: first on PATH), `--runs-dir` (default `~/.cmux-fleet/runs`), `--codex-home` (the agents'
+isolated Codex home, default `~/.cmux-fleet/codex-home`), `--handoff-ratio`,
 `--handoff-timeout`, `--stall-timeout`, `--window` (fallback context size until the rollout reports one),
 `--compact-limit` (Codex auto-compaction token limit; by default Codex decides), `--chrome-script`
 (see below).
@@ -139,16 +147,28 @@ the verb, confines `js` files to the run directory, paces page actions (`--chrom
 
 ## Test status
 
-Be honest about what has run where:
+- **End-to-end on a clean second Mac (macOS 26.2, cmux 0.64.25, codex-cli 0.156.1, GPT-6-Sol via a
+  ChatGPT login):** `start` → both agents READY in 7 s → a one-step task completed with the artifact
+  check in 40 s → a two-step task during which the supervisor hit the handoff ratio, wrote its own
+  handoff note, was retired into a read-only record pane and replaced by a successor that finished
+  the task. Rotation, artifact verification, the update-dialog suppression and the isolated Codex home
+  were all exercised live.
+- The unit suite (27 tests) runs the daemon against an in-memory Redis, a fake cmux manager and
+  synthetic rollout files.
+- Not exercised live yet: the stall watchdog (unit-tested only) and the browser broker.
 
-- The predecessor of this code (same daemon logic, Chinese prompts, one fixed local model) ran
-  multi-hour tasks with five automatic worker handoffs on codex-cli 0.149–0.156.
-- On codex-cli 0.156.1 the paste path (multi-line paste into the composer, no bracketed-paste markers)
-  and the update-dialog behaviour were verified live in cmux.
-- The extracted, model-agnostic version in this repository has **not yet been started end to end**
-  (daemon + three live Codex tabs) since the extraction. Its 25 tests exercise the daemon against an
-  in-memory Redis, a fake cmux manager and synthetic rollout files. Expect to run it once and file an
-  issue if a prompt or a cmux call misbehaves.
+## What the live run taught us (already fixed)
+
+- Typing a ~1.5 kB command into a fresh login shell truncates it (macOS tty line limit before the
+  line editor is up). Spawns now go through a short launcher script and cmux's `--command`.
+- Codex asks "Trust this folder?" per exact directory and does not accept the trust table as a `-c`
+  override. The fleet runs agents in its own `CODEX_HOME` and writes the trust entry per agent.
+- Running agents in your personal Codex home also runs your hooks, MCP servers and plugins inside
+  them; a failing Stop hook blocked the READY turn. The isolated home fixes this too, and the
+  hook-trust bypass flag is gone.
+- A fresh session whose baseline usage already exceeds `--handoff-ratio` would be rotated forever
+  (observed: 21 generations in ten minutes at a 1 % test ratio). Fresh sessions are never rotated;
+  the daemon logs `rotate.impossible` and delivers anyway.
 
 ## Known limitations
 

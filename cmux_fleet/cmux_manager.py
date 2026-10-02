@@ -18,8 +18,15 @@ Hard-won cmux facts (all measured, not documented):
   workspace back afterwards.
 * ``pipe-pane`` is a one-shot snapshot, not a stream. The final screen is saved when a
   surface is closed; the real transcript is Codex's rollout file.
-* Wait for the shell prompt itself before typing into a new surface; "Last login" is
-  not enough.
+* Start a surface's program with ``new-surface --command`` / ``new-workspace --command``
+  (cmux ≥ 0.64.25): cmux types the command into the login shell once the prompt is up.
+  Typing it ourselves races the shell startup; typed-ahead text gets truncated and leaves
+  the shell waiting at a quote prompt (seen on a slow login shell). The typing path is kept
+  only as a fallback for older cmux, and it fails closed when no prompt appears.
+* Keep the typed command short. Before the line editor is up, macOS tty input is limited to
+  1024 bytes per line, and a ~1.5 kB command (an inlined PATH) was silently truncated or
+  left sitting unexecuted at the prompt. Every spawn therefore writes a small launcher
+  script and the surface runs ``exec bash <launcher>``.
 """
 from __future__ import annotations
 
@@ -32,7 +39,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 CMUX = os.environ.get('CMUX_BIN') or '/Applications/cmux.app/Contents/Resources/bin/cmux'
 STATE_DIR = Path(os.environ.get('CMUX_FLEET_STATE') or (Path.home() / '.local/state/cmux-fleet'))
@@ -174,22 +181,32 @@ class CmuxSessionManager:
     def get_or_create_session(self) -> bool:
         return cmux_available()  # workspaces are created on first spawn
 
-    def _new_surface(self, control: bool = False) -> Optional[str]:
-        """A fresh shell tab in the agents workspace (created if closed) or the control one."""
+    def _new_surface(self, control: bool = False, command: Optional[str] = None) -> Tuple[Optional[str], bool]:
+        """A fresh shell tab in the agents workspace (created if closed) or the control one.
+
+        Returns (surface_id, ran): ``ran`` is True when cmux itself started ``command`` in the
+        new shell, False when the caller still has to type it (older cmux without --command).
+        """
         meta = self._meta()
         key = 'control_workspace' if control else 'workspace'
         live = self._surfaces(meta.get(key))
         if live:
             anchor = next(iter(live.values()))['pane_id']
-            p = _run('--id-format', 'uuids', 'new-surface', '--workspace', meta[key],
-                     '--pane', anchor, '--focus', 'false')
+            base = ['--id-format', 'uuids', 'new-surface', '--workspace', meta[key], '--pane', anchor, '--focus', 'false']
+            ran = False
+            p = _run(*base, '--command', command) if command else _run(*base)
+            if command and p.returncode:  # cmux too old for new-surface --command: create, then type
+                p = _run(*base)
+            else:
+                ran = bool(command)
             parts = p.stdout.split()
             if p.returncode or len(parts) < 2:
-                return None
-            return parts[1]
+                return None, False
+            return parts[1], ran
         name = self.control_title if control else self.agents_title
         before = _run('--id-format', 'uuids', 'current-workspace').stdout.strip()
-        p = _run('--id-format', 'uuids', 'new-workspace', '--name', name, '--focus', 'false')
+        extra = ['--command', command] if command else []
+        p = _run('--id-format', 'uuids', 'new-workspace', '--name', name, '--focus', 'false', *extra)
         if before:  # --focus false still switches the view; give the user their workspace back
             _run('select-workspace', '--workspace', before)
         if p.returncode:
@@ -206,18 +223,30 @@ class CmuxSessionManager:
         meta[key] = ws
         self._save_meta(meta)
         live = self._surfaces(ws)
-        return next(iter(live)) if live else None
+        return (next(iter(live)), bool(command)) if live else (None, False)
+
+    def _launcher(self, name: str, script: str, folder: Optional[Path] = None) -> str:
+        """Write ``script`` to a launcher file and return the short command that runs it."""
+        folder = folder or (STATE_DIR / 'launch')
+        folder.mkdir(parents=True, exist_ok=True)
+        safe = ''.join(c if c.isalnum() or c in '-_.' else '_' for c in name)
+        path = folder / (safe + '-' + uuid.uuid4().hex[:6] + '.sh')
+        path.write_text('#!/bin/bash\n' + script + '\n')
+        path.chmod(0o700)
+        return 'exec /bin/bash ' + shlex.quote(str(path))
 
     def _type_command(self, sid: str, command: str) -> bool:
         ws = self._where(sid)
         if not ws:
             return False
-        for _ in range(75):  # wait for the login shell prompt itself, not just "Last login"
+        for _ in range(300):  # wait for the login shell prompt itself, not just "Last login"
             screen = _run('read-screen', '--workspace', ws, '--surface', sid, '--lines', '5')
             lines = [line.rstrip() for line in screen.stdout.splitlines() if line.strip()]
             if screen.returncode == 0 and lines and lines[-1].endswith(('%', '$', '#')):
                 break
             time.sleep(.2)
+        else:
+            return False  # never type ahead of the prompt: the text gets truncated
         return self._paste(ws, sid, command)
 
     def _paste(self, ws: str, sid: str, text: str) -> bool:
@@ -233,12 +262,12 @@ class CmuxSessionManager:
     def spawn_window(self, window_name: str, command: str, metadata: Optional[Dict[str, str]] = None,
                      start_directory: Optional[str] = None) -> SpawnResult:
         control = (metadata or {}).get('type') == 'daemon'
-        sid = self._new_surface(control=control)
+        full = self._launcher(window_name, 'cd ' + shlex.quote(start_directory or '.') + ' && exec ' + command)
+        sid, ran = self._new_surface(control=control, command=full)
         if not sid:
             return SpawnResult(success=False, error='cmux surface creation failed (run inside cmux)')
         self._tag(sid, type=(metadata or {}).get('type', ''), label=window_name)
-        cwd = start_directory or '.'
-        if not self._type_command(sid, 'cd ' + shlex.quote(cwd) + ' && exec ' + command):
+        if not ran and not self._type_command(sid, full):
             return SpawnResult(success=False, error='cmux command delivery failed')
         self.rename(sid, window_name)
         return SpawnResult(success=True, pane_id=sid, window_name=window_name)
@@ -254,12 +283,13 @@ class CmuxSessionManager:
             inner = f'{inner}; exec {os.environ.get("SHELL") or "/bin/zsh"} -l'
         env = ' '.join(shlex.quote(k + '=' + v) for k, v in (env_vars or {}).items() if v is not None)
         command = ('env ' + env + ' ' if env else '') + 'bash -lc ' + shlex.quote(inner)
-        sid = self._new_surface()
+        full = self._launcher(window_name, 'cd ' + shlex.quote(start_directory or '.') + ' && exec ' + command,
+                              Path(output_file).parent if output_file else None)
+        sid, ran = self._new_surface(command=full)
         if not sid:
             return SpawnResult(success=False, error='cmux surface creation failed (run inside cmux)')
         self._tag(sid, type=(metadata or {}).get('type', ''), label=window_name, output_file=output_file or '')
-        cwd = start_directory or '.'
-        if not self._type_command(sid, 'cd ' + shlex.quote(cwd) + ' && exec ' + command):
+        if not ran and not self._type_command(sid, full):
             return SpawnResult(success=False, error='cmux command delivery failed')
         self.rename(sid, window_name)
         return SpawnResult(success=True, pane_id=sid, window_name=window_name)
@@ -359,14 +389,19 @@ class CmuxSessionManager:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(self.capture_output(pane_id, 100000), encoding='utf-8')
         pane = self._surfaces(ws)[pane_id]['pane_id']
-        p = _run('--id-format', 'uuids', 'new-surface', '--workspace', ws, '--pane', pane, '--focus', 'false')
+        # LESSSECURE disables shell escapes/editing; this surface never hosts an agent.
+        viewer = 'LESSSECURE=1 exec less -+F -S +G ' + shlex.quote(str(path))
+        base = ['--id-format', 'uuids', 'new-surface', '--workspace', ws, '--pane', pane, '--focus', 'false']
+        p = _run(*base, '--command', viewer)
+        ran = p.returncode == 0
+        if not ran:
+            p = _run(*base)
         parts = p.stdout.split()
         if p.returncode or len(parts) < 2:
             return None
         history = parts[1]
         self._tag(history, type='handoff_archive', label=label, handoff_snapshot=str(path))
-        # LESSSECURE disables shell escapes/editing; this surface never hosts an agent.
-        if not self._type_command(history, 'LESSSECURE=1 exec less -+F -S +G ' + shlex.quote(str(path))):
+        if not ran and not self._type_command(history, viewer):
             return None
         _run('split-off', '--workspace', ws, '--surface', history, 'down', '--focus', 'false')
         self.rename(history, label)

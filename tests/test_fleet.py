@@ -147,7 +147,7 @@ def fx(tmp_path):
     (run / 'workspace').mkdir(parents=True)
     cfg = {'run': str(run), 'redis_socket': '/tmp/cmux-fleet-test.sock', 'python': sys.executable,
            'workers': ['worker-1'], 'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 95000,
-           'chrome_script': str(tmp_path / 'broker.sh')}
+           'chrome_script': str(tmp_path / 'broker.sh'), 'codex_home': str(tmp_path / 'codex-home')}
     (run / 'config.json').write_text(json.dumps(cfg))
     sessions = tmp_path / 'sessions'
     f = fleet.Fleet(run / 'config.json', FakeRedis(), FakeMgr(), sessions=sessions)
@@ -174,6 +174,11 @@ def last_to(f, name):
     return [t for p, t in f.mgr.sent if p == pane][-1]
 
 
+def seasoned(f, name):
+    """Mark a session as having handled a message already (fresh sessions are never rotated)."""
+    f.setf(name, delivered=1)
+
+
 def test_all_agents_get_role_scope_file_in_own_cwd(fx):
     sup = fleet.agent_cwd(fx.cfg, 'supervisor') / 'AGENTS.md'
     wrk = fleet.agent_cwd(fx.cfg, 'worker-1') / 'AGENTS.md'
@@ -182,6 +187,10 @@ def test_all_agents_get_role_scope_file_in_own_cwd(fx):
     assert '{{' not in wrk.read_text() and str(fx.workspace()) in wrk.read_text()
     assert 'chrome --config' in wrk.read_text()
     assert json.loads(fx.r.get('fx:reply:r1'))['status'] == 'accepted'
+    trust = (Path(fx.cfg['codex_home']) / 'config.toml').read_text()
+    assert json.dumps(str(sup.parent)) in trust and json.dumps(str(wrk.parent)) in trust  # pre-answered trust prompt
+    assert trust.count('trust_level') == 2
+    assert fx.mgr.spawned[-1]['env_vars']['CODEX_HOME'] == fx.cfg['codex_home']
 
 
 def test_supervisor_dispatch_reaches_worker(fx):
@@ -237,6 +246,7 @@ def test_three_false_completions_block(fx):
 
 def test_usage_over_ratio_rotates_before_delivery_and_drops_stale(fx):
     cwd = fleet.agent_cwd(fx.cfg, 'supervisor')
+    seasoned(fx, 'supervisor')
     write_rollout(fx.sessions, THREADS['supervisor'], cwd, used=60000)  # 0.63 of 95k
     fx.pump()
     info = fx.agent('supervisor')
@@ -271,6 +281,7 @@ def test_window_comes_from_rollout_not_config(fx):
 
 def test_rotation_timeout_falls_back_to_skeleton(fx):
     fx.cfg['handoff_timeout'] = 0
+    seasoned(fx, 'supervisor')
     write_rollout(fx.sessions, THREADS['supervisor'], fleet.agent_cwd(fx.cfg, 'supervisor'), used=90000)
     fx.pump()
     fx.tick()
@@ -288,6 +299,7 @@ def test_below_ratio_delivers_without_rotation(fx):
 
 def test_busy_native_subagent_defers_rotation(fx):
     cwd = fleet.agent_cwd(fx.cfg, 'supervisor')
+    seasoned(fx, 'supervisor')
     write_rollout(fx.sessions, THREADS['supervisor'], cwd, used=90000)
     child = fx.sessions / '2026/09/25/rollout-child.jsonl'
     child.write_text(json.dumps({'type': 'session_meta', 'payload': {'id': 'c', 'source': {'subagent': {
@@ -300,7 +312,8 @@ def test_busy_native_subagent_defers_rotation(fx):
 
 def test_notify_requires_real_completion_and_dedupes(tmp_path, monkeypatch):
     run = tmp_path / 'run'
-    cfg = {'run': str(run), 'redis_socket': '/tmp/cmux-fleet-t.sock', 'workers': ['worker-1'], 'python': 'py'}
+    cfg = {'run': str(run), 'redis_socket': '/tmp/cmux-fleet-t.sock', 'workers': ['worker-1'], 'python': 'py',
+           'codex_home': str(tmp_path / 'codex-home')}
     (tmp_path / 'c.json').write_text(json.dumps(cfg))
     r = FakeRedis()
     monkeypatch.setattr(fleet, 'connect', lambda cfg: r)
@@ -327,7 +340,7 @@ def test_actor_argv_is_configurable_and_pins_notify_generation(tmp_path):
     cfg = {'python': 'py', 'codex': '/opt/codex', 'profile': 'local-llm'}
     argv = fleet.actor_argv(tmp_path / 'c.json', cfg, 'worker-1', 2, 'hi')
     assert argv[:3] == ['/opt/codex', '--profile', 'local-llm'] and argv[-1] == 'hi'
-    assert 'check_for_update_on_startup=false' in argv
+    assert 'check_for_update_on_startup=false' in argv and '--dangerously-bypass-hook-trust' not in argv
     assert not any(a.startswith('model_auto_compact_token_limit') for a in argv)  # codex decides by default
     notify = json.loads(next(a for a in argv if a.startswith('notify='))[7:])
     assert notify[-4:] == ['notify', str(tmp_path / 'c.json'), 'worker-1', '2']
@@ -380,6 +393,7 @@ def test_empty_turn_redelivers_same_message_with_backoff(fx):
 def test_every_past_generation_record_is_kept_as_tabs(fx):
     fx.cfg['handoff_timeout'] = 0
     for gen in range(2):
+        seasoned(fx, 'worker-1')
         write_rollout(fx.sessions, fx.agent('worker-1').get('thread') or THREADS['worker-1'],
                       fleet.agent_cwd(fx.cfg, 'worker-1'), used=60000)
         fx.queue('worker-1', 'Instruction %d: write worker-1/x.md, at least 50 chars' % gen)
@@ -482,3 +496,32 @@ def test_handoff_merge_keeps_skeleton_for_mangled_sections():
     assert '- wrote a.md' in merged and '1. do x' in merged  # empty model sections keep skeleton text
     assert merged.count('## ') == 8
     assert handoff.merge_partial(base, 'sure, writing it now') == base
+
+
+def test_prepare_codex_home_links_login_and_profile(tmp_path, monkeypatch):
+    user = tmp_path / 'user-codex'; user.mkdir()
+    (user / 'auth.json').write_text('{"tokens": {}}')
+    (user / 'fleet.config.toml').write_text('model = "x"\n')
+    monkeypatch.setattr(fleet, 'USER_CODEX_HOME', user)
+    home = fleet.prepare_codex_home(tmp_path / 'agents-home', 'fleet')
+    assert (home / 'auth.json').is_symlink() and (home / 'fleet.config.toml').read_text() == 'model = "x"\n'
+    assert 'check_for_update_on_startup = false' in (home / 'config.toml').read_text()
+    assert not (home / 'hooks.json').exists()
+    with pytest.raises(SystemExit):
+        fleet.prepare_codex_home(tmp_path / 'other-home', 'missing-profile')
+
+
+def test_fresh_session_over_ratio_is_delivered_not_rotated_forever(fx):
+    # Baseline usage above the ratio: rotating would only spawn another over-budget session.
+    cwd = fleet.agent_cwd(fx.cfg, 'supervisor')
+    write_rollout(fx.sessions, THREADS['supervisor'], cwd, used=90000)  # 95% of 95k, nothing delivered yet
+    fx.pump()
+    sup = fx.agent('supervisor')
+    assert sup['state'] == 'busy' and sup['generation'] == '0' and sup['delivered'] == '1'
+    assert 'write a test report' in last_to(fx, 'supervisor')
+    assert json.loads([x for x in fx.r.l['fx:log'] if 'rotate.impossible' in x][-1])['agent'] == 'supervisor'
+    # ... but once it has handled a message, the usual rotation applies before the next one.
+    fx.handle(turn('supervisor', decision()))
+    fx.queue('supervisor', 'anything else')
+    fx.pump()
+    assert fx.agent('supervisor')['state'] == 'handoff'
