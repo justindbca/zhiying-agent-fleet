@@ -525,3 +525,85 @@ def test_fresh_session_over_ratio_is_delivered_not_rotated_forever(fx):
     fx.queue('supervisor', 'anything else')
     fx.pump()
     assert fx.agent('supervisor')['state'] == 'handoff'
+
+
+# ---------------------------------------------------------------- claude workers
+@pytest.fixture
+def cfx(tmp_path, monkeypatch):
+    monkeypatch.setattr(fleet, 'CLAUDE_JSON', tmp_path / 'claude.json')
+    kit = tmp_path / 'kit'
+    (kit / '.claude/agents').mkdir(parents=True)
+    (kit / '.claude/agents/research.md').write_text('agent')
+    (kit / 'mcp.json').write_text('{"mcpServers": {}}')
+    run = tmp_path / 'run'
+    (run / 'workspace').mkdir(parents=True)
+    cfg = {'run': str(run), 'redis_socket': '/tmp/cmux-fleet-test.sock', 'python': sys.executable,
+           'workers': ['worker-1'], 'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 95000,
+           'codex_home': str(tmp_path / 'codex-home'), 'worker_cli': 'claude', 'worker_kit': str(kit),
+           'claude': '/bin/claude', 'claude_window': 200000}
+    (run / 'config.json').write_text(json.dumps(cfg))
+    f = fleet.Fleet(run / 'config.json', FakeRedis(), FakeMgr(), sessions=tmp_path / 'sessions')
+    f.start_all()
+    for name in f.names:
+        f.handle(turn(name, 'READY'))
+    f.handle({'kind': 'task', 'request_id': 'r1', 'spec': {'goal': 'write a test report'}})
+    return f
+
+
+def test_claude_worker_gets_claude_md_kit_and_trust(cfx, tmp_path):
+    cwd = fleet.agent_cwd(cfx.cfg, 'worker-1')
+    assert (cwd / 'CLAUDE.md').read_text() == (cwd / 'AGENTS.md').read_text()
+    assert (cwd / '.claude/agents/research.md').exists() and (cwd / 'mcp.json').exists()
+    trusted = json.loads((tmp_path / 'claude.json').read_text())['projects']
+    assert trusted[str(cwd.resolve())]['hasTrustDialogAccepted'] is True
+    assert not (fleet.agent_cwd(cfx.cfg, 'supervisor') / 'CLAUDE.md').exists()  # supervisor stays codex
+
+
+def test_claude_argv_pins_stop_hook_generation(cfx):
+    argv = fleet.claude_argv(cfx.path, cfx.cfg, 'worker-1', 4, 'hi')
+    assert argv[0] == '/bin/claude' and '--dangerously-skip-permissions' in argv and argv[-2:] == ['--', 'hi']
+    settings = json.loads(Path(argv[argv.index('--settings') + 1]).read_text())
+    cmd = settings['hooks']['Stop'][0]['hooks'][0]['command']
+    assert cmd.endswith('claude-stop ' + str(cfx.path) + ' worker-1 4')
+    assert argv[argv.index('--mcp-config') + 1].endswith('mcp.json')
+
+
+def test_claude_multiline_message_goes_through_a_file(cfx):
+    cfx.handle(turn('supervisor', decision()))
+    cfx.pump()
+    sent = last_to(cfx, 'worker-1')
+    assert '\n' not in sent and '.inbox/msg-' in sent
+    path = Path(sent.split('the full message is in ')[1].split(' . Read')[0])
+    assert 'Write worker-1/report.md' in path.read_text()
+
+
+def test_claude_stop_skips_background_work_and_dedupes(tmp_path, monkeypatch):
+    (tmp_path / 'c.json').write_text(json.dumps({'redis_socket': '/tmp/cmux-fleet-t.sock'}))
+    r = FakeRedis()
+    monkeypatch.setattr(fleet, 'connect', lambda cfg: r)
+    busy = json.dumps({'session_id': 's1', 'transcript_path': '/x', 'last_assistant_message': 'wait',
+                       'background_tasks': [{'id': 'a'}]})
+    done = json.dumps({'session_id': 's1', 'transcript_path': '/x', 'last_assistant_message': 'Done: x',
+                       'background_tasks': []})
+    assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', busy) is False
+    assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', done) is True
+    assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', done) is False
+    ev = json.loads(r.l['fx:events'][0])
+    assert ev['text'] == 'Done: x' and ev['transcript'] == '/x' and ev['generation'] == 1
+
+
+def test_claude_usage_and_activity_come_from_transcript(cfx, tmp_path):
+    tr = tmp_path / 'proj' / 'sess.jsonl'
+    tr.parent.mkdir()
+    rows = [{'type': 'assistant', 'message': {'usage': {'input_tokens': 10, 'cache_read_input_tokens': 120000,
+                                                         'cache_creation_input_tokens': 5, 'output_tokens': 5}}},
+            {'type': 'assistant', 'isSidechain': True, 'message': {'usage': {'input_tokens': 999999}}}]
+    tr.write_text('\n'.join(json.dumps(x) for x in rows) + '\n')
+    cfx.setf('worker-1', transcript=str(tr))
+    assert cfx.usage('worker-1') == (120020, 200000)
+    sub = tr.with_suffix('') / 'subagents' / 'agent-1.jsonl'
+    sub.parent.mkdir(parents=True)
+    sub.write_text('{}\n')
+    os.utime(tr, (1000, 1000))
+    os.utime(sub, (5000, 5000))
+    assert cfx.last_activity(dict(cfx.agent('worker-1'), busy_since=0)) == 5000

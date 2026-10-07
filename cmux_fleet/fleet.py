@@ -14,6 +14,7 @@ Subcommands
   stop      cancel the task, shut the daemon and its Redis down (tabs stay open)
   chrome    run a vetted browser verb through the daemon (for sandboxed agents, optional)
   notify    Codex notify hook (internal)
+  claude-stop  Claude Code Stop hook for claude workers (internal)
   actor     exec codex for one agent (internal)
 """
 import argparse
@@ -47,7 +48,9 @@ EVENTS, TASK, LOG, NAMES = 'fx:events', 'fx:task', 'fx:log', 'fx:names'
 CHROME_VERBS = {'check', 'tabs', 'newtab', 'go', 'url', 'js'}
 THREAD_RE = r'[0-9a-f-]{36}'
 DEFAULTS = {'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 100000, 'stall_timeout': 1800,
-            'chrome_min_interval': 20, 'profile': 'fleet'}
+            'chrome_min_interval': 20, 'profile': 'fleet', 'worker_cli': 'codex', 'worker_model': 'sonnet',
+            'claude_window': 200000}
+CLAUDE_JSON = Path.home() / '.claude.json'
 
 
 def load(path):
@@ -123,6 +126,87 @@ def trust_agent_dir(home, cwd):
     if entry not in text:
         with cfg_file.open('a') as f:
             f.write('\n' + entry + '\ntrust_level = "trusted"\n')
+
+
+def is_claude(cfg, name):
+    return name != 'supervisor' and cfg.get('worker_cli') == 'claude'
+
+
+def trust_claude_dir(cwd):
+    """Claude Code asks "trust this folder?" per directory; pre-answer it in ~/.claude.json."""
+    cwd = str(Path(cwd).resolve())
+    with open(str(CLAUDE_JSON) + '.fleet.lock', 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            data = json.loads(CLAUDE_JSON.read_text())
+        except (OSError, ValueError):
+            data = {}
+        entry = data.setdefault('projects', {}).setdefault(cwd, {})
+        if entry.get('hasTrustDialogAccepted'):
+            return
+        entry['hasTrustDialogAccepted'] = True
+        tmp = CLAUDE_JSON.with_suffix('.json.fleet-tmp')
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        tmp.replace(CLAUDE_JSON)
+
+
+def install_kit(kit, cwd):
+    """Copy a worker kit (.claude/agents, .claude/skills, mcp.json) into a claude worker's cwd."""
+    if not kit:
+        return
+    kit = Path(kit).expanduser()
+    if (kit / '.claude').is_dir():
+        shutil.copytree(kit / '.claude', cwd / '.claude', dirs_exist_ok=True)
+    if (kit / 'mcp.json').exists():
+        shutil.copy(kit / 'mcp.json', cwd / 'mcp.json')
+
+
+def claude_transcript_usage(path, window):
+    """Context used by a Claude Code session: the last main-thread assistant usage in its transcript."""
+    try:
+        lines = _tail(Path(path), 524288)
+    except OSError:
+        return 0, window
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        usage = (row.get('message') or {}).get('usage') if row.get('type') == 'assistant' else None
+        if usage and not row.get('isSidechain'):
+            used = sum(int(usage.get(k) or 0) for k in
+                       ('input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens', 'output_tokens'))
+            return used, window
+    return 0, window
+
+
+def claude_stop(cfg_path, name, generation, raw):
+    """Claude Code Stop hook. Pushes a turn event unless background work will resume the turn."""
+    data = json.loads(raw or '{}')
+    if data.get('background_tasks'):
+        return False  # subagents still running in the background: the session will wake and stop again
+    text = data.get('last_assistant_message')
+    if text is None:
+        text = ''
+        try:
+            for line in reversed(_tail(Path(data.get('transcript_path', '')), 262144)):
+                row = json.loads(line)
+                if row.get('type') == 'assistant' and not row.get('isSidechain'):
+                    parts = (row.get('message') or {}).get('content') or []
+                    text = '\n'.join(p.get('text', '') for p in parts if isinstance(p, dict) and p.get('type') == 'text')
+                    if text:
+                        break
+        except (OSError, ValueError):
+            pass
+    cfg = load(cfg_path)
+    r = connect(cfg)
+    digest = hashlib.sha256((name + str(generation) + raw).encode()).hexdigest()
+    if not r.set('fx:seen:' + digest, '1', nx=True, ex=86400):
+        return False
+    r.rpush(EVENTS, json.dumps({'kind': 'turn', 'agent': name, 'generation': int(generation),
+                                'thread': data.get('session_id'), 'transcript': data.get('transcript_path', ''),
+                                'text': text, 'at': time.time()}, ensure_ascii=False))
+    return True
 
 
 # ---------------------------------------------------------------- trust gate
@@ -320,11 +404,27 @@ def actor_argv(cfg_path, cfg, name, generation, prompt):
     return argv + [prompt]
 
 
+def claude_argv(cfg_path, cfg, name, generation, prompt):
+    cwd = agent_cwd(cfg, name)
+    hook = shlex.join([cfg['python'], str(Path(__file__).resolve()), 'claude-stop', str(cfg_path), name, str(generation)])
+    settings = cwd / '.fleet-settings.json'
+    settings.write_text(json.dumps({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': hook, 'timeout': 30}]}]}}))
+    argv = [cfg.get('claude') or 'claude', '--dangerously-skip-permissions', '--model', cfg.get('worker_model') or 'sonnet',
+            '--settings', str(settings), '--add-dir', str(Path(cfg['run']) / 'workspace')]
+    if (cwd / 'mcp.json').exists():
+        argv += ['--mcp-config', str(cwd / 'mcp.json')]
+    return argv + ['--', prompt]  # --add-dir / --mcp-config are variadic: end options first
+
+
 def actor(cfg_path, name, prompt):
     cfg = load(cfg_path)
     generation = int(connect(cfg).hget(key('agent', name), 'generation') or 0)
     os.chdir(agent_cwd(cfg, name))
-    argv = actor_argv(cfg_path, cfg, name, generation, prompt)
+    if is_claude(cfg, name):
+        os.environ.pop('CLAUDECODE', None)
+        argv = claude_argv(cfg_path, cfg, name, generation, prompt)
+    else:
+        argv = actor_argv(cfg_path, cfg, name, generation, prompt)
     os.execvp(argv[0], argv)
 
 
@@ -388,7 +488,12 @@ class Fleet:
         scope = (HERE / 'agents' / (role + '.md')).read_text()
         scope = scope.replace('{{WORKSPACE}}', str(self.workspace())).replace('{{FLEET_CHROME}}', self.fleet_cmd())
         (cwd / 'AGENTS.md').write_text(scope)
-        trust_agent_dir(codex_home(self.cfg), cwd)
+        if is_claude(self.cfg, name):
+            (cwd / 'CLAUDE.md').write_text(scope)  # Claude Code reads CLAUDE.md, not AGENTS.md
+            install_kit(self.cfg.get('worker_kit'), cwd)
+            trust_claude_dir(cwd)
+        else:
+            trust_agent_dir(codex_home(self.cfg), cwd)
         generation = int(self.agent(name).get('generation', 0))
         self.setf(name, role=role, generation=generation, state='starting', thread='', pane='',
                   busy_since=time.time(), delivered=0)
@@ -399,7 +504,8 @@ class Fleet:
             window_name='fx-' + self.label(name), prompt_file=str(prompt_file), start_directory=str(cwd),
             cli_command=shlex.join([self.cfg['python'], str(Path(__file__).resolve()), 'actor', str(self.path), name]),
             output_file=str(self.run_dir / 'prompts' / (name + '-g' + str(generation) + '.terminal.log')),
-            auto_close=False, metadata={'type': role, 'cli_type': 'codex', 'profile': self.cfg['profile']},
+            auto_close=False, metadata={'type': role, 'cli_type': 'claude' if is_claude(self.cfg, name) else 'codex',
+                      'profile': self.cfg['profile']},
             env_vars={'PATH': os.environ.get('PATH', ''), 'CODEX_HOME': str(codex_home(self.cfg))})
         if not result.success:
             raise RuntimeError('spawn failed: ' + name + ': ' + str(result.error))
@@ -471,6 +577,8 @@ class Fleet:
             return
         if ev.get('thread'):
             self.setf(name, thread=ev['thread'])
+        if ev.get('transcript'):
+            self.setf(name, transcript=ev['transcript'])
         if info.get('state') == 'handoff':
             self.finish_rotation(name)
             return
@@ -596,6 +704,13 @@ class Fleet:
                 self.deliver(name)
 
     def usage(self, name):
+        if is_claude(self.cfg, name):
+            path = self.agent(name).get('transcript')
+            if not path:
+                return 0, 0
+            used, window = claude_transcript_usage(path, int(self.cfg['claude_window']))
+            self.setf(name, ctx_used=used, ctx_window=window)
+            return used, window
         thread = self.agent(name).get('thread')
         paths = rollouts(thread, self.sessions) if thread else []
         if not paths:
@@ -625,12 +740,25 @@ class Fleet:
         if not text:
             return
         self.setf(name, state='busy', busy_since=time.time(), delivered=int(info.get('delivered') or 0) + 1)
-        if not self.mgr.send_prompt_to_idle(self.agent(name)['pane'], text):
+        if not self.send(name, self.agent(name)['pane'], text):
             self.r.lpush(key('inbox', name), text)
             self.finish('blocked', 'delivery failed: ' + name)
             return
         self.setf(name, last_msg=text)
         self.log('deliver', agent=name, text=text[:120])
+
+    def send(self, name, pane, text):
+        """Codex takes the message pasted verbatim. Claude Code would submit a pasted newline as
+        Enter, so a claude worker gets the full message as a file and a one-line pointer."""
+        if not is_claude(self.cfg, name) or '\n' not in text:
+            return self.mgr.send_prompt_to_idle(pane, text)
+        box = agent_cwd(self.cfg, name) / '.inbox'
+        box.mkdir(exist_ok=True)
+        msg = box / ('msg-' + time.strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:6] + '.md')
+        msg.write_text(text)
+        first = ' '.join(text.split('\n', 1)[0].split())[:200]
+        return self.mgr.send_prompt_to_idle(pane, first + ' -- the full message is in ' + str(msg)
+                                            + ' . Read that whole file first and follow it.')
 
     def start_rotation(self, name, used, window):
         info = self.agent(name)
@@ -644,7 +772,7 @@ class Fleet:
         self.log('rotate.start', agent=name, used=used, window=window, generation=info.get('generation'))
         prompt = (handoff.DUMP_PROMPT.format(path=draft, used=used, window=window)
                   + ' This is a same-task handoff: do not open windows, do not continue the task itself.')
-        if not self.mgr.send_prompt_to_idle(info['pane'], prompt):
+        if not self.send(name, info['pane'], prompt):
             self.finish_rotation(name, timed_out=True)
 
     def skeleton(self, name, info):
@@ -706,6 +834,14 @@ class Fleet:
     def last_activity(self, info):
         """Newest of: when we handed the agent its message, and its rollout file's mtime."""
         last = float(info.get('busy_since') or 0)
+        if info.get('transcript'):  # claude worker: main transcript + its subagent transcripts
+            main = Path(info['transcript'])
+            for path in [main] + list(main.with_suffix('').glob('**/*.jsonl')):
+                try:
+                    last = max(last, path.stat().st_mtime)
+                except OSError:
+                    pass
+            return last
         thread = info.get('thread')
         paths = rollouts(thread, self.sessions) if thread else []
         if paths:
@@ -807,6 +943,8 @@ def start(args):
     codex = args.codex or shutil.which('codex')
     redis_server = args.redis_server or shutil.which('redis-server')
     missing = [n for n, p in (('codex', codex), ('redis-server', redis_server)) if not p]
+    if args.worker_cli == 'claude' and not (args.claude or shutil.which('claude')):
+        missing.append('claude')
     if missing:
         raise SystemExit('not found on PATH: ' + ', '.join(missing) + ' (pass --codex / --redis-server)')
     mgr = CmuxSessionManager(SESSION)
@@ -822,7 +960,9 @@ def start(args):
            'handoff_ratio': args.handoff_ratio, 'handoff_timeout': args.handoff_timeout,
            'window': args.window, 'stall_timeout': args.stall_timeout,
            'compact_limit': args.compact_limit, 'chrome_script': args.chrome_script,
-           'chrome_min_interval': args.chrome_min_interval}
+           'chrome_min_interval': args.chrome_min_interval, 'worker_cli': args.worker_cli,
+           'worker_model': args.worker_model, 'worker_kit': args.worker_kit,
+           'claude': args.claude or shutil.which('claude'), 'claude_window': args.claude_window}
     save(run / 'config.json', cfg)
     subprocess.run([redis_server, '--port', '0', '--unixsocket', cfg['redis_socket'],
                     '--unixsocketperm', '700', '--dir', str(run), '--dbfilename', 'fleet.rdb',
@@ -895,6 +1035,12 @@ def main(argv=None):
     s.add_argument('--compact-limit', type=int, help='codex model_auto_compact_token_limit (default: codex decides)')
     s.add_argument('--chrome-script', help='optional browser broker script run by the daemon for sandboxed agents')
     s.add_argument('--chrome-min-interval', type=float, default=DEFAULTS['chrome_min_interval'])
+    s.add_argument('--worker-cli', choices=('codex', 'claude'), default=DEFAULTS['worker_cli'],
+                   help='CLI for workers (the supervisor is always codex)')
+    s.add_argument('--worker-model', default=DEFAULTS['worker_model'], help='claude workers: --model value')
+    s.add_argument('--worker-kit', help='claude workers: dir with .claude/{agents,skills} and mcp.json copied into each worker cwd')
+    s.add_argument('--claude', help='claude binary (default: first on PATH)')
+    s.add_argument('--claude-window', type=int, default=DEFAULTS['claude_window'], help='claude workers: context window')
     sub.add_parser('daemon', help='run the coordinator (internal)').add_argument('cfg')
     t = sub.add_parser('task', help='submit a goal: JSON file or - for stdin ({"goal":..., "hours":..., "artifacts":[...]})')
     t.add_argument('spec')
@@ -907,6 +1053,9 @@ def main(argv=None):
     c = sub.add_parser('chrome', help='run a vetted browser verb through the daemon (sandboxed agents)')
     c.add_argument('--config', default=str(LATEST))
     c.add_argument('argv', nargs=argparse.REMAINDER)
+    h = sub.add_parser('claude-stop', help='Claude Code Stop hook (internal; hook JSON on stdin)')
+    for arg in ('cfg', 'agent', 'generation'):
+        h.add_argument(arg)
     a = sub.add_parser('actor', help='exec codex for one agent (internal)')
     for arg in ('cfg', 'agent', 'prompt'):
         a.add_argument(arg)
@@ -917,6 +1066,8 @@ def main(argv=None):
         daemon(args.cfg)
     elif args.cmd == 'notify':
         notify(args.cfg, args.agent, args.generation, args.payload)
+    elif args.cmd == 'claude-stop':
+        claude_stop(args.cfg, args.agent, args.generation, sys.stdin.read())
     elif args.cmd == 'actor':
         actor(args.cfg, args.agent, args.prompt)
     else:

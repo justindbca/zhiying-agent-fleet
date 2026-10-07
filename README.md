@@ -104,6 +104,23 @@ Each run writes to `~/.cmux-fleet/runs/fleet-<time>-<token>/`: `config.json`, `w
 (worker cwd, all deliverables land here), `agents/supervisor/`, `handoffs/`, `prompts/`, the private
 Redis dump and log. `~/.cmux-fleet/latest.json` points at the newest run.
 
+## Claude Code workers (optional)
+
+The supervisor is always Codex. Workers can be [Claude Code](https://claude.com/claude-code) sessions instead:
+
+```bash
+cmux-fleet start --workers 2 --worker-cli claude --worker-model sonnet --worker-kit ~/my-kit
+```
+
+- Each worker runs `claude --dangerously-skip-permissions --model <model> --settings <hook> --add-dir <workspace> [--mcp-config mcp.json] -- <prompt>`.
+- Turn ends come from a Claude Code **Stop hook** (`fleet.py claude-stop`) instead of Codex `notify`. A Stop that still lists
+  `background_tasks` (subagents running in the background) is ignored; the session stops again when they finish.
+- Context usage and the stall watchdog read the session transcript (plus its `subagents/` transcripts).
+- Multi-line messages are written to `<worker>/.inbox/msg-*.md` and the tab gets a one-line pointer: Claude Code would
+  submit a pasted newline as Enter.
+- The "trust this folder?" prompt is pre-answered in `~/.claude.json`; the scope file is also written as `CLAUDE.md`.
+- `--worker-kit DIR` is copied into every worker cwd: `DIR/.claude/{agents,skills}` and `DIR/mcp.json`.
+
 ## How a task flows
 
 1. `task` puts the goal in the supervisor's inbox. The daemon pastes it into the supervisor tab.
