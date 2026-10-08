@@ -204,12 +204,13 @@ def claude_stop(cfg_path, name, generation, raw):
     # .inbox/msg-*.md file. User messages are written when the turn starts, so they are present even
     # when the final assistant message has not been flushed yet.
     msg_id = ''
-    try:
-        for line in reversed(_tail(Path(data.get('transcript_path', '')), 1048576)):
-            m = re.search(r'\.inbox/(msg-[0-9]{8}-[0-9]{6}-[0-9a-f]{6})\.md', line)
-            if m and '"type":"user"' in line.replace(' ', ''):
-                msg_id = m.group(1)
-                break
+    try:  # scan the whole transcript: tool output after the pointer can be megabytes
+        with open(data.get('transcript_path', ''), errors='replace') as f:
+            for line in f:
+                if '.inbox/msg-' in line and '"type":"user"' in line.replace(' ', ''):
+                    m = re.search(r'\.inbox/(msg-[0-9]{8}-[0-9]{6}-[0-9a-f]{6})\.md', line)
+                    if m:
+                        msg_id = m.group(1)
     except OSError:
         pass
     cfg = load(cfg_path)

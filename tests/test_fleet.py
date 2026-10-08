@@ -629,7 +629,8 @@ def test_claude_stop_reads_delivery_id_from_transcript(tmp_path, monkeypatch):
     rows = [{'type': 'user', 'message': {'content': 'x -- the full message is in /w/.inbox/msg-20261008-090500-abc123.md . Read'}},
             {'type': 'user', 'message': {'content': '<task-notification>agent done</task-notification>'}},
             {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'partial'}]}}]
-    tr.write_text('\n'.join(json.dumps(x) for x in rows) + '\n')
+    rows += [{'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'z' * 32768}]}}] * 40
+    tr.write_text('\n'.join(json.dumps(x) for x in rows) + '\n')  # pointer is > 1 MiB from the end
     payload = json.dumps({'session_id': 's', 'transcript_path': str(tr), 'last_assistant_message': 'Done', 'background_tasks': []})
     assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '0', payload) is True
     assert json.loads(r.l['fx:events'][0])['msg_id'] == 'msg-20261008-090500-abc123'
