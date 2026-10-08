@@ -576,11 +576,15 @@ class Fleet:
         if not info or ev.get('generation') != int(info.get('generation', 0)):
             self.log('turn.stale', agent=name, generation=ev.get('generation'))
             return
-        if is_claude(self.cfg, name) and info.get('state') == 'idle':
-            # A re-delivered Stop, or a Stop for work that already reported: nothing was delivered
-            # since the last turn end, so this cannot be a new reply.
-            self.log('turn.duplicate', agent=name)
-            return
+        if is_claude(self.cfg, name):
+            # The Stop hook has no turn id. Drop a turn for an idle claude worker (nothing was delivered
+            # since its last turn end) and a late re-delivery of the reply it already reported, even if a
+            # new instruction made the worker busy again.
+            last = (self.r.lrange(key('replies', name), -1, -1) or [None])[0]
+            if info.get('state') == 'idle' or (last is not None and info.get('state') == 'busy'
+                                                and ev.get('text', '')[-4000:] == last and ev.get('text', '').strip()):
+                self.log('turn.duplicate', agent=name)
+                return
         if ev.get('thread'):
             self.setf(name, thread=ev['thread'])
         if ev.get('transcript'):

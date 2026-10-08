@@ -599,6 +599,18 @@ def test_daemon_drops_duplicate_stop_for_idle_claude_worker(cfx):
     reports = len([m for m in cfx.r.l.get('fx:inbox:supervisor', []) if 'worker-1 report' in m])
     cfx.handle(turn('worker-1', 'Done: report written'))  # same Stop delivered again
     assert len([m for m in cfx.r.l.get('fx:inbox:supervisor', []) if 'worker-1 report' in m]) == reports == 1
+    # next instruction makes it busy; a late copy of the first Stop must not be taken as the new reply
+    cfx.handle(turn('supervisor', decision(dispatch=[{'to': 'worker-1', 'instruction': 'Write worker-1/two.md now please'}])))
+    cfx.pump()
+    assert cfx.agent('worker-1')['state'] == 'busy'
+    cfx.handle(turn('worker-1', 'Done: report written'))
+    assert cfx.agent('worker-1')['state'] == 'busy'
+    cfx.handle(turn('worker-1', 'Done: two.md written'))
+    sup = cfx.agent('supervisor')['pane']
+    seen = [txt for p_, txt in cfx.mgr.sent if p_ == sup] + cfx.r.l.get('fx:inbox:supervisor', [])
+    allmsg = ''.join(seen) + ''.join(open(f).read() for f in [x.split('the full message is in ')[1].split(' . Read')[0]
+                                                          for x in seen if 'the full message is in' in x])
+    assert allmsg.count('Done: report written') == 1 and allmsg.count('Done: two.md written') == 1
 
 
 def test_trust_claude_dir_refuses_to_overwrite_unreadable_config(tmp_path, monkeypatch):
