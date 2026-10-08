@@ -133,16 +133,20 @@ def is_claude(cfg, name):
 
 
 def trust_claude_dir(cwd):
-    """Claude Code asks "trust this folder?" per directory; pre-answer it in ~/.claude.json."""
-    cwd = str(Path(cwd).resolve())
+    """Claude Code asks "trust this folder?" per directory, and a trusted parent covers its
+    subdirectories. Write ~/.claude.json only when neither the agent cwd nor any parent is
+    trusted yet, and then trust the fleet home (or the cwd outside it) once, so running Claude
+    sessions are not raced on every spawn."""
+    cwd = Path(cwd).resolve()
     with open(str(CLAUDE_JSON) + '.fleet.lock', 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         # Unreadable or half-written config: refuse rather than replace the user's file with {}.
         data = json.loads(CLAUDE_JSON.read_text()) if CLAUDE_JSON.exists() else {}
-        entry = data.setdefault('projects', {}).setdefault(cwd, {})
-        if entry.get('hasTrustDialogAccepted'):
+        projects = data.setdefault('projects', {})
+        if any(projects.get(str(d), {}).get('hasTrustDialogAccepted') for d in [cwd, *cwd.parents]):
             return
-        entry['hasTrustDialogAccepted'] = True
+        root = HOME.resolve() if HOME.exists() and HOME.resolve() in cwd.parents else cwd
+        projects.setdefault(str(root), {})['hasTrustDialogAccepted'] = True
         tmp = CLAUDE_JSON.with_suffix('.json.fleet-tmp')
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
         tmp.replace(CLAUDE_JSON)
@@ -198,18 +202,31 @@ def claude_stop(cfg_path, name, generation, raw):
             pass
     cfg = load(cfg_path)
     r = connect(cfg)
-    # The Stop payload has no turn id; the transcript grows every turn, so its size tells two
-    # identical replies of the same session apart while a re-delivered hook still dedupes.
+    # The Stop payload has no turn id. The uuid of the last main-chain assistant message in the
+    # transcript identifies the turn: a re-delivered hook sees the same uuid, the next turn a new one.
+    turn = ''
     try:
-        size = Path(data.get('transcript_path', '')).stat().st_size
+        for line in reversed(_tail(Path(data.get('transcript_path', '')), 262144)):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if row.get('type') == 'assistant' and not row.get('isSidechain') and row.get('uuid'):
+                turn = row['uuid']
+                break
     except OSError:
-        size = -1
-    digest = hashlib.sha256((name + str(generation) + str(data.get('session_id')) + str(size) + text).encode()).hexdigest()
-    if not r.set('fx:seen:' + digest, '1', nx=True, ex=86400):
+        pass
+    ident = name + '|' + str(generation) + '|' + str(data.get('session_id')) + '|' + (turn or 'text:' + text)
+    seen = 'fx:seen:' + hashlib.sha256(ident.encode()).hexdigest()
+    if not r.set(seen, '1', nx=True, ex=86400):
         return False
-    r.rpush(EVENTS, json.dumps({'kind': 'turn', 'agent': name, 'generation': int(generation),
-                                'thread': data.get('session_id'), 'transcript': data.get('transcript_path', ''),
-                                'text': text, 'at': time.time()}, ensure_ascii=False))
+    try:
+        r.rpush(EVENTS, json.dumps({'kind': 'turn', 'agent': name, 'generation': int(generation),
+                                    'thread': data.get('session_id'), 'transcript': data.get('transcript_path', ''),
+                                    'text': text, 'at': time.time()}, ensure_ascii=False))
+    except Exception:
+        r.delete(seen)  # let a retry through instead of losing the turn
+        raise
     return True
 
 
@@ -909,6 +926,7 @@ class Fleet:
         self.mgr.get_or_create_session()
         self.start_all()
         while not self.stopping:
+            self.r.set('fx:daemon:beat', str(time.time()))  # liveness for operators: a hung loop stops beating
             item = self.r.blpop(EVENTS, timeout=2)
             if item:
                 try:
@@ -1012,7 +1030,7 @@ def request(cfg, event, wait=30):
 
 def status(cfg):
     r = connect(cfg)
-    print(json.dumps({'task': r.hgetall(TASK),
+    print(json.dumps({'task': r.hgetall(TASK), 'daemon_beat': float(r.get('fx:daemon:beat') or 0),
                       'agents': {n: dict(r.hgetall(key('agent', n)), inbox=r.llen(key('inbox', n)))
                                  for n in ['supervisor'] + cfg['workers']}}, ensure_ascii=False, indent=2))
 

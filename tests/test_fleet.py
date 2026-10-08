@@ -582,7 +582,7 @@ def test_claude_stop_skips_background_work_and_dedupes(tmp_path, monkeypatch):
     r = FakeRedis()
     monkeypatch.setattr(fleet, 'connect', lambda cfg: r)
     tr = tmp_path / 't.jsonl'
-    tr.write_text('{}\n')
+    tr.write_text(json.dumps({'type': 'assistant', 'uuid': 'u-1', 'message': {}}) + '\n')
     busy = json.dumps({'session_id': 's1', 'transcript_path': str(tr), 'last_assistant_message': 'wait',
                        'background_tasks': [{'id': 'a'}]})
     done = json.dumps({'session_id': 's1', 'transcript_path': str(tr), 'last_assistant_message': 'Done: x',
@@ -592,7 +592,10 @@ def test_claude_stop_skips_background_work_and_dedupes(tmp_path, monkeypatch):
     assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', done) is False  # re-delivered hook
     ev = json.loads(r.l['fx:events'][0])
     assert ev['text'] == 'Done: x' and ev['transcript'] == str(tr) and ev['generation'] == 1
-    tr.write_text('{}\n{}\n')  # next turn, same reply text: must not be swallowed
+    tr.write_text(tr.read_text() + '{"type": "user"}\n')  # transcript grew, same turn: still a duplicate
+    assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', done) is False
+    tr.write_text(tr.read_text() + json.dumps({'type': 'assistant', 'uuid': 'u-2', 'message': {}}) + '\n')
+    # next turn, same reply text: must not be swallowed
     assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', done) is True
 
 
@@ -608,6 +611,22 @@ def test_trust_claude_dir_refuses_to_overwrite_unreadable_config(tmp_path, monke
     data = json.loads(cj.read_text())
     assert data['other'] == 2 and data['projects']['/a'] == {'x': 1}
     assert data['projects'][str(tmp_path.resolve())]['hasTrustDialogAccepted'] is True
+    before = cj.read_text()
+    (tmp_path / 'child').mkdir()
+    fleet.trust_claude_dir(tmp_path / 'child')  # parent already trusted: no write at all
+    assert cj.read_text() == before
+
+
+def test_trust_goes_to_fleet_home_once(tmp_path, monkeypatch):
+    cj = tmp_path / 'claude.json'
+    cj.write_text('{}')
+    home = tmp_path / 'fleet-home'
+    run_cwd = home / 'runs' / 'r1' / 'workspace' / 'worker-1'
+    run_cwd.mkdir(parents=True)
+    monkeypatch.setattr(fleet, 'CLAUDE_JSON', cj)
+    monkeypatch.setattr(fleet, 'HOME', home)
+    fleet.trust_claude_dir(run_cwd)
+    assert list(json.loads(cj.read_text())['projects']) == [str(home.resolve())]
 
 
 def test_claude_usage_and_activity_come_from_transcript(cfx, tmp_path):
