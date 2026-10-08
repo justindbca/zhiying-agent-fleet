@@ -137,10 +137,8 @@ def trust_claude_dir(cwd):
     cwd = str(Path(cwd).resolve())
     with open(str(CLAUDE_JSON) + '.fleet.lock', 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            data = json.loads(CLAUDE_JSON.read_text())
-        except (OSError, ValueError):
-            data = {}
+        # Unreadable or half-written config: refuse rather than replace the user's file with {}.
+        data = json.loads(CLAUDE_JSON.read_text()) if CLAUDE_JSON.exists() else {}
         entry = data.setdefault('projects', {}).setdefault(cwd, {})
         if entry.get('hasTrustDialogAccepted'):
             return
@@ -200,7 +198,13 @@ def claude_stop(cfg_path, name, generation, raw):
             pass
     cfg = load(cfg_path)
     r = connect(cfg)
-    digest = hashlib.sha256((name + str(generation) + raw).encode()).hexdigest()
+    # The Stop payload has no turn id; the transcript grows every turn, so its size tells two
+    # identical replies of the same session apart while a re-delivered hook still dedupes.
+    try:
+        size = Path(data.get('transcript_path', '')).stat().st_size
+    except OSError:
+        size = -1
+    digest = hashlib.sha256((name + str(generation) + str(data.get('session_id')) + str(size) + text).encode()).hexdigest()
     if not r.set('fx:seen:' + digest, '1', nx=True, ex=86400):
         return False
     r.rpush(EVENTS, json.dumps({'kind': 'turn', 'agent': name, 'generation': int(generation),

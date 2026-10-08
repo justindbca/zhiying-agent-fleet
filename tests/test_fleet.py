@@ -581,15 +581,33 @@ def test_claude_stop_skips_background_work_and_dedupes(tmp_path, monkeypatch):
     (tmp_path / 'c.json').write_text(json.dumps({'redis_socket': '/tmp/cmux-fleet-t.sock'}))
     r = FakeRedis()
     monkeypatch.setattr(fleet, 'connect', lambda cfg: r)
-    busy = json.dumps({'session_id': 's1', 'transcript_path': '/x', 'last_assistant_message': 'wait',
+    tr = tmp_path / 't.jsonl'
+    tr.write_text('{}\n')
+    busy = json.dumps({'session_id': 's1', 'transcript_path': str(tr), 'last_assistant_message': 'wait',
                        'background_tasks': [{'id': 'a'}]})
-    done = json.dumps({'session_id': 's1', 'transcript_path': '/x', 'last_assistant_message': 'Done: x',
+    done = json.dumps({'session_id': 's1', 'transcript_path': str(tr), 'last_assistant_message': 'Done: x',
                        'background_tasks': []})
     assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', busy) is False
     assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', done) is True
-    assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', done) is False
+    assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', done) is False  # re-delivered hook
     ev = json.loads(r.l['fx:events'][0])
-    assert ev['text'] == 'Done: x' and ev['transcript'] == '/x' and ev['generation'] == 1
+    assert ev['text'] == 'Done: x' and ev['transcript'] == str(tr) and ev['generation'] == 1
+    tr.write_text('{}\n{}\n')  # next turn, same reply text: must not be swallowed
+    assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', done) is True
+
+
+def test_trust_claude_dir_refuses_to_overwrite_unreadable_config(tmp_path, monkeypatch):
+    cj = tmp_path / 'claude.json'
+    cj.write_text('{"projects": {"/a": {"x": 1}}')  # half-written
+    monkeypatch.setattr(fleet, 'CLAUDE_JSON', cj)
+    with pytest.raises(ValueError):
+        fleet.trust_claude_dir(tmp_path)
+    assert cj.read_text() == '{"projects": {"/a": {"x": 1}}'
+    cj.write_text('{"projects": {"/a": {"x": 1}}, "other": 2}')
+    fleet.trust_claude_dir(tmp_path)
+    data = json.loads(cj.read_text())
+    assert data['other'] == 2 and data['projects']['/a'] == {'x': 1}
+    assert data['projects'][str(tmp_path.resolve())]['hasTrustDialogAccepted'] is True
 
 
 def test_claude_usage_and_activity_come_from_transcript(cfx, tmp_path):
