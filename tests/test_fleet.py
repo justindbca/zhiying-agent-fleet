@@ -577,26 +577,28 @@ def test_claude_multiline_message_goes_through_a_file(cfx):
     assert 'Write worker-1/report.md' in path.read_text()
 
 
-def test_claude_stop_skips_background_work_and_dedupes(tmp_path, monkeypatch):
+def test_claude_stop_skips_background_work(tmp_path, monkeypatch):
     (tmp_path / 'c.json').write_text(json.dumps({'redis_socket': '/tmp/cmux-fleet-t.sock'}))
     r = FakeRedis()
     monkeypatch.setattr(fleet, 'connect', lambda cfg: r)
-    tr = tmp_path / 't.jsonl'
-    tr.write_text(json.dumps({'type': 'assistant', 'uuid': 'u-1', 'message': {}}) + '\n')
-    busy = json.dumps({'session_id': 's1', 'transcript_path': str(tr), 'last_assistant_message': 'wait',
+    busy = json.dumps({'session_id': 's1', 'transcript_path': '/x', 'last_assistant_message': 'wait',
                        'background_tasks': [{'id': 'a'}]})
-    done = json.dumps({'session_id': 's1', 'transcript_path': str(tr), 'last_assistant_message': 'Done: x',
+    done = json.dumps({'session_id': 's1', 'transcript_path': '/x', 'last_assistant_message': 'Done: x',
                        'background_tasks': []})
     assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', busy) is False
     assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', done) is True
-    assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', done) is False  # re-delivered hook
     ev = json.loads(r.l['fx:events'][0])
-    assert ev['text'] == 'Done: x' and ev['transcript'] == str(tr) and ev['generation'] == 1
-    tr.write_text(tr.read_text() + '{"type": "user"}\n')  # transcript grew, same turn: still a duplicate
-    assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', done) is False
-    tr.write_text(tr.read_text() + json.dumps({'type': 'assistant', 'uuid': 'u-2', 'message': {}}) + '\n')
-    # next turn, same reply text: must not be swallowed
-    assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', done) is True
+    assert ev['text'] == 'Done: x' and ev['transcript'] == '/x' and ev['generation'] == 1
+
+
+def test_daemon_drops_duplicate_stop_for_idle_claude_worker(cfx):
+    cfx.handle(turn('supervisor', decision()))
+    cfx.pump()
+    assert cfx.agent('worker-1')['state'] == 'busy'
+    cfx.handle(turn('worker-1', 'Done: report written'))
+    reports = len([m for m in cfx.r.l.get('fx:inbox:supervisor', []) if 'worker-1 report' in m])
+    cfx.handle(turn('worker-1', 'Done: report written'))  # same Stop delivered again
+    assert len([m for m in cfx.r.l.get('fx:inbox:supervisor', []) if 'worker-1 report' in m]) == reports == 1
 
 
 def test_trust_claude_dir_refuses_to_overwrite_unreadable_config(tmp_path, monkeypatch):

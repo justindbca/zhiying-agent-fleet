@@ -202,31 +202,11 @@ def claude_stop(cfg_path, name, generation, raw):
             pass
     cfg = load(cfg_path)
     r = connect(cfg)
-    # The Stop payload has no turn id. The uuid of the last main-chain assistant message in the
-    # transcript identifies the turn: a re-delivered hook sees the same uuid, the next turn a new one.
-    turn = ''
-    try:
-        for line in reversed(_tail(Path(data.get('transcript_path', '')), 262144)):
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            if row.get('type') == 'assistant' and not row.get('isSidechain') and row.get('uuid'):
-                turn = row['uuid']
-                break
-    except OSError:
-        pass
-    ident = name + '|' + str(generation) + '|' + str(data.get('session_id')) + '|' + (turn or 'text:' + text)
-    seen = 'fx:seen:' + hashlib.sha256(ident.encode()).hexdigest()
-    if not r.set(seen, '1', nx=True, ex=86400):
-        return False
-    try:
-        r.rpush(EVENTS, json.dumps({'kind': 'turn', 'agent': name, 'generation': int(generation),
-                                    'thread': data.get('session_id'), 'transcript': data.get('transcript_path', ''),
-                                    'text': text, 'at': time.time()}, ensure_ascii=False))
-    except Exception:
-        r.delete(seen)  # let a retry through instead of losing the turn
-        raise
+    # No hook-side de-dup: the Stop payload carries no turn id and the transcript may lag the final
+    # message. The daemon drops a turn for a claude worker that is already idle (see on_turn).
+    r.rpush(EVENTS, json.dumps({'kind': 'turn', 'agent': name, 'generation': int(generation),
+                                'thread': data.get('session_id'), 'transcript': data.get('transcript_path', ''),
+                                'text': text, 'at': time.time()}, ensure_ascii=False))
     return True
 
 
@@ -595,6 +575,11 @@ class Fleet:
         name, info = ev.get('agent'), self.agent(ev.get('agent', ''))
         if not info or ev.get('generation') != int(info.get('generation', 0)):
             self.log('turn.stale', agent=name, generation=ev.get('generation'))
+            return
+        if is_claude(self.cfg, name) and info.get('state') == 'idle':
+            # A re-delivered Stop, or a Stop for work that already reported: nothing was delivered
+            # since the last turn end, so this cannot be a new reply.
+            self.log('turn.duplicate', agent=name)
             return
         if ev.get('thread'):
             self.setf(name, thread=ev['thread'])
