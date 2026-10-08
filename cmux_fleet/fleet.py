@@ -200,13 +200,25 @@ def claude_stop(cfg_path, name, generation, raw):
                         break
         except (OSError, ValueError):
             pass
+    # Which delivery this turn answers: the last user message in the transcript that points at an
+    # .inbox/msg-*.md file. User messages are written when the turn starts, so they are present even
+    # when the final assistant message has not been flushed yet.
+    msg_id = ''
+    try:
+        for line in reversed(_tail(Path(data.get('transcript_path', '')), 1048576)):
+            m = re.search(r'\.inbox/(msg-[0-9]{8}-[0-9]{6}-[0-9a-f]{6})\.md', line)
+            if m and '"type":"user"' in line.replace(' ', ''):
+                msg_id = m.group(1)
+                break
+    except OSError:
+        pass
     cfg = load(cfg_path)
     r = connect(cfg)
     # No hook-side de-dup: the Stop payload carries no turn id and the transcript may lag the final
     # message. The daemon drops a turn for a claude worker that is already idle (see on_turn).
     r.rpush(EVENTS, json.dumps({'kind': 'turn', 'agent': name, 'generation': int(generation),
                                 'thread': data.get('session_id'), 'transcript': data.get('transcript_path', ''),
-                                'text': text, 'at': time.time()}, ensure_ascii=False))
+                                'msg_id': msg_id, 'text': text, 'at': time.time()}, ensure_ascii=False))
     return True
 
 
@@ -576,15 +588,13 @@ class Fleet:
         if not info or ev.get('generation') != int(info.get('generation', 0)):
             self.log('turn.stale', agent=name, generation=ev.get('generation'))
             return
-        if is_claude(self.cfg, name):
-            # The Stop hook has no turn id. Drop a turn for an idle claude worker (nothing was delivered
-            # since its last turn end) and a late re-delivery of the reply it already reported, even if a
-            # new instruction made the worker busy again.
-            last = (self.r.lrange(key('replies', name), -1, -1) or [None])[0]
-            if info.get('state') == 'idle' or (last is not None and info.get('state') == 'busy'
-                                                and ev.get('text', '')[-4000:] == last and ev.get('text', '').strip()):
-                self.log('turn.duplicate', agent=name)
+        if is_claude(self.cfg, name) and info.get('state') in ('busy', 'handoff', 'idle'):
+            # A claude turn end counts only if it answers the message delivered last, once. (The spawn /
+            # takeover prompt is a CLI argument without a msg id: that turn is accepted in 'starting'.)
+            if info.get('state') == 'idle' or ev.get('msg_id') != info.get('msg_id') or info.get('msg_done') == info.get('msg_id'):
+                self.log('turn.duplicate', agent=name, msg_id=ev.get('msg_id'), current=info.get('msg_id'))
                 return
+            self.setf(name, msg_done=ev.get('msg_id'))
         if ev.get('thread'):
             self.setf(name, thread=ev['thread'])
         if ev.get('transcript'):
@@ -760,12 +770,16 @@ class Fleet:
     def send(self, name, pane, text):
         """Codex takes the message pasted verbatim. Claude Code would submit a pasted newline as
         Enter, so a claude worker gets the full message as a file and a one-line pointer."""
-        if not is_claude(self.cfg, name) or '\n' not in text:
+        if not is_claude(self.cfg, name):
             return self.mgr.send_prompt_to_idle(pane, text)
+        # Every message to a claude worker goes through a uniquely named file. The Stop hook reads the
+        # id of the last such pointer from the transcript, which binds each turn end to its delivery.
         box = agent_cwd(self.cfg, name) / '.inbox'
         box.mkdir(exist_ok=True)
-        msg = box / ('msg-' + time.strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:6] + '.md')
+        mid = 'msg-' + time.strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:6]
+        msg = box / (mid + '.md')
         msg.write_text(text)
+        self.setf(name, msg_id=mid)
         first = ' '.join(text.split('\n', 1)[0].split())[:200]
         return self.mgr.send_prompt_to_idle(pane, first + ' -- the full message is in ' + str(msg)
                                             + ' . Read that whole file first and follow it.')

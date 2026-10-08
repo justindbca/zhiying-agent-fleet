@@ -591,26 +591,48 @@ def test_claude_stop_skips_background_work(tmp_path, monkeypatch):
     assert ev['text'] == 'Done: x' and ev['transcript'] == '/x' and ev['generation'] == 1
 
 
-def test_daemon_drops_duplicate_stop_for_idle_claude_worker(cfx):
+def claude_turn(f, name, text):
+    """A Stop for the message currently delivered to a claude worker."""
+    return dict(turn(name, text), msg_id=f.agent(name).get('msg_id'))
+
+
+def sup_traffic(f):
+    sup = f.agent('supervisor')['pane']
+    seen = [txt for p_, txt in f.mgr.sent if p_ == sup] + f.r.l.get('fx:inbox:supervisor', [])
+    return ''.join(seen)
+
+
+def test_claude_turn_must_answer_the_current_delivery_once(cfx):
     cfx.handle(turn('supervisor', decision()))
     cfx.pump()
-    assert cfx.agent('worker-1')['state'] == 'busy'
-    cfx.handle(turn('worker-1', 'Done: report written'))
-    reports = len([m for m in cfx.r.l.get('fx:inbox:supervisor', []) if 'worker-1 report' in m])
-    cfx.handle(turn('worker-1', 'Done: report written'))  # same Stop delivered again
-    assert len([m for m in cfx.r.l.get('fx:inbox:supervisor', []) if 'worker-1 report' in m]) == reports == 1
-    # next instruction makes it busy; a late copy of the first Stop must not be taken as the new reply
-    cfx.handle(turn('supervisor', decision(dispatch=[{'to': 'worker-1', 'instruction': 'Write worker-1/two.md now please'}])))
-    cfx.pump()
-    assert cfx.agent('worker-1')['state'] == 'busy'
-    cfx.handle(turn('worker-1', 'Done: report written'))
-    assert cfx.agent('worker-1')['state'] == 'busy'
-    cfx.handle(turn('worker-1', 'Done: two.md written'))
-    sup = cfx.agent('supervisor')['pane']
-    seen = [txt for p_, txt in cfx.mgr.sent if p_ == sup] + cfx.r.l.get('fx:inbox:supervisor', [])
-    allmsg = ''.join(seen) + ''.join(open(f).read() for f in [x.split('the full message is in ')[1].split(' . Read')[0]
-                                                          for x in seen if 'the full message is in' in x])
-    assert allmsg.count('Done: report written') == 1 and allmsg.count('Done: two.md written') == 1
+    first = cfx.agent('worker-1')['msg_id']
+    assert first and cfx.agent('worker-1')['state'] == 'busy'
+    stop_a = claude_turn(cfx, 'worker-1', 'Done: report.md updated')
+    cfx.handle(stop_a)
+    cfx.handle(stop_a)  # same Stop again: dropped
+    assert sup_traffic(cfx).count('Done: report.md updated') == 1
+    for n in (2, 3):  # rework twice, identical reply text each time: both are real turns
+        cfx.handle(turn('supervisor', decision(dispatch=[{'to': 'worker-1', 'instruction': 'Rework worker-1/report.md round ' + str(n)}])))
+        cfx.pump()
+        assert cfx.agent('worker-1')['msg_id'] != first
+        cfx.handle(stop_a)  # a stale Stop for the first delivery never counts
+        assert cfx.agent('worker-1')['state'] == 'busy'
+        cfx.handle(claude_turn(cfx, 'worker-1', 'Done: report.md updated'))
+    assert sup_traffic(cfx).count('Done: report.md updated') == 3
+
+
+def test_claude_stop_reads_delivery_id_from_transcript(tmp_path, monkeypatch):
+    (tmp_path / 'c.json').write_text(json.dumps({'redis_socket': '/tmp/cmux-fleet-t.sock'}))
+    r = FakeRedis()
+    monkeypatch.setattr(fleet, 'connect', lambda cfg: r)
+    tr = tmp_path / 't.jsonl'
+    rows = [{'type': 'user', 'message': {'content': 'x -- the full message is in /w/.inbox/msg-20261008-090500-abc123.md . Read'}},
+            {'type': 'user', 'message': {'content': '<task-notification>agent done</task-notification>'}},
+            {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'partial'}]}}]
+    tr.write_text('\n'.join(json.dumps(x) for x in rows) + '\n')
+    payload = json.dumps({'session_id': 's', 'transcript_path': str(tr), 'last_assistant_message': 'Done', 'background_tasks': []})
+    assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '0', payload) is True
+    assert json.loads(r.l['fx:events'][0])['msg_id'] == 'msg-20261008-090500-abc123'
 
 
 def test_trust_claude_dir_refuses_to_overwrite_unreadable_config(tmp_path, monkeypatch):
