@@ -424,10 +424,12 @@ def test_history_page_escapes_script_end():
     import tempfile
     run = Path(tempfile.mkdtemp())
     snap = run / 's.txt'
-    snap.write_text('</script><b>x')
+    snap.write_text('<!-- <script> </script><b>x')
     history.record(run, slot='worker-1', label='worker-1', generation=0, snapshot=str(snap), handoff='', source='model')
     page = history.write_page(run, [('worker-1', 'worker-1.1')]).read_text()
-    assert page.count('</script>') == 1
+    assert page.count('</script>') == 1 and page.count('<!--') == 0
+    data = json.loads(page.split('const DATA=', 1)[1].split(';\n', 1)[0])
+    assert data['slots'][0]['gens'][0]['screen'] == '<!-- <script> </script><b>x'
 
 
 def test_stalled_worker_is_aborted_and_reported_to_supervisor(fx):

@@ -61,7 +61,7 @@ def write_page(run_dir, slots):
                 for e in rows if e.get('slot') == slot]
         data.append({'slot': slot, 'live': live, 'gens': gens})
     blob = json.dumps({'run': str(run_dir), 'updated': time.time(), 'slots': data}, ensure_ascii=False)
-    blob = blob.replace('</', '<\\/')  # never close the <script> early
+    blob = blob.replace('<', '\\u003c')  # no </script>, <!-- or <script inside the script block
     path = page_path(run_dir)
     tmp = path.with_suffix('.tmp')
     tmp.write_text(PAGE.replace('/*DATA*/null', blob))
