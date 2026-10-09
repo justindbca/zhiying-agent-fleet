@@ -16,7 +16,7 @@ daemon 独立于模型的自述做这几件事：
 - **验收是字面的。** 任务只有在声明的每个产物都存在、够长、含必需文字时才算完成。监工三次误报 `COMPLETED` 直接判阻塞。
 - **模型不能提交宿主命令。** 监工只能声明要检查的文件，不能提交要跑的命令。worker 跑在沙盒里（可写工作区、开网络）。
 - **上下文满之前先轮换。** 每次投递前 daemon 从 Codex 自己的 rollout 文件读 token 用量。到 `--handoff-ratio`（默认 60%）就让会话写三节交接单，
-  并进机器骨架，把旧标签收成只读记录，起接班者（`worker-1` → `worker-1.1` → `worker-1.2`）读交接单继续。模型不写就用骨架，轮换永不失败。
+  并进机器骨架，旧屏幕存进历史页，在原位置起接班者（`worker-1` → `worker-1.1` → `worker-1.2`）读交接单继续。模型不写就用骨架，轮换永不失败。
 - **卡死看门。** 忙碌中的 agent 若 rollout 文件 `--stall-timeout` 秒（默认 30 分钟）没动，就中止该轮并报给监工；监工自己卡死给一次重试，再卡就判阻塞交人。
 - **过期回调一律丢弃。** 每次拉起会话都把代数烘进 notify 钩子参数，退役会话的迟到回调会被忽略。
 
@@ -64,6 +64,21 @@ cmux-fleet stop                     # 取消任务，关 daemon 和它的 redis�
 
 每次运行写在 `~/.cmux-fleet/runs/fleet-<时间>-<token>/`：`config.json`、`workspace/<worker>/`（worker 的 cwd，产物都在这）、
 `agents/supervisor/`、`handoffs/`、`prompts/`、私有 Redis 的 dump 和日志。`~/.cmux-fleet/latest.json` 指向最近一次。
+
+## 一页布局与历史页
+
+所有窗口在同一个 cmux 页面：左上 supervisor，左下「history」浏览器格，右边 worker 竖排。换代时接班者在原位置打开；
+退下来的那一代的整屏（含回滚）和交接单写进 `<run>/history.html`，历史格自动刷新。页面上可选 agent（supervisor / worker-1 …）、
+选某一代（supervisor、supervisor.1 …，worker-1、worker-1.1 …），切换看屏幕或交接单，或一次搜索所有 agent 的所有代（回车跳下一处）。
+supervisor 和 worker 一样按「槽位.代数」命名。
+
+## 服务模式（常驻 fleet）
+
+`start --mode service`：没有目标、没有结束，持续处理一串请求。supervisor 只分派；每个 worker 可以有自己的 prompt（`--roles DIR`，
+`DIR/<名字>.md` 追加进它的 AGENTS.md）；回答必须是一个 JSON 对象，由 daemon 按 `reply.required` / `reply.allowed` 字面校验，
+答错一次给一次更正机会，再错发布为 `invalid`。`--worker-names` 按角色给 worker 命名；`--supervisor-profile` / `--worker-profile`
+两边可用不同模型（如本地模型）；`--max-busy N` 限同时干活的 worker 数；`pause` / `resume` 由外部（交易日历等）控制，
+暂停时不投递、不换代，请求照常排队并会超时。命令与字段见英文 README「Service mode」。
 
 ## 任务怎么流转
 

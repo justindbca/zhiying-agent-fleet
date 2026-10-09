@@ -380,46 +380,45 @@ class CmuxSessionManager:
             return True  # already side by side
         return _run('split-off', '--workspace', ws, '--surface', pane_id, 'right', '--focus', 'false').returncode == 0
 
-    def archive_pane(self, pane_id: str, snapshot: str, label: str) -> Optional[str]:
-        """Snapshot a retiring agent's screen into a read-only ``less`` surface."""
-        ws = self._where(pane_id)
+    def capture_to(self, pane_id: str, path: str) -> None:
+        """Save a retiring agent's whole screen (with scrollback) for the history page."""
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(self.capture_output(pane_id, 100000), encoding='utf-8')
+
+    def arrange(self, supervisor: str, workers: List[str], history_url: str) -> Optional[str]:
+        """One page: supervisor top-left, the history browser below it, workers stacked on the right.
+
+        Returns the history browser surface (None if it could not be created).
+        """
+        ws = self._where(supervisor)
         if not ws:
             return None
-        path = Path(snapshot).resolve()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.capture_output(pane_id, 100000), encoding='utf-8')
-        pane = self._surfaces(ws)[pane_id]['pane_id']
-        # LESSSECURE disables shell escapes/editing; this surface never hosts an agent.
-        viewer = 'LESSSECURE=1 exec less -+F -S +G ' + shlex.quote(str(path))
-        base = ['--id-format', 'uuids', 'new-surface', '--workspace', ws, '--pane', pane, '--focus', 'false']
-        p = _run(*base, '--command', viewer)
-        ran = p.returncode == 0
-        if not ran:
-            p = _run(*base)
+        prev = None
+        for w in workers:
+            if self._where(w) != ws:
+                continue
+            if prev is None:
+                self.place_right_of(w, supervisor)
+            else:
+                target = self._surfaces(ws)[prev]['pane_id']
+                _run('move-surface', '--workspace', ws, '--surface', w, '--pane', target, '--focus', 'false')
+                _run('split-off', '--workspace', ws, '--surface', w, 'down', '--focus', 'false')
+            prev = w
+        pane = self._surfaces(ws)[supervisor]['pane_id']
+        p = _run('--id-format', 'uuids', 'new-surface', '--type', 'browser', '--workspace', ws, '--pane', pane,
+                 '--url', history_url, '--focus', 'false')
         parts = p.stdout.split()
         if p.returncode or len(parts) < 2:
             return None
-        history = parts[1]
-        self._tag(history, type='handoff_archive', label=label, handoff_snapshot=str(path))
-        if not ran and not self._type_command(history, viewer):
-            return None
-        _run('split-off', '--workspace', ws, '--surface', history, 'down', '--focus', 'false')
-        self.rename(history, label)
-        return history
+        sid = parts[1]
+        self._tag(sid, type='history', label='history')
+        _run('split-off', '--workspace', ws, '--surface', sid, 'down', '--focus', 'false')
+        self.rename(sid, 'history')
+        return sid
 
-    def place_below_archive(self, pane_id: str, history: str, label: str) -> bool:
-        ws = self._where(pane_id)
-        if not ws or self._where(history) != ws:
-            return False
-        if self._meta()['surfaces'][history].get('type') != 'handoff_archive':
-            return False
-        target = self._surfaces(ws)[history]['pane_id']
-        if _run('move-surface', '--workspace', ws, '--surface', pane_id, '--pane', target, '--focus', 'false').returncode:
-            return False
-        if _run('split-off', '--workspace', ws, '--surface', pane_id, 'down', '--focus', 'false').returncode:
-            return False
-        self.rename(pane_id, label)
-        return True
+    def reload_browser(self, surface: str) -> bool:
+        return bool(self._where(surface)) and _run('browser', '--surface', surface, 'reload').returncode == 0
 
     def tab_into(self, pane_id: str, peer: str) -> bool:
         """Move a surface into the pane holding ``peer``, as another tab."""
@@ -430,15 +429,3 @@ class CmuxSessionManager:
         return _run('move-surface', '--workspace', ws, '--surface', pane_id, '--pane', target,
                     '--focus', 'false').returncode == 0
 
-    def grow_up(self, pane_id: str, amount: int = 4000) -> bool:
-        """Push this pane's top border up, collapsing the pane above to its minimum height."""
-        ws = self._where(pane_id)
-        if not ws:
-            return False
-        pane = self._surfaces(ws)[pane_id]['pane_id']
-        return _run('resize-pane', '--workspace', ws, '--pane', pane, '-U', '--amount', str(amount)).returncode == 0
-
-    def close_archive_pane(self, pane_id: str) -> bool:
-        if not self.owns(pane_id) or self._meta()['surfaces'][pane_id].get('type') != 'handoff_archive':
-            return False
-        return self.kill_pane(pane_id)

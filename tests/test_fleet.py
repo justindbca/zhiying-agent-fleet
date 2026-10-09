@@ -70,6 +70,9 @@ class FakeRedis:
         items = self.l.get(k, [])
         return items[a:] if b == -1 else items[a:b + 1]
 
+    def lrem(self, k, count, v):
+        self.l[k] = [x for x in self.l.get(k, []) if x != v]
+
     def ltrim(self, k, a, b):
         items = self.l.get(k, [])
         self.l[k] = items[a:] if b == -1 else items[a:b + 1]
@@ -97,24 +100,20 @@ class FakeMgr:
     def place_right_of(self, a, b):
         return True
 
-    def archive_pane(self, pane, snapshot, label):
-        Path(snapshot).write_text('screen')
-        self.alive.add('hist-' + pane)
-        return 'hist-' + pane
+    def capture_to(self, pane, path):
+        Path(path).write_text('screen of ' + pane)
+
+    def arrange(self, sup, workers, url):
+        self.arranged = (sup, list(workers), url)
+        self.alive.add('history-pane')
+        return 'history-pane'
+
+    def reload_browser(self, pane):
+        self.reloaded = getattr(self, 'reloaded', 0) + 1
+        return True
 
     def tab_into(self, pane, peer):
         self.tabbed = getattr(self, 'tabbed', []) + [(pane, peer)]
-        return True
-
-    def grow_up(self, pane):
-        self.grown = getattr(self, 'grown', []) + [pane]
-        return True
-
-    def close_archive_pane(self, pane):
-        self.closed = getattr(self, 'closed', []) + [pane]
-        return True
-
-    def place_below_archive(self, pane, history, label):
         return True
 
     def kill_pane(self, pane):
@@ -390,20 +389,45 @@ def test_empty_turn_redelivers_same_message_with_backoff(fx):
     assert '[worker-1 report]' in last_to(fx, 'supervisor')  # 4th empty goes to the supervisor
 
 
-def test_every_past_generation_record_is_kept_as_tabs(fx):
+def test_one_page_layout_and_history_page_lists_every_generation(fx):
+    sup, workers, url = fx.mgr.arranged
+    assert sup == fx.agent('supervisor')['pane'] and workers == [fx.agent('worker-1')['pane']]
+    assert url.startswith('file://') and url.endswith('history.html')
     fx.cfg['handoff_timeout'] = 0
-    for gen in range(2):
-        seasoned(fx, 'worker-1')
-        write_rollout(fx.sessions, fx.agent('worker-1').get('thread') or THREADS['worker-1'],
-                      fleet.agent_cwd(fx.cfg, 'worker-1'), used=60000)
-        fx.queue('worker-1', 'Instruction %d: write worker-1/x.md, at least 50 chars' % gen)
+    for name in ('worker-1', 'worker-1', 'supervisor'):
+        info = fx.agent(name)
+        gen = int(info['generation'])
+        seasoned(fx, name)
+        write_rollout(fx.sessions, info.get('thread') or THREADS[name], fleet.agent_cwd(fx.cfg, name), used=60000)
+        for n in fx.names:  # only this agent has a message, so only it rotates
+            fx.r.delete('fx:inbox:' + n); fx.setf(n, state='idle')
+        fx.queue(name, 'Instruction: write ' + name + '/x.md, at least 50 chars')
+        old = info['pane']
         fx.pump(); fx.tick()
-        thread = '5555555%d-5555-5555-5555-555555555555' % gen
-        fx.handle({'kind': 'turn', 'agent': 'worker-1', 'generation': gen + 1, 'thread': thread, 'text': 'READY'})
-        fx.r.delete('fx:inbox:worker-1'); fx.setf('worker-1', state='idle')
-    assert fx.label('worker-1') == 'worker-1.2'
-    assert getattr(fx.mgr, 'closed', []) == [] and len(fx.mgr.tabbed) == 1
-    assert fx.mgr.grown[-1] == fx.agent('worker-1')['pane'] and len(fx.mgr.grown) == 2
+        assert (fx.agent(name)['pane'], old) in fx.mgr.tabbed and old in fx.mgr.killed  # successor takes its place
+        thread = '5555555%d-5555-5555-5555-55555555555%d' % (gen, len(fx.mgr.killed))
+        fx.handle({'kind': 'turn', 'agent': name, 'generation': gen + 1, 'thread': thread, 'text': 'READY'})
+        fx.r.delete('fx:inbox:' + name); fx.setf(name, state='idle')
+    assert fx.label('worker-1') == 'worker-1.2' and fx.label('supervisor') == 'supervisor.1'
+    assert fx.r.hget('fx:names', 'supervisor.1') is None  # the supervisor is never a dispatch target
+    page = (fx.run_dir / 'history.html').read_text()
+    data = json.loads(page.split('const DATA=', 1)[1].split(';\n', 1)[0])
+    slots = {s['slot']: s for s in data['slots']}
+    assert [g['label'] for g in slots['worker-1']['gens']] == ['worker-1', 'worker-1.1']
+    assert [g['label'] for g in slots['supervisor']['gens']] == ['supervisor']
+    assert slots['worker-1']['live'] == 'worker-1.2' and slots['supervisor']['live'] == 'supervisor.1'
+    assert slots['worker-1']['gens'][0]['screen'].startswith('screen of ') and fx.mgr.reloaded == 3
+
+
+def test_history_page_escapes_script_end():
+    from cmux_fleet import history
+    import tempfile
+    run = Path(tempfile.mkdtemp())
+    snap = run / 's.txt'
+    snap.write_text('</script><b>x')
+    history.record(run, slot='worker-1', label='worker-1', generation=0, snapshot=str(snap), handoff='', source='model')
+    page = history.write_page(run, [('worker-1', 'worker-1.1')]).read_text()
+    assert page.count('</script>') == 1
 
 
 def test_stalled_worker_is_aborted_and_reported_to_supervisor(fx):
@@ -681,3 +705,177 @@ def test_claude_usage_and_activity_come_from_transcript(cfx, tmp_path):
     os.utime(tr, (1000, 1000))
     os.utime(sub, (5000, 5000))
     assert cfx.last_activity(dict(cfx.agent('worker-1'), busy_since=0)) == 5000
+
+
+# ------------------------------------------------------------ service mode
+SVC_THREADS = {'supervisor': THREADS['supervisor'], 'exit': '66666666-6666-6666-6666-666666666666',
+               'reentry': '77777777-7777-7777-7777-777777777777'}
+
+
+@pytest.fixture
+def sfx(tmp_path):
+    run = tmp_path / 'run'
+    (run / 'workspace').mkdir(parents=True)
+    roles = tmp_path / 'roles'
+    roles.mkdir()
+    (roles / 'exit.md').write_text('You judge exits. Propose only trail_dd.')
+    cfg = {'run': str(run), 'redis_socket': '/tmp/cmux-fleet-test.sock', 'python': sys.executable,
+           'workers': ['exit', 'reentry'], 'mode': 'service', 'roles': str(roles), 'max_busy': 1,
+           'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 95000, 'codex_home': str(tmp_path / 'codex-home')}
+    (run / 'config.json').write_text(json.dumps(cfg))
+    f = fleet.Fleet(run / 'config.json', FakeRedis(), FakeMgr(), sessions=tmp_path / 'sessions')
+    f.start_all()
+    for name in f.names:
+        write_rollout(f.sessions, SVC_THREADS[name], fleet.agent_cwd(cfg, name))
+        f.handle({'kind': 'turn', 'agent': name, 'generation': 0, 'thread': SVC_THREADS[name], 'text': 'READY'})
+    return f
+
+
+def req(rid, to=None, **extra):
+    spec = dict({'id': rid, 'payload': {'did': 'cu-1', 'round': 3}, 'reply': {'required': ['verdict', 'param']}}, **extra)
+    if to:
+        spec['to'] = to
+    return spec
+
+
+def submit(f, spec):
+    f.handle({'kind': 'request', 'request_id': 'q-' + spec['id'], 'spec': spec})
+    return json.loads(f.r.get('fx:reply:q-' + spec['id']))
+
+
+def answer(f, name, text):
+    f.handle({'kind': 'turn', 'agent': name, 'generation': int(f.agent(name)['generation']),
+              'thread': SVC_THREADS[name], 'text': text})
+
+
+def results(f):
+    return [json.loads(x) for x in f.r.lrange('fx:results', 0, -1)]
+
+
+def test_service_scope_files_carry_each_workers_own_prompt(sfx):
+    exit_md = (fleet.agent_cwd(sfx.cfg, 'exit') / 'AGENTS.md').read_text()
+    re_md = (fleet.agent_cwd(sfx.cfg, 'reentry') / 'AGENTS.md').read_text()
+    sup_md = (fleet.agent_cwd(sfx.cfg, 'supervisor') / 'AGENTS.md').read_text()
+    assert 'service mode' in exit_md and 'You judge exits' in exit_md and 'Your role (exit)' in exit_md
+    assert 'You judge exits' not in re_md and 'route each request' in sup_md
+
+
+def test_direct_request_gets_validated_json_result(sfx):
+    assert submit(sfx, req('r1', to='exit'))['status'] == 'accepted'
+    sfx.pump()
+    msg = last_to(sfx, 'exit')
+    assert msg.startswith('[Request r1]') and '"round": 3' in msg and 'verdict, param' in msg
+    assert sfx.agent('supervisor')['state'] == 'idle'  # direct requests cost no supervisor turn
+    answer(sfx, 'exit', 'thinking...\n{"verdict": "sold early", "param": {"trail_dd": 0.25}}')
+    res = results(sfx)[-1]
+    assert res['id'] == 'r1' and res['status'] == 'ok' and res['worker'] == 'exit'
+    assert res['result']['param'] == {'trail_dd': 0.25}
+    assert json.loads(sfx.r.get('fx:result:r1'))['status'] == 'ok'
+    assert not sfx.r.hgetall('fx:req:r1') and sfx.r.llen('fx:reqq') == 0
+    assert submit(sfx, req('r1', to='exit'))['status'] == 'rejected'  # ids are single-use
+
+
+def test_invalid_reply_gets_one_correction_then_invalid_result(sfx):
+    submit(sfx, req('r2', to='exit'))
+    sfx.pump()
+    answer(sfx, 'exit', 'the trail was too tight')
+    sfx.pump()
+    assert 'Your last reply was rejected (no JSON object found)' in last_to(sfx, 'exit')
+    assert last_to(sfx, 'exit').startswith('[Request r2]')
+    answer(sfx, 'exit', '{"verdict": "x"}')
+    res = results(sfx)[-1]
+    assert res['status'] == 'invalid' and 'missing keys: param' in res['error']
+
+
+def test_allowed_keys_are_enforced(sfx):
+    submit(sfx, req('r3', to='exit', reply={'required': ['verdict'], 'allowed': ['verdict', 'param']}))
+    sfx.pump()
+    answer(sfx, 'exit', '{"verdict": "ok", "qty": 4}')
+    sfx.pump()
+    assert 'keys not allowed: qty' in last_to(sfx, 'exit')
+
+
+def test_supervisor_routes_or_skips(sfx):
+    submit(sfx, req('r4'))
+    submit(sfx, req('r5'))
+    sfx.pump()
+    assert '[Request r4] A new request needs routing' in last_to(sfx, 'supervisor')
+    answer(sfx, 'supervisor', json.dumps({'reason': 'exit question', 'dispatch': [
+        {'to': 'exit', 'request_id': 'r4', 'instruction': 'Check the last sell against the high after it'},
+        {'to': 'exit', 'request_id': 'nope', 'instruction': 'Check something that does not exist'}]}))
+    sfx.pump()
+    assert 'Check the last sell' in last_to(sfx, 'exit') and 'verdict, param' in last_to(sfx, 'exit')
+    answer(sfx, 'supervisor', json.dumps({'skip': [{'request_id': 'r5', 'reason': 'nothing changed'}]}))
+    assert results(sfx)[-1] == dict(results(sfx)[-1], id='r5', status='skipped', reason='nothing changed')
+
+
+def test_max_busy_caps_concurrent_workers(sfx):
+    submit(sfx, req('r6', to='exit'))
+    submit(sfx, req('r7', to='reentry'))
+    sfx.pump()
+    assert sfx.agent('exit')['state'] == 'busy' and sfx.agent('reentry')['state'] == 'idle'
+    answer(sfx, 'exit', '{"verdict": 1, "param": 2}')
+    sfx.pump()
+    assert sfx.agent('reentry')['state'] == 'busy'
+
+
+def test_pause_stops_delivery_and_rotation_until_resume(sfx):
+    sfx.handle({'kind': 'pause', 'request_id': 'p', 'reason': 'market closed'})
+    seasoned(sfx, 'exit')
+    write_rollout(sfx.sessions, SVC_THREADS['exit'], fleet.agent_cwd(sfx.cfg, 'exit'), used=90000)
+    submit(sfx, req('r8', to='exit'))
+    sfx.pump()
+    assert sfx.agent('exit')['state'] == 'idle' and sfx.r.llen('fx:inbox:exit') == 1
+    sfx.handle({'kind': 'resume', 'request_id': 'p2'})
+    sfx.pump()
+    assert sfx.agent('exit')['state'] == 'handoff'  # the held rotation runs only after resume
+
+
+def test_timeout_publishes_and_late_work_is_dropped(sfx):
+    submit(sfx, req('r9', to='exit', timeout_s=10))
+    sfx.r.hset('fx:req:r9', mapping={'created': 0})
+    sfx.tick()
+    assert results(sfx)[-1]['status'] == 'timeout'
+    sfx.pump()  # the queued message for a finished request is never delivered
+    assert sfx.agent('exit')['state'] == 'idle' and sfx.r.llen('fx:inbox:exit') == 0
+    submit(sfx, req('r10', to='exit'))
+    sfx.pump()
+    sfx.r.hset('fx:req:r10', mapping={'created': 0})
+    sfx.tick()
+    answer(sfx, 'exit', '{"verdict": 1, "param": 2}')
+    assert [r['status'] for r in results(sfx)] == ['timeout', 'timeout']
+    assert json.loads(sfx.r.l['fx:log'][-1])['kind'] == 'result.late'
+
+
+def test_service_never_ends_blocked_pauses_and_tasks_are_refused(sfx):
+    sfx.handle({'kind': 'task', 'request_id': 't', 'spec': {'goal': 'x'}})
+    assert json.loads(sfx.r.get('fx:reply:t'))['status'] == 'rejected'
+    submit(sfx, req('r11'))
+    sfx.pump()
+    answer(sfx, 'supervisor', '{"status": "BLOCKED", "reason": "login expired"}')
+    assert sfx.paused() and 'login expired' in sfx.r.hget('fx:service', 'reason')
+    sfx.handle({'kind': 'resume', 'request_id': 'p'})
+    for _ in range(3):
+        sfx.pump()
+        answer(sfx, 'supervisor', 'not json')
+    assert sfx.paused() and sfx.r.hgetall('fx:req:r11')  # the request is still waiting, nothing ended
+
+
+def test_stalled_worker_publishes_stalled_result(sfx):
+    sfx.cfg['stall_timeout'] = 600
+    submit(sfx, req('r12', to='exit'))
+    sfx.pump()
+    sfx.setf('exit', busy_since=1)
+    os.utime(fleet.rollouts(SVC_THREADS['exit'], sfx.sessions)[0], (1, 1))
+    sfx.tick()
+    assert results(sfx)[-1]['status'] == 'stalled' and sfx.agent('exit')['state'] == 'idle'
+
+
+def test_role_profiles_and_request_validation(sfx):
+    cfg = dict(sfx.cfg, profile='fleet', supervisor_profile='flashnext')
+    assert fleet.actor_argv('c', cfg, 'supervisor', 0, 'p')[2] == 'flashnext'
+    assert fleet.actor_argv('c', cfg, 'exit', 0, 'p')[2] == 'fleet'
+    for bad in (dict(req('a b')), dict(req('x'), reply={'required': []}), dict(req('x'), to='ghost'),
+                dict(req('x'), reply={'required': ['a'], 'allowed': ['b']}), dict(req('x'), timeout_s=1)):
+        with pytest.raises(ValueError):
+            fleet.validate_request(bad, ['exit', 'reentry'])

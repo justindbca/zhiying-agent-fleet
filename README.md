@@ -8,15 +8,16 @@ written handoff note, so a task can run for hours across many model sessions.
 [中文说明](README.zh-CN.md)
 
 ```
- cmux workspace "Fleet agents"                 cmux workspace "Fleet control"
- ┌──────────────┬──────────────┬─────────────┐  ┌──────────────────────────────┐
- │ supervisor   │ worker-1     │ worker-2    │  │ daemon (fleet.py daemon)     │
- │ codex TUI    │ codex TUI    │ codex TUI   │  │  ├─ private Redis (unix sock)│
- │              │              │             │  │  ├─ routes replies           │
- │ ↑ notify ────┼──────────────┼─────────────┼─▶│  ├─ verifies artifacts       │
- │   hook       │              │             │  │  ├─ rotates full sessions    │
- │ ◀────────────┴── pastes next message ─────┼──│  └─ stall watchdog           │
- └──────────────┴──────────────┴─────────────┘  └──────────────────────────────┘
+ cmux workspace "Fleet agents" (one page)            cmux workspace "Fleet control"
+ ┌────────────────────────┬────────────────────┐    ┌──────────────────────────────┐
+ │ supervisor.2 (live)    │ worker-1.1 (live)  │    │ daemon (fleet.py daemon)     │
+ │ codex TUI              ├────────────────────┤    │  ├─ private Redis (unix sock)│
+ │                        │ worker-2 (live)    │    │  ├─ routes replies           │
+ ├────────────────────────┼────────────────────┤    │  ├─ verifies artifacts       │
+ │ history (browser):     │ worker-3 (live)    │    │  ├─ rotates full sessions    │
+ │ supervisor / worker-1… │                    │    │  └─ stall watchdog           │
+ │ every retired gen, 🔍  │                    │    └──────────────────────────────┘
+ └────────────────────────┴────────────────────┘
 ```
 
 ## Why
@@ -34,8 +35,8 @@ What the daemon enforces, independently of what the models claim:
   run. Workers are sandboxed (`workspace-write`, network on).
 - **Context rotation before overflow.** Before each delivery the daemon reads the session's token usage
   from Codex's own rollout file. At `--handoff-ratio` (default 60 %) it asks the session to write a
-  three-section handoff note, merges it into a machine skeleton, retires the tab into a read-only record,
-  and starts a successor (`worker-1` → `worker-1.1` → `worker-1.2`) that reads the note. If the model
+  three-section handoff note, merges it into a machine skeleton, saves the old screen to the history
+  page, and starts a successor in the same place (`worker-1` → `worker-1.1` → `worker-1.2`) that reads the note. If the model
   does not write, the skeleton is used; a rotation never fails.
 - **Stall watchdog.** A busy agent whose rollout file has not changed for `--stall-timeout` seconds
   (default 30 min) is aborted and reported to the supervisor; a stalled supervisor gets one retry, then
@@ -104,6 +105,49 @@ Each run writes to `~/.cmux-fleet/runs/fleet-<time>-<token>/`: `config.json`, `w
 (worker cwd, all deliverables land here), `agents/supervisor/`, `handoffs/`, `prompts/`, the private
 Redis dump and log. `~/.cmux-fleet/latest.json` points at the newest run.
 
+## Layout and the history page
+
+Everything lives on one cmux page: the supervisor top-left, the **history** browser pane under it, the
+workers stacked on the right. When a session rotates, its successor opens in the same spot and the
+retired session's whole screen (with scrollback) and handoff note go to `<run>/history.html`, which the
+history pane reloads. On that page you pick an agent (`supervisor`, `worker-1`, …), pick a retired
+generation (`supervisor`, `supervisor.1`, …, `worker-1`, `worker-1.1`, …), switch between its screen
+and its handoff note, or search every generation of every agent at once (Enter jumps to the next match).
+Successors are named `<slot>.<generation>` for the supervisor and the workers alike.
+
+## Service mode (resident fleet)
+
+`start --mode service` keeps the fleet running with no goal and no end: it answers a stream of
+requests. The supervisor only routes; each worker can have its own prompt; answers are JSON checked by
+the daemon, not by a model.
+
+```bash
+cmux-fleet start --mode service --worker-names exit,reentry,rung --roles ~/my-roles \
+    --supervisor-profile flashnext --worker-profile fleet --max-busy 2 --request-timeout 600
+echo '{"id": "cu-1:r7", "to": "exit", "payload": {...},
+       "reply": {"required": ["verdict", "param", "evidence"], "allowed": ["verdict", "param", "evidence", "note"]}}' \
+  | cmux-fleet request -
+cmux-fleet results --drain        # one JSON line per finished request
+cmux-fleet pause --reason "market closed"; cmux-fleet resume
+```
+
+- `--worker-names`: worker slots named by role (lowercase, no dots; dots mark generations).
+- `--roles DIR`: `DIR/<agent>.md` is appended to that agent's `AGENTS.md` as "Your role". One prompt per worker.
+- `--supervisor-profile` / `--worker-profile`: separate Codex profiles, e.g. a local model for one side.
+- `--max-busy N`: at most N workers work at once (a local model server may reject concurrent large
+  requests). The supervisor is not counted.
+- A request: `id` (single use, `[A-Za-z0-9][A-Za-z0-9:._-]*`), `payload` (any JSON, ≤ 200 000 chars),
+  `reply.required` (keys the answer must have), optional `reply.allowed` (no other keys accepted), optional
+  `to` (a worker: Python routes it, no supervisor turn), optional `instruction`, optional `timeout_s`.
+  Without `to` the supervisor picks a worker or skips the request.
+- The answer must be one JSON object. A bad answer gets one correction; a second bad answer is published
+  as `invalid`. Result statuses: `ok`, `invalid`, `skipped`, `timeout`, `stalled`.
+- `pause` stops delivery and rotation; requests keep queuing and still time out, so a caller never
+  waits forever. A supervisor `BLOCKED`, a closed tab or a failed delivery pauses the fleet instead of
+  ending it. Calendars (market hours, holidays) are the caller's business: pause and resume from outside.
+- Callers on the same machine can skip the CLI: push `{"kind": "request", "request_id": ..., "spec": ...}`
+  to `fx:events` on the private socket named in `~/.cmux-fleet/latest.json`, then read `fx:result:<id>`.
+
 ## Claude Code workers (optional)
 
 The supervisor is always Codex. Workers can be [Claude Code](https://claude.com/claude-code) sessions instead:
@@ -153,7 +197,7 @@ the verb, confines `js` files to the run directory, paces page actions (`--chrom
 
 | Key | Type | Content |
 |---|---|---|
-| `fx:events` | list | daemon BLPOP: `turn` (notify hook), `task` / `stop` / `chrome` (requests with `request_id`) |
+| `fx:events` | list | daemon BLPOP: `turn` (notify hook), `task` / `request` / `pause` / `resume` / `stop` / `chrome` (with `request_id`) |
 | `fx:reply:<request_id>` | string | request reply (24 h) |
 | `fx:agent:<name>` | hash | role, pane, thread, generation, state (starting/idle/busy/handoff/dead), ctx_used, ctx_window, busy_since, stalls, handoff_* |
 | `fx:inbox:<name>` | list | pending messages; delivered only when the agent is idle |
@@ -161,6 +205,11 @@ the verb, confines `js` files to the run directory, paces page actions (`--chrom
 | `fx:task` | hash | id, goal, status, completion, reason, deadline, artifacts, bad_replies, bounces |
 | `fx:log` | list | event log, last 2000 |
 | `fx:seen:<sha256>` | string | notify de-duplication (SET NX, 24 h) |
+| `fx:service` | hash | paused, reason, history_pane, bad_replies |
+| `fx:req:<id>` | hash | an open request: spec, status (routing/dispatched), worker, created, attempts |
+| `fx:reqq` | list | ids of open requests (timeout scan) |
+| `fx:result:<id>` | string | finished request result JSON (7 days) |
+| `fx:results` | list | finished results in order, last 1000 (`results --drain` pops them) |
 
 ## Test status
 
