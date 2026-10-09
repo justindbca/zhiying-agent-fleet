@@ -881,3 +881,25 @@ def test_role_profiles_and_request_validation(sfx):
                 dict(req('x'), reply={'required': ['a'], 'allowed': ['b']}), dict(req('x'), timeout_s=1)):
         with pytest.raises(ValueError):
             fleet.validate_request(bad, ['exit', 'reentry'])
+
+
+def test_kill_pane_retries_with_force_when_cmux_asks(monkeypatch, tmp_path):
+    from cmux_fleet import cmux_manager as cm
+    calls = []
+
+    def fake_run(*args):
+        calls.append(args)
+        refused = args[0] == 'close-surface' and '--force' not in args
+        return SimpleNamespace(returncode=1 if refused else 0, stdout='',
+                               stderr='Error: confirmation_required: Surface has a running process' if refused else '')
+    monkeypatch.setattr(cm, '_run', fake_run)
+    mgr = cm.CmuxSessionManager.__new__(cm.CmuxSessionManager)
+    state = {'workspace': 'ws', 'control_workspace': None, 'surfaces': {'s1': {}}}
+    live = {'s1': {'pane_id': 'p1', 'tty': None}}
+    monkeypatch.setattr(mgr, '_meta', lambda: json.loads(json.dumps(state)), raising=False)
+    monkeypatch.setattr(mgr, '_save_meta', lambda m: (state.update(m), live.clear()), raising=False)
+    monkeypatch.setattr(mgr, '_where', lambda sid: 'ws', raising=False)
+    monkeypatch.setattr(mgr, '_surfaces', lambda ws: dict(live), raising=False)
+    assert mgr.kill_pane('s1')
+    closes = [c for c in calls if c[0] == 'close-surface']
+    assert len(closes) == 2 and '--force' in closes[1] and '--force' not in closes[0]

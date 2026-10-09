@@ -364,7 +364,11 @@ class CmuxSessionManager:
             for pid, ppid in ((int(r[0]), int(r[1])) for r in rows):
                 if ppid not in pids:  # tree roots on this tty
                     kill_process_tree(pid)
-        _run('close-surface', '--workspace', ws, '--surface', pane_id)
+        p = _run('close-surface', '--workspace', ws, '--surface', pane_id)
+        if p.returncode and 'confirmation_required' in p.stdout + p.stderr:
+            # cmux >= 0.65 refuses to close a surface that still shows a running process; this
+            # surface is ours and its process tree was just killed above.
+            _run('close-surface', '--workspace', ws, '--surface', pane_id, '--force')
         meta = self._meta()
         meta['surfaces'].pop(pane_id, None)
         self._save_meta(meta)
