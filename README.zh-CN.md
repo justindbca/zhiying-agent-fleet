@@ -69,8 +69,8 @@ cmux-fleet stop                     # 取消任务，关 daemon 和它的 redis�
 
 所有窗口在同一个 cmux 页面：左上 supervisor，左下「history」浏览器格，右边一个区域放所有 worker 的标签页（worker-1、worker-2 …，点标签切换）。换代时接班者在原位置打开；
 退下来的那一代的整屏（含回滚）和交接单写进 `<run>/history.html`，历史格自动刷新。页面上可选 agent（supervisor / worker-1 …）、
-选某一代（supervisor、supervisor.1 …，worker-1、worker-1.1 …），切换看屏幕或交接单，或一次搜索所有 agent 的所有代（回车跳下一处）。
-supervisor 和 worker 一样按「槽位.代数」命名。
+选某一代（supervisor-1、supervisor-1.1 …，worker-1、worker-1.1 …），切换看屏幕或交接单，或一次搜索所有 agent 的所有代（回车跳下一处）。
+supervisor 和 worker 一样按「槽位.代数」命名：supervisor-1 → supervisor-1.1 → supervisor-1.2，worker-1 → worker-1.1 → worker-1.2。
 
 ## 服务模式（常驻 fleet）
 

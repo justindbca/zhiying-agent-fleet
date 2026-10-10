@@ -111,9 +111,9 @@ Everything lives on one cmux page: the supervisor top-left, the **history** brow
 workers as tabs of one pane on the right (worker-1, worker-2, …). When a session rotates, its successor opens in the same spot and the
 retired session's whole screen (with scrollback) and handoff note go to `<run>/history.html`, which the
 history pane reloads. On that page you pick an agent (`supervisor`, `worker-1`, …), pick a retired
-generation (`supervisor`, `supervisor.1`, …, `worker-1`, `worker-1.1`, …), switch between its screen
+generation (`supervisor-1`, `supervisor-1.1`, …, `worker-1`, `worker-1.1`, …), switch between its screen
 and its handoff note, or search every generation of every agent at once (Enter jumps to the next match).
-Successors are named `<slot>.<generation>` for the supervisor and the workers alike.
+Successors are named `<slot>.<generation>` for the supervisor and the workers alike: `supervisor-1` → `supervisor-1.1` → `supervisor-1.2`, `worker-1` → `worker-1.1` → `worker-1.2`.
 
 ## Service mode (resident fleet)
 

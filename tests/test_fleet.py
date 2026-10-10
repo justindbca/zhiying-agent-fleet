@@ -408,14 +408,16 @@ def test_one_page_layout_and_history_page_lists_every_generation(fx):
         thread = '5555555%d-5555-5555-5555-55555555555%d' % (gen, len(fx.mgr.killed))
         fx.handle({'kind': 'turn', 'agent': name, 'generation': gen + 1, 'thread': thread, 'text': 'READY'})
         fx.r.delete('fx:inbox:' + name); fx.setf(name, state='idle')
-    assert fx.label('worker-1') == 'worker-1.2' and fx.label('supervisor') == 'supervisor.1'
-    assert fx.r.hget('fx:names', 'supervisor.1') is None  # the supervisor is never a dispatch target
+    assert fx.label('worker-1') == 'worker-1.2' and fx.label('supervisor') == 'supervisor-1.1'
+    assert fx.mgr.spawned[-1]['window_name'] == 'fx-supervisor-1.1'
+    assert fx.r.hget('fx:names', 'supervisor-1.1') is None  # the supervisor is never a dispatch target
     page = (fx.run_dir / 'history.html').read_text()
     data = json.loads(page.split('const DATA=', 1)[1].split(';\n', 1)[0])
     slots = {s['slot']: s for s in data['slots']}
     assert [g['label'] for g in slots['worker-1']['gens']] == ['worker-1', 'worker-1.1']
-    assert [g['label'] for g in slots['supervisor']['gens']] == ['supervisor']
-    assert slots['worker-1']['live'] == 'worker-1.2' and slots['supervisor']['live'] == 'supervisor.1'
+    assert [g['label'] for g in slots['supervisor']['gens']] == ['supervisor-1']
+    assert slots['worker-1']['live'] == 'worker-1.2' and slots['supervisor']['live'] == 'supervisor-1.1'
+    assert slots['supervisor']['title'] == 'supervisor-1' and slots['worker-1']['title'] == 'worker-1'
     assert slots['worker-1']['gens'][0]['screen'].startswith('screen of ') and fx.mgr.reloaded == 3
 
 
@@ -426,7 +428,7 @@ def test_history_page_escapes_script_end():
     snap = run / 's.txt'
     snap.write_text('<!-- <script> </script><b>x')
     history.record(run, slot='worker-1', label='worker-1', generation=0, snapshot=str(snap), handoff='', source='model')
-    page = history.write_page(run, [('worker-1', 'worker-1.1')]).read_text()
+    page = history.write_page(run, [('worker-1', 'worker-1.1', 'worker-1')]).read_text()
     assert page.count('</script>') == 1 and page.count('<!--') == 0
     data = json.loads(page.split('const DATA=', 1)[1].split(';\n', 1)[0])
     assert data['slots'][0]['gens'][0]['screen'] == '<!-- <script> </script><b>x'

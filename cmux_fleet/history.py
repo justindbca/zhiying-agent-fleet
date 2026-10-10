@@ -2,7 +2,7 @@
 
 Each rotation appends a line to ``<run>/history.jsonl`` (which slot, which label retired, where its
 screen snapshot and handoff note are). ``write_page`` renders ``<run>/history.html``: pick an agent
-(supervisor / worker-1 / ...), pick a generation (supervisor, supervisor.1, ...), read its screen or
+(supervisor-1 / worker-1 / ...), pick a generation (supervisor-1, supervisor-1.1, ...), read its screen or
 its handoff note, or search all of them at once. The page is self-contained (data embedded), so the
 cmux browser pane only needs a reload after each rotation; the selection lives in the URL hash.
 """
@@ -51,15 +51,15 @@ def entries(run_dir):
 
 
 def write_page(run_dir, slots):
-    """``slots``: [(slot, live label)] in display order."""
+    """``slots``: [(slot, live label, title)] in display order (title = the slot's first-generation name)."""
     data = []
     rows = entries(run_dir)
-    for slot, live in slots:
+    for slot, live, title in slots:
         gens = [{'label': e.get('label'), 'generation': e.get('generation'), 'at': e.get('at'),
                  'source': e.get('source'), 'timed_out': bool(e.get('timed_out')),
                  'screen': _read(e.get('snapshot'), SNAPSHOT_LIMIT), 'note': _read(e.get('handoff'))}
                 for e in rows if e.get('slot') == slot]
-        data.append({'slot': slot, 'live': live, 'gens': gens})
+        data.append({'slot': slot, 'title': title, 'live': live, 'gens': gens})
     blob = json.dumps({'run': str(run_dir), 'updated': time.time(), 'slots': data}, ensure_ascii=False)
     blob = blob.replace('<', '\\u003c')  # no </script>, <!-- or <script inside the script block
     path = page_path(run_dir)
@@ -116,7 +116,7 @@ function rows(){
   const s=slot();return s?s.gens.slice().reverse().map(g=>[s,g,0]):[];
 }
 function render(){
-  $('agents').innerHTML=DATA.slots.map(s=>`<button data-a="${s.slot}" class="${s.slot===st.agent&&!st.q?'on':''}">${s.slot}
+  $('agents').innerHTML=DATA.slots.map(s=>`<button data-a="${s.slot}" class="${s.slot===st.agent&&!st.q?'on':''}">${s.title||s.slot}
     <span class="muted">· ${s.gens.length} retired · live ${s.live}</span></button>`).join('')+
     `<span class="muted">updated ${when(DATA.updated)}</span>`;
   const list=rows();

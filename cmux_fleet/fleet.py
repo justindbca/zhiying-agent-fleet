@@ -52,6 +52,9 @@ REQ, REQQ, RESULT, RESULTS, SERVICE = 'fx:req:', 'fx:reqq', 'fx:result:', 'fx:re
 REQ_ID_RE = r'[A-Za-z0-9][A-Za-z0-9:._-]{0,127}'
 REQ_HEAD = re.compile(r'^\[Request (' + REQ_ID_RE + r')\]')
 WORKER_NAME_RE = r'[a-z][a-z0-9-]{0,30}'
+# Display name of the supervisor's first generation; successors are supervisor-1.1, supervisor-1.2, ...
+# (same <slot>.<generation> pattern as worker-1 -> worker-1.1). Redis keys and the cwd stay 'supervisor'.
+SUPERVISOR_LABEL = 'supervisor-1'
 RESULT_TTL = 7 * 86400
 # Sandboxed agents cannot drive the user's browser themselves (and must never be allowed
 # to kill it). If the operator supplies a broker script, the daemon runs these verbs for them.
@@ -628,7 +631,7 @@ class Fleet:
         return result.pane_id
 
     def start_all(self):
-        self.setf('supervisor', label='supervisor')
+        self.setf('supervisor', label=SUPERVISOR_LABEL)
         for name in self.workers:
             self.setf(name, label=name)
             self.r.hset(NAMES, mapping={name: name})
@@ -643,7 +646,7 @@ class Fleet:
         self.r.hset(SERVICE, mapping={'history_pane': self.history_pane or ''})
 
     def history_slots(self):
-        return [(n, self.label(n)) for n in self.names]
+        return [(n, self.label(n), SUPERVISOR_LABEL if n == 'supervisor' else n) for n in self.names]
 
     # -- events
     def handle(self, ev):
@@ -1089,7 +1092,8 @@ class Fleet:
         snapshot = out.with_suffix('.terminal.txt')
         self.mgr.capture_to(old, str(snapshot))
         prev = self.label(name)
-        label = name + '.' + str(generation + 1)  # supervisor -> supervisor.1, worker-1 -> worker-1.1
+        base = SUPERVISOR_LABEL if name == 'supervisor' else name
+        label = base + '.' + str(generation + 1)  # supervisor-1 -> supervisor-1.1, worker-1 -> worker-1.1
         self.setf(name, generation=generation + 1, handoff_id='', label=label)
         if name != 'supervisor':
             self.setf(name, prev_label=prev)
