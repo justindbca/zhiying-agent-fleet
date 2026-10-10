@@ -903,3 +903,42 @@ def test_kill_pane_retries_with_force_when_cmux_asks(monkeypatch, tmp_path):
     assert mgr.kill_pane('s1')
     closes = [c for c in calls if c[0] == 'close-surface']
     assert len(closes) == 2 and '--force' in closes[1] and '--force' not in closes[0]
+
+
+def test_workers_become_tabs_of_one_pane_and_successor_takes_its_place(monkeypatch):
+    from cmux_fleet import cmux_manager as cm
+    calls = []
+
+    def fake_run(*args):
+        calls.append(args)
+        out = 'OK hist-1 pane-h' if args[:4] == ('--id-format', 'uuids', 'new-surface', '--type') else ''
+        return SimpleNamespace(returncode=0, stdout=out, stderr='')
+    monkeypatch.setattr(cm, '_run', fake_run)
+    mgr = cm.CmuxSessionManager.__new__(cm.CmuxSessionManager)
+    panes = {'sup': 'p0', 'w1': 'p0', 'w2': 'p0', 'w3': 'p0'}
+    monkeypatch.setattr(mgr, '_where', lambda sid: 'ws', raising=False)
+    monkeypatch.setattr(mgr, '_surfaces', lambda ws: {k: {'pane_id': v} for k, v in panes.items()}, raising=False)
+    monkeypatch.setattr(mgr, '_tag', lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(mgr, 'rename', lambda *a: None, raising=False)
+
+    def place_right_of(w, sup):
+        panes[w] = 'p1'
+        return True
+    monkeypatch.setattr(mgr, 'place_right_of', place_right_of, raising=False)
+    orig_run = fake_run
+
+    def tracking_run(*args):  # a move-surface lands the surface in the target pane
+        if args[0] == 'move-surface':
+            panes[args[args.index('--surface') + 1]] = args[args.index('--pane') + 1]
+        return orig_run(*args)
+    monkeypatch.setattr(cm, '_run', tracking_run)
+    assert mgr.arrange('sup', ['w1', 'w2', 'w3'], 'file:///h.html') == 'hist-1'
+    moves = [c for c in calls if c[0] == 'move-surface']
+    assert [m[m.index('--surface') + 1] for m in moves] == ['w2', 'w3'] and all('--before' not in m for m in moves)
+    assert panes['w1'] == panes['w2'] == panes['w3'] == 'p1' and panes['sup'] == 'p0'
+    assert not [c for c in calls if c[0] == 'split-off' and 'w2' in c]  # workers are tabs, never split again
+    calls.clear()
+    panes['w1-succ'] = 'p0'
+    assert mgr.tab_into('w1-succ', 'w1')
+    move = [c for c in calls if c[0] == 'move-surface'][0]
+    assert move[move.index('--before') + 1] == 'w1' and panes['w1-succ'] == 'p1'

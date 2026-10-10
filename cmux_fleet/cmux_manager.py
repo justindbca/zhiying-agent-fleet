@@ -391,24 +391,23 @@ class CmuxSessionManager:
         out.write_text(self.capture_output(pane_id, 100000), encoding='utf-8')
 
     def arrange(self, supervisor: str, workers: List[str], history_url: str) -> Optional[str]:
-        """One page: supervisor top-left, the history browser below it, workers stacked on the right.
+        """One page: supervisor top-left, the history browser below it, the workers as tabs of one pane
+        on the right (worker-1, worker-2, ... in order).
 
         Returns the history browser surface (None if it could not be created).
         """
         ws = self._where(supervisor)
         if not ws:
             return None
-        prev = None
+        first = None
         for w in workers:
             if self._where(w) != ws:
                 continue
-            if prev is None:
+            if first is None:
                 self.place_right_of(w, supervisor)
+                first = w
             else:
-                target = self._surfaces(ws)[prev]['pane_id']
-                _run('move-surface', '--workspace', ws, '--surface', w, '--pane', target, '--focus', 'false')
-                _run('split-off', '--workspace', ws, '--surface', w, 'down', '--focus', 'false')
-            prev = w
+                self.tab_into(w, first, before=False)
         pane = self._surfaces(ws)[supervisor]['pane_id']
         p = _run('--id-format', 'uuids', 'new-surface', '--type', 'browser', '--workspace', ws, '--pane', pane,
                  '--url', history_url, '--focus', 'false')
@@ -424,12 +423,14 @@ class CmuxSessionManager:
     def reload_browser(self, surface: str) -> bool:
         return bool(self._where(surface)) and _run('browser', '--surface', surface, 'reload').returncode == 0
 
-    def tab_into(self, pane_id: str, peer: str) -> bool:
-        """Move a surface into the pane holding ``peer``, as another tab."""
+    def tab_into(self, pane_id: str, peer: str, before: bool = True) -> bool:
+        """Move a surface into the pane holding ``peer`` as another tab: just before ``peer`` (a successor
+        takes its predecessor's place in the tab row) or, with ``before=False``, at the end of the row."""
         ws = self._where(pane_id)
         if not ws or self._where(peer) != ws:
             return False
         target = self._surfaces(ws)[peer]['pane_id']
-        return _run('move-surface', '--workspace', ws, '--surface', pane_id, '--pane', target,
+        place = ['--before', peer] if before else []
+        return _run('move-surface', '--workspace', ws, '--surface', pane_id, '--pane', target, *place,
                     '--focus', 'false').returncode == 0
 

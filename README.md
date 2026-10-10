@@ -10,11 +10,11 @@ written handoff note, so a task can run for hours across many model sessions.
 ```
  cmux workspace "Fleet agents" (one page)            cmux workspace "Fleet control"
  ┌────────────────────────┬────────────────────┐    ┌──────────────────────────────┐
- │ supervisor.2 (live)    │ worker-1.1 (live)  │    │ daemon (fleet.py daemon)     │
- │ codex TUI              ├────────────────────┤    │  ├─ private Redis (unix sock)│
- │                        │ worker-2 (live)    │    │  ├─ routes replies           │
- ├────────────────────────┼────────────────────┤    │  ├─ verifies artifacts       │
- │ history (browser):     │ worker-3 (live)    │    │  ├─ rotates full sessions    │
+ │ supervisor.2 (live)    │ ▸worker-1.1│worker-2│    │ daemon (fleet.py daemon)     │
+ │ codex TUI              │  worker-3  (tabs)  │    │  ├─ private Redis (unix sock)│
+ │                        │                    │    │  ├─ routes replies           │
+ ├────────────────────────┤ selected worker's  │    │  ├─ verifies artifacts       │
+ │ history (browser):     │ live TUI           │    │  ├─ rotates full sessions    │
  │ supervisor / worker-1… │                    │    │  └─ stall watchdog           │
  │ every retired gen, 🔍  │                    │    └──────────────────────────────┘
  └────────────────────────┴────────────────────┘
@@ -108,7 +108,7 @@ Redis dump and log. `~/.cmux-fleet/latest.json` points at the newest run.
 ## Layout and the history page
 
 Everything lives on one cmux page: the supervisor top-left, the **history** browser pane under it, the
-workers stacked on the right. When a session rotates, its successor opens in the same spot and the
+workers as tabs of one pane on the right (worker-1, worker-2, …). When a session rotates, its successor opens in the same spot and the
 retired session's whole screen (with scrollback) and handoff note go to `<run>/history.html`, which the
 history pane reloads. On that page you pick an agent (`supervisor`, `worker-1`, …), pick a retired
 generation (`supervisor`, `supervisor.1`, …, `worker-1`, `worker-1.1`, …), switch between its screen
