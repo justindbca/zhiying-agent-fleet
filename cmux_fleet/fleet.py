@@ -496,6 +496,9 @@ def actor_argv(cfg_path, cfg, name, generation, prompt):
             '--sandbox', 'workspace-write', '-c', 'sandbox_workspace_write.network_access=true',
             '-c', 'approval_policy="never"',
             '-c', 'check_for_update_on_startup=false',  # the update dialog would eat the first paste
+            # The operator's skills (~/.agents/skills) are listed to every session regardless of CODEX_HOME;
+            # a local model took that list as its task and ran a skill instead of replying READY.
+            '-c', 'skills.include_instructions=false',
             '-c', 'notify=' + json.dumps(callback),
             '-c', 'developer_instructions=' + json.dumps(
                 'Your role, rules and reply format are in AGENTS.md in the current directory. Follow it.')]

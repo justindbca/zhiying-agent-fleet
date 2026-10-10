@@ -335,6 +335,11 @@ def test_connect_refuses_non_private_socket():
             fleet.connect({'redis_socket': sock})
 
 
+def test_actor_argv_hides_operator_skills(tmp_path):
+    argv = fleet.actor_argv('cfg.json', {'python': 'py', 'profile': 'fleet'}, 'worker-1', 0, 'hi')
+    assert 'skills.include_instructions=false' in argv
+
+
 def test_actor_argv_is_configurable_and_pins_notify_generation(tmp_path):
     cfg = {'python': 'py', 'codex': '/opt/codex', 'profile': 'local-llm'}
     argv = fleet.actor_argv(tmp_path / 'c.json', cfg, 'worker-1', 2, 'hi')

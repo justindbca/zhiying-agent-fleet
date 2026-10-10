@@ -59,7 +59,7 @@ What the daemon enforces, independently of what the models claim:
   daemon reads the context window from the rollout, so no window size has to be configured.
 - Agents run in an **isolated Codex home** (`--codex-home`, default `~/.cmux-fleet/codex-home`):
   `auth.json` and the profile file are symlinked from your `~/.codex`, so the login is shared, but
-  your hooks, MCP servers and plugins do not run inside agents. Per-agent "trust this folder" entries
+  your hooks, MCP servers, plugins and skills do not run inside agents (`skills.include_instructions=false`). Per-agent "trust this folder" entries
   are written there automatically.
 
 ## Install
