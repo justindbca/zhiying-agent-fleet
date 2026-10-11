@@ -116,7 +116,7 @@ def kill_process_tree(pid: int, term_timeout: float = 3.0) -> None:
 
 
 class CmuxSessionManager:
-    """Agents in one cmux workspace; the daemon in a separate control workspace."""
+    """Agents in one workspace; dock the daemon into an inactive history-pane tab."""
 
     def __init__(self, session_name: str = 'cmux-fleet', agents_title: str = 'Fleet agents',
                  control_title: str = 'Fleet control'):
@@ -290,7 +290,7 @@ class CmuxSessionManager:
             return SpawnResult(success=False, error='cmux surface creation failed (run inside cmux)')
         self._tag(sid, type=(metadata or {}).get('type', ''), label=window_name, output_file=output_file or '')
         if not ran and not self._type_command(sid, full):
-            return SpawnResult(success=False, error='cmux command delivery failed')
+            return SpawnResult(success=False, pane_id=sid, error='cmux command delivery failed')
         self.rename(sid, window_name)
         return SpawnResult(success=True, pane_id=sid, window_name=window_name)
 
@@ -390,6 +390,32 @@ class CmuxSessionManager:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(self.capture_output(pane_id, 100000), encoding='utf-8')
 
+    def dock_control(self, history_surface: str) -> bool:
+        """Keep control beside history as an inactive tab, without restarting the daemon."""
+        ws = self._where(history_surface)
+        meta = self._meta()
+        source = meta.get('control_workspace')
+        if not ws or not source:
+            return False
+        controls = [sid for sid, info in meta['surfaces'].items()
+                    if info.get('type') == 'daemon' and self._where(sid) == source]
+        if not controls:
+            return False
+        pane = self._surfaces(ws)[history_surface]['pane_id']
+        for sid in controls:
+            p = _run('move-surface', '--surface', sid, '--workspace', ws, '--pane', pane,
+                     '--after', history_surface, '--focus', 'false')
+            if p.returncode:
+                return False  # leave the existing control workspace alive on failure
+        meta = self._meta()
+        meta['control_workspace'] = ws
+        self._save_meta(meta)
+        if source != ws and not self._surfaces(source):
+            _run('close-workspace', '--workspace', source)  # empty only; never --force
+        # move-surface can select the moved tab even with --focus false. Select the
+        # history surface explicitly, not just its pane (which could show control).
+        return _run('focus-panel', '--workspace', ws, '--panel', history_surface).returncode == 0
+
     def arrange(self, supervisor: str, workers: List[str], history_url: str) -> Optional[str]:
         """One page: supervisor top-left, the history browser below it, the workers as tabs of one pane
         on the right (worker-1, worker-2, ... in order).
@@ -418,6 +444,8 @@ class CmuxSessionManager:
         self._tag(sid, type='history', label='history')
         _run('split-off', '--workspace', ws, '--surface', sid, 'down', '--focus', 'false')
         self.rename(sid, 'history')
+        self.dock_control(sid)
+        _run('focus-panel', '--workspace', ws, '--panel', supervisor)
         return sid
 
     def reload_browser(self, surface: str) -> bool:

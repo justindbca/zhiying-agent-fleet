@@ -1,10 +1,12 @@
 # cmux-fleet
 
-一个**监工**（supervisor）加 N 个**执行**（worker），全是 [Codex CLI](https://github.com/openai/codex)
+一个**监工**（supervisor）加 N 个**执行**（worker），默认使用 Codex，也支持 pi 和官方 Claude Code CLI
 交互会话，各占一个 [cmux](https://cmux.dev) 标签，由一个小 daemon 协调。监工只判断、只派活；worker 只执行。
 上下文快满的会话会自动写交接单并换新会话接力，一个任务可以跨很多个模型会话跑几个小时。
 
-[English](README.md)
+[English](README.md) · **[已确认设计基线](docs/design.md)**
+
+先读设计基线再修改；它固定原角色分工、标识、布局、交接和协议。当前范围与验证见 [2026-10-12 本地集成复核](reports/full-local-merge-20261012.md)。**本地合并不等于生产部署，也不等于 Redis v2 运行链已验收。**
 
 ## 为什么这样做
 
@@ -14,9 +16,9 @@ daemon 从不读屏幕：Codex 的 `notify` 钩子在每一轮结束时回调 da
 daemon 独立于模型的自述做这几件事：
 
 - **验收是字面的。** 任务只有在声明的每个产物都存在、够长、含必需文字时才算完成。监工三次误报 `COMPLETED` 直接判阻塞。
-- **模型不能提交宿主命令。** 监工只能声明要检查的文件，不能提交要跑的命令。worker 跑在沙盒里（可写工作区、开网络）。
+- **模型不能提交宿主命令。** 监工只能声明要检查的文件，不能提交要跑的命令。Codex agent 跑在沙盒里（可写工作区、开网络）；pi 和可选的 Claude worker 没有这一层沙盒。
 - **上下文满之前先轮换。** 每次投递前 daemon 从 Codex 自己的 rollout 文件读 token 用量。到 `--handoff-ratio`（默认 60%）就让会话写三节交接单，
-  并进机器骨架，旧屏幕存进历史页，在原位置起接班者（`worker-1` → `worker-1.1` → `worker-1.2`）读交接单继续。模型不写就用骨架，轮换永不失败。
+  并进机器骨架，旧屏幕存进历史页，在原位置起接班者（`worker-1` → `worker-1.1` → `worker-1.2`）读交接单继续。模型不写就用骨架，不会单因缺交接文本阻塞；窗口/进程错误仍按原故障语义处理。
 - **卡死看门。** 忙碌中的 agent 若 rollout 文件 `--stall-timeout` 秒（默认 30 分钟）没动，就中止该轮并报给监工；监工自己卡死给一次重试，再卡就判阻塞交人。
 - **过期回调一律丢弃。** 每次拉起会话都把代数烘进 notify 钩子参数，退役会话的迟到回调会被忽略。
 
@@ -67,7 +69,7 @@ cmux-fleet stop                     # 取消任务，关 daemon 和它的 redis�
 
 ## 一页布局与历史页
 
-所有窗口在同一个 cmux 页面：左上 supervisor，左下「history」浏览器格，右边一个区域放所有 worker 的标签页（worker-1、worker-2 …，点标签切换）。换代时接班者在原位置打开；
+所有窗口在同一个 cmux 页面：左上 supervisor，左下「history」浏览器格，右边一个区域放所有 worker 的标签页（worker-1、worker-2 …，点标签切换）。启动后 daemon 的 control 终端收进左下 history 同一栏的后台标签，该栏默认显示 history，supervisor 独占左上；关闭已空的启动工作区不杀 daemon。control 只是日志控制台，不是另一个 AI。换代时接班者在原位置打开；
 退下来的那一代的整屏（含回滚）和交接单写进 `<run>/history.html`，历史格自动刷新。页面上可选 agent（supervisor / worker-1 …）、
 选某一代（supervisor-1、supervisor-1.1 …，worker-1、worker-1.1 …），切换看屏幕或交接单，或一次搜索所有 agent 的所有代（回车跳下一处）。
 supervisor 和 worker 一样按「槽位.代数」命名：supervisor-1 → supervisor-1.1 → supervisor-1.2，worker-1 → worker-1.1 → worker-1.2。
@@ -79,6 +81,33 @@ supervisor 和 worker 一样按「槽位.代数」命名：supervisor-1 → supe
 答错一次给一次更正机会，再错发布为 `invalid`。`--worker-names` 按角色给 worker 命名；`--supervisor-profile` / `--worker-profile`
 两边可用不同模型（如本地模型）；`--max-busy N` 限同时干活的 worker 数；`pause` / `resume` 由外部（交易日历等）控制，
 暂停时不投递、不换代，请求照常排队并会超时。命令与字段见英文 README「Service mode」。
+
+## pi 监工 + 官方 Claude Code worker
+
+pi 可运行 supervisor 或 worker；Claude 侧始终由 fleet **直接启动官方 `claude` CLI**，不是 pi 接 Claude 订阅接口，
+也不读取/复制 Claude 的登录凭证给 pi。仍需遵守服务条款，不能据此保证不会限流或封号。
+
+```bash
+cmux-fleet start --mode service --workers 2 \
+  --supervisor-cli pi --pi-model local/my-model --pi-thinking off \
+  --worker-cli claude --worker-model sonnet \
+  --allow-unsandboxed-pi
+```
+
+- pi ≥ 1.1.0；`--pi` 指定真实 CLI 路径。先在 pi 的 `models.json` 配好 `local/my-model`，替换示例模型名。
+- `--pi-model` 必填，不隐式回退到云模型。若 worker 也用本地 pi，改 `--worker-cli pi`；全 pi 无需 Codex binary/profile。
+- `--pi-agent-dir` 指定已有 pi 配置目录（默认环境变量 `PI_CODING_AGENT_DIR` 或 `~/.pi/agent`），只软链其中的
+  `auth.json`、`models.json` 到本次 `<run>/pi-home`，不带用户 hooks/skills/MCP/扩展，也不改用户默认模型。
+- 仅加载 fleet 自带 pi 桥接扩展，生成的 AGENTS.md 显式注入。会话文件按 `<run>/pi-sessions/<槽位>/g<代数>/` 隔离。
+- **pi 无 OS 沙盒**，所以必须显式给 `--allow-unsandboxed-pi`。该参数是风险确认，不会创建沙盒；提示词禁令不等于权限隔离。
+- pi 会话名和终端标题直接使用 fleet 原有的 `supervisor-1.1`、`worker-1.1` 等标识，不另造命名规则，原槽位/换代/历史机制不变。
+- 可以直接在 supervisor 输入框用自然语言派活：文字接入原 daemon 队列。service 模式由 Python 建真实请求 ID，worker 将文字答案放进 `reply` 字段，结果再交回 supervisor 转告；task 模式首次文字建任务、后续文字补充当前任务。不会把 daemon 的消息指针、`/model` 等命令再次入队。图像附件需改成文件路径。
+- 回合结束用 `agent_settled`（不是可能仍会重试的 `agent_end`），回调绑定代数和投递 ID。只取消息末尾指向本 agent `.inbox` 的投递 ID，不取正文引用的 supervisor/其他 agent 路径。错误/中止的半截 JSON 不会当成成功。
+- 用量由 pi API 提供，fleet 仍负责轮换与历史页；pi 自动压缩只作长回合保险。`--compact-limit` 只作用于 Codex。
+- 回调只写本套 fleet 的私有 Redis socket；回调失败交给看门处理，不会回退生产 Redis。
+
+可选真实 pi 冒烟：`python tests/pi_smoke.py --model local/my-model`。仅启动临时私有 Redis，用假 cmux 验证 READY、
+请求/JSON 结果、换代/接力；不调用 Claude，不代表真实 cmux 窗口验收通过。
 
 ## 任务怎么流转
 
@@ -105,7 +134,9 @@ daemon 校验动词、把 `js` 文件限制在本次运行目录、给页面动�
 - **在另一台干净的 Mac 上端到端跑通**（macOS 26.2、cmux 0.64.25、codex-cli 0.156.1、ChatGPT 登录的 GPT-6-Sol）：`start` → 两个 agent 7 秒 READY →
   单步任务 40 秒完成并过产物校验 → 两步任务中监工触到轮换阈值、自己写了交接单、旧标签收成只读记录格、接班者继续把任务做完。
   轮换、产物验收、更新弹窗压制、隔离的 Codex home 都在真盘跑过。
-- 单测 27 个：内存 Redis、假 cmux 管理器、合成 rollout 文件。
+- 当前开发版：本机 **91 测试通过**（含实际 TypeScript bridge 合同测试）；Studio 隔离目录90通过、1缺Node跳过，该项本机已过。
+- 真实 pi + Flash Next + cmux0.65 已验证启动、请求、双角色换代、历史；直接在 supervisor 里要求 worker 回复OK，worker回复及supervisor转告闭环通过；control/history同栏且移动不中断daemon。
+- Claude真实混合任务仍未实测，只验证了官方CLI路由单测；独立复核及生产合并/部署仍未完成。详见[设计基线](docs/design.md)。
 - 还没真盘跑过：卡死看门（只有单测）、浏览器代办。
 
 ## 真盘跑出来的坑（都已修）

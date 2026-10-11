@@ -1,0 +1,15 @@
+{
+  "id": "flashnext-coder",
+  "display_name": "FlashNext Coder",
+  "cli": "pi",
+  "capabilities": [
+    "code-edit",
+    "test-fix",
+    "planning"
+  ],
+  "role_file": "worker.md",
+  "cost_rank": 1,
+  "latency_rank": 1,
+  "risk_rank": 3,
+  "model": "flashnext/Qwen3.8-Flash-Next-Uncensored-oQ4e-100K-MTP"
+}

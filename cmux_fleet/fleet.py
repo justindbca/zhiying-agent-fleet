@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""cmux-fleet: one supervisor + N worker Codex sessions in cmux tabs, coordinated by a daemon.
+"""cmux-fleet: one supervisor + N workers in cmux tabs, coordinated by a daemon.
 
-Every agent is an interactive ``codex`` TUI in its own cmux tab. The daemon never reads
-their screens: Codex's ``notify`` hook calls back into this file (``fleet.py notify``) at
-the end of every turn, and the daemon routes the reply through a private Redis instance
-that listens only on a Unix socket under /tmp (never localhost:6379).
+Agents use Codex by default, with optional Pi supervisors/workers and official Claude
+Code workers. The daemon never reads screens: each CLI's hook/extension calls back at
+the end of a turn. Replies route through a private Redis instance listening only on a
+Unix socket under /tmp (never localhost:6379).
 
 Subcommands
   start     provision the private Redis + the control surface (must run inside cmux)
@@ -17,14 +17,18 @@ Subcommands
   status    task + per-agent state, context usage, inbox depth
   stop      cancel the task, shut the daemon and its Redis down (tabs stay open)
   chrome    run a vetted browser verb through the daemon (for sandboxed agents, optional)
+  agents    list or match offline agent profiles (does not contact a fleet)
+  plan      build an offline dynamic dispatch plan (does not contact a fleet)
   notify    Codex notify hook (internal)
   claude-stop  Claude Code Stop hook for claude workers (internal)
-  actor     exec codex for one agent (internal)
+  pi-event  Pi settled/session extension callback (internal)
+  actor     exec the configured CLI for one agent (internal)
 """
 import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -38,8 +42,12 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import handoff, history  # noqa: E402
+from cmux_fleet import handoff, history, pi_adapter, profile_runtime, profile_launch  # noqa: E402
+from cmux_fleet.agent_registry import AgentRegistry  # noqa: E402
+from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
+from cmux_fleet.planner import build_dispatch_plan  # noqa: E402
+from cmux_fleet.router import route_task  # noqa: E402
 
 SOCK_PREFIX = '/tmp/cmux-fleet-'
 SESSION = 'cmux-fleet'  # cmux registry name
@@ -51,6 +59,7 @@ EVENTS, TASK, LOG, NAMES = 'fx:events', 'fx:task', 'fx:log', 'fx:names'
 REQ, REQQ, RESULT, RESULTS, SERVICE = 'fx:req:', 'fx:reqq', 'fx:result:', 'fx:results', 'fx:service'
 REQ_ID_RE = r'[A-Za-z0-9][A-Za-z0-9:._-]{0,127}'
 REQ_HEAD = re.compile(r'^\[Request (' + REQ_ID_RE + r')\]')
+SUPERVISOR_INSTRUCTION_HEAD = re.compile(r'^\[Supervisor instruction ([^\]\n]+)\] ', re.MULTILINE)
 WORKER_NAME_RE = r'[a-z][a-z0-9-]{0,30}'
 # Display name of the supervisor's first generation; successors are supervisor-1.1, supervisor-1.2, ...
 # (same <slot>.<generation> pattern as worker-1 -> worker-1.1). Redis keys and the cwd stay 'supervisor'.
@@ -62,7 +71,8 @@ CHROME_VERBS = {'check', 'tabs', 'newtab', 'go', 'url', 'js'}
 THREAD_RE = r'[0-9a-f-]{36}'
 DEFAULTS = {'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 100000, 'stall_timeout': 1800,
             'chrome_min_interval': 20, 'profile': 'fleet', 'worker_cli': 'codex', 'worker_model': 'sonnet',
-            'claude_window': 200000, 'mode': 'task', 'max_busy': 0, 'request_timeout': 900}
+            'claude_window': 200000, 'mode': 'task', 'max_busy': 0, 'request_timeout': 900,
+            'apply_profiles_live': False, 'allow_profile_live_switch': False, 'profile_ready_timeout': 180}
 CLAUDE_JSON = Path.home() / '.claude.json'
 
 
@@ -143,8 +153,16 @@ def trust_agent_dir(home, cwd):
             f.write('\n' + entry + '\ntrust_level = "trusted"\n')
 
 
+def agent_cli(cfg, name):
+    return cfg.get('supervisor_cli' if name == 'supervisor' else 'worker_cli') or 'codex'
+
+
 def is_claude(cfg, name):
-    return name != 'supervisor' and cfg.get('worker_cli') == 'claude'
+    return agent_cli(cfg, name) == 'claude'
+
+
+def is_pi(cfg, name):
+    return agent_cli(cfg, name) == 'pi'
 
 
 def trust_claude_dir(cwd):
@@ -273,6 +291,23 @@ def check_artifacts(artifacts, root):
             if len(text) < item.get('min_chars', 1) or not all(c in text for c in item.get('contains', [])):
                 failures.append('artifact below requirements (length / required text): ' + item['path'])
     return failures
+
+
+def validate_agent_registry_path(value):
+    """Validate a task-provided registry path without shell or environment expansion."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or '\x00' in value:
+        raise ValueError('agent_registry must be a non-empty directory path')
+    try:
+        path = Path(value.strip()).expanduser()
+        if not path.is_dir():
+            raise ValueError('agent_registry must exist and be a directory: ' + str(path))
+    except (OSError, RuntimeError, ValueError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith('agent_registry '):
+            raise
+        raise ValueError('invalid agent_registry path: ' + str(exc)) from exc
+    return path
 
 
 def parse_decision(text, workers, others_active):
@@ -502,6 +537,8 @@ def actor_argv(cfg_path, cfg, name, generation, prompt):
             '-c', 'notify=' + json.dumps(callback),
             '-c', 'developer_instructions=' + json.dumps(
                 'Your role, rules and reply format are in AGENTS.md in the current directory. Follow it.')]
+    if cfg.get('codex_model'):
+        argv += ['--model', cfg['codex_model']]
     if cfg.get('compact_limit'):
         # The daemon rotates sessions at handoff_ratio before each delivery; Codex's own
         # compaction is only a safety net for a single runaway turn.
@@ -512,7 +549,7 @@ def actor_argv(cfg_path, cfg, name, generation, prompt):
 def claude_argv(cfg_path, cfg, name, generation, prompt):
     cwd = agent_cwd(cfg, name)
     hook = shlex.join([cfg['python'], str(Path(__file__).resolve()), 'claude-stop', str(cfg_path), name, str(generation)])
-    settings = cwd / '.fleet-settings.json'
+    settings = cwd / ('.fleet-settings-g' + str(generation) + '.json')
     settings.write_text(json.dumps({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': hook, 'timeout': 30}]}]}}))
     argv = [cfg.get('claude') or 'claude', '--dangerously-skip-permissions', '--model', cfg.get('worker_model') or 'sonnet',
             '--settings', str(settings), '--add-dir', str(Path(cfg['run']) / 'workspace')]
@@ -521,11 +558,42 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
     return argv + ['--', prompt]  # --add-dir / --mcp-config are variadic: end options first
 
 
-def actor(cfg_path, name, prompt):
+def pi_event(cfg_path, name, generation, raw):
+    """Pi's bundled extension sends session metadata and final settlement over stdin."""
     cfg = load(cfg_path)
-    generation = int(connect(cfg).hget(key('agent', name), 'generation') or 0)
+    if name not in ['supervisor'] + cfg['workers'] or not is_pi(cfg, name):
+        raise ValueError('pi callback must name a pi agent in this fleet')
+    if len(raw) > 1000000:
+        raise ValueError('pi event too large')
+    ev = pi_adapter.event(cfg, name, int(generation), json.loads(raw))
+    ev['at'] = time.time()
+    if ev['kind'] == 'operator_input':
+        print(json.dumps(request(cfg, ev), ensure_ascii=False))
+    else:
+        connect(cfg).rpush(EVENTS, json.dumps(ev, ensure_ascii=False))
+
+
+def actor(cfg_path, name, prompt, generation=None):
+    cfg = load(cfg_path)
+    r = connect(cfg)
+    info = r.hgetall(key('agent', name))
+    # Every daemon launch pins this value in argv, never adopts a newer generation.
+    generation = int(info.get('generation') or 0) if generation is None else generation
+    deadline = time.monotonic() + 60
+    while True:
+        if generation != int(info.get('generation', -1)) or info.get('state') == 'dead':
+            raise RuntimeError('actor generation was retired or blocked before launch')
+        if info.get('launch_ready', '1') == '1':
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError('profile launch gate timed out; old runtime retirement unconfirmed')
+        time.sleep(.1)
+        info = r.hgetall(key('agent', name))
     os.chdir(agent_cwd(cfg, name))
-    if is_claude(cfg, name):
+    if is_pi(cfg, name):
+        os.environ.update(pi_adapter.environment(cfg_path, cfg, name, generation))
+        argv = pi_adapter.argv(cfg, name, generation, prompt, agent_cwd(cfg, name), label=info['label'])
+    elif is_claude(cfg, name):
         os.environ.pop('CLAUDECODE', None)
         argv = claude_argv(cfg_path, cfg, name, generation, prompt)
     else:
@@ -538,6 +606,11 @@ class Fleet:
     def __init__(self, cfg_path, r, mgr, sessions=None):
         self.path = Path(cfg_path).resolve()
         self.cfg = dict(DEFAULTS, **load(self.path))
+        profile_runtime.validate_live_setting(self.cfg['apply_profiles_live'],
+                                              allowed=self.cfg['allow_profile_live_switch'])
+        timeout = self.cfg['profile_ready_timeout']
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError('profile_ready_timeout must be a finite positive number')
         self.run_dir = Path(self.cfg['run'])
         self.r, self.mgr = r, mgr
         self.sessions = Path(sessions) if sessions else sessions_dir(self.cfg)
@@ -551,6 +624,10 @@ class Fleet:
     # -- small helpers
     def agent(self, name):
         return self.r.hgetall(key('agent', name))
+
+    def runtime_cfg(self, name):
+        launch = json.loads(self.agent(name).get('runtime_launch') or '{}')
+        return dict(self.cfg, **launch.get('overrides', {}))
 
     def setf(self, name, **fields):
         self.r.hset(key('agent', name), mapping={k: str(v) for k, v in fields.items()})
@@ -591,6 +668,113 @@ class Fleet:
     def queue(self, name, text):
         self.r.rpush(key('inbox', name), text)
 
+    def prepare_worker_profile(self, slot, instruction):
+        """Authorize intent without spawning; recheck immediately before delivery."""
+        task = self.task()
+        try:
+            registry = AgentRegistry(task.get('agent_registry') or None) if task.get('profile_assignments') else None
+            return profile_runtime.prepare_profile(
+                slot, instruction, task, self.agent(slot), registry,
+                allow_profile_live_switch=self.cfg['allow_profile_live_switch'])
+        except (OSError, TypeError, ValueError) as exc:
+            blocked = profile_runtime.ProfileApplication(state='blocked', reason=str(exc))
+            self.record_worker_profile(slot, blocked)
+            self.log('profile.blocked', agent=slot, reason=str(exc))
+            raise profile_runtime.ProfileRuntimeError(str(exc)) from exc
+
+    def record_worker_profile(self, slot, application):
+        self.setf(slot, **application.metadata(), profile_task=self.task().get('id', ''))
+
+    def block_profile(self, name, reason, *, dead=False):
+        fields = dict(profile_state='blocked', profile_reason=reason)
+        if dead:
+            fields.update(state='dead', launch_ready=0, runtime_ready=0, current_profile='')
+        self.setf(name, **fields)
+        self.log('profile.blocked', agent=name, reason=reason)
+        self.finish('blocked', name + ': ' + reason)
+
+    def preflight_profile(self, launch):
+        """Check dependencies before retiring anything. Never select a fallback CLI."""
+        cfg = dict(self.cfg, **launch['overrides'])
+        cli = cfg['worker_cli']
+        binary = cfg.get(cli) or cli
+        if not shutil.which(binary):
+            raise ValueError('profile CLI binary not found: ' + binary)
+        if cli == 'pi':
+            if not cfg.get('allow_unsandboxed_pi'):
+                raise ValueError('pi profile requires --allow-unsandboxed-pi')
+            version = subprocess.run([binary, '--version'], capture_output=True, text=True,
+                                     timeout=15, check=True).stdout.strip()
+            match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', version)
+            if not match or tuple(map(int, match.groups())) < (1, 1, 0):
+                raise ValueError('pi >= 1.1.0 required; found: ' + version)
+            if not self.cfg.get('pi_home'):
+                home = pi_adapter.prepare_home(self.run_dir / 'pi-home',
+                                              cfg.get('pi_agent_dir') or str(Path.home() / '.pi/agent'))
+                self.cfg['pi_home'] = str(home)
+            if not Path(self.cfg['pi_home']).is_dir():
+                raise ValueError('configured isolated pi_home does not exist')
+        elif cli == 'codex':
+            prepare_codex_home(codex_home(cfg), agent_profile(cfg, 'worker'))
+
+    def switch_profile(self, name, launch):
+        """Same slot, successor generation, gated CLI exec until old tab is retired."""
+        info = self.agent(name)
+        if name not in self.workers or info.get('state') != 'idle':
+            raise ValueError('profile switch requires an idle worker slot')
+        if info.get('idle_confirmed') == '0':
+            raise ValueError('worker idle state is unconfirmed after an abort; restart this dev slot before switching')
+        if not profile_runtime.task_live_setting(self.task(), self.cfg['allow_profile_live_switch']):
+            raise ValueError('profile switch requires task apply_profiles_live=true')
+        if agent_cli(self.runtime_cfg(name), name) == 'codex' and active_children(info.get('thread'), self.sessions):
+            self.setf(name, profile_state='pending', profile_reason='waiting for native subagents to finish')
+            return
+        self.preflight_profile(launch)
+        generation, old, prev = int(info['generation']), info['pane'], self.label(name)
+        if not old or self.mgr.get_pane_status(old) is None:
+            raise ValueError('old runtime tab is missing; cannot safely replace it')
+        label = name + '.' + str(generation + 1)
+        note = self.run_dir / 'handoffs' / (name + '-g' + str(generation) + '-profile.md')
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text('Idle profile switch: ' + prev + ' -> ' + label + '\n'
+                        'Target profile: ' + launch['profile_id'] + '\n'
+                        'The queued instruction is retained by the daemon. No task work before READY.\n')
+        snapshot = note.with_suffix('.terminal.txt')
+        self.mgr.capture_to(old, str(snapshot))
+        history.record(self.run_dir, slot=name, label=prev, generation=generation,
+                       handoff=str(note), snapshot=str(snapshot), source='profile-switch', timed_out=False)
+        # Fence old callbacks before touching shared role files or creating a successor.
+        self.setf(name, state='starting', generation=generation + 1, label=label, prev_label=prev,
+                  runtime_launch=profile_launch.encode_launch(launch), current_profile='', runtime_ready=0,
+                  runtime_profile='', profile_state='switching', launch_ready=0, retired_pane=old)
+        self.r.hset(NAMES, mapping={label: name})
+        new = None
+        try:
+            new = self.spawn(name, 'You are fleet agent ' + label + '. Read AGENTS.md first. '
+                             'This is an idle runtime profile switch. Do no task work. Reply exactly READY.',
+                             launch_held=True)
+            if not self.mgr.tab_into(new, old):
+                raise RuntimeError('could not place successor in the worker pane')
+            if not self.mgr.kill_pane(old) or self.mgr.get_pane_status(old) is not None:
+                raise RuntimeError('could not confirm retirement of old runtime ' + prev)
+            self.setf(name, retired_pane='', launch_ready=1)
+            self.refresh_history()
+            self.log('profile.switch', agent=name, label=label, generation=generation + 1,
+                     profile=launch['profile_id'], cli=launch['overrides']['worker_cli'])
+        except (Exception, SystemExit) as exc:
+            # Revoke launch before cleanup; even a late READY cannot revive this generation.
+            self.setf(name, launch_ready=0, state='dead')
+            new = new or self.agent(name).get('pane')
+            if new == old:
+                new = None
+            if new:
+                try:
+                    if not self.mgr.kill_pane(new):
+                        self.log('profile.cleanup_failed', agent=name, pane=new)
+                except Exception as cleanup:
+                    self.log('profile.cleanup_failed', agent=name, pane=new, reason=str(cleanup))
+            self.block_profile(name, 'profile switch failed: ' + str(exc), dead=True)
+
     def workspace(self):
         return self.run_dir / 'workspace'
 
@@ -598,36 +782,63 @@ class Fleet:
         return shlex.join([self.cfg['python'], str(Path(__file__).resolve()), 'chrome', '--config', str(self.path)])
 
     # -- actors
-    def spawn(self, name, prompt):
+    def spawn(self, name, prompt, *, launch_held=False):
+        cfg = self.runtime_cfg(name)
+        info = self.agent(name)
+        generation = int(info.get('generation', 0))
+        launch = json.loads(info.get('runtime_launch') or '{}')
+        cfg_path = self.path
+        if launch:
+            cfg_path = self.run_dir / 'runtime' / (name + '-g' + str(generation) + '.json')
+            save(cfg_path, cfg)  # generation-specific callback config; never edit old snapshots
         cwd = agent_cwd(self.cfg, name)
         cwd.mkdir(parents=True, exist_ok=True)
         role = 'supervisor' if name == 'supervisor' else 'worker'
         scope = (HERE / 'agents' / (('service_' if self.service else '') + role + '.md')).read_text()
+        if launch.get('role_text') and launch['role_text'].strip() != scope.strip():
+            scope += '\n## Assigned profile role\n\n' + launch['role_text']
         extra = Path(self.cfg['roles']).expanduser() / (name + '.md') if self.cfg.get('roles') else None
         if extra and extra.is_file():  # this agent's own prompt (one per worker in service mode)
             scope += '\n## 4. Your role (' + name + ')\n\n' + extra.read_text()
         scope = scope.replace('{{WORKSPACE}}', str(self.workspace())).replace('{{FLEET_CHROME}}', self.fleet_cmd())
+        sandbox_notice = ('You run inside a sandbox. Driving the user\'s browser directly (AppleScript, GUI automation) '
+                          'fails there with an error. That error means the sandbox stopped you, not that the browser '
+                          'is broken. Browser actions go only through the broker command below, if enabled.')
+        scope = scope.replace('{{SANDBOX_NOTICE}}', sandbox_notice if agent_cli(cfg, name) == 'codex'
+                              else pi_adapter.UNSANDBOXED_SCOPE)
+        if is_pi(cfg, name):
+            scope += '\n## Runtime permissions\n\n' + pi_adapter.UNSANDBOXED_SCOPE + '\n'
         (cwd / 'AGENTS.md').write_text(scope)
-        if is_claude(self.cfg, name):
+        if is_claude(cfg, name):
             (cwd / 'CLAUDE.md').write_text(scope)  # Claude Code reads CLAUDE.md, not AGENTS.md
             install_kit(self.cfg.get('worker_kit'), cwd)
             trust_claude_dir(cwd)
-        else:
+        elif not is_pi(cfg, name):
             trust_agent_dir(codex_home(self.cfg), cwd)
-        generation = int(self.agent(name).get('generation', 0))
         self.setf(name, role=role, generation=generation, state='starting', thread='', pane='',
-                  busy_since=time.time(), delivered=0)
+                  transcript='', ctx_used=0, ctx_window=0, msg_id='', msg_done='',
+                  busy_since=time.time(), delivered=0, retry_at=0, last_msg='', empty_tries=0,
+                  launch_ready=int(not launch_held), runtime_ready=0, current_profile='', idle_confirmed=0)
+        if launch:
+            self.setf(name, profile_state='switching', runtime_profile=launch['profile_id'],
+                      profile_ready_deadline=time.time() + float(self.cfg['profile_ready_timeout']))
         prompt_file = self.run_dir / 'prompts' / (name + '-g' + str(generation) + '.md')
         prompt_file.parent.mkdir(parents=True, exist_ok=True)
         prompt_file.write_text(prompt)
         result = self.mgr.spawn_interactive_cli(
             window_name='fx-' + self.label(name), prompt_file=str(prompt_file), start_directory=str(cwd),
-            cli_command=shlex.join([self.cfg['python'], str(Path(__file__).resolve()), 'actor', str(self.path), name]),
+            cli_command=shlex.join([self.cfg['python'], str(Path(__file__).resolve()), 'actor', str(cfg_path), name,
+                                    '--generation', str(generation)]),
             output_file=str(self.run_dir / 'prompts' / (name + '-g' + str(generation) + '.terminal.log')),
-            auto_close=False, metadata={'type': role, 'cli_type': 'claude' if is_claude(self.cfg, name) else 'codex',
-                      'profile': self.cfg['profile']},
-            env_vars={'PATH': os.environ.get('PATH', ''), 'CODEX_HOME': str(codex_home(self.cfg))})
+            auto_close=False, metadata={'type': role, 'cli_type': agent_cli(cfg, name),
+                      'profile': (cfg.get('pi_model') if is_pi(cfg, name) else
+                                  cfg.get('worker_model') if is_claude(cfg, name) else agent_profile(cfg, name))},
+            env_vars=dict({'PATH': os.environ.get('PATH', '')}, **(
+                pi_adapter.environment(cfg_path, cfg, name, generation) if is_pi(cfg, name)
+                else {'CODEX_HOME': str(codex_home(self.cfg))})))
         if not result.success:
+            if result.pane_id:
+                self.setf(name, pane=result.pane_id)
             raise RuntimeError('spawn failed: ' + name + ': ' + str(result.error))
         self.setf(name, pane=result.pane_id)
         self.log('spawn', agent=name, generation=generation, pane=result.pane_id)
@@ -636,7 +847,9 @@ class Fleet:
     def start_all(self):
         self.setf('supervisor', label=SUPERVISOR_LABEL)
         for name in self.workers:
-            self.setf(name, label=name)
+            self.setf(name, label=name, current_profile='', runtime_profile='', advisory_profile='',
+                      runtime_ready=0, runtime_launch='', profile_task='',
+                      **profile_runtime.ProfileApplication().metadata())
             self.r.hset(NAMES, mapping={name: name})
         for name in self.names:
             self.spawn(name, 'You are fleet agent ' + name + '. Read AGENTS.md in the current directory first. '
@@ -666,6 +879,34 @@ class Fleet:
             except (ValueError, TypeError) as exc:
                 answer = {'status': 'rejected', 'reason': str(exc)}
             self.r.set('fx:reply:' + ev['request_id'], json.dumps(answer, ensure_ascii=False), ex=86400)
+        elif kind == 'operator_input':
+            try:
+                info = self.agent('supervisor')
+                if (ev.get('agent') != 'supervisor' or not is_pi(self.cfg, 'supervisor')
+                        or ev.get('generation') != int(info.get('generation', -1))
+                        or ev.get('thread') != info.get('thread')
+                        or info.get('state') not in ('idle', 'busy')):
+                    raise ValueError('supervisor is not ready or this input belongs to an old session')
+                if not isinstance(ev.get('text'), str) or not 1 <= len(ev['text'].strip()) <= 32000:
+                    raise ValueError('operator input must be 1-32000 chars of text')
+                if self.service:
+                    rid = self.request({'id': 'ui-' + uuid.uuid4().hex,
+                                        'payload': {'message': ev['text']},
+                                        'instruction': 'The operator typed the payload message in your terminal. '
+                                                       'Route it to a worker; do not invent request IDs. '
+                                                       'The worker puts its answer text in the reply field.',
+                                        'reply': {'required': ['reply'], 'allowed': ['reply']}})
+                    self.r.hset(REQ + rid, mapping={'operator': '1'})
+                    answer = {'status': 'accepted', 'id': rid}
+                elif self.running():
+                    self.queue('supervisor', '[Operator instruction] ' + ev['text']
+                               + '\nContinue the current task using the AGENTS.md decision JSON.')
+                    answer = {'status': 'accepted', 'task_id': self.task()['id']}
+                else:
+                    answer = {'status': 'accepted', 'task_id': self.submit({'goal': ev['text']})}
+            except (ValueError, TypeError) as exc:
+                answer = {'status': 'rejected', 'reason': str(exc)}
+            self.r.set('fx:reply:' + ev['request_id'], json.dumps(answer, ensure_ascii=False), ex=86400)
         elif kind in ('pause', 'resume'):
             if kind == 'pause':
                 self.pause(ev.get('reason') or 'paused by operator')
@@ -679,6 +920,11 @@ class Fleet:
             self.r.set('fx:reply:' + ev['request_id'], json.dumps({'status': 'accepted'}), ex=86400)
         elif kind == 'chrome':
             self.r.set('fx:reply:' + ev['request_id'], json.dumps(self.chrome(ev.get('argv')), ensure_ascii=False), ex=3600)
+        elif kind == 'pi_session':
+            name = ev.get('agent')
+            info = self.agent(name or '')
+            if info and is_pi(self.runtime_cfg(name), name) and ev.get('generation') == int(info.get('generation', 0)):
+                self.pi_metadata(name, ev)
         elif kind == 'turn':
             self.on_turn(ev)
 
@@ -709,18 +955,42 @@ class Fleet:
         self.log('chrome', argv=argv[:2], rc=p.returncode)
         return {'status': 'ok', 'rc': p.returncode, 'out': (p.stdout + p.stderr)[-200000:]}
 
+    def pi_metadata(self, name, ev):
+        fields = {k: ev[k] for k in ('thread', 'transcript', 'ctx_used', 'ctx_window')
+                  if ev.get(k) is not None}
+        if fields:
+            self.setf(name, **fields)
+
     def on_turn(self, ev):
         name, info = ev.get('agent'), self.agent(ev.get('agent', ''))
         if not info or ev.get('generation') != int(info.get('generation', 0)):
             self.log('turn.stale', agent=name, generation=ev.get('generation'))
             return
-        if is_claude(self.cfg, name) and info.get('state') in ('busy', 'handoff', 'idle'):
-            # A claude turn end counts only if it answers the message delivered last, once. (The spawn /
+        if info.get('state') == 'dead' or (is_pi(self.runtime_cfg(name), name) and info.get('state') not in ('starting', 'busy', 'handoff')):
+            self.log('turn.duplicate', agent=name, msg_id=ev.get('msg_id'))
+            return
+        if info.get('state') == 'starting':
+            if info.get('launch_ready', '1') != '1':
+                self.log('turn.launch_held', agent=name, generation=ev.get('generation'))
+                return
+            if ev.get('failed') or ev.get('aborted') or ev.get('text', '').strip() != 'READY':
+                self.block_profile(name, 'startup did not return READY; check its terminal', dead=True)
+                return
+        if (is_claude(self.runtime_cfg(name), name) or is_pi(self.runtime_cfg(name), name)) and info.get('state') in ('busy', 'handoff', 'idle'):
+            # A Claude/Pi turn counts only if it answers the message delivered last, once. (The spawn /
             # takeover prompt is a CLI argument without a msg id: that turn is accepted in 'starting'.)
             if info.get('state') == 'idle' or ev.get('msg_id') != info.get('msg_id') or info.get('msg_done') == info.get('msg_id'):
                 self.log('turn.duplicate', agent=name, msg_id=ev.get('msg_id'), current=info.get('msg_id'))
                 return
             self.setf(name, msg_done=ev.get('msg_id'))
+        if is_pi(self.runtime_cfg(name), name):
+            self.pi_metadata(name, ev)
+            failed = ev.get('failed') or ev.get('aborted')
+            if failed and info.get('state') == 'handoff':
+                self.finish_rotation(name, timed_out=True)
+                return
+            if failed:
+                ev = dict(ev, text='')  # never publish a partial/error response as a successful result
         if ev.get('thread'):
             self.setf(name, thread=ev['thread'])
         if ev.get('transcript'):
@@ -729,8 +999,11 @@ class Fleet:
             self.finish_rotation(name)
             return
         was = info.get('state')
-        self.setf(name, state='idle', stalls=0)
+        self.setf(name, state='idle', stalls=0, idle_confirmed=1)
         if was == 'starting':  # READY after spawn / takeover
+            self.setf(name, runtime_ready=1, current_profile=info.get('runtime_profile', ''))
+            if info.get('runtime_profile'):
+                self.setf(name, profile_state='ready', profile_reason='runtime returned READY; queued assignment awaits revalidation')
             self.log('ready', agent=name, generation=info.get('generation'))
             return
         text = ev.get('text', '')
@@ -775,6 +1048,13 @@ class Fleet:
         t = self.task()
         try:
             decision = parse_decision(text, self.labels() + list(self.r.hgetall(NAMES)), self.others_active())
+            # Validate the whole dispatch before queuing any part of it. Rejections
+            # use the existing supervisor correction/three-strike blocked path.
+            prepared = []
+            for item in decision['dispatch'] if decision['status'] == 'RUNNING' else []:
+                slot = self.resolve(item['to'])
+                instruction = item['instruction'].strip()
+                prepared.append((slot, instruction, self.prepare_worker_profile(slot, instruction)))
         except (ValueError, TypeError, KeyError) as exc:
             bad = self.r.hincrby(TASK, 'bad_replies', 1)
             if bad >= 3:
@@ -805,9 +1085,13 @@ class Fleet:
                 self.queue('supervisor', 'Independent verification failed, the task cannot end: ' + '; '.join(failures)
                            + '\nDispatch corrective instructions to the workers (RUNNING + dispatch).')
             return
-        for item in decision['dispatch']:
-            slot = self.resolve(item['to'])
-            self.queue(slot, '[Supervisor instruction ' + t.get('id', '') + '] ' + item['instruction'].strip()
+        for slot, instruction, application in prepared:
+            # Metadata describes the next instruction, not the last appended one.
+            # A busy worker records intent only; delivery re-evaluates at idle.
+            if not self.r.llen(key('inbox', slot)):
+                self.record_worker_profile(slot, application)
+            advisory = profile_runtime.profile_advisory(slot, application)
+            self.queue(slot, advisory + '[Supervisor instruction ' + t.get('id', '') + '] ' + instruction
                        + '\nShared output directory: ' + str(self.workspace()) + ' (write only inside your own '
                        'subdirectory ' + slot + '/). Reply in the AGENTS.md format when done.')
         self.log('dispatch', count=len(decision['dispatch']), completion=decision['completion'])
@@ -819,22 +1103,62 @@ class Fleet:
             raise ValueError('this fleet runs in service mode: submit requests, not tasks')
         if self.running():
             raise ValueError('a task is already running; stop it or wait for it to finish')
+        auto_agents = spec.get('auto_agents', False)
+        if type(auto_agents) is not bool:
+            raise ValueError('auto_agents must be a boolean')
+        profile_runtime.validate_live_setting(spec.get('apply_profiles_live', False),
+                                              allowed=self.cfg['allow_profile_live_switch'])
+        if spec.get('apply_profiles_live') and not auto_agents:
+            raise ValueError('apply_profiles_live requires auto_agents and profile assignments')
         if 'artifacts' in spec:
-            validate_artifacts(spec['artifacts'])
+            # Auto-planned task specs may explicitly say there are no pre-declared artifacts.
+            # Keep the legacy non-auto validation unchanged.
+            if not (auto_agents and spec['artifacts'] == []):
+                validate_artifacts(spec['artifacts'])
         hours = spec.get('hours', 16)
         if isinstance(hours, bool) or not isinstance(hours, (int, float)) or not 0 < hours < 1000:
             raise ValueError('hours must be a positive number')
+        registry_path = validate_agent_registry_path(spec.get('agent_registry'))
+        dispatch_plan = profile_assignments = None
+        if auto_agents:
+            registry = AgentRegistry(registry_path)
+            plan = build_dispatch_plan(spec['goal'], registry)
+            dispatch_plan = plan.to_dict()
+            profile_assignments = assign_profiles(plan, self.workers, registry)
         task_id = 'task-' + uuid.uuid4().hex[:10]
         self.r.delete(TASK)
-        self.r.hset(TASK, mapping={'id': task_id, 'goal': spec['goal'], 'status': 'running', 'completion': 0,
-                                   'reason': '', 'deadline': time.time() + hours * 3600, 'bad_replies': 0,
-                                   'bounces': 0, 'artifacts': json.dumps(spec.get('artifacts', []), ensure_ascii=False)})
-        self.queue('supervisor', '[New task ' + task_id + '] Goal: ' + spec['goal']
-                   + '\nWorkers you can dispatch to: ' + ', '.join(self.labels())
-                   + '\nShared output directory: ' + str(self.workspace())
-                   + ' (artifact paths are relative to it, e.g. worker-1/report.md)'
-                   + '\nArtifacts pre-declared by the operator: ' + json.dumps(spec.get('artifacts', []), ensure_ascii=False)
-                   + '\nReply with the JSON format from AGENTS.md.')
+        fields = {'id': task_id, 'goal': spec['goal'], 'status': 'running', 'completion': 0,
+                  'reason': '', 'deadline': time.time() + hours * 3600, 'bad_replies': 0,
+                  'bounces': 0, 'artifacts': json.dumps(spec.get('artifacts', []), ensure_ascii=False),
+                  'apply_profiles_live': json.dumps(spec.get('apply_profiles_live', False))}
+        if dispatch_plan is not None:
+            fields.update(
+                auto_agents=1,
+                agent_registry=str(registry.directory),
+                dispatch_plan=json.dumps(dispatch_plan, ensure_ascii=False, separators=(',', ':')),
+                profile_assignments=json.dumps(
+                    profile_assignments, ensure_ascii=False, separators=(',', ':')),
+            )
+        self.r.hset(TASK, mapping=fields)
+        prompt = ('[New task ' + task_id + '] Goal: ' + spec['goal']
+                  + '\nWorkers you can dispatch to: ' + ', '.join(self.labels())
+                  + '\nShared output directory: ' + str(self.workspace())
+                  + ' (artifact paths are relative to it, e.g. worker-1/report.md)'
+                  + '\nArtifacts pre-declared by the operator: '
+                  + json.dumps(spec.get('artifacts', []), ensure_ascii=False))
+        if dispatch_plan is not None:
+            prompt += ('\nAuto-agent dispatch plan (profile ids are recommendations, not worker names): '
+                       + fields['dispatch_plan']
+                       + '\nProfile assignments to stable worker slots: ' + fields['profile_assignments']
+                       + '\nUse each assignment worker value for dispatch.to; never use agent_id/profile as a worker name.'
+                       + '\nInclude "Recommended profile: <agent_id>" in each worker instruction so the profile stays '
+                       'assigned while the worker slot remains authoritative.'
+                       + '\nInclude "Subtask: <subtask_id>" to bind the instruction to its assignment. '
+                       'Only the daemon may apply profiles; workers must not switch their own runtime.'
+                       + (' Live profile switching is enabled for this task.' if spec.get('apply_profiles_live')
+                          else ' Profile application is advisory metadata only.')
+                       + '\nDo not dispatch dependent subtasks until every id in depends_on has finished.')
+        self.queue('supervisor', prompt + '\nReply with the JSON format from AGENTS.md.')
         self.log('task.submitted', task=task_id)
         return task_id
 
@@ -850,7 +1174,7 @@ class Fleet:
             if pane and self.agent(name).get('state') == 'busy':
                 # An aborted turn fires no notify, so mark idle here; tabs stay open.
                 self.mgr.send_key(pane, 'Escape')
-                self.setf(name, state='idle')
+                self.setf(name, state='idle', idle_confirmed=0)
 
     # -- service mode
     def request(self, spec):
@@ -900,6 +1224,11 @@ class Fleet:
         self.r.delete(REQ + rid)
         self.r.lrem(REQQ, 0, rid)
         self.log('result', id=rid, status=status)
+        if req.get('operator') == '1':
+            self.queue('supervisor', '[Operator result ' + rid + '] ' + raw
+                       + '\nThis request is finished. Report the worker result to the operator in the reason '
+                       'field of the usual service decision JSON: status RUNNING, dispatch [], skip []. '
+                       'Do not dispatch it again or invent a new request ID.')
 
     def on_service_worker(self, name, info, text):
         rid = info.get('request')
@@ -976,7 +1305,10 @@ class Fleet:
                     busy += 1
 
     def usage(self, name):
-        if is_claude(self.cfg, name):
+        if is_pi(self.runtime_cfg(name), name):
+            info = self.agent(name)
+            return int(info.get('ctx_used') or 0), int(info.get('ctx_window') or self.cfg['window'])
+        if is_claude(self.runtime_cfg(name), name):
             path = self.agent(name).get('transcript')
             if not path:
                 return 0, 0
@@ -992,8 +1324,45 @@ class Fleet:
         return used, window
 
     def deliver(self, name):
-        used, window = self.usage(name)
         info = self.agent(name)
+        if info.get('state') != 'idle':
+            return
+        pending = self.r.lrange(key('inbox', name), 0, 0)
+        if not pending:
+            return
+        text = pending[0]
+        if name != 'supervisor' and not self.service:
+            head = SUPERVISOR_INSTRUCTION_HEAD.search(text)
+            if head:
+                if head.group(1) != self.task().get('id'):
+                    self.finish('blocked', 'stale task instruction for ' + name)
+                    return
+                try:
+                    # Strip only the daemon-generated advisory; reauthorize the
+                    # original instruction against this task after queueing/READY/
+                    # handoff. Queue and callback wire formats stay unchanged.
+                    application = self.prepare_worker_profile(name, text[head.end():])
+                except profile_runtime.ProfileRuntimeError as exc:
+                    self.finish('blocked', 'profile validation before delivery to ' + name + ': ' + str(exc))
+                    return
+                self.record_worker_profile(name, application)
+                if application.state in ('switching', 'applied-live'):
+                    try:
+                        registry = AgentRegistry(self.task().get('agent_registry') or None)
+                        launch = profile_launch.resolve_launch(registry.get(application.desired_profile), registry, self.cfg)
+                        if application.state == 'switching':
+                            self.switch_profile(name, launch)
+                            return  # never pop/deliver until this generation returns READY
+                        if profile_launch.encode_launch(launch) != info.get('runtime_launch'):
+                            raise ValueError('profile launch definition changed since spawn; submit a new task after repair')
+                    except (OSError, ValueError, RuntimeError, KeyError, SystemExit, subprocess.SubprocessError) as exc:
+                        self.block_profile(name, str(exc))
+                        return
+                text = profile_runtime.profile_advisory(name, application) + text[head.start():]
+        # Validate profile intent before even the existing context rotation path.
+        # Leave the original message queued across handoff; READY triggers another
+        # idle-boundary validation. This daemon remains the sole inbox consumer.
+        used, window = self.usage(name)
         if window and used >= float(self.cfg['handoff_ratio']) * window:
             if int(info.get('delivered') or 0) == 0:
                 # A fresh session (only its READY turn so far) is already over the ratio: its
@@ -1001,16 +1370,14 @@ class Fleet:
                 # successors forever. Deliver anyway and say so once per generation.
                 self.log('rotate.impossible', agent=name, used=used, window=window,
                          ratio=self.cfg['handoff_ratio'], reason='fresh session already over ratio; raise --handoff-ratio')
-            elif active_children(info.get('thread'), self.sessions):
+            elif agent_cli(self.runtime_cfg(name), name) == 'codex' and active_children(info.get('thread'), self.sessions):
                 # Hold the message: never feed a near-full session while its subagents run.
                 self.log('rotate.deferred', agent=name, reason='native subagents still running')
                 return
             else:
                 self.start_rotation(name, used, window)
                 return
-        text = self.r.lpop(key('inbox', name))
-        if not text:
-            return
+        self.r.lpop(key('inbox', name))
         if self.service:
             head = REQ_HEAD.match(text)
             if head and not self.r.hgetall(REQ + head.group(1)):
@@ -1027,12 +1394,11 @@ class Fleet:
         self.log('deliver', agent=name, text=text[:120])
 
     def send(self, name, pane, text):
-        """Codex takes the message pasted verbatim. Claude Code would submit a pasted newline as
-        Enter, so a claude worker gets the full message as a file and a one-line pointer."""
-        if not is_claude(self.cfg, name):
+        """Codex accepts verbatim paste; Claude and Pi use a file pointer with a delivery id."""
+        if not (is_claude(self.runtime_cfg(name), name) or is_pi(self.runtime_cfg(name), name)):
             return self.mgr.send_prompt_to_idle(pane, text)
-        # Every message to a claude worker goes through a uniquely named file. The Stop hook reads the
-        # id of the last such pointer from the transcript, which binds each turn end to its delivery.
+        # Claude's Stop hook reads the pointer from its transcript; Pi's extension captures it
+        # from before_agent_start. Both bind each turn end to exactly one daemon delivery.
         box = agent_cwd(self.cfg, name) / '.inbox'
         box.mkdir(exist_ok=True)
         mid = 'msg-' + time.strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:6]
@@ -1155,8 +1521,10 @@ class Fleet:
         stalls = int(info.get('stalls', 0)) + 1
         self.log('agent.stalled', agent=name, state=info.get('state'), idle_s=idle_s, stalls=stalls)
         self.mgr.send_key(info['pane'], 'Escape')  # abort the turn; an aborted turn fires no notify
-        self.setf(name, state='idle', stalls=stalls, busy_since=time.time())
+        self.setf(name, state='idle', idle_confirmed=0, stalls=stalls, busy_since=time.time())
         if info.get('state') == 'starting':
+            self.setf(name, state='dead', runtime_ready=0, current_profile='',
+                      profile_state='blocked', profile_reason='startup timed out before READY')
             if self.running():
                 self.finish('blocked', name + ' never became ready (' + str(idle_s) + ' s without activity)')
             return
@@ -1183,6 +1551,10 @@ class Fleet:
         now = time.time()
         for name in self.names:
             info = self.agent(name)
+            if (info.get('state') == 'starting' and info.get('runtime_profile')
+                    and now >= float(info.get('profile_ready_deadline', '0'))):
+                self.block_profile(name, 'profile runtime timed out before READY', dead=True)
+                continue
             if info.get('state') == 'handoff' and now >= float(info.get('handoff_deadline', 0)):
                 self.finish_rotation(name, timed_out=True)
         t = self.task()
@@ -1196,7 +1568,8 @@ class Fleet:
             for name in self.names:
                 pane = self.agent(name).get('pane')
                 if pane and self.mgr.get_pane_status(pane) is None:
-                    self.setf(name, state='dead')
+                    self.setf(name, state='dead', runtime_ready=0, current_profile='',
+                              profile_state='blocked', profile_reason='runtime tab was closed')
                     if self.running():
                         self.finish('blocked', name + ' tab was closed')
 
@@ -1240,13 +1613,24 @@ def start(args):
     from cmux_fleet.cmux_manager import CmuxSessionManager, cmux_available
     if not cmux_available():
         raise SystemExit('run this inside a cmux terminal: cmux only accepts processes started in its windows')
+    clis = {args.supervisor_cli, args.worker_cli}
     codex = args.codex or shutil.which('codex')
+    pi = args.pi or shutil.which('pi')
     redis_server = args.redis_server or shutil.which('redis-server')
-    missing = [n for n, p in (('codex', codex), ('redis-server', redis_server)) if not p]
-    if args.worker_cli == 'claude' and not (args.claude or shutil.which('claude')):
-        missing.append('claude')
+    binaries = {'codex': codex, 'pi': pi, 'claude': args.claude or shutil.which('claude'),
+                'redis-server': redis_server}
+    missing = [n for n in sorted(clis | {'redis-server'}) if not binaries[n] or not shutil.which(binaries[n])]
     if missing:
-        raise SystemExit('not found on PATH: ' + ', '.join(missing) + ' (pass --codex / --redis-server)')
+        raise SystemExit('binaries not found: ' + ', '.join(missing) + ' (pass the corresponding binary flag)')
+    if 'pi' in clis:
+        if not args.allow_unsandboxed_pi:
+            raise SystemExit('pi has no sandbox: explicitly pass --allow-unsandboxed-pi after reviewing permissions')
+        if not args.pi_model:
+            raise SystemExit('--pi-model provider/model is required for pi agents')
+        version = subprocess.run([pi, '--version'], text=True, capture_output=True, timeout=15, check=True).stdout.strip()
+        match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', version)
+        if not match or tuple(map(int, match.groups())) < (1, 1, 0):
+            raise SystemExit('pi >= 1.1.0 is required (agent_settled); found: ' + version)
     mgr = CmuxSessionManager(SESSION)
     if mgr.session_exists():
         raise SystemExit('cmux-fleet tabs already exist; run `stop` and close them with the ✕ first')
@@ -1257,10 +1641,12 @@ def start(args):
         raise SystemExit('--worker-names: distinct names matching ' + WORKER_NAME_RE + ' (no dots: dots mark generations)')
     if args.roles and not Path(args.roles).expanduser().is_dir():
         raise SystemExit('--roles must be a directory of <agent-name>.md files')
-    profiles = [args.supervisor_profile or args.profile]
+    profiles = [args.supervisor_profile or args.profile] if args.supervisor_cli == 'codex' else []
     if args.worker_cli == 'codex':
         profiles.append(args.worker_profile or args.profile)
-    home = prepare_codex_home(Path(args.codex_home).expanduser(), profiles)
+    home = Path(args.codex_home).expanduser()
+    if profiles:
+        prepare_codex_home(home, profiles)
     token = uuid.uuid4().hex[:8]
     run = Path(args.runs_dir).expanduser() / ('fleet-' + time.strftime('%Y%m%d-%H%M%S-') + token)
     (run / 'workspace').mkdir(parents=True)
@@ -1273,7 +1659,12 @@ def start(args):
            'compact_limit': args.compact_limit, 'chrome_script': args.chrome_script,
            'chrome_min_interval': args.chrome_min_interval, 'worker_cli': args.worker_cli,
            'worker_model': args.worker_model, 'worker_kit': args.worker_kit,
-           'claude': args.claude or shutil.which('claude'), 'claude_window': args.claude_window}
+           'claude': args.claude or shutil.which('claude'), 'claude_window': args.claude_window,
+           'supervisor_cli': args.supervisor_cli, 'pi': pi, 'pi_model': args.pi_model,
+           'pi_thinking': args.pi_thinking, 'allow_unsandboxed_pi': args.allow_unsandboxed_pi,
+           'pi_agent_dir': args.pi_agent_dir, 'allow_profile_live_switch': args.allow_profile_live_switch}
+    if 'pi' in clis:
+        cfg['pi_home'] = str(pi_adapter.prepare_home(run / 'pi-home', args.pi_agent_dir))
     save(run / 'config.json', cfg)
     subprocess.run([redis_server, '--port', '0', '--unixsocket', cfg['redis_socket'],
                     '--unixsocketperm', '700', '--dir', str(run), '--dbfilename', 'fleet.rdb',
@@ -1326,6 +1717,22 @@ def status(cfg):
                                  for n in ['supervisor'] + cfg['workers']}}, ensure_ascii=False, indent=2))
 
 
+def print_inspection(args):
+    """Print an offline registry, route, or plan without loading fleet config."""
+    registry = AgentRegistry(args.registry)
+    if args.cmd == 'agents' and args.agents_cmd == 'list':
+        result = {'agents': registry.as_list()}
+    elif args.cmd == 'agents':
+        result = route_task(args.text, registry).to_dict()
+    else:
+        plan = build_dispatch_plan(args.goal, registry)
+        result = plan.to_dict()
+        if args.workers:
+            workers = [worker.strip() for worker in args.workers.split(',')]
+            result['profile_assignments'] = assign_profiles(plan, workers, registry)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog='cmux-fleet', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='cmd', required=True)
@@ -1348,8 +1755,18 @@ def main(argv=None):
     s.add_argument('--compact-limit', type=int, help='codex model_auto_compact_token_limit (default: codex decides)')
     s.add_argument('--chrome-script', help='optional browser broker script run by the daemon for sandboxed agents')
     s.add_argument('--chrome-min-interval', type=float, default=DEFAULTS['chrome_min_interval'])
-    s.add_argument('--worker-cli', choices=('codex', 'claude'), default=DEFAULTS['worker_cli'],
-                   help='CLI for workers (the supervisor is always codex)')
+    s.add_argument('--supervisor-cli', choices=('codex', 'pi'), default='codex', help='CLI for the supervisor')
+    s.add_argument('--worker-cli', choices=('codex', 'claude', 'pi'), default=DEFAULTS['worker_cli'],
+                   help='CLI for workers')
+    s.add_argument('--pi', help='pi binary (>= 1.1.0; default: first on PATH)')
+    s.add_argument('--pi-model', help='explicit provider/model for all pi agents; no implicit cloud fallback')
+    s.add_argument('--pi-thinking', choices=('off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'), default='off')
+    s.add_argument('--pi-agent-dir', default=os.environ.get('PI_CODING_AGENT_DIR') or str(Path.home() / '.pi/agent'),
+                   help='source of auth.json/models.json only, linked into a fresh per-run pi home')
+    s.add_argument('--allow-unsandboxed-pi', action='store_true',
+                   help='acknowledge that pi tools run with your OS permissions, without a sandbox')
+    s.add_argument('--allow-profile-live-switch', action='store_true',
+                   help='allow task apply_profiles_live=true to respawn idle workers for assigned profiles')
     s.add_argument('--worker-model', default=DEFAULTS['worker_model'], help='claude workers: --model value')
     s.add_argument('--worker-kit', help='claude workers: dir with .claude/{agents,skills} and mcp.json copied into each worker cwd')
     s.add_argument('--claude', help='claude binary (default: first on PATH)')
@@ -1364,8 +1781,24 @@ def main(argv=None):
                    help='at most this many workers working at once (0 = no limit)')
     s.add_argument('--request-timeout', type=float, default=DEFAULTS['request_timeout'],
                    help='service mode: seconds before an unanswered request is published as timeout')
+    ag = sub.add_parser('agents', help='inspect offline agent profiles without starting or contacting a fleet')
+    ag_sub = ag.add_subparsers(dest='agents_cmd', required=True)
+    ag_list = ag_sub.add_parser('list', help='list validated agent cards as JSON')
+    ag_list.add_argument('--registry', help='agent card directory (default: project or package agents/)')
+    ag_list.add_argument('--json', action='store_true', help='JSON output (already the default)')
+    ag_match = ag_sub.add_parser('match', help='select an agent profile for task text')
+    ag_match.add_argument('text')
+    ag_match.add_argument('--registry', help='agent card directory (default: project or package agents/)')
+    ag_match.add_argument('--json', action='store_true', help='JSON output (already the default)')
+    pl = sub.add_parser('plan', help='build an offline rule-based dispatch plan as JSON')
+    pl.add_argument('goal')
+    pl.add_argument('--registry', help='agent card directory (default: project or package agents/)')
+    pl.add_argument('--workers', help='comma-separated stable worker slots; include profile assignments when supplied')
+    pl.add_argument('--json', action='store_true', help='JSON output (already the default)')
     sub.add_parser('daemon', help='run the coordinator (internal)').add_argument('cfg')
-    t = sub.add_parser('task', help='submit a goal: JSON file or - for stdin ({"goal":..., "hours":..., "artifacts":[...]})')
+    t = sub.add_parser(
+        'task', help='submit a goal: JSON file or - for stdin '
+        '({"goal":..., "hours":..., "artifacts":[...], "auto_agents":true, "agent_registry":...})')
     t.add_argument('spec')
     for name in ('status', 'stop', 'resume'):
         sub.add_parser(name).add_argument('--config', default=str(LATEST))
@@ -1388,9 +1821,13 @@ def main(argv=None):
     h = sub.add_parser('claude-stop', help='Claude Code Stop hook (internal; hook JSON on stdin)')
     for arg in ('cfg', 'agent', 'generation'):
         h.add_argument(arg)
-    a = sub.add_parser('actor', help='exec codex for one agent (internal)')
+    h = sub.add_parser('pi-event', help='Pi extension callback (internal; event JSON on stdin)')
+    for arg in ('cfg', 'agent', 'generation'):
+        h.add_argument(arg)
+    a = sub.add_parser('actor', help='exec the configured CLI for one agent (internal)')
     for arg in ('cfg', 'agent', 'prompt'):
         a.add_argument(arg)
+    a.add_argument('--generation', type=int, help='pinned spawn generation (internal)')
     args = p.parse_args(argv)
     if args.cmd == 'start':
         start(args)
@@ -1400,8 +1837,12 @@ def main(argv=None):
         notify(args.cfg, args.agent, args.generation, args.payload)
     elif args.cmd == 'claude-stop':
         claude_stop(args.cfg, args.agent, args.generation, sys.stdin.read())
+    elif args.cmd == 'pi-event':
+        pi_event(args.cfg, args.agent, args.generation, sys.stdin.read(1000001))
     elif args.cmd == 'actor':
-        actor(args.cfg, args.agent, args.prompt)
+        actor(args.cfg, args.agent, args.prompt, args.generation)
+    elif args.cmd in ('agents', 'plan'):
+        print_inspection(args)
     else:
         cfg = load(args.config)
         if args.cmd == 'status':
