@@ -202,6 +202,111 @@ def test_supervisor_dispatch_reaches_worker(fx):
     assert fx.agent('worker-1')['state'] == 'busy'
 
 
+def test_auto_agents_stores_plan_and_keeps_profile_ids_out_of_slot_routing(fx):
+    fx.finish('cancelled', 'replace fixture task')
+    artifacts = []
+    task_id = fx.submit({
+        'goal': 'implement a router bug fix and tests',
+        'auto_agents': True,
+        'hours': 2,
+        'artifacts': artifacts,
+    })
+
+    task = fx.task()
+    plan = json.loads(task['dispatch_plan'])
+    assignments = json.loads(task['profile_assignments'])['assignments']
+    assert task['id'] == task_id and task['auto_agents'] == '1'
+    assert json.loads(task['artifacts']) == artifacts
+    assert [(item['id'], item['agent_id']) for item in plan['subtasks']] == [
+        ('implementation', 'flashnext-coder'),
+        ('review', 'claude-reviewer'),
+    ]
+    assert plan['subtasks'][1]['depends_on'] == ['implementation']
+    assert [(item['subtask_id'], item['worker'], item['agent_id']) for item in assignments] == [
+        ('implementation', 'worker-1', 'flashnext-coder'),
+        ('review', 'worker-1', 'claude-reviewer'),
+    ]
+
+    queued = fx.r.l['fx:inbox:supervisor'][-1]
+    assert 'flashnext-coder' in queued and 'claude-reviewer' in queued
+    assert 'profile ids are recommendations, not worker names' in queued
+    assert 'Profile assignments to stable worker slots:' in queued
+    assert 'Use each assignment worker value for dispatch.to' in queued
+    assert 'Include "Recommended profile: <agent_id>"' in queued
+    assert 'Do not dispatch dependent subtasks until every id in depends_on has finished' in queued
+    assert fx.labels() == ['worker-1']
+    assert fx.r.llen('fx:inbox:flashnext-coder') == 0
+
+    with pytest.raises(ValueError, match='dispatch.to must be one of worker-1'):
+        fleet.parse_decision(decision(dispatch=[{
+            'to': 'flashnext-coder',
+            'instruction': 'Implement the planned router change and tests',
+        }]), ['worker-1'], False)
+
+    fx.pump()
+    fx.handle(turn('supervisor', decision(dispatch=[{
+        'to': 'worker-1',
+        'instruction': 'Recommended profile: flashnext-coder. Implement the router change and tests.',
+    }])))
+    assert fx.r.llen('fx:inbox:worker-1') == 1
+    worker_message = fx.r.l['fx:inbox:worker-1'][0]
+    assert worker_message.startswith('[Recommended agent profile: flashnext-coder]\n')
+    assert 'Capabilities: code-edit, test-fix, planning' in worker_message
+    assert 'You are still the stable slot worker-1.' in worker_message
+    assert 'Recommended profile: flashnext-coder' in worker_message
+    assert fx.r.llen('fx:inbox:flashnext-coder') == 0
+
+
+def test_task_without_auto_agents_has_no_profile_assignment_metadata(fx):
+    task = fx.task()
+    assert 'dispatch_plan' not in task and 'profile_assignments' not in task
+
+
+def test_unique_worker_assignment_adds_advisory_without_explicit_marker(fx):
+    fx.finish('cancelled', 'replace fixture task')
+    fx.submit({'goal': 'review code changes for safety', 'auto_agents': True})
+    fx.pump()
+    fx.handle(turn('supervisor', decision(dispatch=[{
+        'to': 'worker-1',
+        'instruction': 'Review the current code changes and report findings in severity order.',
+    }])))
+
+    worker_message = fx.r.l['fx:inbox:worker-1'][0]
+    assert worker_message.startswith('[Recommended agent profile: claude-reviewer]\n')
+    assert 'Capabilities: code-review, safety-audit, planning' in worker_message
+
+
+@pytest.mark.parametrize('bad_auto_agents', ['true', 1, 0, None, []])
+def test_task_rejects_non_boolean_auto_agents(fx, bad_auto_agents):
+    fx.finish('cancelled', 'replace fixture task')
+    fx.handle({'kind': 'task', 'request_id': 'bad-auto', 'spec': {
+        'goal': 'implement a router bug fix',
+        'auto_agents': bad_auto_agents,
+    }})
+    answer = json.loads(fx.r.get('fx:reply:bad-auto'))
+    assert answer['status'] == 'rejected'
+    assert answer['reason'] == 'auto_agents must be a boolean'
+    assert fx.task()['status'] == 'cancelled'
+
+
+def test_task_without_auto_agents_keeps_legacy_empty_artifact_validation(fx):
+    fx.finish('cancelled', 'replace fixture task')
+    with pytest.raises(ValueError, match='artifacts must be a non-empty list'):
+        fx.submit({'goal': 'write a report', 'artifacts': []})
+
+
+def test_task_agent_registry_path_must_be_an_existing_directory(fx, tmp_path, monkeypatch):
+    fx.finish('cancelled', 'replace fixture task')
+    registry_file = tmp_path / 'registry.json'
+    registry_file.write_text('{}')
+    with pytest.raises(ValueError, match='must exist and be a directory'):
+        fx.submit({'goal': 'plan this change', 'agent_registry': str(registry_file)})
+    assert fleet.validate_agent_registry_path(str(tmp_path)) == tmp_path
+    monkeypatch.setenv('FLEET_TEST_REGISTRY', str(tmp_path))
+    with pytest.raises(ValueError, match='must exist and be a directory'):
+        fleet.validate_agent_registry_path('$FLEET_TEST_REGISTRY')
+
+
 def test_worker_reply_becomes_tagged_supervisor_report(fx):
     fx.pump(); fx.handle(turn('supervisor', decision())); fx.pump()
     fx.handle(turn('worker-1', 'Done: wrote report.md'))
@@ -927,6 +1032,7 @@ def test_workers_become_tabs_of_one_pane_and_successor_takes_its_place(monkeypat
     monkeypatch.setattr(mgr, '_surfaces', lambda ws: {k: {'pane_id': v} for k, v in panes.items()}, raising=False)
     monkeypatch.setattr(mgr, '_tag', lambda *a, **k: None, raising=False)
     monkeypatch.setattr(mgr, 'rename', lambda *a: None, raising=False)
+    monkeypatch.setattr(mgr, '_meta', lambda: {'surfaces': {}}, raising=False)
 
     def place_right_of(w, sup):
         panes[w] = 'p1'

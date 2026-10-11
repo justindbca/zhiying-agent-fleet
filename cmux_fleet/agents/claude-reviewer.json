@@ -1,0 +1,15 @@
+{
+  "id": "claude-reviewer",
+  "display_name": "Claude Reviewer",
+  "cli": "claude",
+  "capabilities": [
+    "code-review",
+    "safety-audit",
+    "planning"
+  ],
+  "role_file": "worker.md",
+  "cost_rank": 3,
+  "latency_rank": 3,
+  "risk_rank": 1,
+  "model": "sonnet"
+}

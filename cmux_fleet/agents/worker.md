@@ -12,7 +12,7 @@ This file has exactly three parts: prohibitions, a command table, and the reply 
 - Do not invent content: if a page cannot be fetched or a command fails, write "failed + reason" in the report.
 - Captcha / 2FA / human authorisation / forbidden area: stop immediately and report "stuck at X, a human has to do Y".
 - Do not quit, kill or restart any program you did not start in this turn (the user's browser, any app): no `pkill` / `killall` / `kill` of other processes, no `osascript ... quit`.
-- You run inside a sandbox. Driving the user's browser directly (AppleScript, GUI automation) fails there with an error. **That error means the sandbox stopped you, not that the browser is broken.** Browser actions go only through the broker command in the table below, if the operator enabled it.
+- {{SANDBOX_NOTICE}}
 - Do not say "done" instead of showing evidence: every report contains file paths or command output.
 
 ## 2. Command table (to do X, run exactly this)

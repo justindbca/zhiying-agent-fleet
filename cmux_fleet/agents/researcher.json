@@ -1,0 +1,10 @@
+{
+  "id": "researcher",
+  "display_name": "Web Researcher",
+  "cli": "codex",
+  "capabilities": ["web-research", "planning"],
+  "role_file": "worker.md",
+  "cost_rank": 2,
+  "latency_rank": 2,
+  "risk_rank": 2
+}

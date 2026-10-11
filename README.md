@@ -1,23 +1,27 @@
 # cmux-fleet
 
-One **supervisor** and N **worker** [Codex CLI](https://github.com/openai/codex) sessions, each in its
+One **supervisor** and N **worker** sessions (Codex by default; optional Pi and Claude Code), each in its
 own [cmux](https://cmux.dev) tab, coordinated by a small daemon. The supervisor only judges and
 dispatches; workers only execute. Sessions whose context fills up are rotated automatically with a
 written handoff note, so a task can run for hours across many model sessions.
 
-[中文说明](README.zh-CN.md)
+[中文说明](README.zh-CN.md) · [Design baseline / 已确认设计基线](docs/design.md)
+
+The design baseline preserves the original supervisor/worker roles, naming, handoff and protocols.
+See the [2026-10-12 local integration review](reports/full-local-merge-20261012.md) for the current scope and validation.
+**Local integration is not production deployment or Redis-v2 runtime acceptance.**
 
 ```
- cmux workspace "Fleet agents" (one page)            cmux workspace "Fleet control"
- ┌────────────────────────┬────────────────────┐    ┌──────────────────────────────┐
- │ supervisor.2 (live)    │ ▸worker-1.1│worker-2│    │ daemon (fleet.py daemon)     │
- │ codex TUI              │  worker-3  (tabs)  │    │  ├─ private Redis (unix sock)│
- │                        │                    │    │  ├─ routes replies           │
- ├────────────────────────┤ selected worker's  │    │  ├─ verifies artifacts       │
- │ history (browser):     │ live TUI           │    │  ├─ rotates full sessions    │
- │ supervisor / worker-1… │                    │    │  └─ stall watchdog           │
- │ every retired gen, 🔍  │                    │    └──────────────────────────────┘
- └────────────────────────┴────────────────────┘
+ cmux workspace "Fleet agents" (one page)
+ ┌───────────────────────────────┬────────────────────────┐
+ │ supervisor-1.2                │ [worker-1.1] [worker-2] │
+ │ supervisor TUI (selected)     │ worker tabs            │
+ │                               │                        │
+ ├───────────────────────────────┤ selected worker's TUI  │
+ │ [history] [control]           │                        │
+ │ retired screens + handoffs    │                        │
+ └───────────────────────────────┴────────────────────────┘
+ control: the same daemon, private Redis socket, routing, verification and watchdog.
 ```
 
 ## Why
@@ -32,12 +36,13 @@ What the daemon enforces, independently of what the models claim:
 - **Acceptance is literal.** A task ends only when every declared artifact exists, is long enough and
   contains the required text. Three false `COMPLETED` claims block the task.
 - **No host commands from models.** The supervisor can only declare files to check, never commands to
-  run. Workers are sandboxed (`workspace-write`, network on).
+  run. Codex agents are sandboxed (`workspace-write`, network on); Pi and the optional Claude workers are not.
 - **Context rotation before overflow.** Before each delivery the daemon reads the session's token usage
-  from Codex's own rollout file. At `--handoff-ratio` (default 60 %) it asks the session to write a
+  from the selected CLI's rollout/transcript or Pi context API. At `--handoff-ratio` (default 60 %) it asks the session to write a
   three-section handoff note, merges it into a machine skeleton, saves the old screen to the history
   page, and starts a successor in the same place (`worker-1` → `worker-1.1` → `worker-1.2`) that reads the note. If the model
-  does not write, the skeleton is used; a rotation never fails.
+  does not write, the skeleton is used; missing model-written notes alone do not block rotation.
+  Window/process failures still follow the normal failure path.
 - **Stall watchdog.** A busy agent whose rollout file has not changed for `--stall-timeout` seconds
   (default 30 min) is aborted and reported to the supervisor; a stalled supervisor gets one retry, then
   the task is blocked for a human.
@@ -49,7 +54,7 @@ What the daemon enforces, independently of what the models claim:
 - macOS with [cmux](https://cmux.dev) ≥ 0.64.25 (`new-surface --command`). Run `start` **inside a cmux
   terminal**, or set cmux's *automation → socket control mode* away from `cmuxOnly`; by default cmux
   only accepts commands from processes it started.
-- [Codex CLI](https://github.com/openai/codex) ≥ 0.156 (per-file profiles, `check_for_update_on_startup`). The daemon parses Codex's rollout `.jsonl` files (`token_count`,
+- For Codex agents: [Codex CLI](https://github.com/openai/codex) ≥ 0.156 (per-file profiles, `check_for_update_on_startup`). The daemon parses Codex's rollout `.jsonl` files (`token_count`,
   `task_complete`, subagent metadata); if a Codex release changes that format, pin the version that
   works for you.
 - `redis-server` on PATH (`brew install redis`). Each run starts its own instance on a Unix socket under
@@ -108,7 +113,10 @@ Redis dump and log. `~/.cmux-fleet/latest.json` points at the newest run.
 ## Layout and the history page
 
 Everything lives on one cmux page: the supervisor top-left, the **history** browser pane under it, the
-workers as tabs of one pane on the right (worker-1, worker-2, …). When a session rotates, its successor opens in the same spot and the
+workers as tabs of one pane on the right (worker-1, worker-2, …). After startup the daemon's `control`
+surface is docked as an inactive tab beside history in the lower-left pane; history stays selected.
+Its now-empty startup workspace closes
+without killing the daemon. Click `control` only when you need logs; it is not another AI agent. When a session rotates, its successor opens in the same spot and the
 retired session's whole screen (with scrollback) and handoff note go to `<run>/history.html`, which the
 history pane reloads. On that page you pick an agent (`supervisor`, `worker-1`, …), pick a retired
 generation (`supervisor-1`, `supervisor-1.1`, …, `worker-1`, `worker-1.1`, …), switch between its screen
@@ -150,7 +158,7 @@ cmux-fleet pause --reason "market closed"; cmux-fleet resume
 
 ## Claude Code workers (optional)
 
-The supervisor is always Codex. Workers can be [Claude Code](https://claude.com/claude-code) sessions instead:
+The supervisor defaults to Codex (or select Pi below). Workers can be official [Claude Code](https://claude.com/claude-code) CLI sessions instead:
 
 ```bash
 cmux-fleet start --workers 2 --worker-cli claude --worker-model sonnet --worker-kit ~/my-kit
@@ -164,6 +172,63 @@ cmux-fleet start --workers 2 --worker-cli claude --worker-model sonnet --worker-
   submit a pasted newline as Enter.
 - The "trust this folder?" prompt is pre-answered in `~/.claude.json`; the scope file is also written as `CLAUDE.md`.
 - `--worker-kit DIR` is copied into every worker cwd: `DIR/.claude/{agents,skills}` and `DIR/mcp.json`.
+
+## Pi agents (optional, Pi >= 1.1.0)
+
+Pi can run the supervisor, workers, or both. Claude workers still run the **official `claude` CLI
+as a separate process started by fleet**. Pi does not proxy Claude requests or consume Claude Code's
+subscription credentials. This separation is not a guarantee against account limits or enforcement;
+follow the providers' terms.
+
+Example: a local-model Pi supervisor with official Claude Code workers:
+
+```bash
+cmux-fleet start --mode service --workers 2 \
+  --supervisor-cli pi --pi-model local/my-model --pi-thinking off \
+  --worker-cli claude --worker-model sonnet \
+  --allow-unsandboxed-pi
+```
+
+Configure `local/my-model` in Pi's `models.json` first. `--pi-model` is required (no implicit
+fallback to a personal/cloud default). To use the same Pi model for workers instead, select
+`--worker-cli pi`. An all-Pi fleet needs neither a Codex binary nor a Codex profile.
+
+- `--pi PATH`: Pi CLI binary, >= 1.1.0 (the `agent_settled` lifecycle is required).
+- `--pi-agent-dir DIR`: source Pi directory, default `$PI_CODING_AGENT_DIR` or `~/.pi/agent`.
+  Only its `auth.json` and `models.json` are linked into a fresh `<run>/pi-home`. Credentials are
+  not printed. No Claude configuration/credentials are copied. Model-file credential commands
+  are executable configuration: use a trusted source.
+- Discovered extensions, skills, MCP, prompt templates, themes, project settings and context
+  files are disabled. Only the bundled bridge extension loads, and the generated `AGENTS.md`
+  is explicitly appended to the system prompt. Pi's read/bash/edit/write tools remain enabled.
+- **Pi has no OS sandbox.** `--allow-unsandboxed-pi` is an explicit acknowledgement, not a sandbox
+  switch. Role instructions are not a security boundary. Use a dedicated account/VM for untrusted tasks.
+- Pi session names and terminal titles use the fleet's existing label (`supervisor-1.1`, `worker-1.1`,
+  etc.), not the cwd or a separate naming scheme. The original slot/generation/history rules stay unchanged.
+- In the supervisor TUI, ordinary typed text enters the daemon's existing request/task queue instead
+  of bypassing it. In service mode Python assigns a real request ID, the worker answers in a `reply`
+  JSON field, and the result is queued back to the supervisor for reporting. In task mode text starts
+  a task or supplies a follow-up to the current task. Slash commands and daemon inbox pointers are
+  not re-enqueued; images are rejected with a message (supply a file path instead).
+- Pi reports completion only on `agent_settled`, after tools, retries and automatic continuations.
+  Generation plus inbox delivery ID reject stale/duplicate completions, including after Escape.
+  The ID comes only from the final daemon pointer in this agent's own `.inbox`, never an inbox path
+  quoted in the instruction text (e.g. a supervisor's path forwarded to a worker).
+  An unsuccessful startup never counts as READY; error/aborted partial JSON is never accepted as a result.
+- Context usage comes from Pi's `getContextUsage()`; each generation writes its session under
+  `<run>/pi-sessions/<slot>/g<N>/`. Fleet still handles idle-boundary rotation and history; Pi's
+  automatic compaction remains a safety net within a long turn. `--compact-limit` is Codex-only.
+- The Pi bridge callback runs through the fleet Python interpreter and **only its private Redis
+  Unix socket**, not `localhost:6379`. A callback failure is shown by Pi; the fleet watchdog
+  eventually handles a missing completion.
+
+Optional live adapter smoke (uses a temporary private Redis, fake cmux, real Pi/model; **no Claude calls**):
+
+```bash
+python tests/pi_smoke.py --model local/my-model
+```
+
+This tests READY, JSON request/result and handoff to a new generation. It is not a real cmux TUI test.
 
 ## How a task flows
 
@@ -197,7 +262,7 @@ the verb, confines `js` files to the run directory, paces page actions (`--chrom
 
 | Key | Type | Content |
 |---|---|---|
-| `fx:events` | list | daemon BLPOP: `turn` (notify hook), `task` / `request` / `pause` / `resume` / `stop` / `chrome` (with `request_id`) |
+| `fx:events` | list | daemon BLPOP: `turn` (CLI callback), `pi_session`; `task` / `request` / `operator_input` / `pause` / `resume` / `stop` / `chrome` (with `request_id`) |
 | `fx:reply:<request_id>` | string | request reply (24 h) |
 | `fx:agent:<name>` | hash | role, pane, thread, generation, state (starting/idle/busy/handoff/dead), ctx_used, ctx_window, busy_since, stalls, handoff_* |
 | `fx:inbox:<name>` | list | pending messages; delivered only when the agent is idle |
@@ -219,8 +284,13 @@ the verb, confines `js` files to the run directory, paces page actions (`--chrom
   handoff note, was retired into a read-only record pane and replaced by a successor that finished
   the task. Rotation, artifact verification, the update-dialog suppression and the isolated Codex home
   were all exercised live.
-- The unit suite (27 tests) runs the daemon against an in-memory Redis, a fake cmux manager and
-  synthetic rollout files.
+- Historical Pi-adapter suite (before dynamic routing and Redis-v2 foundations): **91 passed** locally, including the actual TypeScript bridge contract;
+  isolated target tests: **90 passed, 1 skipped** because Node was not on that test process's PATH.
+- Real Pi + Flash Next + cmux 0.65 validation covered READY, request/result, both-role handoff and
+  history. A real supervisor TUI instruction to ask a worker to reply OK completed end-to-end.
+  Control/history share a pane without restarting the daemon. See [design status](docs/design.md#10-验证与交付状态截至本次固化).
+- A real Pi-supervisor / official-Claude-worker task has **not** been exercised; only that mixed CLI
+  dispatch path is unit-tested. Development validation does not waive the review/deployment gate.
 - Not exercised live yet: the stall watchdog (unit-tested only) and the browser broker.
 
 ## What the live run taught us (already fixed)
