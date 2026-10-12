@@ -269,7 +269,9 @@ cmux-fleet start --supervisor-cli codex --supervisor-profile fleet-astra \
 cmux-fleet task goal.json
 ```
 
-Service mode, Claude supervisors, Codex workers and Pi/official-CLI mixes stay refused with a reason
+Validated locally with `--claude` pointing at the real Claude Code binary; the cmux `claude` shim found
+first on PATH inside cmux was not exercised. Service mode, Claude supervisors, Codex workers and
+Pi/official-CLI mixes stay refused with a reason
 before provisioning or profile retirement.
 New `start` commands now require Redis v2 (the default); `--transport-version 1` is rejected. Existing v1 configs remain readable for draining/status/stop only: do not edit their transport version in place. The file-delivery and native-Codex/Claude startup descriptions above are legacy behavior, not a supported new v2 launch path. Unsupported CLI combinations fail rather than silently falling back to files. The development opt-in is still required.
 
