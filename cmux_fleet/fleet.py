@@ -1462,6 +1462,15 @@ class Fleet:
             unready = [r for r, e in zip(row.get('provides') or [], current) if not e or e['status'] != 'ready']
             row['status'] = 'failed' if unready else 'done'
             row['reason'] = ('reported, but not ready: ' + ', '.join(unready)) if unready else 'outputs verified'
+            claimed = {i + '@' + str(v) for i, v in contracts.ready_claims(str(fields.get('interfaces', '')))}
+            unclaimed = [contracts.ref(e) for e in current if e and e['status'] != 'ready'
+                         and contracts.ref(e) not in claimed and not contracts.file_failures(e, ws)]
+            if unclaimed:  # file passes, announcement line missing/garbled: say which literal line
+                line = 'Interfaces: ' + ', '.join(x + ' provided: ready' for x in unclaimed)
+                row['reason'] += ' (the report has no line `' + line + '`; ' + self.label(name) + ' was asked for it)'
+                self.contract_queue(s, name, '[contract] ' + row['id'] + ' is not done: your report did not announce '
+                                    + ', '.join(unclaimed) + '. If the file is written, reply in the AGENTS.md format '
+                                    'with this exact line: ' + line, row['id'])
             self.contract_log('task.' + row['status'], task=row['id'], by=name, reason=row['reason'])
             for held in contracts.releasable(s) if not unready else []:
                 held['status'] = 'running'

@@ -6,7 +6,7 @@ real ``claude_stop`` hooks, a fake cmux world.
 import json
 from pathlib import Path
 
-from test_contracts import cf, inbox, item, p0_reply, report  # noqa: F401  (fixture + helpers)
+from test_contracts import cf, inbox, item, p0_reply, report, write  # noqa: F401  (fixture + helpers)
 from test_escalate import escalate, ok_check, parallel_m0  # noqa: F401
 from test_subfleet import (child_daemon, hook, no_launch, parent_hook, step,  # noqa: F401
                            stop_child_like_daemon, tree)
@@ -177,3 +177,17 @@ def test_child_that_did_not_complete_copies_nothing(tree):
     stop_child_like_daemon(cf)
     f.tick()
     assert subfleet.record(rec['run'])['state'] == 'failed' and not out.exists()
+
+
+# ------------------------------------------------------------------ P2: a garbled Interfaces line is named
+def test_written_file_without_the_interfaces_line_tells_the_worker(cf):
+    parallel_m0(cf)
+    write(cf, 'worker-1/sources.md', '## Sources\n| https://a |\n')
+    report(cf, 'worker-1', 'IF-M0-src@1: provided: ready\n')  # the acceptance slip: no `Interfaces:` prefix
+    row = cf.contract_state()['tasks']['M0']
+    assert row['status'] == 'failed' and 'no line `Interfaces: IF-M0-src@1 provided: ready`' in row['reason']
+    hint = inbox(cf, 'worker-1')[-1]
+    assert 'did not announce IF-M0-src@1' in hint and 'Interfaces: IF-M0-src@1 provided: ready' in hint
+    # the corrected report settles M0 (the hint was queued under M0)
+    report(cf, 'worker-1', 'Interfaces: IF-M0-src@1 provided: ready\n')
+    assert cf.contract_state()['tasks']['M0']['status'] == 'done'
