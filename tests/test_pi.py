@@ -320,7 +320,7 @@ def mock_start(tmp_path, monkeypatch):
     monkeypatch.setattr(fleet, 'connect', lambda cfg: FakeRedis())
     # Provisioning is fake here: do not create persistent Redis directories in the checkout.
     monkeypatch.setattr(fleet.redis_runtime, 'prepare', fleet.redis_runtime.paths)
-    args = ['start', '--supervisor-cli', 'pi', '--worker-cli', 'pi', '--pi-model', 'local/test',
+    args = ['start', '--lifecycle', 'dev_task', '--supervisor-cli', 'pi', '--worker-cli', 'pi', '--pi-model', 'local/test',
             '--allow-unsandboxed-pi', '--allow-development-v2', '--runs-dir', str(tmp_path / 'runs'),
             '--pi-agent-dir', str(tmp_path / 'user-pi'), '--codex-home', str(tmp_path / 'codex-home')]
     return args, ran
