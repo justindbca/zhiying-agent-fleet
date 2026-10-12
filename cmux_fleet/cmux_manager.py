@@ -493,6 +493,58 @@ class CmuxSessionManager:
     def reload_browser(self, surface: str) -> bool:
         return bool(self._where(surface)) and _run('browser', '--surface', surface, 'reload').returncode == 0
 
+    # -- handover between fleets (sub-fleets, docs/design.md §19) ----------------
+    def workspace_id(self) -> Optional[str]:
+        return self._meta().get('workspace')
+
+    def release(self, pane_id: str) -> Optional[Dict]:
+        """Give up ownership of a live surface without closing it, so another fleet's
+        registry can adopt it. Returns its registry entry (None if not ours)."""
+        meta = self._meta()
+        info = meta['surfaces'].pop(pane_id, None)
+        if info is not None:
+            self._save_meta(meta)
+        return info
+
+    def adopt(self, pane_id: str, peer: str, info: Dict) -> bool:
+        """Move a surface released by another fleet into ``peer``'s pane (just before it) and own it.
+
+        Same cross-workspace ``move-surface`` that docks the control tab. On failure the surface
+        stays where it was and is not registered here."""
+        ws = self._where(peer)
+        if not ws:
+            return False
+        pane = self._surfaces(ws)[peer]['pane_id']
+        if _run('move-surface', '--surface', pane_id, '--workspace', ws, '--pane', pane, '--before', peer,
+                '--focus', 'false').returncode:
+            return False
+        if not _wait_until(lambda: self._surfaces(ws).get(pane_id, {}).get('pane_id') == pane):
+            return False
+        self._tag(pane_id, **{k: v for k, v in (info or {}).items() if isinstance(v, str)})
+        return True
+
+    def place_after(self, workspace: Optional[str]) -> bool:
+        """Sidebar order: put this fleet's agents workspace right after ``workspace``."""
+        own = self.workspace_id()
+        if not own or not workspace or own == workspace:
+            return False
+        return _run('reorder-workspace', '--workspace', own, '--after', workspace).returncode == 0
+
+    def close_all(self) -> bool:
+        """Close every surface this registry owns, then its now-empty workspaces (history files
+        stay on disk). False if anything could not be confirmed closed."""
+        ok = True
+        for sid in list(self._meta()['surfaces']):
+            ok = self.kill_pane(sid) and ok
+        meta = self._meta()
+        for key in ('workspace', 'control_workspace'):
+            ws = meta.get(key)
+            if ws and not self._surfaces(ws):
+                _run('close-workspace', '--workspace', ws)  # empty only; never --force
+            elif ws:
+                ok = False
+        return ok
+
     def tab_into(self, pane_id: str, peer: str, before: bool = True) -> bool:
         """Move a surface into the pane holding ``peer`` as another tab: just before ``peer`` (a successor
         takes its predecessor's place in the tab row) or, with ``before=False``, at the end of the row."""

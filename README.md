@@ -241,6 +241,27 @@ Opt-in per task; without the key nothing changes. Rules: `docs/design.md` §18 (
 The program writes `<run>/contracts.json` (copied to `<workspace>/contracts.json`) and
 `<run>/contracts.log.jsonl`; agents only read them. Each agent directory gets `CONTRACTS.md`.
 
+## Sub-fleets (a worker becomes a sub-fleet supervisor; development)
+
+A busy worker can be turned into the supervisor of its own fleet for one numbered piece of work
+(`M0`, `M1`, ...; a sub-fleet of `M0` numbers `M0.0`, `M0.1`, ...). Details: `docs/design.md` §19.
+
+- Each fleet has its own cmux registry (`cmux-fleet`, `cmux-fleet:M0`, ...), daemon, private Redis and run
+  directory (`<main run>/sub/M0`). Only the main fleet is written to `latest.json`.
+- The sub-fleet is a separate workspace right after its parent in the sidebar, titled
+  `<main fleet name> › worker-1 › 子 fleet M0` (`start --name` sets the name; default: the task goal or
+  the run token). Its supervisor is the worker's live tab (same Claude session, moved top-left); the
+  parent keeps a placeholder tab in its place. When the sub-fleet finishes, the tab moves back and the
+  worker continues as `worker-1` of the main fleet.
+- Limits (program-enforced, reasons returned): `max_depth` 2, `max_children` 3, `max_agents_total` 12,
+  `child_workers_max` 3; override in config `limits` or in the roster YAML `limits:` (read on each check).
+- Only official Claude Code worker tabs can be handed over (a Pi bridge cannot reconnect to another Redis).
+- `status` shows the whole tree; `stop` on the main fleet stops sub-fleets first; `start --resume` on the
+  main fleet restarts sub-fleets that were running.
+- Test / operator entry (the owning daemon executes it):
+  `cmux-fleet subfleet spawn --slot worker-1 --task-id M0 --goal "..." --workers 2 [--output /abs/path]`.
+  The supervisor-approval path that calls it automatically is not wired yet.
+
 ## Claude Code workers (optional)
 
 The supervisor defaults to Codex (or select Pi below). Workers can be official [Claude Code](https://claude.com/claude-code) CLI sessions instead:

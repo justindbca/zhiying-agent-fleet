@@ -24,8 +24,10 @@ def parse(raw, base):
         data = yaml.safe_load(raw)
     except yaml.YAMLError as exc:
         raise ValueError('invalid YAML: ' + ' '.join(str(exc).split())) from exc
-    if not isinstance(data, dict) or set(data) != {'workers'} or not isinstance(data['workers'], list):
-        raise ValueError('the roster must be a mapping with only a "workers" list')
+    if (not isinstance(data, dict) or 'workers' not in data or not set(data) <= {'workers', 'limits'}
+            or not isinstance(data['workers'], list)):
+        raise ValueError('the roster must be a mapping with only a "workers" list (and optional "limits")')
+    parse_limits(data.get('limits'))
     if not data['workers']:
         raise ValueError('the roster needs at least one worker')
     errors, workers, roles = [], [], {}
@@ -52,6 +54,27 @@ def parse(raw, base):
     if errors:
         raise ValueError('\n'.join(errors))
     return workers, roles
+
+
+LIMIT_KEYS = ('max_depth', 'max_children', 'max_agents_total', 'child_workers_max')
+
+
+def parse_limits(value):
+    """Optional sub-fleet limits (docs/design.md §19): positive integers, known keys only."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError('limits must be a mapping of ' + ', '.join(LIMIT_KEYS))
+    bad = [k for k, v in value.items() if k not in LIMIT_KEYS or isinstance(v, bool) or not isinstance(v, int) or v < 1]
+    if bad:
+        raise ValueError('limits: unknown key or not a positive integer: ' + ', '.join(map(str, bad)))
+    return dict(value)
+
+
+def load_limits(path):
+    import yaml
+    data = yaml.safe_load(Path(path).expanduser().read_bytes())
+    return parse_limits(data.get('limits') if isinstance(data, dict) else None)
 
 
 def load(path):
