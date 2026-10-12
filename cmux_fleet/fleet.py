@@ -39,13 +39,14 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import contracts, handoff, history, lifecycle, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
+from cmux_fleet import cli_pairs, contracts, handoff, history, lifecycle, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -620,8 +621,38 @@ def claude_user_prompts(path, count=3):
     return list(out)
 
 
-PROMPT_HOOK_TIMEOUT = 30  # seconds; Claude lets the prompt through when a hook times out
-PROMPT_WAIT = 20  # daemon acceptance wait, kept inside PROMPT_HOOK_TIMEOUT
+PROMPT_HOOK_TIMEOUT = 60  # seconds; Claude lets the prompt through when a hook times out or crashes
+PROMPT_DEADLINE = 40  # the hook's own hard stop: it blocks the prompt itself well before Claude's timeout
+PROMPT_WAIT = 20  # daemon acceptance wait, kept inside PROMPT_DEADLINE
+
+
+class PromptDeadline(Exception):
+    pass
+
+
+def claude_prompt_main(cfg_path, name, generation, raw, deadline=PROMPT_DEADLINE):
+    """Fail-closed wrapper of claude_prompt for the hook process: the decision JSON it returns
+    always blocks unless claude_prompt explicitly let the prompt through. A crash (non-zero exit)
+    or a hook timeout would make Claude Code pass the operator text to the model, bypassing the
+    design.md §5 queue, so every error and the PROMPT_DEADLINE alarm end in a block instead."""
+    def expire(signum, frame):
+        raise PromptDeadline
+    # The hook process runs this on its main thread; an embedding thread (tests) skips the alarm.
+    armed = threading.current_thread() is threading.main_thread()
+    if armed:
+        previous = signal.signal(signal.SIGALRM, expire)
+        signal.setitimer(signal.ITIMER_REAL, deadline)
+    try:
+        reason = claude_prompt(cfg_path, name, generation, raw, wait=min(PROMPT_WAIT, max(1.0, deadline - 10)))
+    except PromptDeadline:
+        reason = 'Fleet 输入未确认（超过 ' + str(deadline) + ' 秒）；请先查看 control 再决定是否重试。'
+    except Exception as exc:  # noqa: BLE001 - fail closed: never let operator text reach the model
+        reason = 'Fleet 输入未受理（' + type(exc).__name__ + ': ' + str(exc)[:200] + '）；请先查看 control。'
+    finally:
+        if armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+    return reason
 IMAGE_PLACEHOLDER = re.compile(r'\[Image #\d+\]')
 
 
@@ -2509,6 +2540,12 @@ def start(args):
             return
     if args.transport_version != 2:
         raise SystemExit('new fleet instances require Redis transport v2; v1 is only readable for existing runs')
+    if getattr(args, 'supervisor_cli', None) is None or getattr(args, 'worker_cli', None) is None:
+        # A new run without an explicit CLI takes the pair table's default combination; the
+        # config written below always names both CLIs (the codex fallback is for old configs only).
+        default = cli_pairs.load_pairs().default
+        args.supervisor_cli = getattr(args, 'supervisor_cli', None) or default['supervisor_cli']
+        args.worker_cli = getattr(args, 'worker_cli', None) or default['worker_cli']
     lifecycle_problem = None
     try:  # --lifecycle decides cfg['mode'] (its base) before the CLI-pair check reads both keys
         args.lifecycle, args.mode = lifecycle.resolve_start(getattr(args, 'lifecycle', None), getattr(args, 'mode', None))
@@ -2705,10 +2742,11 @@ def main(argv=None):
     s.add_argument('--compact-limit', type=int, help='codex model_auto_compact_token_limit (default: codex decides)')
     s.add_argument('--chrome-script', help='optional browser broker script run by the daemon for sandboxed agents')
     s.add_argument('--chrome-min-interval', type=float, default=DEFAULTS['chrome_min_interval'])
-    s.add_argument('--supervisor-cli', choices=('codex', 'pi', 'claude'), default='codex', help='CLI for the supervisor')
+    s.add_argument('--supervisor-cli', choices=('codex', 'pi', 'claude'), default=None,
+                   help='CLI for the supervisor (default: cli_pairs.yaml default)')
     s.add_argument('--supervisor-model', default=DEFAULTS['supervisor_model'], help='claude supervisor: --model value')
-    s.add_argument('--worker-cli', choices=('codex', 'claude', 'pi'), default=DEFAULTS['worker_cli'],
-                   help='CLI for workers')
+    s.add_argument('--worker-cli', choices=('codex', 'claude', 'pi'), default=None,
+                   help='CLI for workers (default: cli_pairs.yaml default)')
     s.add_argument('--pi', help='pi binary (>= 1.1.0; default: first on PATH)')
     s.add_argument('--pi-model', help='explicit provider/model for all pi agents; no implicit cloud fallback')
     s.add_argument('--pi-thinking', choices=('off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'), default='off')
@@ -2824,7 +2862,7 @@ def main(argv=None):
     elif args.cmd == 'claude-stop':
         claude_stop(args.cfg, args.agent, args.generation, sys.stdin.read())
     elif args.cmd == 'claude-prompt':
-        reason = claude_prompt(args.cfg, args.agent, args.generation, sys.stdin.read())
+        reason = claude_prompt_main(args.cfg, args.agent, args.generation, sys.stdin.read())
         if reason:  # nothing at all on pass: a UserPromptSubmit hook's stdout becomes model context
             print(json.dumps({'decision': 'block', 'reason': reason}, ensure_ascii=False))
     elif args.cmd == 'pi-event':

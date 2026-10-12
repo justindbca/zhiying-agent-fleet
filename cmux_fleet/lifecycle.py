@@ -40,6 +40,10 @@ def _validate(table):
     for name, body in modes.items():
         if not isinstance(body, dict) or body.get('base') not in BASE_MODES:
             raise ValueError('fleet_modes.yaml: modes.' + name + '.base must be one of ' + ', '.join(BASE_MODES))
+        bases = body.get('bases', [body['base']])
+        if not isinstance(bases, list) or body['base'] not in bases or any(b not in BASE_MODES for b in bases):
+            raise ValueError('fleet_modes.yaml: modes.' + name + '.bases must be a list of ' + ', '.join(BASE_MODES)
+                             + ' that includes its base')
     if not isinstance(table.get('common', {}), dict):
         raise ValueError('fleet_modes.yaml: common must be a mapping')
     return table
@@ -119,10 +123,11 @@ def resolve_start(lifecycle, mode=None, path=None):
         return None, mode or 'task'
     validate_lifecycle(lifecycle, path)
     base = base_mode(lifecycle, path)
-    if mode and mode != base:
-        raise ValueError('--lifecycle ' + lifecycle + ' runs on --mode ' + base + ', not --mode ' + mode
+    bases = get_mode(lifecycle, path).get('bases') or [base]  # e.g. smoke checks task and service pairs
+    if mode and mode not in bases:
+        raise ValueError('--lifecycle ' + lifecycle + ' runs on --mode ' + ' | '.join(bases) + ', not --mode ' + mode
                          + ' (drop --mode; the lifecycle decides it)')
-    return lifecycle, base
+    return lifecycle, mode or base
 
 
 def _clock_module():

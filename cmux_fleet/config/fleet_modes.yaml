@@ -44,4 +44,5 @@ modes:
     on_cap: stop_and_report
   smoke:
     base: task
+    bases: [task, service]           # pair acceptance (A cli_pairs.yaml): `--mode service` smokes a service pair
     on_any_end: stop_and_close
