@@ -84,7 +84,8 @@ def _planning_prompt(goal: str) -> str:
     ) % goal
 
 
-def build_dispatch_plan(goal: str, registry: Optional[AgentRegistry] = None) -> DispatchPlan:
+def build_dispatch_plan(goal: str, registry: Optional[AgentRegistry] = None,
+                        preferred_cli: Optional[str] = None) -> DispatchPlan:
     if not isinstance(goal, str) or not goal.strip():
         raise ValueError("goal must be a non-empty string")
     goal = goal.strip()
@@ -98,7 +99,7 @@ def build_dispatch_plan(goal: str, registry: Optional[AgentRegistry] = None) -> 
 
     if review_goal:
         decision = route_task("Review and safety-audit: " + goal, registry,
-                              required_capability="code-review")
+                              required_capability="code-review", preferred_cli=preferred_cli)
         return DispatchPlan(goal, "review", (
             DispatchSubtask("review", "Review the requested scope", decision.agent_id,
                             decision.capability, _review_prompt(goal)),
@@ -106,7 +107,7 @@ def build_dispatch_plan(goal: str, registry: Optional[AgentRegistry] = None) -> 
 
     if research_goal or ("web-research" in hints and not hints.intersection(("code-edit", "test-fix"))):
         decision = route_task("Web research with sources: " + goal, registry,
-                              required_capability="web-research")
+                              required_capability="web-research", preferred_cli=preferred_cli)
         return DispatchPlan(goal, "research", (
             DispatchSubtask("research", "Research and synthesize evidence", decision.agent_id,
                             decision.capability, _research_prompt(goal)),
@@ -114,9 +115,9 @@ def build_dispatch_plan(goal: str, registry: Optional[AgentRegistry] = None) -> 
 
     if hints.intersection(("code-edit", "test-fix")):
         implementation = route_task("Implement this code change: " + goal, registry,
-                                    required_capability="test-fix" if "test-fix" in hints else "code-edit")
+                                    required_capability="test-fix" if "test-fix" in hints else "code-edit", preferred_cli=preferred_cli)
         review = route_task("Review and safety-audit this code change: " + goal, registry,
-                            required_capability="code-review")
+                            required_capability="code-review", preferred_cli=preferred_cli)
         subtasks = (
             DispatchSubtask("implementation", "Implement and test the change", implementation.agent_id,
                             implementation.capability, _implementation_prompt(goal)),
@@ -127,14 +128,14 @@ def build_dispatch_plan(goal: str, registry: Optional[AgentRegistry] = None) -> 
 
     if hints.intersection(("code-review", "safety-audit")):
         decision = route_task("Review and safety-audit: " + goal, registry,
-                              required_capability="code-review")
+                              required_capability="code-review", preferred_cli=preferred_cli)
         return DispatchPlan(goal, "review", (
             DispatchSubtask("review", "Review the requested scope", decision.agent_id,
                             decision.capability, _review_prompt(goal)),
         ))
 
     decision = route_task("Plan and design: " + goal, registry,
-                          required_capability="planning")
+                          required_capability="planning", preferred_cli=preferred_cli)
     return DispatchPlan(goal, "planning", (
         DispatchSubtask("planning", "Plan the work", decision.agent_id,
                         decision.capability, _planning_prompt(goal)),

@@ -60,3 +60,62 @@ def test_spawned_reviewer_scope_keeps_base_protocol_then_reviewer_role(live):
     role = scope.index("## Assigned profile role")
     assert base < role < scope.index("复核是为了尽快上线")
     assert "{{" not in scope
+
+
+# -- official Claude workers: implementation goes to claude-coder, never to a Pi card
+
+import json
+
+import pytest
+
+from cmux_fleet.router import route_task
+from test_v2_codex_claude import mixed  # noqa: F401,E402
+from test_message_bus_v2 import private_redis_v2  # noqa: F401,E402
+
+GOAL = "implement a router bug fix and tests"
+
+
+def plan_pairs(task):
+    return [(t["id"], t["agent_id"], t["depends_on"]) for t in json.loads(task["dispatch_plan"])["subtasks"]]
+
+
+def test_claude_coder_card_is_claude_opus_with_plain_worker_role():
+    card = AgentRegistry().get("claude-coder")
+    assert (card.cli, card.model, card.role_file) == ("claude", "opus", "worker.md")
+    assert {"code-edit", "test-fix"} <= set(card.capabilities) and "code-review" not in card.capabilities
+
+
+def test_legacy_routing_without_preferred_cli_is_unchanged():
+    assert [(t.id, t.agent_id) for t in build_dispatch_plan(GOAL).subtasks] == [
+        ("implementation", "flashnext-coder"), ("review", "claude-reviewer")]
+    assert build_dispatch_plan("plan the architecture").subtasks[0].agent_id == "flashnext-coder"
+    assert route_task("fix failing tests").agent_id == "flashnext-coder"
+
+
+def test_preferred_claude_plan_uses_claude_coder_then_claude_reviewer():
+    plan = build_dispatch_plan(GOAL, preferred_cli="claude")
+    assert [(t.id, t.agent_id, t.depends_on) for t in plan.subtasks] == [
+        ("implementation", "claude-coder", ()), ("review", "claude-reviewer", ("implementation",))]
+
+
+@pytest.mark.parametrize("worker_cli", ["pi", "codex"])
+def test_pi_and_codex_fleets_keep_existing_plan(fx, worker_cli):  # noqa: F811
+    fx.finish("cancelled", "replace fixture task")
+    fx.cfg["worker_cli"] = worker_cli
+    fx.submit({"goal": GOAL, "auto_agents": True})
+    assert plan_pairs(fx.task()) == [
+        ("implementation", "flashnext-coder", []), ("review", "claude-reviewer", ["implementation"])]
+
+
+def test_codex_supervisor_claude_workers_plan_passes_v2_preflight(mixed, monkeypatch):  # noqa: F811
+    f = mixed
+    f.cfg["allow_profile_live_switch"] = True
+    f.submit({"goal": GOAL, "auto_agents": True, "apply_profiles_live": True})
+    assert plan_pairs(f.task()) == [
+        ("implementation", "claude-coder", []), ("review", "claude-reviewer", ["implementation"])]
+    monkeypatch.setattr(fleet.shutil, "which", lambda binary: "/usr/bin/" + binary)
+    registry = AgentRegistry()
+    for profile in ("claude-coder", "claude-reviewer"):
+        f.preflight_profile(profile_launch.resolve_launch(registry.get(profile), registry, f.cfg))
+    with pytest.raises(ValueError, match="mixed Pi"):  # the Pi card this replaces is rejected by v2
+        f.preflight_profile(profile_launch.resolve_launch(registry.get("flashnext-coder"), registry, f.cfg))

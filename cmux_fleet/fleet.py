@@ -1267,7 +1267,10 @@ class Fleet:
         dispatch_plan = profile_assignments = None
         if auto_agents:
             registry = AgentRegistry(registry_path)
-            plan = build_dispatch_plan(spec['goal'], registry)
+            # Official Claude workers: prefer claude cards so a live switch never leaves the CLI
+            # (v2 Codex supervisor + Claude workers rejects Pi/Codex workers). Pi/Codex fleets unchanged.
+            plan = build_dispatch_plan(spec['goal'], registry,
+                                       'claude' if self.cfg.get('worker_cli') == 'claude' else None)
             dispatch_plan = plan.to_dict()
             profile_assignments = assign_profiles(plan, self.active_workers(), registry)
         task_id = 'task-' + uuid.uuid4().hex[:10]

@@ -55,22 +55,26 @@ def _primary_capability(hints: Sequence[str]) -> str:
     return "planning"
 
 
-def _sort_key(card: AgentCard, overlap: int, primary: str) -> Tuple[Any, ...]:
+def _sort_key(card: AgentCard, overlap: int, primary: str,
+              preferred_cli: Optional[str] = None) -> Tuple[Any, ...]:
     if primary in ("code-review", "safety-audit"):
         tie_breakers = (_rank(card.risk_rank), _rank(card.latency_rank), _rank(card.cost_rank))
     elif primary in ("code-edit", "test-fix"):
         tie_breakers = (_rank(card.latency_rank), _rank(card.cost_rank), _rank(card.risk_rank))
     else:
         tie_breakers = (_rank(card.latency_rank), _rank(card.cost_rank), _rank(card.risk_rank))
-    return (-int(primary in card.capabilities), -overlap) + tie_breakers + (card.id,)
+    return ((-int(primary in card.capabilities), -int(card.cli == preferred_cli), -overlap)
+            + tie_breakers + (card.id,))
 
 
 def route_task(text: str, registry: Optional[AgentRegistry] = None, *,
-               required_capability: Optional[str] = None) -> RouteDecision:
+               required_capability: Optional[str] = None,
+               preferred_cli: Optional[str] = None) -> RouteDecision:
     """Route by keywords, or exclusively by an explicitly required capability.
 
     A required capability must be supported by the selected card; unrelated task
     keywords do not affect eligibility or ranking. Omitting it preserves legacy routing.
+    ``preferred_cli`` ranks cards on that CLI first among equally capable cards; None keeps legacy order.
     """
     registry = registry or AgentRegistry()
     hints = classify_task(text)
@@ -89,7 +93,7 @@ def route_task(text: str, registry: Optional[AgentRegistry] = None, *,
             candidates.append((card, overlap))
     if not candidates:
         raise ValueError("no registered agent supports task capabilities: %s" % ", ".join(effective_hints))
-    card, overlap = min(candidates, key=lambda item: _sort_key(item[0], item[1], primary))
+    card, overlap = min(candidates, key=lambda item: _sort_key(item[0], item[1], primary, preferred_cli))
     confidence = .25 if not hints else round(overlap / len(effective_hints), 2)
     reason = (
         "%s matched %s; selected %s using %s tie-breakers"
