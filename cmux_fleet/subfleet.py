@@ -294,9 +294,10 @@ def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, lau
     info_now = f.agent(slot)
     sid = info_now['pane']
     # 1. placeholder in the parent, in the worker's place
-    ph = f.mgr.spawn_window('placeholder-' + slot, 'printf "%s\\n" ' + shlex.quote(
-        placeholder_label(slot, task_id, ws_title)) + '; exec sleep 2147483647',
-        metadata={'type': 'placeholder'}, start_directory=str(f.run_dir))
+    # spawn_window execs the command: keep the tab's process alive (an exited tab reads as a closed runtime)
+    show = 'printf "%s\\n" ' + shlex.quote(placeholder_label(slot, task_id, ws_title)) + '; exec sleep 2147483647'
+    ph = f.mgr.spawn_window('placeholder-' + slot, '/bin/bash -c ' + shlex.quote(show),
+                            metadata={'type': 'placeholder'}, start_directory=str(f.run_dir))
     if not ph.success or not f.mgr.tab_into(ph.pane_id, sid):
         if ph.pane_id:
             f.mgr.kill_pane(ph.pane_id)
@@ -568,14 +569,14 @@ def collect(f, child_run, notify=True):
         f.mgr.rename(rec['pane'], 'fx-' + f.cfg.get('tab_prefix', '') + f.label(slot))
         f.setf(slot, pane=rec['pane'], state='starting', launch_ready=1, runtime_ready=0, bridge_available=0,
                startup_deadline=time.time() + float(f.cfg['profile_ready_timeout']), busy_since=time.time())
-        if notify:
-            prompt = ('Sub-fleet ' + rec['task_id'] + ' has finished (' + rec.get('outcome', '') + '). Your role '
-                      'changed back: you are fleet agent ' + f.label(slot) + ', a worker of the main fleet again. '
-                      'AGENTS.md / CLAUDE.md in your current directory were restored to the worker rules: read '
-                      'AGENTS.md now and follow it. Do no task work in this turn: your final reply must be exactly READY.')
-            if not f.mgr.send_prompt_to_idle(rec['pane'], prompt, bracketed=fleet.is_claude(f.runtime_cfg(slot), slot)):
-                f.setf(slot, state='dead', launch_ready=0)
-                f.log('subfleet.return_failed', task=rec['task_id'], slot=slot)
+        # Always told (also on a stop): the session still believes it is a supervisor until then.
+        prompt = ('Sub-fleet ' + rec['task_id'] + ' has finished (' + rec.get('outcome', '') + '). Your role '
+                  'changed back: you are fleet agent ' + f.label(slot) + ', a worker of the main fleet again. '
+                  'AGENTS.md / CLAUDE.md in your current directory were restored to the worker rules: read '
+                  'AGENTS.md now and follow it. Do no task work in this turn: your final reply must be exactly READY.')
+        if not f.mgr.send_prompt_to_idle(rec['pane'], prompt, bracketed=fleet.is_claude(f.runtime_cfg(slot), slot)):
+            f.setf(slot, state='dead', launch_ready=0)
+            f.log('subfleet.return_failed', task=rec['task_id'], slot=slot)
     else:
         # The original session is gone (or could not be moved back): next generation in the placeholder's place.
         f.setf(slot, pane=ph, state='idle')
