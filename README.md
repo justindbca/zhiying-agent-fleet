@@ -217,6 +217,30 @@ finished (`<run>/result.json` exists) or missing. A live daemon makes it a no-op
 - A finished task (any terminal status) or an explicit `stop` writes `<run>/result.json`; such a run is
   never resumed. Without `--resume`, a restarted daemon still holds uncertain work and pauses (no replay).
 
+## Interface contracts (task spec `"contracts": true`)
+
+Opt-in per task; without the key nothing changes. Rules: `docs/design.md` §18 (from the external spec
+`tasks/plans/cmux-fleet-interface-contract-spec-20261013.md`).
+
+1. **P0 – interfaces.** The supervisor's first reply is `phase: "interfaces"` with a plan (M0…Mn) and
+   every interface (path in the producer's worker directory, `contains` / `json_keys`, `writers`,
+   `decisions`, a self-passing `sample`), and no dispatch. The daemon rejects each gap by name.
+2. **P1 – skeleton run.** The daemon sends `[skeleton]` to `skeleton_worker` (task spec, default the first
+   worker); `<worker>/skeleton.md` needs one PASS line per interface and no FAIL. Pass → interfaces frozen
+   at v1; fail → back to P0; a second fail blocks the task.
+3. **P2 – parallel.** Dispatch items carry `id`, `provides`, `consumes` (`id@version`), `edits`,
+   `depends_on` + `serial_reason`; the daemon holds dependent items until their prerequisites are done.
+   A worker's `Interfaces: IF-x@n provided: ready` line is checked literally before the interface is
+   `ready` and consumers get `[contract] ready`. A trailing `{"interface_change": ...}` object is a
+   proposal the supervisor approves or rejects; breaking changes deprecate the old version and mark
+   its consumers stale.
+4. **COMPLETED** also needs every non-deprecated interface `ready`. Contract tasks may add
+   `artifacts[].not_contains` and `artifacts[].cmd_exit` (argv, no shell, run in the shared output
+   directory, `timeout_s` default 120 / max 600; output written to `path`).
+
+The program writes `<run>/contracts.json` (copied to `<workspace>/contracts.json`) and
+`<run>/contracts.log.jsonl`; agents only read them. Each agent directory gets `CONTRACTS.md`.
+
 ## Claude Code workers (optional)
 
 The supervisor defaults to Codex (or select Pi below). Workers can be official [Claude Code](https://claude.com/claude-code) CLI sessions instead:
@@ -393,6 +417,7 @@ the verb, confines `js` files to the run directory, paces page actions (`--chrom
 | `fx:inbox:<name>` | list | pending messages; delivered only when the agent is idle |
 | `fx:replies:<name>` | list | last 5 replies (used for the handoff skeleton) |
 | `fx:task` | hash | id, goal, status, completion, reason, deadline, artifacts, bad_replies, bounces |
+| `fx:contracts` | string | contract tasks only: JSON phase / plan / registry / proposals / task table / per-worker report owners |
 | `fx:log` | list | event log, last 2000 |
 | `fx:seen:<sha256>` | string | notify de-duplication (SET NX, 24 h) |
 | `fx:service` | hash | paused, reason, history_pane, bad_replies |

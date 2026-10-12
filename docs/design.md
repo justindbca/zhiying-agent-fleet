@@ -382,3 +382,18 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - **名单**：沿用 config.json 已落盘的名单；给了 `--roster` 就写进 config，daemon 第一拍按 §16 热加载对账。
 - **已知边界（P2）**：丢失的「报告格式纠错」消息会原样重排给新一代（新一代没有上下文）；只死 daemon、Redis 未死时，worker 在停机期间做完的回合会被拒、再做一次；Pi 不接回；真实 cmux 下只剩 history 栏的整页重建未实测；`has_cli_process` 按进程名（codex/claude/pi/node）判断。
 
+
+## 18. 接口契约：单 fleet 内的任务编号 + 开工闸（2026-10-13 用户新要求）
+
+规范：外部项目 `tasks/plans/cmux-fleet-interface-contract-spec-20261013.md`（用户已批，含四条判断）与 `cmux-fleet-nested-decompose-design-20261013.md` §1–2。本节只落**单个 fleet**（顶级 supervisor = 本 fleet 的 supervisor）；同伴通知（SendMessage / `{{FLEET_PEER}}`）、子 fleet、escalate / veto 是下一块。唯一 daemon、slot/generation 标识、一页布局、task/service 协议、§16 名单、§17 续跑都不变。
+
+- **开关**：task spec `"contracts": true`（严格 boolean）才启用；不带时 Redis、提示词、报告转述、产物校验全部与原来一致。`skeleton_worker` 可选，缺省第一个 worker。
+- **状态**：一份 JSON 存 Redis `fx:contracts`（阶段 / 拆解表 / 登记表 / 待批提案 / 任务表 / 每个 worker 的回报归属），随 AOF 进续跑；程序每次变更写 `<run>/contracts.json` 并拷到 `<workspace>/contracts.json`，tick 再按 Redis 补同步；`<run>/contracts.log.jsonl` 追加日志。模型只读。
+- **提示词**：`agents/contracts_supervisor.md`（附录 A）/ `contracts_worker.md`（附录 B §4），只在契约任务里注入：submit 时写进每个 agent 目录的 `CONTRACTS.md` 并在任务消息里指向它；任务期间新拉起的代（交接 / 名单热加）把同一节附进 AGENTS.md。基础 `supervisor*.md` / `worker*.md` 不改。
+- **P0**：首个回复必须 `phase: "interfaces"` + `plan` + `interfaces` + 空 dispatch；五项检查（无生产方 / 无消费方且非 final / 成环 / 样例自检 / 字段写入方恰一个）逐项拒，走原三次纠错。interfaces / skeleton 段「无 worker 忙时 RUNNING 必须派单」豁免（`others_active`，v1 与 v2 校验同一入口）。`path` 在 P0 只查相对路径，派单时才查是否在 `to` 那个 worker 的目录下（P0 没有 `to`）。
+- **P1**：P0 过后 daemon 自己给 skeleton worker 派 `[skeleton]`；其回报到达时读 `skeleton.md`：每个接口一行 PASS、无 FAIL → 全部 `declared`、冻结 v1、`[contract] interfaces frozen at v1` 随回报转监工；否则回 P0，第 2 次失败 task `blocked`。
+- **任务表与派单**：dispatch 项须带 `id`（M 编号），可带 `provides` / `consumes`（`id@version`）/ `edits` / `depends_on` + `serial_reason`；规范 §3.1 / §3.3 / §3.0.1④ 的拒绝文本原样。`depends_on` 未完成的项由 daemon 挂起，前置全部 `done` 后自动投递。回报归属按「排队时记下每条消息期待谁的回报」FIFO 弹出：派单记 M 编号，`[contract]` 通知与提案拒绝记空，所以通知回合不会结掉别的任务。任务 `done` = 它 provides 的接口全部 `ready`；回报了但未 ready 记 `failed`，监工重派同一编号（attempts+1）。
+- **就绪与变更**：worker 报告 `Interfaces: IF-x@n provided: ready` → 程序字面校验（存在 / 字数 / contains / json_keys）过才 `ready`，并向在跑的消费方投 `[contract] ready`；不过则向生产方与消费方投 `[contract] not ready`。worker 报告末尾最后一个 JSON 对象（`raw_decode` 从后往前，不取第一个 `{`）里的 `interface_change` 按 §4.3 校验，过了进待批并转监工，监工用 `interfaces[].decision` 批 / 拒；监工自己声明的 compatible / breaking 即批准。程序按字段差判级（改 path、减 contains / json_keys = breaking）。breaking 批准后旧版 `deprecated`、消费方 `stale`，其下一条派单必须 consume 新版。通知只投给任务在跑的 worker，其余靠读 `contracts.json`。
+- **COMPLETED**：另需全部非 deprecated 接口 `ready`，否则照原 bounce 回 `Independent verification failed ... IF-x@n not ready (...)`。契约任务的 artifacts 可加 `not_contains` 与 `cmd_exit`（argv 不经 shell，在共享输出目录运行，`timeout_s` 缺省 120、上限 600，输出写进 `path` 再做字面检查）；命令只在 COMPLETED 时跑，result.json / 续跑交底只复查文件。非契约任务这两个键仍被忽略。`pending_user` 的 decisions 汇总进 result.json 的 `contracts`。
+- **v2**：官方 CLI worker 的自由文本报告，只有出现 `Interfaces:` / `Peer notices:` / `Question for supervisor:` 行或末尾带 `interface_change` 等键的 JSON 时才多出对应键，四段原样；续跑交底附任务表一行。
+- **已知边界（P2）**：`cmd_exit` 让监工声明的命令在宿主跑（仅契约任务、无 shell、限时），运行期间 daemon 阻塞；Pi worker 只能把契约字段作为 fleet_result 的额外键交（TypeBox 是否放行额外键未实测）；`consumers_runtime.session` 恒为 null（同伴通知下一块）；契约 notices 会让在跑的 worker 多一个回合；`Interfaces:` 等标题行若出现在非契约 v2 报告里也会被单独取出。
