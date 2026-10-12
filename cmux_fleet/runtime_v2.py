@@ -1069,7 +1069,7 @@ class RuntimeV2:
 
     def brief(self, lost):
         """Re-queue lost dispatches (attempt-capped) and brief the new supervisor generation."""
-        from cmux_fleet.fleet import check_artifacts
+        from cmux_fleet.fleet import check_artifacts, extended_checks
         task = self.f.task()
         cap = int(self.f.cfg['max_attempts'])
         head = lambda text: ' '.join(text.split())[:200]
@@ -1093,7 +1093,7 @@ class RuntimeV2:
                 done.append((msg['committed_at'], '- ' + msg['slot'] + ': ' + head(msg['body']['text'])
                              + '\n  report: ' + dumps(msg.get('result') or {})[:600]))
         artifacts = json.loads(task.get('artifacts') or '[]')
-        checked = [(a['path'], check_artifacts([a], self.f.workspace(), task.get('contracts') == '1'))
+        checked = [(a['path'], check_artifacts([a], self.f.workspace(), extended_checks(task)))
                    for a in artifacts]
         state = self.f.contract_state()
         self.f.queue('supervisor', '[Resumed task ' + task['id'] + '] This run was interrupted and resumed with '
@@ -1156,6 +1156,7 @@ class RuntimeV2:
             self.f.setf(slot, state='busy', msg_id=env['message_id'], busy_since=time.time(),
                         request=env['request_id'], delivered=int(self.f.agent(slot).get('delivered') or 0)+1,
                         bridge_available=0)
+            self.f.brake_count('calls')
             self.audit('deliver', slot=slot, request_id=env['request_id'], message_id=env['message_id'],
                        delivery_id=env['delivery_id'], generation=env['generation'], detail=env['body'])
             if tui_slot(self.f.cfg, slot):

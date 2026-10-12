@@ -26,7 +26,7 @@ cmux-fleet = "cmux_fleet.fleet:main"
 packages = ["cmux_fleet"]
 
 [tool.setuptools.package-data]
-cmux_fleet = ["agents/*.md", "agents/*.json", "pi_extension*.ts"]
+cmux_fleet = ["agents/*.md", "agents/*.json", "config/*.yaml", "pi_extension*.ts"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

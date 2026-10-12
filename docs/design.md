@@ -417,3 +417,23 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 **验证**：`python3 -m pytest -q tests` 全套通过（新增 `tests/test_subfleet.py`：两套真私有 Redis + 两个进程内 daemon + 每套登记分开记归属的假 cmux + 真 `claude_stop`/`notify` 入口：移交→子 fleet READY 走父钩子→子监工决策派给子 worker→交卷→release→父收回同会话 READY→父监工收到结果；委派中不投递不判死；产出缺失判 failed 与重试编号；起子 Redis 失败回滚；收回前 Escape；会话丢失原位起下一代；主 resume 保留 delegated slot 并拉起子 fleet；上限四项与编号范围；Pi/忙槽拒绝；请求文件经 tick 执行；status 树；迟到代数不改投；树停无孤儿 Redis；主 resume 拉起子 fleet；子 resume 接回 adopt 窗格；父任务终态停子 fleet；v2 主循环跑 Fleet.tick 回归；cmux_manager 的 release/adopt/place_after/close_all 用假 `_run`）。
 
 **未验收 / 已知缺口**：真实 cmux 上的跨工作区 `move-surface` 移交、`reorder-workspace`、标签标题与 `--name` 的先后，均未实测；一个正在跑的 Claude 会话在中途换掉 CLAUDE.md 后是否真按监工格式只回决策 JSON（提示词层面），未实测——这是本块最大的剩余风险；主 fleet 控制页「子 fleet 一览/跳转」与子 fleet「回到父 fleet」链接未做；委派中的 slot 仍可被父监工派活，消息排队到收回后再投；申请拆解→审批→`spawn_child` 的接线留给 contracts 合并后的下一块；子 fleet 任务的产出只做「文件存在非空」检查，正式验收交 contracts 块；独立复核、合并、部署均未做。
+
+## 20. 刹车与验收合同（2026-10-13 开发批次 E，`feat/brake-contract`，未合 main）
+
+依据：总设计 v2 §1.3 #2 / #3、v1 §1.3、R2、R14、批 2.1 / 2.3。
+
+### 验收合同第一层：`artifacts_frozen`
+
+- task spec 加 `"contract": {"artifacts_frozen": true}`：调用方写的 `artifacts` 即验收合同。冻结时 artifacts 必须非空；监工 decision 里追加的 artifacts **一律忽略**，审计事件 `contract.append_ignored`（带被丢弃的条目）；监工要改只能 BLOCKED 说明理由，由调用方重提任务（R14：层 1 不留通道）。
+- 冻结任务与 `contracts: true` 任务一样走扩展校验：`not_contains`、`json_keys`（新）、`cmd_exit`。`json_keys`：整个文件是 JSON 对象，或文件以一个 JSON 对象结尾（复核报告末行判决），所列键都要在。`cmd_exit` 只执行调用方冻结的 argv（无 shell，有超时）。
+- 未冻结、非契约任务零变化：监工仍可追加，扩展键仍被忽略。`result.json` 与 `start --resume` 交底复检用同一套规则（`extended_checks`）。
+
+### 刹车：预算卡 + 墙表（`cmux_fleet/brake.py`、`cmux_fleet/config/walls.yaml`）
+
+- 预算卡：task spec `budget`，或 service 的 `start --budget JSON`（写进 config `budget`）。字段 `pool / max_usd / max_week_pct / max_calls / max_rounds / max_hours / max_busy`。按池分：`pool-a` 盯墙 + 等价额度 `max_usd`（池读数相对开卡时基线的增量）；`pool-b` 盯墙 + 周额度 `max_week_pct`（池的绝对百分比）。错池字段直接拒。
+- 计数：`calls` = 每次投递（v1 / v2 同一处计）；`rounds` = 被接受的监工决策；`hours` = 开卡起算（软线，task `hours` 仍是硬的 `budget_exhausted`）；`max_busy` 只能收紧 `--max-busy`。计数在 Redis `fx:brake`，新任务换新卡。
+- 池读数来自额度调度员的 `~/.cmux-fleet/quota.json`（config `quota_file` 可改）：`{"pools": {"pool-a": {"cash_used_usd", "at"}, "pool-b": {"week_used_pct", "at"}}}`。缺失 / 读不出 / 超过 1 小时 = unknown：显示在 `brake.json`，**不触发**。
+- 到线：pause（不投递、不轮换，全部可续）+ 审计 `brake.tripped` + `<run>/brake.json` + 可选 `brake_notify` argv（`start --brake-notify`，无 shell）。v2 下判定在一个事务里做，通知在事务外。
+- 续跑：`cmux-fleet resume` 在预算线仍越线时被拒，须 `resume --raise LIMIT=VALUE`（不能改池）；墙引起的暂停可直接 resume。新任务开新卡时清掉上一张卡的刹车暂停（操作员手动 pause 不清）。
+- 墙表一张：账号级墙（usage / weekly / session limit、429）→ 换边或停，fleet 内即停（pause）；分池墙（"You've reached your Fable limit"、`/usage-credits`）→ 同 CLI 降一档（`same_cli_downgrade`，吸收自 us-stock-option `config/cli_tier_map.yaml`），没有下一档也停。来源：短回合文本（≤400 字，长报告不判墙）与卡住时的屏幕尾部。当前只**判定 + 记录（agent `wall` 字段、`brake.json`）+ 暂停**；自动按降档换下一代未接线（依赖 B 的名单 `profile` 列 / A 的组合表）。
+- v1 task 的 `pause` 现在也会停投递（原来只对 service / v2 生效）。

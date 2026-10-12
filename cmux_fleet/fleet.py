@@ -44,7 +44,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import contracts, handoff, history, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
+from cmux_fleet import brake, contracts, handoff, history, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -80,6 +80,7 @@ DEFAULTS = {'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 100000, 'stal
 CLAUDE_JSON = Path.home() / '.claude.json'
 CONTRACTS = 'fx:contracts'  # contract tasks only: one JSON state document (cmux_fleet/contracts.py)
 CMD_TIMEOUT, CMD_TIMEOUT_MAX = 120, 600  # artifact cmd_exit (contract tasks): seconds the daemon may block
+BRAKE = 'fx:brake'  # budget card + counters + last trip of the current task / service (cmux_fleet/brake.py)
 
 
 def load(path):
@@ -293,10 +294,14 @@ def validate_artifacts(artifacts, extended=False):
         if not isinstance(contains, list) or not all(isinstance(x, str) for x in contains):
             raise ValueError('contains must be a list of literal strings')
         if not extended:
-            continue  # contract-only keys (not_contains / cmd_exit) stay ignored, as before
+            continue  # extended keys (not_contains / json_keys / cmd_exit) stay ignored, as before
         banned = item.get('not_contains', [])
         if not isinstance(banned, list) or not all(isinstance(x, str) and x for x in banned):
             raise ValueError('not_contains must be a list of literal strings')
+        keys = item.get('json_keys')
+        if keys is not None and (not isinstance(keys, list) or not keys
+                                 or not all(isinstance(x, str) and x for x in keys)):
+            raise ValueError('json_keys must be a non-empty list of key names')
         argv = item.get('cmd_exit')
         if argv is not None and (not isinstance(argv, list) or not argv
                                  or not all(isinstance(x, str) and x and '\x00' not in x for x in argv)):
@@ -324,10 +329,22 @@ def run_check_command(item, root, path):
     return None if done.returncode == 0 else 'command exited ' + str(done.returncode) + ': ' + item['path']
 
 
+def json_key_failures(text, keys):
+    """json_keys: the file is one JSON object, or ends with one (a report closing with a verdict
+    line like {"verdict": "PASS", "p0": 0}); every key must be present."""
+    try:
+        obj = json.loads(text)
+    except ValueError:
+        obj = contracts.last_json_object(text)[0]
+    if not isinstance(obj, dict):
+        return ['no JSON object (whole file or final line)']
+    return ['missing JSON key ' + k for k in keys if k not in obj]
+
+
 def check_artifacts(artifacts, root, extended=False, run_commands=False):
     """Literal file checks only (exists / size / contains); returns failures (empty = pass).
-    ``extended`` (contract tasks) adds not_contains and cmd_exit; commands run only when
-    ``run_commands`` (the COMPLETED gate), never from result.json / resume re-checks."""
+    ``extended`` (contract tasks and frozen artifacts) adds not_contains, json_keys and cmd_exit;
+    commands run only when ``run_commands`` (the COMPLETED gate), never from result.json / resume re-checks."""
     root = Path(root).resolve()
     failures = []
     for item in artifacts:
@@ -352,7 +369,23 @@ def check_artifacts(artifacts, root, extended=False, run_commands=False):
             elif banned:
                 failures.append('artifact contains forbidden text ' + json.dumps(banned, ensure_ascii=False)
                                 + ': ' + item['path'])
+            elif extended and item.get('json_keys'):
+                failures += [x + ': ' + item['path'] for x in json_key_failures(text, item['json_keys'])]
     return failures
+
+
+def extended_checks(task):
+    """Contract tasks and caller-frozen artifacts use the extended checks (not_contains / json_keys / cmd_exit)."""
+    return task.get('contracts') == '1' or task.get('artifacts_frozen') == '1'
+
+
+def validate_contract(raw):
+    """Task spec ``contract``: {"artifacts_frozen": bool}. Returns the frozen flag."""
+    raw = {} if raw is None else raw
+    if (not isinstance(raw, dict) or set(raw) - {'artifacts_frozen'}
+            or type(raw.get('artifacts_frozen', False)) is not bool):
+        raise ValueError('contract may only have artifacts_frozen (true or false)')
+    return raw.get('artifacts_frozen', False)
 
 
 def validate_agent_registry_path(value):
@@ -794,6 +827,13 @@ class Fleet:
         self.last_chrome = 0
         self.explicit_stop = False
         self.resume_requested = False  # set by `daemon --resume` (operator ran start --resume)
+        if self.service:
+            brake.validate_budget(self.cfg.get('budget'))
+        elif self.cfg.get('budget') is not None:
+            raise ValueError('config budget is for service mode; a task carries its own budget')
+        argv = self.cfg.get('brake_notify')
+        if argv is not None and (not isinstance(argv, list) or not argv or not all(isinstance(x, str) and x for x in argv)):
+            raise ValueError('brake_notify must be an argv list of strings (no shell)')
         self.v2 = runtime_v2.RuntimeV2(self) if self.transport_version == 2 else None
 
     # -- small helpers
@@ -1130,11 +1170,16 @@ class Fleet:
                 answer = {'status': 'rejected', 'reason': str(exc)}
             self.r.set('fx:reply:' + ev['request_id'], json.dumps(answer, ensure_ascii=False), ex=86400)
         elif kind in ('pause', 'resume'):
+            answer = {'status': 'accepted'}
             if kind == 'pause':
                 self.pause(ev.get('reason') or 'paused by operator')
             else:
-                self.resume()
-            self.r.set('fx:reply:' + ev['request_id'], json.dumps({'status': 'accepted'}), ex=86400)
+                try:
+                    self.brake_resume(ev.get('raise'))
+                    self.resume()
+                except (ValueError, TypeError) as exc:
+                    answer = {'status': 'rejected', 'reason': str(exc)}
+            self.r.set('fx:reply:' + ev['request_id'], json.dumps(answer, ensure_ascii=False), ex=86400)
         elif kind == 'stop':
             if not self.service and self.running():
                 self.finish('cancelled', 'stopped by operator')
@@ -1439,6 +1484,13 @@ class Fleet:
             self.log('ready', agent=name, generation=info.get('generation'))
             return
         text = ev.get('text', '')
+        if self.running() and len(text.strip()) <= brake.TURN_WALL_MAX:
+            record = self.on_wall(name, text, 'turn')
+            if record:  # a wall message is not a report: keep the message for after resume
+                if info.get('last_msg'):
+                    self.r.lpush(key('inbox', name), info['last_msg'])
+                self.brake_notify(record)
+                return
         if not text.strip() and info.get('last_msg'):
             # Empty turn: the model backend dropped the request (seen with a local server
             # under memory pressure). Re-deliver the same message after a backoff instead of
@@ -1510,7 +1562,13 @@ class Fleet:
                            + '). Resend one JSON object in the AGENTS.md format, nothing else.')
             return
         artifacts = json.loads(t.get('artifacts') or '[]')
-        artifacts += [a for a in decision.get('artifacts', []) if a not in artifacts]
+        added = [a for a in decision.get('artifacts', []) if a not in artifacts]
+        if t.get('artifacts_frozen') == '1':
+            if added:  # layer 1 of the contract belongs to the caller: never widened or narrowed here
+                self.log('contract.append_ignored', task=t.get('id', ''), dropped=added)
+        else:
+            artifacts += added
+        self.brake_count('rounds')
         self.r.hset(TASK, mapping={'bad_replies': 0, 'completion': decision['completion'],
                                    'reason': decision.get('reason', ''),
                                    'artifacts': json.dumps(artifacts, ensure_ascii=False)})
@@ -1518,7 +1576,8 @@ class Fleet:
             self.finish('blocked', decision.get('reason', 'needs a human'))
             return
         if decision['status'] == 'COMPLETED':
-            failures = (check_artifacts(artifacts, self.workspace(), state is not None, state is not None)
+            extended = state is not None or t.get('artifacts_frozen') == '1'
+            failures = (check_artifacts(artifacts, self.workspace(), extended, extended)
                         if artifacts else ['no artifacts were declared, nothing to verify'])
             failures += self.contract_gate(state) if state is not None else []
             if not failures:
@@ -1577,11 +1636,15 @@ class Fleet:
         skeleton_worker = spec.get('skeleton_worker', (self.active_workers() or [None])[0])
         if use_contracts and skeleton_worker not in self.active_workers():
             raise ValueError('skeleton_worker must be one of ' + ', '.join(self.active_workers()))
+        frozen = validate_contract(spec.get('contract'))
+        if frozen and not spec.get('artifacts'):
+            raise ValueError('contract.artifacts_frozen needs the caller\'s non-empty artifacts list')
         if 'artifacts' in spec:
             # Auto-planned task specs may explicitly say there are no pre-declared artifacts.
             # Keep the legacy non-auto validation unchanged.
             if not (auto_agents and spec['artifacts'] == []):
-                validate_artifacts(spec['artifacts'], extended=use_contracts)
+                validate_artifacts(spec['artifacts'], extended=use_contracts or frozen)
+        budget = brake.validate_budget(spec.get('budget'))
         hours = spec.get('hours', 16)
         if isinstance(hours, bool) or not isinstance(hours, (int, float)) or not 0 < hours < 1000:
             raise ValueError('hours must be a positive number')
@@ -1603,6 +1666,8 @@ class Fleet:
                   'apply_profiles_live': json.dumps(spec.get('apply_profiles_live', False))}
         if use_contracts:
             fields['contracts'] = 1
+        if frozen:
+            fields['artifacts_frozen'] = 1
         if dispatch_plan is not None:
             fields.update(
                 auto_agents=1,
@@ -1612,12 +1677,18 @@ class Fleet:
                     profile_assignments, ensure_ascii=False, separators=(',', ':')),
             )
         self.r.hset(TASK, mapping=fields)
+        self.brake_start(budget)
         prompt = ('[New task ' + task_id + '] Goal: ' + spec['goal']
                   + '\nWorkers you can dispatch to: ' + ', '.join(self.labels())
                   + '\nShared output directory: ' + str(self.workspace())
                   + ' (artifact paths are relative to it, e.g. worker-1/report.md)'
                   + '\nArtifacts pre-declared by the operator: '
                   + json.dumps(spec.get('artifacts', []), ensure_ascii=False))
+        if frozen:
+            prompt += ('\nThese artifacts are frozen by the caller: they are the acceptance contract. Artifacts you '
+                       'add in a decision are ignored and audited; to change them, reply BLOCKED and say why.')
+        if budget:
+            prompt += '\nBudget card (the daemon pauses the fleet at any line): ' + json.dumps(budget, ensure_ascii=False)
         if dispatch_plan is not None:
             prompt += ('\nAuto-agent dispatch plan (profile ids are recommendations, not worker names): '
                        + fields['dispatch_plan']
@@ -1764,6 +1835,7 @@ class Fleet:
                            + '). Resend one JSON object in the AGENTS.md format, nothing else.')
             return
         self.r.hset(SERVICE, mapping={'bad_replies': 0, 'reason': decision.get('reason', '')})
+        self.brake_count('rounds')
         for item in decision['dispatch']:
             if self.r.hget(REQ + item['request_id'], 'status') != 'routing':
                 self.log('dispatch.unknown_request', id=item['request_id'])
@@ -1788,9 +1860,12 @@ class Fleet:
 
     # -- delivery + rotation
     def pump(self):
-        if (self.service or self.v2) and self.paused():
+        if self.paused():
             return  # nothing is delivered and nothing rotates; requests keep queuing (and may time out)
         cap = int(self.cfg.get('max_busy') or 0)
+        card = (self.brake_budget() or {}).get('max_busy')
+        if card:  # the budget card can only tighten --max-busy
+            cap = min(cap, card) if cap else card
         busy = sum(self.agent(w).get('state') in ('busy', 'handoff', 'held') for w in self.workers)
         for name in self.names:
             info = self.agent(name)
@@ -1900,6 +1975,7 @@ class Fleet:
             if name != 'supervisor':
                 self.setf(name, request=head.group(1) if head else '')
         self.setf(name, state='busy', busy_since=time.time(), delivered=int(info.get('delivered') or 0) + 1)
+        self.brake_count('calls')
         if not self.send(name, self.agent(name)['pane'], text):
             self.r.lpush(key('inbox', name), text)
             self.finish('blocked', 'delivery failed: ' + name)
@@ -2168,9 +2244,18 @@ class Fleet:
             self.on_stall(name, info, int(now - last))
 
     def on_stall(self, name, info, idle_s):
+        screen = self.capture_screen(name, info) if self.running() else ''
         if self.v2:
-            return self.v2.transaction('stall-' + uuid.uuid4().hex,
-                lambda: self.v2.hold(name, 'no activity for ' + str(idle_s) + ' s; stop unconfirmed', public_status='stalled'))
+            def stalled():
+                self.v2.hold(name, 'no activity for ' + str(idle_s) + ' s; stop unconfirmed', public_status='stalled')
+                return self.on_wall(name, screen, 'screen')
+            record = self.v2.transaction('stall-' + uuid.uuid4().hex, stalled)
+            if record:
+                self.brake_notify(record)
+            return None
+        record = self.on_wall(name, screen, 'screen')
+        if record:
+            self.brake_notify(record)
         stalls = int(info.get('stalls', 0)) + 1
         self.log('agent.stalled', agent=name, state=info.get('state'), idle_s=idle_s, stalls=stalls)
         self.mgr.send_key(info['pane'], 'Escape')  # abort the turn; an aborted turn fires no notify
@@ -2200,6 +2285,115 @@ class Fleet:
             self.report(name, 'STALLED: no activity for ' + minutes + ' min, its turn was aborted. The worker is '
                         'idle again. Dispatch a smaller, concrete instruction, or reply BLOCKED if a human is needed.')
 
+    # -- brake (cmux_fleet/brake.py): budget card per pool + wall table
+    def brake_budget(self):
+        return json.loads(self.r.hget(BRAKE, 'budget') or 'null')
+
+    def brake_start(self, budget):
+        """A new card: counters restart (task submit; service: first tick)."""
+        if self.paused() and (self.r.hget(SERVICE, 'reason') or '').startswith('brake: '):
+            self.resume()  # a brake pause belongs to the card it tripped, not to the next task
+        base = brake.pool_reading(brake.read_quota(self.cfg.get('quota_file')), (budget or {}).get('pool'))
+        self.r.delete(BRAKE)
+        self.r.hset(BRAKE, mapping={'budget': json.dumps(budget), 'calls': 0, 'rounds': 0, 'started': time.time(),
+                                    'usd_base': '' if base is None else base, 'tripped': ''})
+
+    def brake_count(self, counter):
+        self.r.hincrby(BRAKE, counter, 1)
+
+    def brake_tick(self, now):
+        """Pause at any budget line. Returns the trip record (notify after the transaction) or None."""
+        if self.service and self.cfg.get('budget') and not self.r.hget(BRAKE, 'budget'):
+            self.brake_start(brake.validate_budget(self.cfg['budget']))
+        state = self.r.hgetall(BRAKE)
+        budget = json.loads(state.get('budget') or 'null')
+        if not budget or not self.running() or self.paused():
+            return None
+        quota = brake.read_quota(self.cfg.get('quota_file'))
+        if budget.get('pool') == 'pool-a' and state.get('usd_base') in (None, ''):
+            base = brake.pool_reading(quota, 'pool-a', now)
+            if base is not None:  # the first known reading is the baseline: spend before it is not ours
+                self.r.hset(BRAKE, mapping={'usd_base': base})
+                state['usd_base'] = base
+        found = brake.trips(budget, brake.counters(state, quota, now))
+        if found:
+            return self.brake_trip('budget', 'budget line reached: ' + brake.describe(found), lines=found)
+        return None
+
+    def brake_trip(self, kind, reason, **detail):
+        record = dict(kind=kind, reason=reason, at=time.time(), task=self.task().get('id', ''), **detail)
+        self.r.hset(BRAKE, mapping={'tripped': json.dumps(record, ensure_ascii=False)})
+        if not self.paused():
+            self.pause('brake: ' + reason)
+        self.log('brake.tripped', **{('brake' if k == 'kind' else k): v for k, v in record.items() if k != 'at'})
+        return record
+
+    def brake_notify(self, record):
+        """Side effects of a trip, outside any v2 transaction: <run>/brake.json and the operator's notify argv."""
+        state = self.r.hgetall(BRAKE)
+        save(self.run_dir / 'brake.json', dict(record, budget=json.loads(state.get('budget') or 'null'),
+             counters=brake.counters(state, brake.read_quota(self.cfg.get('quota_file')))))
+        argv = self.cfg.get('brake_notify')
+        if argv:
+            try:
+                subprocess.Popen(list(argv) + ['[cmux-fleet brake] ' + record['reason']], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            except OSError as exc:
+                self.log('brake.notify_failed', error=str(exc))
+
+    def brake_resume(self, raises):
+        """Operator resume: refused while a budget line is still reached (resume --raise LIMIT=VALUE)."""
+        if raises is not None and (not isinstance(raises, list) or not all(isinstance(x, str) for x in raises)):
+            raise ValueError('raise must be a list of LIMIT=VALUE strings')
+        state = self.r.hgetall(BRAKE)
+        budget = json.loads(state.get('budget') or 'null')
+        tripped = json.loads(state.get('tripped') or 'null')
+        if raises:
+            if not budget:
+                raise ValueError('--raise needs a budget card on the current task / service')
+            budget = brake.parse_raise(raises, budget)
+            if budget.get('pool') != json.loads(state['budget']).get('pool'):
+                raise ValueError('--raise cannot change the pool')
+        if budget and tripped and tripped.get('kind') == 'budget':
+            found = brake.trips(budget, brake.counters(state, brake.read_quota(self.cfg.get('quota_file'))))
+            if found:
+                raise ValueError('budget still over the line (' + brake.describe(found)
+                                 + '); resume with --raise LIMIT=<higher value>')
+        if raises:
+            self.r.hset(BRAKE, mapping={'budget': json.dumps(budget)})
+            self.log('brake.raised', budget=budget)
+        if tripped:
+            self.r.hset(BRAKE, mapping={'tripped': ''})
+
+    def on_wall(self, name, text, source):
+        """A wall on a turn text or a stalled screen: decide (downgrade / stop), record, pause."""
+        wall = brake.classify_wall(text)
+        if not wall:
+            return None
+        cfg = self.runtime_cfg(name)
+        cli = agent_cli(cfg, name)
+        model = (cfg.get('pi_model') if cli == 'pi' else cfg.get('codex_model') if cli == 'codex'
+                 else cfg.get('supervisor_model') if name == 'supervisor' else cfg.get('worker_model')) or ''
+        action = brake.wall_action(wall, cli, model)
+        self.setf(name, wall=json.dumps(dict(wall, **action), ensure_ascii=False))
+        what = ('same CLI one tier down: ' + action['from'] + ' -> ' + action['to'] if action['action'] == 'downgrade'
+                else action['advice'])
+        return self.brake_trip('wall', self.label(name) + ' hit a ' + wall['scope'] + ' wall ("' + wall['line'][:120]
+                               + '"); ' + what, agent=name, source=source, wall=wall, decision=action)
+
+    def capture_screen(self, name, info):
+        """The tail of an agent's screen for wall detection ('' if it cannot be read)."""
+        pane = info.get('pane')
+        if not pane:
+            return ''
+        path = self.run_dir / 'brake' / (name + '-screen.txt')
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.mgr.capture_to(pane, str(path))
+            return '\n'.join(path.read_text(errors='replace').splitlines()[-60:])
+        except (OSError, AttributeError, RuntimeError, subprocess.SubprocessError):
+            return ''
+
     def write_result(self):
         """Task terminal: write <run>/result.json once per task (start --resume refuses a finished run)."""
         t = {} if self.service else self.task()
@@ -2223,6 +2417,10 @@ class Fleet:
         self.write_result()
         self.sync_contract_files()
         subfleet.tick(self)  # sub-fleet spawns/returns: side effects, outside any v2 transaction
+        record = (self.v2.transaction('brake-' + uuid.uuid4().hex, lambda: self.brake_tick(time.time()))
+                  if self.v2 else self.brake_tick(time.time()))
+        if record:
+            self.brake_notify(record)
         if self.v2:
             return self.v2.tick()
         now = time.time()
@@ -2272,7 +2470,7 @@ def save_result(run, task, status=None, reason=None, contract_summary=None):
     """<run>/result.json (atomic): the run is finished. Artifacts are re-checked on disk here."""
     workspace = Path(run) / 'workspace'
     artifacts = json.loads(task.get('artifacts') or '[]')
-    extended = task.get('contracts') == '1'
+    extended = extended_checks(task)
     result = {
         'status': status or task.get('status', ''), 'reason': task.get('reason', '') if reason is None else reason,
         'task_id': task.get('id', ''), 'goal': task.get('goal', ''), 'at': time.time(),
@@ -2423,6 +2621,14 @@ def start(args):
             return
     if args.transport_version != 2:
         raise SystemExit('new fleet instances require Redis transport v2; v1 is only readable for existing runs')
+    budget = None
+    if getattr(args, 'budget', None):
+        if args.mode != 'service':
+            raise SystemExit('--budget is the service budget card; a task carries its own "budget" in the task spec')
+        try:
+            budget = brake.validate_budget(json.loads(args.budget))
+        except ValueError as exc:
+            raise SystemExit('--budget rejected: ' + str(exc)) from exc
     try:
         runtime_v2.validate_config(vars(args))
     except ValueError as exc:
@@ -2486,6 +2692,8 @@ def start(args):
     cfg = {'run': str(run), 'python': sys.executable, **redis_cfg,
            'cmux_state_dir': str(mgr.meta_path.parent),
            'workers': workers, 'mode': args.mode, 'roles': args.roles, 'max_busy': args.max_busy,
+           **({'budget': budget} if budget else {}),
+           **({'brake_notify': shlex.split(args.brake_notify)} if getattr(args, 'brake_notify', None) else {}),
            'request_timeout': args.request_timeout, 'supervisor_profile': args.supervisor_profile,
            'worker_profile': args.worker_profile, 'profile': args.profile, 'codex': codex, 'redis_server': redis_server, 'codex_home': str(home),
            'handoff_ratio': args.handoff_ratio, 'handoff_timeout': args.handoff_timeout,
@@ -2631,6 +2839,10 @@ def main(argv=None):
     s.add_argument('--worker-profile', help='codex profile for codex workers (default: --profile)')
     s.add_argument('--max-busy', type=int, default=DEFAULTS['max_busy'],
                    help='at most this many workers working at once (0 = no limit)')
+    s.add_argument('--budget', help='service mode: budget card JSON, e.g. \'{"pool": "pool-a", "max_usd": 40, '
+                   '"max_calls": 200}\' (tasks put "budget" in the task spec); the daemon pauses at any line')
+    s.add_argument('--brake-notify', help='command run (no shell) with one message argument when the brake pauses '
+                   'the fleet, e.g. "/usr/local/bin/tg-send --chat ops"')
     s.add_argument('--request-timeout', type=float, default=DEFAULTS['request_timeout'],
                    help='service mode: seconds before an unanswered request is published as timeout')
     s.add_argument('--resume', metavar='RUN_DIR|auto',
@@ -2671,7 +2883,10 @@ def main(argv=None):
         '({"goal":..., "hours":..., "artifacts":[...], "auto_agents":true, "agent_registry":...})')
     t.add_argument('spec')
     for name in ('status', 'stop', 'resume'):
-        sub.add_parser(name).add_argument('--config', default=str(LATEST))
+        sp = sub.add_parser(name)
+        sp.add_argument('--config', default=str(LATEST))
+    sp.add_argument('--raise', dest='raise_', action='append', metavar='LIMIT=VALUE',
+                    help='after a budget pause: raise a budget line (e.g. max_calls=400); repeatable')
     ls = sub.add_parser('logs', help='read-only v2 audit timeline/details')
     ls.add_argument('--config', default=str(LATEST))
     for field in ('request', 'slot', 'event', 'level'):
@@ -2744,6 +2959,8 @@ def main(argv=None):
             print(json.dumps(request(cfg, {'kind': 'stop'}), ensure_ascii=False))
         elif args.cmd in ('pause', 'resume'):
             ev = {'kind': args.cmd, 'reason': getattr(args, 'reason', '')}
+            if getattr(args, 'raise_', None):
+                ev['raise'] = args.raise_
             print(json.dumps(request(cfg, ev), ensure_ascii=False))
         elif args.cmd == 'results':
             r = connect(cfg)
