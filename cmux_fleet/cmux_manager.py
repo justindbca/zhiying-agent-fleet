@@ -494,6 +494,12 @@ class CmuxSessionManager:
         return bool(self._where(surface)) and _run('browser', '--surface', surface, 'reload').returncode == 0
 
     # -- handover between fleets (sub-fleets, docs/design.md §19) ----------------
+    def claim_run(self, run: str) -> None:
+        """Tag this registry with the run that owns it (the lifecycle closer checks it before closing)."""
+        meta = self._meta()
+        meta['run'] = run
+        self._save_meta(meta)
+
     def workspace_id(self) -> Optional[str]:
         return self._meta().get('workspace')
 

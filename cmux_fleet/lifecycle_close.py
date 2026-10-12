@@ -1,0 +1,389 @@
+"""Lifecycle closing (lifecycle design §2–§3, master design v2 §4.11/§4.14): what the daemon does once a
+run is done, stuck or out of time, per the mode table (config/fleet_modes.yaml, re-read every tick).
+
+* task modes, terminal state:
+  - ``completed``: dev_task first passes the trusted-Python gate (lifecycle_deliver); review_loop needs a
+    clean PASS verdict. Then stop + close (``closed_by: auto``). A failed gate turns the task blocked.
+  - ``blocked`` / ``budget_exhausted``: hold the run as it is for ``hold_hours`` (default 12), then
+    ``stop_keep_resumable`` (``closed_by: timeout``, result.json ``resumable: true``: start --resume
+    reopens it). scheduled (``on_fail``) and smoke (``on_any_end``) close at once instead.
+  - a review_loop that reaches ``max_rounds`` FAIL verdicts is ended blocked and closed with an
+    outstanding-issues list (``on_cap: stop_and_report``); scheduled past ``hard_timeout_min`` is ended
+    ``budget_exhausted`` and closed (``closed_by: timeout``).
+* service: idle workers are reclaimed and respawned on demand; optional ``idle_stop_hours``
+  (lifecycle_hold).
+* Closing reuses the explicit-stop tail of RuntimeV2.run (descendants first, every runtime retired and
+  confirmed). Only then result.json gets ``closed_by`` / ``closed_at``, the notifications go out (TG +
+  the session that started the run) and, after the daemon has shut its Redis down, a detached closer
+  closes this run's cmux workspace (registry ownership checked). A stop that cannot be confirmed keeps
+  the workspace and Redis and raises an alarm instead.
+* Sub-fleets are not closed here: their parent collects and closes them (subfleet.tick).
+* Runs without a lifecycle (older runs) are untouched.
+"""
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from cmux_fleet import lifecycle, lifecycle_deliver, lifecycle_hold
+
+LIFE = 'fx:lifecycle'  # per-run lifecycle state: started:/gate:/cap:/timeout:/held:<task id>, service_active_at
+NOTIFIER = None        # tests / embedders: callable(record) -> status string; replaces every real channel
+SPAWN_CLOSER = None    # tests: callable(cfg_path) instead of launching the detached closer
+TG_ENV, PARENT_ENV, INITIATOR_ENV = 'CMUX_FLEET_TG_CMD', 'CMUX_FLEET_PARENT_CMD', 'CMUX_FLEET_INITIATOR'
+INITIATOR_KINDS = ('claude', 'codex', 'launchd', 'program', 'fleet', 'cmux', 'user')
+
+
+# ------------------------------------------------------------------ initiator (who started the run)
+def parse_initiator(value):
+    """'kind:id' -> {'kind', 'id'}; ValueError when malformed."""
+    kind, sep, ident = (value or '').partition(':')
+    if not sep or kind not in INITIATOR_KINDS or not ident.strip():
+        raise ValueError('--initiator must be KIND:ID with KIND one of ' + ', '.join(INITIATOR_KINDS)
+                         + ' (e.g. claude:<session name>, launchd:<label>, program:<id>)')
+    return {'kind': kind, 'id': ident.strip()}
+
+
+def initiator_for_start(value=None, env=None):
+    """Explicit --initiator, else $CMUX_FLEET_INITIATOR, else a launchd job's label, else None."""
+    env = os.environ if env is None else env
+    if value:
+        return parse_initiator(value)
+    if env.get(INITIATOR_ENV):
+        return parse_initiator(env[INITIATOR_ENV])
+    label = env.get('XPC_SERVICE_NAME', '')
+    if label and label != '0' and not label.startswith('application.'):
+        return {'kind': 'launchd', 'id': label}
+    return None
+
+
+# ------------------------------------------------------------------ notifications
+def _safe(text):
+    return re.sub(r'[^A-Za-z0-9._-]', '_', text)[:120] or 'unknown'
+
+
+def _run_command(command, data):
+    try:
+        p = subprocess.run(shlex.split(command), input=data, text=True, capture_output=True, timeout=30)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        return 'failed: ' + str(exc)
+    return 'sent' if p.returncode == 0 else 'failed: exit ' + str(p.returncode) + ' ' + (p.stderr or '')[-200:]
+
+
+def notify(f, event, text, policy=None):
+    """One notification per channel (tg, parent); every record lands in <run>/notifications.jsonl.
+
+    No channel command configured ($CMUX_FLEET_TG_CMD / $CMUX_FLEET_PARENT_CMD or the mode table's
+    common.notify_commands) means nothing leaves the machine: the record says ``no_channel`` (TG) or
+    sits in the initiator's mailbox under the fleet state directory (parent)."""
+    policy = policy or {}
+    commands = policy.get('notify_commands') or {}
+    channels = ['tg'] + (['parent'] if policy.get('notify_parent_session', True) else [])
+    cfg, out = f.cfg, []
+    for channel in channels:
+        rec = {'event': event, 'channel': channel, 'text': text, 'run': cfg.get('run'),
+               'lifecycle': cfg.get('lifecycle'), 'task_id': f.task().get('id', '') if not f.service else '',
+               'initiator': cfg.get('initiator'), 'at': time.time()}
+        injected = getattr(f, 'notifier', None) or NOTIFIER
+        if injected:
+            rec['status'] = injected(dict(rec))
+        elif channel == 'tg':
+            command = os.environ.get(TG_ENV) or commands.get('tg')
+            rec['status'] = _run_command(command, text) if command else 'no_channel'
+        else:
+            who = cfg.get('initiator')
+            if not who:
+                rec['status'] = 'no_initiator'
+            else:
+                box = Path(cfg.get('cmux_state_dir') or Path.home() / '.local/state/cmux-fleet') / 'mailbox'
+                box.mkdir(parents=True, exist_ok=True)
+                with open(box / (who['kind'] + '-' + _safe(who['id']) + '.jsonl'), 'a', encoding='utf-8') as fh:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + '\n')
+                command = os.environ.get(PARENT_ENV) or commands.get('parent')
+                rec['status'] = _run_command(command, json.dumps(rec, ensure_ascii=False)) if command else 'mailbox'
+        with open(Path(cfg['run']) / 'notifications.jsonl', 'a', encoding='utf-8') as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + '\n')
+        f.log('lifecycle.notified', what=event, channel=channel, status=rec['status'])
+        out.append(rec)
+    return out
+
+
+# ------------------------------------------------------------------ helpers
+def _hget(f, field):
+    return f.r.hget(LIFE, field)
+
+
+def _hset(f, **fields):
+    f.r.hset(LIFE, mapping=fields)
+
+
+def task_spec(task):
+    try:
+        return json.loads(task.get('lifecycle_spec') or '{}')
+    except ValueError:
+        return {}
+
+
+def fleet_name(f):
+    return f.cfg.get('name') or f.cfg.get('token') or Path(f.cfg['run']).name
+
+
+def set_task_status(f, status, reason):
+    """Rewrite a terminal task's status (the completion gate failed) through a v2 transaction."""
+    from cmux_fleet.fleet import TASK
+    f.v2.transaction('lifecycle-status-' + f.task().get('id', '') + '-' + status,
+                     lambda: f.r.hset(TASK, mapping={'status': status, 'reason': reason}))
+    f.log('lifecycle.status', status=status, reason=reason)
+
+
+def request_close(f, closed_by, reason, *, resumable=False, report=None):
+    """Stop the run through the explicit-stop tail of RuntimeV2.run; finalize() runs after retirement."""
+    if f.lifecycle_close:
+        return
+    f.lifecycle_close = {'closed_by': closed_by, 'reason': reason, 'resumable': resumable, 'report': report}
+    f.explicit_stop = f.stopping = True
+    f.log('lifecycle.closing', closed_by=closed_by, reason=reason, resumable=resumable)
+
+
+def managed(f):
+    return bool(f.cfg.get('lifecycle')) and not f.cfg.get('parent_config') and f.v2 is not None
+
+
+# ------------------------------------------------------------------ the daemon tick
+def tick(f, now=None):
+    """Called by Fleet.tick before write_result (a failed completion gate must reach result.json)."""
+    if not managed(f) or f.stopping:
+        return
+    now = time.time() if now is None else now
+    try:
+        policy = lifecycle.get_mode(f.cfg['lifecycle'])
+    except ValueError as exc:
+        f.log('lifecycle.table_error', error=str(exc))
+        return
+    if f.service:
+        return lifecycle_hold.service_tick(f, policy, now)
+    task = f.task()
+    tid = task.get('id')
+    if not tid:
+        return
+    if task.get('status') == 'running':
+        running_checks(f, policy, task, now)
+        task = f.task()
+        if task.get('status') == 'running':
+            return
+    terminal(f, policy, task, now)
+
+
+def running_checks(f, policy, task, now):
+    tid = task['id']
+    started = _hget(f, 'started:' + tid)
+    if started is None:
+        _hset(f, **{'started:' + tid: now})
+        started = now
+    limit = policy.get('hard_timeout_min')
+    if limit is not None and now - float(started) >= float(limit) * 60:
+        _hset(f, **{'timeout:' + tid: 1})
+        f.finish('budget_exhausted', 'hard_timeout_min ' + str(limit) + ' exceeded (' + policy['name'] + ')')
+        return
+    spec = task_spec(task)
+    if policy['name'] == 'review_loop' and spec.get('review_file'):
+        verdict, _ = lifecycle_deliver.read_verdict(f.workspace() / spec['review_file'])
+        cap = int(policy.get('max_rounds') or 3)
+        if verdict and verdict['verdict'] == 'FAIL' and verdict['round'] >= cap:
+            report = write_outstanding(f, verdict, cap)
+            _hset(f, **{'cap:' + tid: str(report)})
+            left = len(lifecycle_deliver.outstanding(verdict))
+            f.finish('blocked', 'review_loop: round ' + str(verdict['round']) + ' of max_rounds ' + str(cap)
+                     + ' still FAIL; ' + str(left) + ' open issue(s) handed to the user: ' + str(report))
+
+
+def write_outstanding(f, verdict, cap):
+    """The outstanding-issues list (挂账清单) of a capped review loop: JSON + a readable Markdown."""
+    items = lifecycle_deliver.outstanding(verdict)
+    data = {'task_id': f.task().get('id', ''), 'round': verdict['round'], 'max_rounds': cap,
+            'reviewer': verdict.get('reviewer'), 'issues': items, 'at': time.time()}
+    out = f.run_dir / 'outstanding.json'
+    out.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding='utf-8')
+    lines = ['# 挂账清单：review_loop 第 ' + str(verdict['round']) + ' 轮仍 FAIL（max_rounds ' + str(cap) + '）', '']
+    lines += ['- [' + str(i.get('severity', '?')) + '] ' + str(i.get('id', '')) + ' ' + str(i.get('title', ''))
+              for i in items] or ['- （verdict 未列出具体问题）']
+    (f.run_dir / 'outstanding.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return out
+
+
+def terminal(f, policy, task, now):
+    tid, status, name = task['id'], task.get('status'), policy['name']
+    spec = task_spec(task)
+    if status == 'completed':
+        problem = completion_problem(f, policy, task, spec)
+        if problem:
+            set_task_status(f, 'blocked', problem)
+            task, status = f.task(), 'blocked'
+        else:
+            f.write_result()
+            return request_close(f, 'auto', name + ' completed')
+    f.write_result()
+    if status == 'cancelled':
+        return request_close(f, 'auto', name + ' cancelled: ' + task.get('reason', ''))
+    if _hget(f, 'cap:' + tid):
+        return request_close(f, 'auto', task.get('reason', ''), report=_hget(f, 'cap:' + tid))
+    if _hget(f, 'timeout:' + tid):
+        return request_close(f, 'timeout', task.get('reason', ''))
+    if policy.get('on_any_end') == 'stop_and_close' or policy.get('on_fail') == 'stop_and_close':
+        return request_close(f, 'auto', name + ' ' + status + ': ' + task.get('reason', ''))
+    lifecycle_hold.hold_tick(f, policy, task, now)
+
+
+def completion_problem(f, policy, task, spec):
+    """None when a completed task really is done by its mode's done_when; else why not."""
+    name = policy['name']
+    if name == 'dev_task':
+        raw = _hget(f, 'gate:' + task['id'])
+        if raw is None:
+            deliver = spec.get('deliver')
+            if not deliver:
+                rec = {'ok': False, 'problem': 'dev_task has no deliver spec: done_when cannot be judged'}
+            else:
+                review = policy.get('review_step') or {}
+                rec = lifecycle_deliver.deliver(deliver, f.workspace(), task_id=task['id'], run=str(f.run_dir),
+                                                reviewer=review.get('reviewer', 'opus'),
+                                                must_pass=review.get('must_pass', True))
+            _hset(f, **{'gate:' + task['id']: json.dumps(rec, ensure_ascii=False)})
+            f.log('lifecycle.gate', ok=rec['ok'], problem=rec.get('problem', ''), steps=rec.get('steps', []))
+        else:
+            rec = json.loads(raw)
+        return None if rec['ok'] else 'dev_task done_when not met: ' + rec.get('problem', '')
+    if name == 'review_loop' and spec.get('review_file'):
+        verdict, problem = lifecycle_deliver.read_verdict(f.workspace() / spec['review_file'])
+        if verdict is None:
+            return 'review_loop done_when not met: ' + problem
+        problem = lifecycle_deliver.review_problem(verdict)
+        return 'review_loop done_when not met: ' + problem if problem else None
+    return None
+
+
+# ------------------------------------------------------------------ after retirement (RuntimeV2.run tail)
+def closing_text(f, closing, res, stopped):
+    name, tid = f.cfg.get('lifecycle'), res.get('task_id') or ''
+    head = '[fleet ' + fleet_name(f) + '] ' + name + (' ' + tid if tid else '') + ' '
+    if not stopped:
+        return head + '停机未确认：工作区与 Redis 保留，需要人工检查。run: ' + f.cfg['run']
+    delivery = res.get('delivery') or {}
+    if res.get('status') == 'completed' and delivery.get('ok'):
+        q = delivery.get('queue_entry') or {}
+        body = ('完成：' + str(delivery.get('sha', ''))[:12] + ' 已合入 ' + str(q.get('deploy_branch', ''))
+                + '，已入队待批（未上线）')
+    elif closing.get('resumable'):
+        body = (res.get('status', '') + '，保留现场 hold 已到时，已停机并保留可续跑：cmux-fleet start --resume '
+                + f.cfg['run'])
+    else:
+        body = res.get('status', 'stopped') + '：' + (closing.get('reason') or res.get('reason') or '')
+    if closing.get('report'):
+        body += '；挂账清单 ' + str(closing['report'])
+    return head + body + '（closed_by=' + closing['closed_by'] + '）'
+
+
+def finalize(f, stopped):
+    """After the stop tail: result.json fields, notifications, and the workspace-close request."""
+    if not managed(f):
+        return
+    closing = f.lifecycle_close or {'closed_by': 'user', 'reason': 'explicit fleet stop'}
+    try:
+        policy = lifecycle.get_mode(f.cfg['lifecycle'])
+    except ValueError:
+        policy = {}
+    from cmux_fleet.fleet import load, save
+    path = f.run_dir / 'result.json'
+    try:
+        res = load(path)
+    except (OSError, ValueError):
+        res = {}
+    if stopped:
+        res.update(mode=f.cfg['lifecycle'], closed_by=closing['closed_by'], closed_at=time.time())
+        if closing.get('resumable'):
+            res['resumable'] = True
+        if closing.get('report'):
+            res['outstanding'] = str(closing['report'])
+        raw = None if f.service else _hget(f, 'gate:' + (res.get('task_id') or ''))
+        if raw:
+            res['delivery'] = json.loads(raw)
+        close_ws = bool(policy.get('close_workspace_after_stop', True))
+        res['workspace'] = 'closing' if close_ws else 'kept'
+        save(path, res)
+        f.close_workspace_pending = close_ws
+    notify(f, 'closed' if stopped else 'stop_unconfirmed', closing_text(f, closing, res, stopped), policy)
+
+
+def after_daemon(f):
+    """daemon(): Redis is down; launch the detached closer for this run's cmux workspace."""
+    if not getattr(f, 'close_workspace_pending', False):
+        return
+    if SPAWN_CLOSER:
+        return SPAWN_CLOSER(str(f.path))
+    log = open(f.run_dir / 'lifecycle-close.log', 'a')
+    from cmux_fleet import fleet as fleet_mod
+    subprocess.Popen([f.cfg.get('python') or sys.executable, str(Path(fleet_mod.__file__).resolve()), 'lifecycle-close',
+                      str(f.path)], stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+                     cwd=str(f.run_dir))
+
+
+def ownership_problem(meta, run):
+    """None when the cmux registry provably belongs to this run (run tag, or every surface's log under it)."""
+    run = str(Path(run).resolve())
+    if meta.get('run') and str(Path(meta['run']).resolve()) != run:
+        return 'cmux registry belongs to run ' + meta['run'] + ', not ' + run
+    outputs = [info.get('output_file') for info in meta.get('surfaces', {}).values() if info.get('output_file')]
+    foreign = [o for o in outputs if not str(Path(o).resolve()).startswith(run + os.sep)]
+    if foreign:
+        return 'cmux registry holds surfaces of another run: ' + foreign[0]
+    if not meta.get('run') and not outputs:
+        return 'cmux registry has no evidence it belongs to ' + run
+    return None
+
+
+def all_gone(mgr, meta, wait=10.0):
+    """Re-check after close_all reported a failure: on real cmux the last surface of a workspace can
+    linger a few seconds after its process tree is killed (and closing it closes the workspace, so the
+    later close-workspace finds nothing). Closed only when no surface of ours is live any more."""
+    deadline = time.monotonic() + wait
+    while True:
+        live = [ws for ws in (meta.get('workspace'), meta.get('control_workspace')) if ws and mgr._surfaces(ws)]
+        if not live or time.monotonic() >= deadline:
+            return not live
+        time.sleep(.5)
+
+
+def close_workspace(cfg_path, wait=60.0, mgr=None):
+    """The detached closer: wait for the daemon to exit, check ownership, close only this run's tabs and
+    (now empty) workspaces. Result goes to result.json ``workspace`` and the closer log."""
+    from cmux_fleet import fleet as fleet_mod
+    cfg = fleet_mod.load(cfg_path)
+    run = Path(cfg['run'])
+    deadline = time.monotonic() + wait
+    while fleet_mod.daemon_running(run) and time.monotonic() < deadline:
+        time.sleep(.5)
+    if fleet_mod.daemon_running(run):
+        outcome = 'kept: daemon still running'
+    else:
+        mgr = mgr or fleet_mod.manager_for(cfg)
+        meta = mgr._meta()
+        problem = ownership_problem(meta, run)
+        if problem:
+            outcome = 'kept: ' + problem
+        elif mgr.close_all() or all_gone(mgr, meta):
+            mgr.meta_path.unlink(missing_ok=True)
+            outcome = 'closed'
+        else:
+            outcome = 'close_failed: a surface or workspace could not be confirmed closed'
+    try:
+        res = fleet_mod.load(run / 'result.json')
+        res.update(workspace=outcome, workspace_closed_at=time.time())
+        fleet_mod.save(run / 'result.json', res)
+    except (OSError, ValueError):
+        pass
+    print(time.strftime('%Y-%m-%d %H:%M:%S'), 'lifecycle-close', run, outcome, flush=True)
+    return outcome
