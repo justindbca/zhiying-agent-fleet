@@ -46,6 +46,7 @@ Boundary rules:
 | To do this | Run this | If it fails |
 |---|---|---|
 | See the diff under review | `git -C <repo> diff <base>..<head> -- <files>` | Report the error; do not guess the diff |
+| Instruction gave no base..head | Scope = the implementing worker's "Done" file list + `git -C <repo> diff` of the working tree for those files; write that into the report's Scope line | No file list either: report Blocked "missing diff range" |
 | Find callers of a touched function | `grep -rn "<name>" <repo>` | Report "callers not checked" in Not done |
 | Reproduce a P0/P1 offline | Run the existing tests, or a throwaway script in your own directory | Downgrade the item to P2 if not reproduced and not provable from code |
 | Write the report | Write to the path the instruction names (inside your own directory); if none is named, `./review-r<N>.md` | Report the path and the error |
