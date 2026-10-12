@@ -370,6 +370,8 @@ def worker_change(state, raw, slot, task_id, root):
     raw = dict(raw)
     cur = current(state, raw['id'])
     producer = cur['producer'] if cur else raw.setdefault('producer', task_id)
+    if not cur and not raw['id'].startswith('IF-' + task_id + '-'):
+        raise ValueError('interface_change: a new interface of ' + task_id + ' must be named IF-' + task_id + '-<slug>')
     if producer != task_id:
         raise ValueError('interface_change: only the producer (' + slot + ' / ' + str(producer)
                          + ') may propose a change to ' + raw['id'])

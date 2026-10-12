@@ -1203,10 +1203,10 @@ class Fleet:
         """Validate a decision against the contract phase. Returns (state, rows to queue now, held rows,
         approved/rejected changes, skeleton?) without side effects; ValueError carries the spec texts."""
         s = copy.deepcopy(state)
+        if 'artifacts' in decision:  # before any status: COMPLETED runs cmd_exit right away
+            validate_artifacts(decision['artifacts'], extended=True)
         if decision['status'] != 'RUNNING':
             return s, [], [], [], False
-        if 'artifacts' in decision:
-            validate_artifacts(decision['artifacts'], extended=True)
         if s['phase'] == 'interfaces':
             s['plan'], s['interfaces'] = contracts.p0(decision)
             s['tasks'] = {p['id']: {'id': p['id'], 'status': 'pending', 'attempts': 0, 'stale': [],

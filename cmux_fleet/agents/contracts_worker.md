@@ -12,7 +12,7 @@ Your instruction names the task id (`[M2]`) and the interfaces you `provide` (wr
 - Use the answer in the interface's `decisions` even if you would choose differently; disagree only via `Question for supervisor:`.
 - Code tasks: never use `pytest.importorskip` or hard-coded worktree paths; a test run with any `skipped` is not a pass.
 - Do not start real work on any task before the interfaces are frozen; the skeleton run is the only work allowed before that.
-<!-- TODO(next chunk): peer notices to consumers (Claude Code SendMessage / {{FLEET_PEER}} broker). Until then the daemon's [contract] inbox notices are the only channel. -->
+<!-- TODO(next chunk): peer notices to consumers (Claude Code SendMessage / fleet peer broker). Until then the daemon's [contract] inbox notices are the only channel. -->
 
 ### Command table
 | To do this | Run this | If it fails |

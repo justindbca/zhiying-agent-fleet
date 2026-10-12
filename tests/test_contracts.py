@@ -415,6 +415,15 @@ def test_completed_gate_needs_ready_interfaces_and_contract_artifact_checks(cf):
     assert all(not a['problems'] for a in result['artifacts'])
 
 
+def test_completed_with_malformed_cmd_exit_is_a_correction_not_a_run(cf):
+    to_parallel(cf)
+    sup(cf, {'status': 'COMPLETED', 'completion': 100, 'dispatch': [],
+             'artifacts': [{'path': 'checks/x.txt', 'cmd_exit': 'rm -rf /', 'timeout_s': 'abc'}]})
+    assert 'cmd_exit must be a non-empty argv list' in inbox(cf, 'supervisor')[-1]
+    assert cf.task()['bad_replies'] == '1' and cf.task()['bounces'] == '0' and cf.task()['artifacts'] == '[]'
+    assert not (cf.workspace() / 'checks').exists()
+
+
 def test_cmd_exit_is_ignored_outside_contract_tasks(cf, tmp_path):
     marker = tmp_path / 'ran'
     item_ = {'path': 'worker-1/x.md', 'cmd_exit': [sys.executable, '-c', 'open(%r, "w")' % str(marker)]}
