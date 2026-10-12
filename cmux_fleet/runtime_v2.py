@@ -16,38 +16,18 @@ from pathlib import Path
 
 import redis
 
-from cmux_fleet import contracts
+from cmux_fleet import cli_pairs, contracts
 from cmux_fleet.message_bus import BusError, MessageBus, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
 from cmux_fleet import subfleet
 
 
-# Supported v2 CLI combinations. Everything else is refused with its reason, never
-# silently replaced by another CLI/model or by the old file mailbox.
-V2_PI = ('pi', 'pi')
-V2_TUI = ('codex', 'claude')  # Codex supervisor + official Claude Code workers, task mode only
-
-
 def v2_cli_problem(cfg):
-    """None when this supervisor/worker CLI pair and mode may run transport v2."""
-    pair = (cfg.get('supervisor_cli') or 'codex', cfg.get('worker_cli') or 'codex')
-    mode = cfg.get('mode') or 'task'
-    if pair == V2_PI:
-        return None
-    if pair == V2_TUI:
-        if mode != 'task':
-            return ('transport v2 Codex supervisor + Claude workers supports task mode only: '
-                    'service-mode result cards have no Codex renderer and request routing is unvalidated')
-        return None
-    if pair == ('claude', 'claude') and cfg.get('adopt') and mode == 'task':
-        # Sub-fleet (docs/design.md §19): the supervisor is an adopted official-Claude worker pane.
-        return None
-    if pair[0] == 'claude':
-        return 'transport v2 has no Claude supervisor adapter (supported: all-Pi, or Codex supervisor + Claude workers)'
-    if pair == ('codex', 'codex'):
-        return 'transport v2 Codex workers are unvalidated (supported: all-Pi, or Codex supervisor + Claude workers)'
-    return ('transport v2 mixed Pi/' + ('Codex' if 'codex' in pair else 'Claude') + ' fleets are unvalidated '
-            '(supported: all-Pi, or Codex supervisor + Claude workers)')
+    """None when this supervisor/worker CLI pair and mode may run transport v2.
+
+    Decided by the pair table config/cli_pairs.yaml (see cli_pairs.pair_problem); a pair
+    it refuses is never silently replaced by another CLI/model or the old file mailbox."""
+    return cli_pairs.pair_problem(cfg)
 
 
 def validate_config(cfg):

@@ -82,6 +82,7 @@ def inventory():
         item = runs.setdefault(run, {'run': run, 'configs': [], 'processes': [], 'transport_version': version,
             'transport_explicit': 'transport_version' in cfg, 'mode': cfg.get('mode', 'task'),
             'supervisor_cli': cfg.get('supervisor_cli', 'codex'), 'worker_cli': cfg.get('worker_cli', 'codex'),
+            'lifecycle': cfg.get('lifecycle'), 'adopt': bool(cfg.get('adopt')),
             'workers': cfg['workers'], 'roles_path': cfg.get('roles'),
             'redis_socket': cfg['redis_socket'], 'socket_exists': Path(cfg['redis_socket']).exists(),
             'cmux_state_dir': cfg.get('cmux_state_dir'), 'message_file_count': len(messages),

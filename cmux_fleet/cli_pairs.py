@@ -1,0 +1,79 @@
+"""Transport v2 supervisor/worker CLI pair table (config/cli_pairs.yaml).
+
+Every check re-reads the table, so an edit takes effect at the next start. A pair the
+table does not list is refused with its reason, never silently replaced by another
+CLI/model or by the old file mailbox.
+"""
+from pathlib import Path
+
+import yaml
+
+DEFAULT_PATH = Path(__file__).resolve().parent / 'config' / 'cli_pairs.yaml'
+CLIS = ('pi', 'codex', 'claude')
+MODES = ('task', 'service')
+STATUSES = ('verified', 'unverified', 'forbidden')
+SUPPORTED = '(supported: all-Pi, or Codex supervisor + Claude workers)'
+
+
+class PairTable:
+    def __init__(self, data, path=None):
+        self.path = path
+        if not isinstance(data, dict) or data.get('version') != 1:
+            raise ValueError(f'{path}: cli pair table needs version: 1')
+        self.default = dict(data.get('default') or {})
+        self.rows = {}
+        for row in data.get('pairs') or []:
+            key = (row.get('supervisor_cli'), row.get('worker_cli'), row.get('mode'))
+            if key[0] not in CLIS or key[1] not in CLIS or key[2] not in MODES:
+                raise ValueError(f'{path}: bad cli pair row {key}')
+            if row.get('status') not in STATUSES:
+                raise ValueError(f'{path}: {key} status must be one of {STATUSES}')
+            if not isinstance(row.get('adapter_missing', []), list):
+                raise ValueError(f'{path}: {key} adapter_missing must be a list')
+            if key in self.rows:
+                raise ValueError(f'{path}: duplicate cli pair row {key}')
+            self.rows[key] = dict(row, adapter_missing=list(row.get('adapter_missing') or []))
+        if self.default and self.lookup(self.default.get('supervisor_cli'), self.default.get('worker_cli'),
+                                        self.default.get('mode')) is None:
+            raise ValueError(f'{path}: default pair {self.default} is not in the table')
+
+    def lookup(self, supervisor_cli, worker_cli, mode):
+        return self.rows.get((supervisor_cli, worker_cli, mode))
+
+
+def load_pairs(path=None):
+    path = Path(path) if path else DEFAULT_PATH
+    return PairTable(yaml.safe_load(path.read_text()), path)
+
+
+def _unlisted_reason(sup, wrk, mode):
+    if sup == 'claude':
+        return f'transport v2 has no Claude supervisor adapter {SUPPORTED}'
+    if (sup, wrk) == ('codex', 'codex'):
+        return f'transport v2 Codex workers are unvalidated {SUPPORTED}'
+    if 'pi' in (sup, wrk) and sup != wrk:
+        other = 'Codex' if 'codex' in (sup, wrk) else 'Claude'
+        return f'transport v2 mixed Pi/{other} fleets are unvalidated {SUPPORTED}'
+    return f'transport v2 {sup} supervisor + {wrk} workers in {mode} mode is not in the cli pair table {SUPPORTED}'
+
+
+def pair_problem(cfg, table=None):
+    """None when this supervisor/worker CLI pair and mode may run transport v2."""
+    sup, wrk = cfg.get('supervisor_cli') or 'codex', cfg.get('worker_cli') or 'codex'
+    mode = cfg.get('mode') or 'task'
+    if (sup, wrk, mode) == ('claude', 'claude', 'task') and cfg.get('adopt'):
+        # Sub-fleet (docs/design.md §19): the supervisor is an adopted official-Claude worker pane.
+        return None
+    table = table or load_pairs()
+    row = table.lookup(sup, wrk, mode)
+    if row is None or row['status'] == 'forbidden':
+        return (row or {}).get('reason') or _unlisted_reason(sup, wrk, mode)
+    if row['adapter_missing']:
+        return (row.get('reason') or _unlisted_reason(sup, wrk, mode)) + \
+            f' [adapter missing: {", ".join(row["adapter_missing"])}]'
+    if row['status'] == 'unverified':
+        if cfg.get('lifecycle') == 'smoke':
+            return None
+        return (row.get('reason') or _unlisted_reason(sup, wrk, mode)) + \
+            '; an unverified pair may run only with --lifecycle smoke'
+    return None

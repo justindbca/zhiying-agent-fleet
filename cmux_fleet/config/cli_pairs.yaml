@@ -1,0 +1,37 @@
+# Transport v2 supervisor_cli x worker_cli x mode table (read by cmux_fleet/cli_pairs.py).
+# Re-read on every check: an edit takes effect at the next start.
+#   status: verified   -> runs normally
+#           unverified -> runs only with --lifecycle smoke (cfg lifecycle == 'smoke')
+#           forbidden  -> refused; a pair/mode missing from this table is forbidden too
+#   adapter_missing: non-empty -> refused even for smoke
+#   reason: the refusal text shown to the user (unverified / forbidden / adapter_missing rows)
+# Exception kept in code: claude+claude task with cfg adopt (docs/design.md §19 sub-fleet).
+version: 1
+default: {supervisor_cli: codex, worker_cli: claude, mode: task}
+pairs:
+  - {supervisor_cli: pi, worker_cli: pi, mode: task, status: verified, adapter_missing: [],
+     verified_by: "design.md §11 §14", notes: "all-Pi bridge"}
+  - {supervisor_cli: pi, worker_cli: pi, mode: service, status: verified, adapter_missing: [],
+     verified_by: "design.md §11 §14", notes: "all-Pi bridge"}
+  - {supervisor_cli: codex, worker_cli: claude, mode: task, status: verified, adapter_missing: [],
+     verified_by: "user decision 2026-10-12; design.md §18", notes: "default: Codex supervisor + official Claude Code workers"}
+  - {supervisor_cli: codex, worker_cli: claude, mode: service, status: unverified,
+     adapter_missing: [codex_service_renderer], verified_by: null,
+     reason: "transport v2 Codex supervisor + Claude workers supports task mode only: service-mode result cards have no Codex renderer and request routing is unvalidated"}
+  - {supervisor_cli: codex, worker_cli: pi, mode: task, status: unverified, adapter_missing: [], verified_by: null,
+     reason: "transport v2 mixed Pi/Codex fleets are unvalidated (supported: all-Pi, or Codex supervisor + Claude workers)",
+     notes: "night pair (Codex supervisor + pi FlashNext workers)"}
+  - {supervisor_cli: codex, worker_cli: pi, mode: service, status: unverified, adapter_missing: [], verified_by: null,
+     reason: "transport v2 mixed Pi/Codex fleets are unvalidated (supported: all-Pi, or Codex supervisor + Claude workers)"}
+  - {supervisor_cli: claude, worker_cli: pi, mode: task, status: unverified,
+     adapter_missing: [claude_supervisor], verified_by: null,
+     reason: "transport v2 has no Claude supervisor adapter (supported: all-Pi, or Codex supervisor + Claude workers)"}
+  - {supervisor_cli: claude, worker_cli: pi, mode: service, status: unverified,
+     adapter_missing: [claude_supervisor], verified_by: null,
+     reason: "transport v2 has no Claude supervisor adapter (supported: all-Pi, or Codex supervisor + Claude workers)"}
+  - {supervisor_cli: claude, worker_cli: claude, mode: task, status: unverified,
+     adapter_missing: [claude_supervisor], verified_by: null,
+     reason: "transport v2 has no Claude supervisor adapter (supported: all-Pi, or Codex supervisor + Claude workers)",
+     notes: "adopted sub-fleet supervisor (cfg adopt, design.md §19) is allowed in code"}
+  - {supervisor_cli: codex, worker_cli: codex, mode: task, status: unverified, adapter_missing: [], verified_by: null,
+     reason: "transport v2 Codex workers are unvalidated (supported: all-Pi, or Codex supervisor + Claude workers)"}
