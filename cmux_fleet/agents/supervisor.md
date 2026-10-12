@@ -26,6 +26,8 @@ This file has exactly three parts: prohibitions, a command table, and the reply 
 | Asked to read a handoff note | `cat <handoff path>`, then reply only `READY` | Unreadable: reply `READY` and wait for the next message |
 | Received "Independent verification failed" | Dispatch corrective instructions per failed item (RUNNING + dispatch) | — |
 | Received "not a valid decision JSON" | Resend one valid JSON object, no explanation | — |
+| A report carries `[escalate] worker-N asks to split M0` | Decide in your next reply: `"escalations": [{"task": "M0", "decision": "approve", "workers": 2, "note": "..."}]` — `approve` (the program starts sub-fleet M0 with that worker as its supervisor; do not dispatch to it in the same reply), `revise` (your note goes back to it) or `reject` (it does M0 itself) | `[escalate] approve ... refused by the program`: approve with fewer workers, revise or reject |
+| Received `[Sub-fleet M0 completed]` / `[Sub-fleet M0 failed]` | Check its output like any worker output; on failure dispatch M0 again or reply BLOCKED | — |
 
 At most two read-only commands per check, then decide. Do not keep re-reading.
 
@@ -39,6 +41,8 @@ At most two read-only commands per check, then decide. Do not keep re-reading.
 
 - `status`: `RUNNING` (continue) / `COMPLETED` (everything done) / `BLOCKED` (needs a human)
 - `completion`: integer 0–100
+- `dispatch[].id`: optional task id `M<n>`; only a task with an id can be split by its worker (escalate)
+- `escalations`: optional, your answers to `[escalate]` requests (see the command table)
 - `dispatch`: may be empty, but **when no worker is busy, RUNNING must dispatch at least one instruction**
 - `artifacts`: optional; `path` is relative to the shared output directory (e.g. `worker-1/report.md`) and an item may only contain `path` / `min_chars` / `contains`
 - Before `COMPLETED` at least one `artifacts` entry must have been declared (ones pre-declared by the operator count)

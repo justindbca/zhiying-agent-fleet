@@ -48,6 +48,7 @@ from cmux_fleet import contracts, handoff, history, pi_adapter, profile_runtime,
 from cmux_fleet.agent_registry import AgentRegistry  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
+from cmux_fleet.message_bus import BusError  # noqa: E402
 from cmux_fleet.planner import build_dispatch_plan  # noqa: E402
 from cmux_fleet.router import route_task  # noqa: E402
 
@@ -79,6 +80,9 @@ DEFAULTS = {'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 100000, 'stal
             'transport_version': 1, 'allow_development_v2': False, 'max_attempts': 2}
 CLAUDE_JSON = Path.home() / '.claude.json'
 CONTRACTS = 'fx:contracts'  # contract tasks only: one JSON state document (cmux_fleet/contracts.py)
+ESCALATIONS = 'fx:escalations'  # task mode: {task id: worker's split request / approval / delegation} (§20)
+ITEMS = 'fx:items'  # plain task mode: {dispatch id: {to, instruction}} for dispatch items that carry an id
+ESCALATION_DECISIONS = ('approve', 'revise', 'reject')
 CMD_TIMEOUT, CMD_TIMEOUT_MAX = 120, 600  # artifact cmd_exit (contract tasks): seconds the daemon may block
 
 
@@ -389,9 +393,25 @@ def parse_decision(text, workers, others_active):
             raise ValueError('dispatch.to must be one of ' + ', '.join(workers))
         if not isinstance(item.get('instruction'), str) or len(item['instruction'].strip()) < 12:
             raise ValueError('instruction must state the action and the expected output (>= 12 chars)')
+        if 'id' in item and (not isinstance(item['id'], str) or not re.fullmatch(contracts.M_RE, item['id'])):
+            raise ValueError('every dispatch item needs an id (M<n>, e.g. M0)')
+    escalations = decision.setdefault('escalations', [])
+    if not isinstance(escalations, list):
+        raise ValueError('escalations must be a list')
+    for item in escalations:
+        if (not isinstance(item, dict) or not isinstance(item.get('task'), str)
+                or item.get('decision') not in ESCALATION_DECISIONS):
+            raise ValueError('escalations: every item needs task and decision approve / revise / reject')
+        workers_n = item.get('workers', 1)
+        if isinstance(workers_n, bool) or not isinstance(workers_n, int) or workers_n < 1:
+            raise ValueError('escalations: workers must be a positive integer')
+        if not isinstance(item.get('note', ''), str):
+            raise ValueError('escalations: note must be text')
+    if len({x['task'] for x in escalations}) != len(escalations):
+        raise ValueError('escalations: one answer per task')
     if 'artifacts' in decision:
         validate_artifacts(decision['artifacts'])
-    if decision['status'] == 'RUNNING' and not dispatch and not others_active:
+    if decision['status'] == 'RUNNING' and not dispatch and not escalations and not others_active:
         raise ValueError('no worker is busy: RUNNING must dispatch at least one instruction')
     return decision
 
@@ -1256,6 +1276,12 @@ class Fleet:
     def contract_apply(self, t, state, changes, skeleton):
         """Side effects of an accepted decision: change notices, the P1 skeleton delivery."""
         for key_, kind, notify in changes:
+            if kind == 'veto':  # the sub-fleet that registered it withdraws it on its next tick
+                folder = Path(notify['run']) / 'subfleet-vetoes'
+                folder.mkdir(parents=True, exist_ok=True)
+                save(folder / (uuid.uuid4().hex[:12] + '.json'), {'ref': key_, 'note': notify['note']})
+                self.contract_log('vetoed', by='supervisor', iface=key_, run=notify['run'], note=notify['note'])
+                continue
             self.contract_log('approved' if kind != 'rejected' else 'rejected', by='supervisor', iface=key_, change=kind)
             self.contract_notify(state, notify, '[contract] ' + ('rejected ' + key_ if kind == 'rejected'
                                  else 'approved ' + key_ + ' (' + kind + '); read it in contracts.json'))
@@ -1273,6 +1299,7 @@ class Fleet:
                                 '\nShared output directory: ' + str(self.workspace()) + ' (write only inside your own '
                                 'subdirectory ' + worker + '/). Reply in the AGENTS.md format when done.',
                                 contracts.SKELETON)
+        self.notify_parent(state, [(k, kind) for k, kind, _ in changes if kind not in ('rejected', 'veto')])
 
     def contract_message(self, task_id, row):
         def names(k):
@@ -1312,6 +1339,7 @@ class Fleet:
                 for e in s['interfaces'].values():
                     e.update(status='declared', approved_by='supervisor')
                 s['phase'] = 'parallel'
+                self.notify_parent(s, [(k, 'new') for k in sorted(s['interfaces'])])
                 notes.append('[contract] interfaces frozen at v1. Dispatch M0…Mn now: every dispatch item has id, '
                              'provides and consumes (id@version) per the plan; consumers start from the samples.')
             elif contracts.SKELETON_TRIES and s['skeleton_tries'] >= contracts.SKELETON_TRIES:
@@ -1328,6 +1356,16 @@ class Fleet:
                              'no dispatch).')
         row = s['tasks'].get(owner) if owner and owner != contracts.SKELETON else None
         mine = row or next((t for t in s['tasks'].values() if t.get('to') == name and t['status'] == 'running'), None)
+        hold = None  # an escalate report is not a completion: the task row stays open
+        if fields.get('escalate') is not None:
+            task_id, ok, note, reply = self.escalate_intake(name, fields, s)
+            hold = task_id if task_id in s['tasks'] else (mine or {}).get('id')
+            if hold:
+                s['tasks'][hold].update(status='escalated' if ok else 'running',
+                                        reason='asked to split' if ok else 'escalate refused; worker continues')
+            if reply:
+                self.contract_queue(s, name, reply, hold)
+            notes.append(note)
         change = fields.get('interface_change')
         if change is not None:
             try:
@@ -1365,7 +1403,7 @@ class Fleet:
             self.contract_log('ready' if not failures else 'not_ready', by=name, iface=key_, failures=failures)
             notes.append('[contract] ' + ('ready ' if not failures else 'not ready ') + key_
                          + ((': ' + '; '.join(failures)) if failures else ''))
-        if row:
+        if row and row['id'] != hold:
             current = [contracts.current(s, i) for i in row.get('provides') or []]
             unready = [r for r, e in zip(row.get('provides') or [], current) if not e or e['status'] != 'ready']
             row['status'] = 'failed' if unready else 'done'
@@ -1384,6 +1422,270 @@ class Fleet:
         notes.append(contracts.table_line(s))
         self.save_contract(s)
         return '\n' + '\n'.join(notes)
+
+    # ------------------------------------------------------------ escalate: worker asks to split (§20)
+    def escalation_state(self):
+        raw = None if self.service else self.r.get(ESCALATIONS)
+        return json.loads(raw) if raw else {}
+
+    def save_escalations(self, state):
+        self.r.set(ESCALATIONS, json.dumps(state, ensure_ascii=False, separators=(',', ':')))
+
+    def escalation_item(self, task_id, state):
+        """(worker slot, original instruction) of a task id: the contract task table, else plain dispatch ids."""
+        if state is not None:
+            row = state['tasks'].get(task_id) or {}
+            return row.get('to'), row.get('instruction'), row.get('status')
+        row = json.loads(self.r.get(ITEMS) or '{}').get(task_id) or {}
+        return row.get('to'), row.get('instruction'), 'running' if row else None
+
+    def escalate_check(self, name, fields, state):
+        reason, proposal = fields.get('escalate'), fields.get('proposal')
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError('escalate must be a one-sentence reason')
+        if not isinstance(proposal, list) or not proposal or not all(
+                isinstance(p, dict) and isinstance(p.get('id'), str) and isinstance(p.get('instruction'), str)
+                and len(p['instruction'].strip()) >= 12 and isinstance(p.get('output'), str) and p['output'].strip()
+                for p in proposal):
+            raise ValueError('proposal must be a non-empty list of {id, instruction (>= 12 chars), output}')
+        ids = [p['id'] for p in proposal]
+        parents = {i.rsplit('.', 1)[0] for i in ids if re.fullmatch(contracts.M_RE + r'\.\d+', i)}
+        if len(parents) != 1 or len(set(ids)) != len(ids) or not all('.' in i for i in ids):
+            raise ValueError('proposal ids must be distinct and all <your task id>.<n> (e.g. M0.0, M0.1)')
+        task_id = parents.pop()
+        slot, instruction, status = self.escalation_item(task_id, state)
+        if slot is None and state is None and not json.loads(self.r.get(ITEMS) or '{}'):
+            raise ValueError('escalate needs a task id: the supervisor must dispatch with "id" (M<n>) '
+                             'or run a contracts task')
+        if slot != name or status not in ('running', 'escalated'):
+            raise ValueError(task_id + ' is not a running task of ' + self.label(name))
+        workers = fields.get('workers', len(proposal))
+        if isinstance(workers, bool) or not isinstance(workers, int):
+            raise ValueError('workers must be a positive integer')
+        refused = subfleet.check(self, name, task_id, workers, ready=False)
+        if refused:
+            raise ValueError(refused)
+        return task_id, {'slot': name, 'reason': reason.strip(), 'proposal': proposal, 'workers': workers,
+                         'instruction': instruction or '', 'status': 'escalated'}
+
+    def escalate_intake(self, name, fields, state):
+        """A worker report carrying ``escalate``. Returns (task id, accepted?, note for the supervisor,
+        reply for the worker or None). Refusals carry the program's reason to both."""
+        try:
+            task_id, rec = self.escalate_check(name, fields, state)
+        except ValueError as exc:
+            self.log('escalate.refused', agent=name, reason=str(exc))
+            return None, False, ('\n[escalate] refused for ' + self.label(name) + ': ' + str(exc)
+                                 + ' (the worker was told and continues its task)'), \
+                ('[escalate] your split request was refused by the program: ' + str(exc)
+                 + '\nContinue your current task yourself (or fix the escalate JSON and send it again). '
+                 'Reply in the AGENTS.md format (Done / Evidence / Not done / Blocked).')
+        esc = self.escalation_state()
+        esc[task_id] = rec
+        self.save_escalations(esc)
+        self.log('escalate.asked', agent=name, task=task_id, workers=rec['workers'], reason=rec['reason'])
+        who = self.label(name)
+        pieces = '\n'.join('- ' + p['id'] + ': ' + p['instruction'].strip() + ' -> ' + p['output'] for p in rec['proposal'])
+        note = ('\n[escalate] ' + who + ' asks to split ' + task_id + ' into ' + str(len(rec['proposal']))
+                + ' pieces run by a sub-fleet of ' + str(rec['workers']) + ' workers. Reason: ' + rec['reason']
+                + '\n' + pieces + '\nAnswer in your next JSON: "escalations": [{"task": "' + task_id
+                + '", "decision": "approve" | "revise" | "reject", "workers": <n, optional>, "note": "<optional>"}]. '
+                'approve: the program starts sub-fleet ' + task_id + ' with ' + who + ' as its supervisor; '
+                'revise: your note goes back to ' + who + '; reject: ' + who + ' does ' + task_id + ' itself. '
+                'Do not dispatch to ' + who + ' in the reply that approves.')
+        return task_id, True, note, None
+
+    def escalation_decision(self, decision, state):
+        """Validate the supervisor's escalations against the open requests (no side effects)."""
+        open_ = self.escalation_state()
+        busy = {self.resolve(x['to']) for x in decision['dispatch']}
+        out = []
+        for item in decision['escalations']:
+            rec = open_.get(item['task'])
+            if not rec or rec.get('status') != 'escalated':
+                raise ValueError('escalations: ' + item['task'] + ' has no open escalate request')
+            if item['task'] in {x.get('id') for x in decision['dispatch']}:
+                raise ValueError('escalations: ' + item['task'] + ' is also dispatched in this reply; do one or the other')
+            if item['decision'] == 'approve' and rec['slot'] in busy:
+                raise ValueError('escalations: approve ' + item['task'] + ' hands ' + self.label(rec['slot'])
+                                 + ' over to a sub-fleet; do not dispatch to it in the same reply')
+            out.append((item['task'], rec, item))
+        return out
+
+    def escalation_apply(self, t, state, task_id, rec, answer):
+        esc = self.escalation_state()
+        note = answer.get('note', '').strip()
+        row = state['tasks'].get(task_id) if state is not None else None
+        slot = rec['slot']
+        if answer['decision'] == 'approve':
+            workers = answer.get('workers', rec['workers'])
+            refused = subfleet.check(self, slot, task_id, workers, ready=False)
+            if refused:  # a limit, not a malformed reply: no strike, the request stays open
+                self.log('escalate.approve_refused', task=task_id, reason=refused)
+                self.queue('supervisor', '[escalate] approve of ' + task_id + ' refused by the program: ' + refused
+                           + '. ' + task_id + ' still waits for your answer (approve with fewer workers / revise / '
+                           'reject). Reply with the JSON format from AGENTS.md.')
+                return
+            output, goal = None, rec['instruction']
+            if row is not None:
+                paths = [e['path'] for e in (contracts.current(state, i) for i in row.get('provides') or []) if e]
+                output = str(self.workspace() / paths[0]) if paths else None
+                if paths:
+                    goal += ('\nThe parent fleet verifies these interfaces of ' + task_id + ' (shapes in '
+                             + str(self.workspace() / 'contracts.json') + '): '
+                             + ', '.join(str(self.workspace() / x) for x in paths))
+                row.update(status='delegated', attempts=row.get('attempts', 0) + 1, reason='sub-fleet ' + task_id)
+            if note:
+                goal += '\nSupervisor note: ' + note
+            rid = subfleet.request(self.run_dir, slot, task_id, goal, workers, output=output,
+                                   proposal=rec['proposal'], contracts=state is not None)
+            rec.update(status='approved', rid=rid, workers=workers, note=note)
+            esc[task_id] = rec
+            self.log('escalate.approved', task=task_id, request=rid, workers=workers)
+        else:
+            esc.pop(task_id, None)
+            text = ('[escalate] the supervisor asks you to revise your split of ' + task_id + ': ' + (note or '-')
+                    + '\nSend a new escalate JSON at the end of your report, or continue ' + task_id + ' yourself.'
+                    if answer['decision'] == 'revise' else
+                    '[escalate] the supervisor rejected splitting ' + task_id + (': ' + note if note else '')
+                    + '\nDo ' + task_id + ' yourself now.')
+            text = '[Supervisor instruction ' + t.get('id', '') + '] [' + task_id + '] ' + text + \
+                '\nReply in the AGENTS.md format (Done / Evidence / Not done / Blocked) when done.'
+            if row is not None:
+                row.update(status='running', reason=answer['decision'] + 'd split')
+                self.contract_queue(state, slot, text, task_id)
+            else:
+                self.queue(slot, text)
+            self.log('escalate.' + answer['decision'] + 'd', task=task_id, note=note)
+        self.save_escalations(esc)
+
+    def escalation_tick(self):
+        """Approved splits: read the spawn answer; a refusal reopens the request for the supervisor."""
+        if not self.running():
+            return
+        esc, changed = self.escalation_state(), False
+        for task_id, rec in esc.items():
+            if rec.get('status') != 'approved':
+                continue
+            try:
+                answer = load(subfleet.answer_path(self.run_dir, rec['rid']))
+            except (OSError, ValueError):
+                continue
+            changed = True
+            if answer.get('status') == 'accepted':
+                rec.update(status='delegated', run=answer.get('run'))
+                self.log('escalate.delegated', task=task_id, run=answer.get('run'))
+                continue
+            rec['status'] = 'escalated'
+            state = self.contract_state()
+            if state is not None and task_id in state['tasks']:
+                state['tasks'][task_id].update(status='escalated', reason='sub-fleet refused')
+                self.save_contract(state)
+            self.log('escalate.spawn_refused', task=task_id, reason=answer.get('reason'))
+            self.queue('supervisor', '[escalate] sub-fleet ' + task_id + ' could not start: ' + str(answer.get('reason'))
+                       + '\n' + task_id + ' waits for your answer again (escalations: approve with fewer workers / '
+                       'revise / reject). Reply with the JSON format from AGENTS.md.')
+        if changed:
+            self.save_escalations(esc)
+
+    def escalation_finished(self, rec, ok):
+        """A delegated task came back (subfleet.collect). Returns extra lines for the supervisor."""
+        task_id = rec['task_id']
+        esc = self.escalation_state()
+        if esc.pop(task_id, None) is None:
+            return ''  # an operator spawn, not an escalation
+        self.save_escalations(esc)
+        state = self.contract_state()
+        row = state['tasks'].get(task_id) if state is not None else None
+        if row is None:
+            return ''
+        failures = [] if ok else ['sub-fleet failed (attempt ' + str(rec.get('attempt', 1)) + '): '
+                                  + str(rec.get('reason') or rec.get('outcome'))]
+        entries = [contracts.current(state, i) for i in row.get('provides') or []]
+        if ok:
+            for i, e in zip(row.get('provides') or [], entries):
+                failures += ([i + ' is not registered'] if e is None else contracts.file_failures(e, self.workspace()))
+        notes = []
+        if not failures:
+            for e in entries:
+                if e['status'] != 'ready':
+                    e['status'] = 'ready'
+                    self.contract_notify(state, e['consumers'], '[contract] ready ' + contracts.ref(e)
+                                         + ': switch your input from ./stubs/ to ' + e['path'] + ' and re-run.')
+                    notes.append('[contract] ready ' + contracts.ref(e))
+            row.update(status='done', reason='sub-fleet outputs verified')
+            for held in contracts.releasable(state):
+                held['status'] = 'running'
+                held['attempts'] = held.get('attempts', 0) + 1
+                self.contract_queue(state, held['to'], held['message'], held['id'])
+                self.contract_log('task.released', task=held['id'])
+        else:
+            row.update(status='failed', reason='; '.join(failures))
+        self.contract_log('task.' + row['status'], task=task_id, by='sub-fleet', reason=row['reason'])
+        notes.append(contracts.table_line(state))
+        self.save_contract(state)
+        return '\n' + '\n'.join(notes)
+
+    # ------------------------------------------------------------ sub-fleet interfaces: notify the top, veto (§20)
+    def notify_parent(self, state, changes):
+        """A sub-fleet's interfaces take effect at once; the top supervisor is told and may veto."""
+        if not changes or not self.cfg.get('parent_config'):
+            return
+        folder = Path(load(self.cfg['parent_config'])['run']) / 'subfleet-notices'
+        folder.mkdir(parents=True, exist_ok=True)
+        items = [{'ref': k, 'change': kind, 'path': state['interfaces'][k]['path'],
+                  'producer': state['interfaces'][k]['producer']} for k, kind in changes if k in state['interfaces']]
+        save(folder / (uuid.uuid4().hex[:12] + '.json'),
+             {'origin_run': str(self.run_dir), 'task': self.cfg.get('task_id'), 'interfaces': items})
+
+    def relay_notices(self):
+        """Parent tick: pass a sub-fleet notice up the tree; the top fleet tells its supervisor."""
+        folder = self.run_dir / 'subfleet-notices'
+        for path in sorted(folder.glob('*.json')) if folder.is_dir() else []:
+            if self.cfg.get('parent_config'):
+                up = Path(load(self.cfg['parent_config'])['run']) / 'subfleet-notices'
+                up.mkdir(parents=True, exist_ok=True)
+                os.replace(path, up / path.name)
+                continue
+            try:
+                note = load(path)
+            except (OSError, ValueError):
+                note = None
+            path.unlink(missing_ok=True)
+            if not note or not self.running():
+                continue
+            state = self.contract_state()
+            if state is not None:
+                state.setdefault('child_interfaces', {}).update({i['ref']: note['origin_run'] for i in note['interfaces']})
+                self.save_contract(state)
+            self.log('subfleet.interfaces', task=note.get('task'), interfaces=[i['ref'] for i in note['interfaces']])
+            self.queue('supervisor', '[sub-fleet interfaces] sub-fleet ' + str(note.get('task')) + ' registered: '
+                       + '; '.join(i['ref'] + ' (' + i['change'] + ', ' + i['path'] + ')' for i in note['interfaces'])
+                       + '\nThey are in effect already. To withdraw one, add to your next JSON "interfaces": [{"id": '
+                       '"<id>", "version": <n>, "decision": "veto", "note": "<why>"}]. Reply with the JSON format '
+                       'from AGENTS.md.')
+
+    def apply_vetoes(self):
+        """Sub-fleet tick: the top supervisor vetoed one of our interfaces: withdraw it (deprecated)."""
+        folder = self.run_dir / 'subfleet-vetoes'
+        for path in sorted(folder.glob('*.json')) if folder.is_dir() else []:
+            try:
+                veto = load(path)
+            except (OSError, ValueError):
+                veto = None
+            path.unlink(missing_ok=True)
+            state = self.contract_state() if veto and self.running() else None
+            e = state['interfaces'].get(veto['ref']) if state else None
+            if not e or e['status'] == 'deprecated':
+                continue
+            e.update(status='deprecated', deprecated_by='veto by the top supervisor')
+            self.contract_log('vetoed', by='top supervisor', iface=veto['ref'], note=veto.get('note', ''))
+            self.contract_notify(state, [e['producer']] + e['consumers'], '[contract] ' + veto['ref']
+                                 + ' was vetoed by the top supervisor: ' + (veto.get('note') or '-') + '. Stop using it.')
+            self.queue('supervisor', '[contract] the top supervisor vetoed ' + veto['ref'] + ': ' + (veto.get('note') or '-')
+                       + '\nIt is withdrawn (deprecated). Re-plan the tasks that provide or consume it (declare a '
+                       'replacement under a new id). Reply with the JSON format from AGENTS.md.')
+            self.save_contract(state)
 
     def pi_metadata(self, name, ev):
         fields = {k: ev[k] for k in ('thread', 'transcript', 'ctx_used', 'ctx_window')
@@ -1474,6 +1776,12 @@ class Fleet:
         extra = self.contract_report(name, text)
         if extra is None:  # the contract gate ended the task
             return
+        fields = contracts.report_fields(text) if self.contract_state() is None else {}
+        if fields.get('escalate') is not None:  # plain task: no task table, same validation
+            _, _, note, reply = self.escalate_intake(name, fields, None)
+            if reply:
+                self.queue(name, reply)
+            extra += note
         self.queue('supervisor', tag + '\n' + text + extra + '\n\nReply with the JSON format from AGENTS.md.')
 
     def others_active(self):
@@ -1498,6 +1806,7 @@ class Fleet:
                 slot = self.resolve(item['to'])
                 instruction = item['instruction'].strip()
                 prepared.append((slot, instruction, self.prepare_worker_profile(slot, instruction)))
+            escalations = self.escalation_decision(decision, state) if decision['status'] == 'RUNNING' else []
         except (ValueError, TypeError, KeyError) as exc:
             # P0 gap lists never count toward the three-strike limit (user 10/13): the supervisor
             # keeps fixing interfaces until all checks pass; the task `hours` budget is the bound.
@@ -1550,9 +1859,20 @@ class Fleet:
             if state is not None:
                 self.contract_queue(state, slot, row['message'], row['id'])
                 continue
-            self.queue(slot, advisory + '[Supervisor instruction ' + t.get('id', '') + '] ' + instruction
+            if item.get('id'):  # plain task: an id makes the item escalatable (§20)
+                items = json.loads(self.r.get(ITEMS) or '{}')
+                items[item['id']] = {'to': slot, 'instruction': instruction}
+                self.r.set(ITEMS, json.dumps(items, ensure_ascii=False))
+            self.queue(slot, advisory + '[Supervisor instruction ' + t.get('id', '') + '] '
+                       + ('[' + item['id'] + '] ' if item.get('id') else '') + instruction
                        + '\nShared output directory: ' + str(self.workspace()) + ' (write only inside your own '
                        'subdirectory ' + slot + '/). Reply in the AGENTS.md format when done.')
+        esc = self.escalation_state()
+        redispatched = [x['id'] for x in decision['dispatch'] if esc.get(x.get('id'), {}).get('status') == 'escalated']
+        if redispatched:  # the supervisor answered the split by dispatching the task again
+            self.save_escalations({k: v for k, v in esc.items() if k not in redispatched})
+        for task_id, rec, answer in escalations:
+            self.escalation_apply(t, state, task_id, rec, answer)
         if state is not None:
             self.save_contract(state)
         self.log('dispatch', count=len(decision['dispatch']), completion=decision['completion'])
@@ -1643,6 +1963,9 @@ class Fleet:
                        + skeleton_worker + '.')
         elif self.r.get(CONTRACTS) is not None:
             self.r.delete(CONTRACTS)  # an earlier contract task's state never leaks into this one
+        for stale in (ESCALATIONS, ITEMS):
+            if self.r.get(stale) is not None:
+                self.r.delete(stale)
         self.queue('supervisor', prompt + '\nReply with the JSON format from AGENTS.md.')
         (self.run_dir / 'result.json').unlink(missing_ok=True)  # a new task: this run is not finished
         self.log('task.submitted', task=task_id)
@@ -2219,10 +2542,19 @@ class Fleet:
         save_result(self.run_dir, t, contract_summary=summary)
 
     def tick(self):
-        self.roster_tick()  # the only place the roster changes: never inside per-slot loops
-        self.write_result()
-        self.sync_contract_files()
-        subfleet.tick(self)  # sub-fleet spawns/returns: side effects, outside any v2 transaction
+        # Each part is guarded: under v2 this runs in the daemon loop, and one failing part (a bad
+        # roster, a broken sub-fleet record, a full disk) must not kill the daemon. Bus errors stay fatal.
+        for part, run in (('roster', self.roster_tick),  # the only place the roster changes
+                          ('result', self.write_result), ('contracts', self.sync_contract_files),
+                          ('subfleet', lambda: subfleet.tick(self)),  # side effects, outside any v2 transaction
+                          ('escalations', self.escalation_tick), ('notices', self.relay_notices),
+                          ('vetoes', self.apply_vetoes)):
+            try:
+                run()
+            except BusError:
+                raise
+            except Exception as exc:
+                self.log('tick.error', part=part, error=repr(exc))
         if self.v2:
             return self.v2.tick()
         now = time.time()

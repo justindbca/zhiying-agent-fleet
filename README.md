@@ -260,7 +260,12 @@ A busy worker can be turned into the supervisor of its own fleet for one numbere
   main fleet restarts sub-fleets that were running.
 - Test / operator entry (the owning daemon executes it):
   `cmux-fleet subfleet spawn --slot worker-1 --task-id M0 --goal "..." --workers 2 [--output /abs/path]`.
-  The supervisor-approval path that calls it automatically is not wired yet.
+- Normal path (§20): a worker whose task is too big ends its report with
+  `{"escalate": "<why>", "proposal": [{"id": "M0.0", "instruction": "...", "output": "m0.0.md"}], "workers": 2}`;
+  the supervisor answers `"escalations": [{"task": "M0", "decision": "approve|revise|reject", "workers": 2, "note": "..."}]`;
+  on approve the program starts the sub-fleet. The task needs an id: contract tasks always have one, plain tasks
+  need `"id": "M0"` on the dispatch item. In contract tasks the sub-fleet runs its own P0 / P1; its interfaces take
+  effect at once and are reported to the top supervisor, which may `veto` them.
 
 ## Claude Code workers (optional)
 

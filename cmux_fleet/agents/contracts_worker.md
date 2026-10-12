@@ -24,6 +24,7 @@ Your instruction names the task id (`[M2]`) and the interfaces you `provide` (wr
 | Received `[contract] approved IF-x@n` | Switch when your next instruction names `@n`; finish the current batch first | — |
 | Received `[contract] ready IF-x@n` | Switch input from `./stubs/` to the registered `path`, re-run, write it in your report | Real file does not match the shape: report `Question for supervisor:` with the mismatch |
 | Received `[contract] not ready IF-x@n` | Producer: fix the file, verify, announce again. Consumer: keep using the stub | — |
+| Your task is too big for one worker | End your report with the JSON object `{"escalate": "<why>", "proposal": [{"id": "M0.0", "instruction": "...", "output": "m0.0.md"}], "workers": 2}` (ids = your task id + `.<n>`; the same single object as any `interface_change`); keep Done / Evidence for what you did so far, then wait | Refused or rejected: do the task yourself; asked to revise: send a corrected object |
 | Assigned the P1 skeleton run (instruction contains `[skeleton]`) | Read `{{WORKSPACE}}/contracts.json`; in dependency order feed each upstream `sample` into its consumer (code: a minimal stub function per interface and one call chain; research: walk the outline using the samples); write `./skeleton.md`, one line per interface: `IF-x@1 · producer → consumer · PASS/FAIL · evidence` | A sample cannot be consumed as written: FAIL with the exact mismatch; never edit the samples yourself |
 
 ### Report format additions
