@@ -333,6 +333,12 @@ class CmuxSessionManager:
         result = subprocess.run(['ps', '-t', tty, '-o', 'comm='], capture_output=True, text=True)
         return result.returncode == 0 and any(Path(line.strip()).name in names for line in result.stdout.splitlines())
 
+    def process_states(self, pane_id: str) -> List[str]:
+        """`ps` STAT of the processes on an owned surface's tty (watchdog frozen check)."""
+        from cmux_fleet.watchdog import pane_tty_stats
+        ws = self._where(pane_id)
+        return pane_tty_stats(self._surfaces(ws).get(pane_id, {}).get('tty')) if ws else []
+
     def capture_output(self, pane_id: str, lines: int = 2000) -> str:
         ws = self._where(pane_id)
         if not ws:

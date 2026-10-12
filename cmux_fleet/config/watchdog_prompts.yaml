@@ -1,0 +1,52 @@
+# Watchdog prompt table (docs/design.md §24). Hot-reloaded: the daemon re-reads this file when it
+# changes; an invalid edit is refused (audited) and the previous table stays in force.
+#
+# prompts: whitelist of KNOWN, harmless confirmation dialogs. When every string in `match` (case-
+#   insensitive, literal) is on the last `tail_lines` lines of the agent's screen, the watchdog
+#   saves the screen and sends `keys` (cmux send-key names). The same dialog answered `max_hits`
+#   times within one delivery stops being answered: the slot is treated as stalled.
+#   `any` (optional) additionally needs at least one of its strings.
+#   `verify` (required): matching text is NOT an authorisation. Before any key is sent the watchdog
+#   checks that the pane is this run's own (cmux registry, not an adopted pane) and that the
+#   dialog's concrete operation / path lies inside a grant the run already has:
+#     own_cwd       every path shown is the slot's own directory (trusted at spawn)
+#     paths_in_run  every path shown is inside the slot directory or <run>/workspace (--add-dir)
+#     rm_in_cwd     rm targets are literal (no $var / substitution) and strictly inside the slot dir
+#   If the scope cannot be read off the screen, nothing is pressed: screen saved, slot held.
+# unknown_markers: a screen that shows one of these but matches no whitelist entry is an UNKNOWN
+#   dialog: the screen is saved, the slot is held, and nothing is pressed (an Enter could approve
+#   something the task never authorised).
+tail_lines: 25
+max_hits: 3
+prompts:
+  - name: dangerous_rm
+    # Claude Code still asks for `rm` on a possibly-empty variable under
+    # --dangerously-skip-permissions (10/12 E16). The variable's value is not on the screen, so in
+    # practice this dialog is held for a human; only a literal in-directory target is answered.
+    match: ["dangerous rm"]
+    keys: [Enter]
+    verify: rm_in_cwd
+  - name: read_outside
+    # "Read outside the working directories?" (E2: hub stuck 26 days on it).
+    match: ["outside the working director"]
+    keys: [Enter]
+    verify: paths_in_run
+  - name: trust_folder
+    # Claude Code 2.1.280, captured live 2026-10-12 in a throwaway PTY: "Accessing workspace: <path>
+    # ... Is this a project you created or one you trust?" with "❯ No, exit" PRESELECTED; Enter alone
+    # would close the session. Down was verified live to move the cursor to "Yes, I trust this folder".
+    match: ["yes, i trust this folder", "❯ no, exit"]
+    keys: [Down, Enter]
+    verify: own_cwd
+  - name: trust_folder_legacy
+    # Codex "Trust this folder?" / older Claude "Do you trust the files in this folder?" (default Yes).
+    # Text NOT reproduced live: Codex 0.162.1 showed no trust dialog in a non-git directory.
+    match: ["trust"]
+    any: ["trust this folder?", "trust the files in this folder"]
+    keys: [Enter]
+    verify: own_cwd
+unknown_markers:
+  - "Do you want to proceed?"
+  - "Do you want to make this edit"
+  - "Do you want to create"
+  - "❯ 1. Yes"
