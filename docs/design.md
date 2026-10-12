@@ -357,7 +357,7 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 
 用户要求“worker 可以热载也可以卸载，用 yaml 控制”。本节替代“worker 名单在 `start` 时冻结”的旧行为；slot/generation 标识、一页布局、唯一 daemon、task/service 协议不变。
 
-- 入口：`start --roster <yaml>`，与 `--workers/--worker-names` 互斥；schema 为 `workers: [{name, role?}]`，`role` 相对 yaml 目录、优先于 `--roles DIR/<name>.md`。启动时文件不合法直接拒绝启动。不带 `--roster` 的 run 行为不变。
+- 入口：`start --roster <yaml>`，与 `--workers/--worker-names` 互斥；schema 为 `workers: [{name, role?, window?, handoff_ratio?}]`（后两项与顶层 `handoff:` 见 §22），`role` 相对 yaml 目录、优先于 `--roles DIR/<name>.md`。启动时文件不合法直接拒绝启动。不带 `--roster` 的 run 行为不变。
 - 检测：daemon 每次 tick 开头比较文件 mtime/大小，再比内容哈希；名单只在这一处改动，不在逐 slot 循环里改。
 - 整份校验：YAML 错、未知字段、名字不合法/重复、零个 worker、角色文件不存在、本 run 已用过的名字（Redis agent 状态或 workspace 目录已存在）→ 整份拒收，保留当前名单，`roster.rejected` 写入审计（control 可见）并列出每条原因。
 - 加：先写 `config.json`（`latest.json` 指向本 run 时同步）再启动——钩子/桥按配置文件校验成员；Redis 字段与 `start_all` 相同，READY 提示相同，标签放进右侧 worker 栏末尾（无 worker 时放 supervisor 右侧），刷新历史页。
@@ -453,3 +453,19 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 
 **已知缺口（P2）**：跨 fleet 投递（目标在同树另一套 fleet）直接拒绝并请在报告里说明，抄送也只到本 fleet 监工、不沿父链到顶级——规范要根 daemon 持有全树路由，§18 契约本身还只到单 fleet，这块随子 fleet 契约一起做；`[peer]` 投给官方 CLI worker 后若它不按 Done/Evidence 回报，走原 2 次纠错后 blocked（同 §18 `[contract]` 通知）；daemon 在 Claude worker 被同伴唤醒、Redis 里仍是 idle 时可能把下一条投递打进它的输入框，Claude 把打进去的文字排到当前回合之后，该回合按「不是由投递启动」记 unsolicited，若 Claude 把两者并成一个回合则会被当成那条投递的回报（未实测）；Claude 收到 `SendMessage` 时在 transcript 里的具体形态、`--name` 与 `ListAgents` 在真实 2.1.x 上的可见性，均未在本块实测；`--from` 可被沙盒内 agent 伪造（同 chrome）。违规检测按 `Peer notices:` 行里的 `from <x>` 取词，worker 若把 daemon 的 `[contract]` 通知写成「from daemon / from the supervisor」会误报 `[peer violation]`；`fx:peer:notes` / `fx:peer:sent:*` 随 AOF 进续跑，但带未抄送的 notes 或半用的限速窗口续跑未测。独立复核、合并、部署均未做。
 
+## 22. 换代阈值按模型 / CLI 分别配置（2026-10-13 用户新要求）
+
+用户原话：「handoff 对于 worker 窗口要根据模型不同去设置不同配置，像 claude code 是 1M 上下文就不该频繁的 handoff」。此前 Claude 的窗口固定取 `--claude-window`（200,000），换代比例全局一个 `--handoff-ratio`，1M 的 opus worker 在 120k 就换代。本节只改阈值来源；换代流程（§4）、交接单、代数标识不变。
+
+- **判定**：投递前 `used >= ratio × window` 才换代（原规则）。`window`、`ratio` 各自独立解析，先命中者生效：
+  1. roster 该 worker 条目的 `window` / `handoff_ratio`；
+  2. roster 顶层 `handoff:` 表，键先 `<cli>:<model>`（模型串精确匹配）再 `<cli>`，值 `{window?, ratio?}`；
+  3. `config.json` 的同名 `handoff:` 表（静态，启动时校验，不热载）；
+  4. 内置：Claude 模型名含 `[1m]` / `opus` / `fable`（小写子串）→ 1,000,000，其余 Claude 模型 → `--claude-window`；Codex 取 rollout 自报 `model_context_window`、Pi 取自报 ctx_window（"measured"），只有显式 `window` 才覆盖；
+  5. `--handoff-ratio`。两个旗标保留为最低层缺省，向后兼容。
+- **模型取当前运行值**：`runtime_cfg(name)`（含 profile 切换写入的 `runtime_launch.overrides`）里的 `worker_model`（Claude，监工同）/ `codex_model` / `pi_model`；监工走同一解析，只是没有 worker 条目。
+- **热载**：随 §16 名单检测，下一次投递检查即生效，不重启；`roster.changed` 带 `handoff` 字段记新旧值（表 `table`、各 worker）。校验：ratio 是 (0,1) 内的数、window 是正整数（布尔不算）、表键 CLI 只能 claude/codex/pi、条目只许 window/ratio；任一不合法按 §16 整份拒收，原阈值保留。退役中 worker 保留原阈值直到退役。
+- **显示**：每次解析写入 `fx:agent:<slot>` 的 `handoff_window`（或 `measured`）/ `handoff_ratio` / `handoff_source`（如 `window: built-in opus; ratio: --handoff-ratio`）；名单变更后立即刷新全体。`status` 的 `context` 带这三项，control 行显示 `handoff=<ratio>@<window>`。
+- **已知边界**：内置表按子串判断，`opus` 一律当 1M 依据用户陈述（未在 API 层核实具体模型的真实窗口，若某个 opus 变体实为 200k 用 `claude:<model>` 覆盖）；模型串精确匹配，别名（`opus`）与全名（`claude-opus-…`）是不同键；adopt 的子 fleet 监工仍不换代（§19）。
+
+**验证**：`python3 -m pytest -q tests` 全套通过（新增 `tests/test_handoff_limits.py`：内置表与旗标、五层顺序、opus 300k 不换代 / sonnet 120k 换代、profile 运行模型、worker 覆盖 + 不重启热载改变阈值、坏值整份拒收保留原阈值、config 表校验、Codex 实测窗口不动除非显式覆盖、状态字段；`tests/test_roster.py` 新增坏值参数与 v2 热载进 `status`）。独立复核、合并、部署均未做。

@@ -234,6 +234,37 @@ def claude_transcript_usage(path, window):
     return 0, window
 
 
+CLAUDE_1M = ('[1m]', 'opus', 'fable')  # built-in: Claude models with a 1,000,000-token window
+
+
+def handoff_limits(cli, model, cfg, table=None, worker=None):
+    """Effective (window, ratio, source) for one agent (docs/design.md §22).
+
+    Window and ratio are resolved separately, first hit wins: the roster worker entry, the
+    roster ``handoff`` table (``<cli>:<model>`` then ``<cli>``), the config ``handoff`` table
+    (same keys), then built-ins / start flags. ``window`` None means "measured" (Codex rollout,
+    Pi report). Only Claude needs a built-in: its transcript carries no window."""
+    layers = [('worker', worker or {})]
+    for where, tab in (('roster', table or {}), ('config', cfg.get('handoff') or {})):
+        layers += [(where + ' ' + k, tab[k]) for k in ((cli + ':' + model) if model else None, cli) if k and k in tab]
+    window = ratio = None
+    for where, entry in layers:
+        if window is None and 'window' in entry:
+            window, wsrc = int(entry['window']), where
+        if ratio is None and 'ratio' in entry:
+            ratio, rsrc = float(entry['ratio']), where
+    if window is None:
+        if cli != 'claude':
+            wsrc = 'measured'
+        elif any(t in (model or '').lower() for t in CLAUDE_1M):
+            window, wsrc = 1000000, 'built-in ' + (model or '')
+        else:
+            window, wsrc = int(cfg['claude_window']), '--claude-window'
+    if ratio is None:
+        ratio, rsrc = float(cfg['handoff_ratio']), '--handoff-ratio'
+    return window, ratio, 'window: ' + wsrc + '; ratio: ' + rsrc
+
+
 def claude_stop(cfg_path, name, generation, raw):
     """Claude Code Stop hook. Pushes a turn event unless background work will resume the turn."""
     data = json.loads(raw or '{}')
@@ -805,6 +836,9 @@ class Fleet:
         timeout = self.cfg['profile_ready_timeout']
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError('profile_ready_timeout must be a finite positive number')
+        bad = roster.handoff_errors({'handoff': self.cfg.get('handoff')})  # static config table (§22)
+        if bad:
+            raise ValueError('config ' + '; '.join(bad))
         self.run_dir = Path(self.cfg['run'])
         self.r, self.mgr = r, mgr
         self.sessions = Path(sessions) if sessions else sessions_dir(self.cfg)
@@ -814,6 +848,7 @@ class Fleet:
         # queued work, then retire; until then they still count as busy but take no new work.
         self.desired = list(self.workers)
         self.roster_stamp = self.roster_digest = None
+        self.handoff_table, self.worker_handoff = {}, {}  # roster `handoff:` / per-worker overrides (§22)
         self.service = self.cfg.get('mode') == 'service'
         self.stopping = False
         self.next_liveness = 0
@@ -2141,15 +2176,25 @@ class Fleet:
                 if name != 'supervisor' and self.agent(name).get('state') in ('busy', 'handoff'):
                     busy += 1
 
+    def handoff_limits(self, name):
+        """(window or None = measured, ratio, source) for this agent's current runtime model."""
+        cfg = self.runtime_cfg(name)
+        cli = agent_cli(cfg, name)
+        model = cfg.get({'claude': 'worker_model', 'pi': 'pi_model'}.get(cli, 'codex_model')) or ''
+        limits = handoff_limits(cli, str(model), self.cfg, self.handoff_table, self.worker_handoff.get(name))
+        self.setf(name, handoff_window=limits[0] or 'measured', handoff_ratio=limits[1], handoff_source=limits[2])
+        return limits
+
     def usage(self, name):
+        override = self.handoff_limits(name)[0]
         if is_pi(self.runtime_cfg(name), name):
             info = self.agent(name)
-            return int(info.get('ctx_used') or 0), int(info.get('ctx_window') or self.cfg['window'])
+            return int(info.get('ctx_used') or 0), override or int(info.get('ctx_window') or self.cfg['window'])
         if is_claude(self.runtime_cfg(name), name):
             path = self.agent(name).get('transcript')
             if not path:
                 return 0, 0
-            used, window = claude_transcript_usage(path, int(self.cfg['claude_window']))
+            used, window = claude_transcript_usage(path, override)
             self.setf(name, ctx_used=used, ctx_window=window)
             return used, window
         thread = self.agent(name).get('thread')
@@ -2157,6 +2202,7 @@ class Fleet:
         if not paths:
             return 0, 0
         used, window = read_usage(str(paths[0]), int(self.cfg['window']))
+        window = override or window
         self.setf(name, ctx_used=used, ctx_window=window)
         return used, window
 
@@ -2212,15 +2258,16 @@ class Fleet:
         # Leave the original message queued across handoff; READY triggers another
         # idle-boundary validation. This daemon remains the sole inbox consumer.
         used, window = self.usage(name)
+        ratio = float(self.agent(name).get('handoff_ratio') or self.cfg['handoff_ratio'])  # set by usage()
         if subfleet.adopted(self.cfg, name, info.get('generation')):
             window = 0  # an adopted pane goes back to its parent fleet: never replace it with a successor
-        if window and used >= float(self.cfg['handoff_ratio']) * window:
+        if window and used >= ratio * window:
             if int(info.get('delivered') or 0) == 0:
                 # A fresh session (only its READY turn so far) is already over the ratio: its
                 # baseline (system prompt + AGENTS.md) exceeds the budget, so rotating would spawn
                 # successors forever. Deliver anyway and say so once per generation.
                 self.log('rotate.impossible', agent=name, used=used, window=window,
-                         ratio=self.cfg['handoff_ratio'], reason='fresh session already over ratio; raise --handoff-ratio')
+                         ratio=ratio, reason='fresh session already over ratio; raise handoff_ratio (roster) or --handoff-ratio')
             elif agent_cli(self.runtime_cfg(name), name) == 'codex' and active_children(info.get('thread'), self.sessions):
                 # Hold the message: never feed a near-full session while its subagents run.
                 self.log('rotate.deferred', agent=name, reason='native subagents still running')
@@ -2390,6 +2437,7 @@ class Fleet:
             if problem:
                 raise ValueError(problem)
             workers, roles = roster.parse(raw, Path(path).parent)
+            table, per_worker = roster.handoff(raw)
             # A slot name used earlier in this run still has Redis state and a workspace.
             used = [n + ': name was already used in this run (agent state or workspace exists); pick a new name'
                     for n in workers if n not in self.workers
@@ -2406,6 +2454,15 @@ class Fleet:
         results.update({n: 'retiring when idle' for n in self.desired if n not in workers})
         results.update({n: 'role changed; applies at its next generation' for n in workers
                         if n in self.workers and roles.get(n) != old_roles.get(n)})
+        # Handoff thresholds (§22): next delivery check uses them; retiring workers keep theirs.
+        per_worker = dict({w: v for w, v in self.worker_handoff.items() if w in self.workers and w not in workers},
+                          **per_worker)
+        changed = {n: {'before': self.worker_handoff.get(n) or {}, 'after': per_worker.get(n) or {}}
+                   for n in sorted(set(per_worker) | set(self.worker_handoff))
+                   if per_worker.get(n) != self.worker_handoff.get(n)}
+        if table != self.handoff_table:
+            changed['table'] = {'before': self.handoff_table, 'after': table}
+        self.handoff_table, self.worker_handoff = table, per_worker
         self.desired = workers
         # Retiring workers keep their role until gone (a handoff successor may still finish work).
         roles = dict({w: old_roles[w] for w in self.workers if w not in workers and w in old_roles}, **roles)
@@ -2420,8 +2477,11 @@ class Fleet:
             results[name] = self.add_worker(name)
         if adds or any(n not in workers for n in before) or any(n not in before for n in workers):
             self.r.hset(ROSTER, mapping={'notify': 1})
-        if results:
-            self.log('roster.changed', before=before, after=self.desired, results=results)
+        if results or changed:
+            self.log('roster.changed', before=before, after=self.desired, results=results, handoff=changed)
+        for name in self.names:  # status shows the effective values without waiting for a delivery
+            if self.agent(name):
+                self.handoff_limits(name)
 
     def persist_roster(self):
         self.cfg['workers'][:] = self.workers  # in place: the control view holds this list
@@ -2943,7 +3003,8 @@ def main(argv=None):
     s.add_argument('--codex-home', default=str(HOME / 'codex-home'),
                    help='isolated CODEX_HOME for the agents (login + profile symlinked from yours; no hooks/MCP)')
     s.add_argument('--handoff-ratio', type=float, default=DEFAULTS['handoff_ratio'],
-                   help='rotate a session once its context use reaches this share of the window')
+                   help='rotate a session once its context use reaches this share of the window '
+                        '(lowest-priority default; roster handoff: overrides per CLI/model, docs/design.md §22)')
     s.add_argument('--handoff-timeout', type=float, default=DEFAULTS['handoff_timeout'],
                    help='seconds to wait for the model to write its handoff before using the skeleton')
     s.add_argument('--window', type=int, default=DEFAULTS['window'],
@@ -2968,7 +3029,7 @@ def main(argv=None):
     s.add_argument('--worker-model', default=DEFAULTS['worker_model'], help='claude workers: --model value')
     s.add_argument('--worker-kit', help='claude workers: dir with .claude/{agents,skills} and mcp.json copied into each worker cwd')
     s.add_argument('--claude', help='claude binary (default: first on PATH)')
-    s.add_argument('--claude-window', type=int, default=DEFAULTS['claude_window'], help='claude workers: context window')
+    s.add_argument('--claude-window', type=int, default=DEFAULTS['claude_window'], help='claude models not in the built-in 1M list ([1m]/opus/fable): context window (§22)')
     s.add_argument('--mode', choices=('task', 'service'), default=DEFAULTS['mode'],
                    help='task: one goal until COMPLETED; service: resident, handles a stream of requests')
     s.add_argument('--worker-names', help='comma-separated worker names (default worker-1..N), e.g. exit,reentry,rung')
