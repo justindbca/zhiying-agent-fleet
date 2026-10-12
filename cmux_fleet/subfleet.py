@@ -24,6 +24,7 @@ Internal API
   resume_children(fleet)         root --resume: relaunch children that were running
   delegated_route(cfg, name, generation) -> (cfg, name, generation)  hook re-targeting
   tree(cfg) -> nested status for ``status``
+  page_links(cfg) -> {'parent', 'children'} for the history/control page (both directions)
 """
 import json
 import re
@@ -117,6 +118,31 @@ def save_record(child_run, rec):
 
 def active_children(run):
     return [d for d in children_dirs(run) if record(d).get('state') in ACTIVE]
+
+
+def page_links(cfg):
+    """Cross links of this fleet's history page: 'back to the parent fleet' and the sub-fleet list.
+
+    Read-only, from disk (config + subfleet.json); every target is the other fleet's history page.
+    The sidebar title is shown too: a file link moves the browser pane, it cannot switch cmux workspaces."""
+    from cmux_fleet import history
+    fleet = _fleet()
+    parent = None
+    if cfg.get('parent_config'):
+        try:
+            pcfg = fleet.load(cfg['parent_config'])
+        except (OSError, ValueError):
+            pcfg = None
+        if pcfg:
+            parent = {'task_id': pcfg.get('task_id') or '', 'url': history.page_url(pcfg['run']),
+                      'title': pcfg.get('agents_title') or root_name(pcfg)}
+    children = []
+    for d in children_dirs(cfg['run']):
+        rec = record(d)
+        children.append({'task_id': rec.get('task_id') or d.name, 'run': d.name, 'state': rec.get('state'),
+                         'outcome': rec.get('outcome'), 'slot': rec.get('slot'), 'attempt': rec.get('attempt'),
+                         'title': rec.get('title') or '', 'url': history.page_url(d)})
+    return {'parent': parent, 'children': children}
 
 
 def root_config(cfg):
@@ -345,6 +371,7 @@ def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, lau
         raise Refused('sub-fleet ' + task_id + ' could not start: ' + str(exc)) from exc
     rec['state'] = 'running'
     save_record(rec_dir, rec)
+    f.refresh_history()  # the sub-fleet list on the parent's page
     f.log('subfleet.spawned', task=task_id, slot=slot, run=str(rec_dir), workers=workers, title=ws_title)
     return rec
 
@@ -409,7 +436,7 @@ def start_adopted(f):
         f.log('subfleet.adopt_failed', pane=sid)
         return f.finish('blocked', 'could not take over the delegated pane of ' + adopt['slot'])
     f.mgr.rename(sid, 'fx-' + f.cfg.get('tab_prefix', '') + fleet.SUPERVISOR_LABEL)
-    history.write_page(f.run_dir, f.history_slots())
+    history.write_page(f.run_dir, f.history_slots(), f.history_links())
     f.history_pane = f.mgr.arrange(sid, [f.agent(w)['pane'] for w in f.workers], history.page_url(f.run_dir))
     f.r.hset(fleet.SERVICE, mapping={'history_pane': f.history_pane or ''})
     if adopt.get('parent_workspace') and hasattr(f.mgr, 'place_after'):
@@ -539,6 +566,7 @@ def tick(f):
             rec['reason'] = (res or {}).get('reason') or 'main task ended while the sub-fleet was running'
             rec['state'] = 'stopping'
             save_record(d, rec)
+            f.refresh_history()
             post_stop(cfg)  # a crashed child (Redis gone) is collected below all the same
             f.log('subfleet.stopping', task=rec['task_id'], outcome=rec['outcome'])
         if rec['state'] == 'stopping' and not fleet.daemon_running(d):
@@ -594,6 +622,7 @@ def collect(f, child_run, notify=True):
     rec['state'] = 'returned' if ok else 'failed'
     rec['finished'] = time.time()
     save_record(child_run, rec)
+    f.refresh_history()
     f.log('subfleet.' + rec['state'], task=rec['task_id'], slot=slot, outcome=rec.get('outcome'),
           reason=rec.get('reason', ''), attempt=rec.get('attempt'))
     if notify and f.running():

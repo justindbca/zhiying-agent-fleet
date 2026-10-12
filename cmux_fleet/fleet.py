@@ -1071,7 +1071,7 @@ class Fleet:
             self.init_worker(name)
         for name in self.names:
             self.spawn_ready(name)
-        history.write_page(self.run_dir, self.history_slots())
+        history.write_page(self.run_dir, self.history_slots(), self.history_links())
         # One page: supervisor above history/control on the left, worker tabs on the right.
         self.history_pane = self.mgr.arrange(self.agent('supervisor')['pane'],
                                              [self.agent(w)['pane'] for w in self.workers],
@@ -1083,6 +1083,9 @@ class Fleet:
         retired = [s for s in dict.fromkeys(e.get('slot') for e in history.entries(self.run_dir))
                    if s and s not in self.names]
         return [(n, self.label(n), SUPERVISOR_LABEL if n == 'supervisor' else n) for n in self.names + retired]
+
+    def history_links(self):
+        return subfleet.page_links(self.cfg)
 
     # -- events
     def handle(self, ev, *, _v2_internal=False):
@@ -2011,7 +2014,7 @@ class Fleet:
                  handoff=str(out), source=source, timed_out=timed_out)
 
     def refresh_history(self):
-        history.write_page(self.run_dir, self.history_slots())
+        history.write_page(self.run_dir, self.history_slots(), self.history_links())
         pane = self.r.hget(SERVICE, 'history_pane')
         if pane:
             self.mgr.reload_browser(pane)

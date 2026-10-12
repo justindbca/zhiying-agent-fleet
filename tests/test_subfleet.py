@@ -95,6 +95,7 @@ class WorldMgr:
         return True
 
     def reload_browser(self, pane):
+        self.__dict__.setdefault('reloaded', []).append(pane)
         return True
 
     def tab_into(self, pane, peer, before=True):
@@ -405,6 +406,52 @@ def test_failed_subfleet_marks_failure_and_missing_deliverable_fails(tree):
     assert parent_hook(t, 'READY', back)['status'] == 'ready'
     rec2, _ = spawn_m0(t)  # a retry keeps the old run (history) and counts the attempt
     assert rec2['attempt'] == 2 and rec2['run'].endswith('M0-attempt-2')
+
+
+def page_data(run):
+    from cmux_fleet import history
+    page = history.page_path(run).read_text()
+    return json.loads(page.split('const DATA=', 1)[1].split(';\n', 1)[0])
+
+
+def test_history_pages_link_parent_and_children_both_ways(tree):
+    """Design §19 / nested §5.3: parent page lists its sub-fleets (jump), child page links back."""
+    from cmux_fleet import history
+    t, f = tree, tree.f
+    f.refresh_history()
+    assert page_data(f.run_dir)['children'] == [] and page_data(f.run_dir)['parent'] is None
+    reloads = len(f.mgr.reloaded)
+    rec, out = spawn_m0(t)
+    data = page_data(f.run_dir)  # the parent page was rewritten (and reloaded) on spawn
+    assert len(f.mgr.reloaded) > reloads
+    [kid] = data['children']
+    assert kid['task_id'] == 'M0' and kid['state'] == 'running' and kid['slot'] == 'worker-1'
+    assert kid['url'] == history.page_url(rec['run']) and kid['title'] == '研报 › worker-1 › 子 fleet M0'
+    cf = child_daemon(t, rec)
+    child = page_data(rec['run'])
+    assert child['parent']['url'] == history.page_url(f.run_dir) and child['children'] == []
+    assert child['parent']['title'] == (f.cfg.get('agents_title') or subfleet.root_name(f.cfg))
+    page = history.page_path(rec['run']).read_text()
+    assert 'id="fleets"' in page and '回到父 fleet' in page
+    # finished: the parent page shows the outcome without a manual refresh
+    out.write_text('done')
+    cf.v2.finish('completed', 'ok')
+    cf.write_result()
+    subfleet.tick(f)
+    assert page_data(f.run_dir)['children'][0]['state'] == 'stopping'
+    stop_child_like_daemon(cf)
+    subfleet.tick(f)
+    [kid] = page_data(f.run_dir)['children']
+    assert kid['state'] == 'returned' and kid['outcome'] == 'completed'
+
+
+def test_history_page_link_text_is_escaped(tmp_path):
+    from cmux_fleet import history
+    links = {'parent': {'task_id': 'M0', 'url': 'file:///x', 'title': '"><img src=x onerror=alert(1)>'},
+             'children': [{'task_id': '</script><b>', 'url': 'file:///y', 'title': 't', 'state': 'running'}]}
+    page = history.write_page(tmp_path, [], links).read_text()
+    assert page.count('</script>') == 1
+    assert page_data(tmp_path)['parent']['title'] == '"><img src=x onerror=alert(1)>'
 
 
 def test_root_stop_stops_children_first_without_orphans(tree):
