@@ -426,12 +426,13 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 |---|---|---|
 | `idle` | 无在途投递且不在 starting | 什么都不做，再久也不判死（E1） |
 | `working` | 在途，转录 / rollout（含 Claude 子 agent 转录）`stall_timeout` 内有更新 | 无 |
-| `prompting` | 屏幕最后 `tail_lines` 行命中弹框表白名单（starting 时也查，信任框在 READY 前） | 存屏到 `<run>/watchdog/`，发表里的预定键；同一投递同一弹框答满 `max_hits`（3）次仍在 → 按 `stalled` |
+| `prompting` | 屏幕最后 `tail_lines` 行命中弹框表白名单（starting 时也查，信任框在 READY 前） | 存屏到 `<run>/watchdog/`；**文案命中不等于授权**：再核①窗格属本 fleet 注册表且非子 fleet 收养，②该条 `verify` 规则证明对话框上的具体操作 / 路径落在 run 已有授权内，两项都过才发预定键（审计 `watch.prompt_answered` 带 `authorized`），否则同未知弹框：只存屏 + hold，审计 `watch.prompt_unverified`。同一投递同一弹框答满 `max_hits`（3）次仍在 → 按 `stalled` |
 | `prompting`（未知） | 命中 `unknown_markers` 但不在白名单 | 只存屏 + hold（暂停派工），一个键都不按 |
 | `stalled` | 在途，`stall_timeout` 无活动 | Escape，最多 `stall_escapes`（3）次，均匀分布在 `stall_grace`（300 s）里；不 hold。期间转录再动 → `working` |
-| `frozen` | stalled 满 `stall_grace`；或 3 次 Escape 后屏幕摘要不变；或 `ps` 连续两次看到该 tty 进程 `U`（Linux `D`） | 存屏 → skeleton 交接单 → 新一代 `tab_into` 原位 → `kill_pane`（只认本 fleet 注册表里的 surface，杀其 tty 进程树）→ `confirm_retired`（投递 cancelled、`stop_confirmed`）→ worker：给监工发 `FROZEN` 报告，原指令**不重跑**；监工：原消息加注重新入队；service：请求公布 `stalled`。run 暂停中 / 子 fleet 收养的窗格 → 只 hold 不杀；杀不掉 → 任务 blocked |
+| `frozen` | stalled 满 `stall_grace`；或 3 次 Escape 后屏幕摘要不变；或 `ps` 连续两次看到该 tty 进程 `U`（Linux `D`） | 存屏 → skeleton 交接单 → 新一代（launch-held）`tab_into` 原位 → `kill_pane`（只认本 fleet 注册表里的 surface，杀其 tty 进程树）→ `confirm_retired`（投递 cancelled、`stop_confirmed`）→ 开启动闸 → worker：给监工发 `FROZEN` 报告，原指令**不重跑**；监工：原消息加注重新入队；service：请求公布 `stalled`。run 暂停中 / 子 fleet 收养 / 不在本 fleet 注册表的窗格 → 只 hold 不杀 |
 
-- 弹框表 `cmux_fleet/config/watchdog_prompts.yaml`（`--prompt-table` 可换），按 mtime 热载；坏改动审计 `watch.table_rejected` 并沿用旧表。缺省白名单只有三条：`dangerous_rm`、`read_outside`、`trust_folder`，键都是 `Enter`。
+- **frozen 换代顺序与失败**：先起新代再杀旧代（与 `respawn` / 交接同序，保布局）。旧代确认退役前新代拿不到活：它是 `starting`（`pump` 只给 `idle` 投），旧租约仍占着投递（`offer` 要 idle 租约，`register_slot` 报 `busy`），`launch_ready=0` 时它的 READY 被拒。任何一步失败（新代起不来 / 进不了原 tab / 旧代杀不掉或杀后仍在）→ 先杀掉新代，槽位字段还原成旧代、hold（投递保持 uncertain，不 cancelled，不重跑），审计 `watch.rotate_failed`；只有新代也杀不掉时才可能两个会话并存：槽位 held + 启动闸关 + 任务 blocked，报告里点名两个 pane 交人工。
+- 弹框表 `cmux_fleet/config/watchdog_prompts.yaml`（`--prompt-table` 可换），按 mtime 热载；坏改动审计 `watch.table_rejected` 并沿用旧表。每条必须写 `verify`：`own_cwd`（对话框上的路径都是本槽目录，spawn 时已信任）、`paths_in_run`（路径都在本槽目录或 `<run>/workspace`，即 `--add-dir` 已授权）、`rm_in_cwd`（rm 目标是字面量、无 `$` / 反引号 / 管道，且严格在本槽目录内）；路径读不出来 → 不按。TUI 折行的长路径按「连续单 token 行」拼回。缺省表：`dangerous_rm`（Enter，变量目标一律 hold）、`read_outside`（Enter）、`trust_folder`（Claude 2.1.280 实录：缺省选中「No, exit」，键 `Down, Enter`，且要求屏上是「❯ No, exit」）、`trust_folder_legacy`（Codex / 旧 Claude，Enter，文案未实录）。
 - 自检：连续 `capture_fail_alarm`（3）次抓屏失败写一条 `watch.capture_fail`（error，每段连续失败只报一次）。
 - **hold 出口**：槽位 held（uncertain / expired）时，若同一会话、同一代、由该投递打字开启的回合结束（Claude Stop / Codex notify 经 `tui_turn`），钩子发 `turn_ended`；daemon 校验身份后 `resolve_uncertain(cancelled, execution_stopped=True)`，槽位回 idle，结果**不采用**，暂停状态不动（审计 `hold.released`）。手打回合 / 旧代 / 未 held 的伪造事件一律拒绝。
 - 参数：`--stall-timeout`（原有，缺省 1800）、`--stall-grace`、`--stall-escapes`、`--prompt-table`；配置非法在 `validate_config` 拒绝。`walled`（墙文案）不在本项，归刹车（E）。

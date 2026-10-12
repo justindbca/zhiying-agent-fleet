@@ -16,7 +16,25 @@ from cmux_fleet import runtime_v2, subfleet, watchdog
 DIALOG_RM = ('Bash command\n  rm -rf "$OUT/"*\n\nDangerous rm on possibly-empty variable\n'
              'Do you want to proceed?\n❯ 1. Yes\n  2. No, and tell Claude what to do differently (esc)')
 DIALOG_UNKNOWN = ('Bash command\n  git push --force origin main\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No')
-DIALOG_TRUST = 'Do you trust the files in this folder?\n\n/tmp/run/workspace/worker-1\n\n❯ 1. Yes, proceed\n  2. No, exit'
+DIALOG_RM_LITERAL = ('Bash command\n  rm -rf build/tmp\n\nDangerous rm on possibly-empty variable\n'
+                     'Do you want to proceed?\n❯ 1. Yes\n  2. No')
+TRUST = 'Do you trust the files in this folder?\n\n{}\n\n❯ 1. Yes, proceed\n  2. No, exit'
+DIALOG_TRUST = TRUST.format('/tmp/run/workspace/worker-1')
+# Claude Code 2.1.280 trust dialog, captured verbatim from a live PTY (120x40) on 2026-10-12. The path
+# wraps at the dialog width; "No, exit" is preselected.
+CLAUDE_TRUST_LIVE = "u\n────────────────────────────────────────────────────────────────────────────────\n Accessing workspace:\n\n /private/tmp/claude-501/-Users-justin--cmux-fleet-dev-runs-fleet-20261013-0252\n 33-a4957e88-workspace-worker-6/24b6f3ae-4cf5-4090-92f6-7f39a32c99d9/scratchpad\n /trust-probe\n\n Quick safety check: Is this a project you created or one you trust? (Like your\n own code, a well-known open source project, or work from your team). If not,\n take a moment to review what's in this folder first.\n\n Claude Code'll be able to read, edit, and execute files here.\n\n Security guide\n\n ❯ No, exit\n   Yes, I trust this folder\n\n Enter to confirm · Esc to cancel\n"
+CLAUDE_TRUST_LIVE_CWD = ('/private/tmp/claude-501/-Users-justin--cmux-fleet-dev-runs-fleet-20261013-025233-a4957e88-'
+                         'workspace-worker-6/24b6f3ae-4cf5-4090-92f6-7f39a32c99d9/scratchpad/trust-probe')
+
+
+def claude_trust(path, width=79):
+    """The live layout above for another directory, wrapped the same way."""
+    rows = [' ' + path[i:i + width - 1] for i in range(0, len(path), width - 1)]
+    head, tail = CLAUDE_TRUST_LIVE.split(' /private/tmp/claude-501/', 1)
+    return head + '\n'.join(rows).lstrip('\n')[0:] + tail[tail.index('\n\n'):]
+
+
+READ = 'Read({})\n\nRead outside the working directories?\n❯ 1. Yes\n  2. No'
 WORKING = '⏺ Reading files…\n\n> '
 
 
@@ -27,7 +45,13 @@ def wd(mixed):  # noqa: F811
     f.mgr.screens, f.mgr.stats = {}, {}
     f.mgr.capture_output = lambda pane, lines=2000: f.mgr.screens.get(pane, WORKING)
     f.mgr.process_states = lambda pane: f.mgr.stats.get(pane, ['Ss', 'S+'])
+    f.mgr.owns = lambda pane: pane in f.mgr.alive  # this fleet's cmux registry
     return f
+
+
+def cwd(f, slot):
+    from cmux_fleet.fleet import agent_cwd
+    return agent_cwd(f.cfg, slot)
 
 
 def audits(f, event=None):
@@ -81,11 +105,16 @@ def test_classify_five_states(change, state):
 
 def test_default_prompt_table_matches_the_three_known_dialogs_only():
     table = watchdog.parse_table(watchdog.DEFAULT_TABLE.read_text())
-    assert [p['name'] for p in table['prompts']] == ['dangerous_rm', 'read_outside', 'trust_folder']
+    assert [p['name'] for p in table['prompts']] == ['dangerous_rm', 'read_outside', 'trust_folder', 'trust_folder_legacy']
     assert watchdog.match_prompt(table, DIALOG_RM)[0]['name'] == 'dangerous_rm'
     assert watchdog.match_prompt(table, 'Read file\n\nRead outside the working directories?\n❯ 1. Yes')[0]['name'] == 'read_outside'
-    assert watchdog.match_prompt(table, DIALOG_TRUST)[0]['name'] == 'trust_folder'
-    assert watchdog.match_prompt(table, 'Trust this folder?\n› 1. Yes')[0]['name'] == 'trust_folder'
+    assert watchdog.match_prompt(table, DIALOG_TRUST)[0]['name'] == 'trust_folder_legacy'
+    assert watchdog.match_prompt(table, 'Trust this folder?\n› 1. Yes')[0]['name'] == 'trust_folder_legacy'
+    live = watchdog.match_prompt(table, CLAUDE_TRUST_LIVE)[0]
+    assert live['name'] == 'trust_folder' and live['keys'] == ['Down', 'Enter']   # Enter alone = "No, exit"
+    # Cursor already on Yes (after Down): neither entry claims it, nothing is pressed again.
+    moved = CLAUDE_TRUST_LIVE.replace(' ❯ No, exit\n   Yes, I trust', '   No, exit\n ❯ Yes, I trust')
+    assert moved != CLAUDE_TRUST_LIVE and watchdog.match_prompt(table, moved) == (None, None)
     assert watchdog.match_prompt(table, DIALOG_UNKNOWN) == (None, 'do you want to proceed?')
     assert watchdog.match_prompt(table, WORKING) == (None, None)
     # Only the bottom of the screen counts: an answered dialog in scrollback is not a dialog.
@@ -99,6 +128,8 @@ def test_default_prompt_table_matches_the_three_known_dialogs_only():
     ({'prompts': [{'name': 'x', 'match': ['a'], 'keys': ['Enter'], 'regex': '.*'}]}, 'exactly name'),
     ({'promts': []}, 'unknown prompt table keys'),
     ({'max_hits': 0}, 'max_hits'),
+    ({'prompts': [{'name': 'x', 'match': ['a'], 'keys': ['Enter']}]}, 'verify must be'),   # text alone never authorises
+    ({'prompts': [{'name': 'x', 'match': ['a'], 'keys': ['Enter'], 'verify': 'always'}]}, 'verify must be'),
 ])
 def test_prompt_table_validation(bad, match):
     with pytest.raises(ValueError, match=match):
@@ -111,7 +142,7 @@ def test_v2_config_validation_rejects_bad_watchdog_settings(tmp_path):
     with pytest.raises(ValueError, match='stall_grace'):
         runtime_v2.validate_config(dict(cfg, stall_grace=-1))
     bad = tmp_path / 'table.yaml'
-    bad.write_text('prompts: [{name: x, match: [a], keys: [Delete]}]')
+    bad.write_text('prompts: [{name: x, match: [a], keys: [Delete], verify: own_cwd}]')
     with pytest.raises(ValueError, match='keys must be'):
         runtime_v2.validate_config(dict(cfg, prompt_table=str(bad)))
 
@@ -136,7 +167,7 @@ def test_busy_worker_with_fresh_transcript_is_working(wd):
 def test_whitelisted_dialog_is_answered_with_screen_saved(wd):
     f = wd
     dispatch_one(f)
-    f.mgr.screens[f.agent('worker-1')['pane']] = DIALOG_RM
+    f.mgr.screens[f.agent('worker-1')['pane']] = DIALOG_RM_LITERAL
     f.v2.watchdog.tick(time.time())
     assert keys(f, 'worker-1') == ['Enter']
     assert f.agent('worker-1')['watch_state'] == 'prompting' and f.agent('worker-1')['state'] == 'busy'
@@ -145,6 +176,7 @@ def test_whitelisted_dialog_is_answered_with_screen_saved(wd):
     assert 'Dangerous rm' in (f.run_dir / 'watchdog' / saved).read_text()
     answered, = audits(f, 'watch.prompt_answered')
     assert answered['prompt'] == 'dangerous_rm' and json.loads(answered['keys']) == ['Enter']
+    assert answered['authorized'] == 'rm build/tmp'
     assert not f.paused() and f.v2.bus.slot_state('worker-1')['status'] == 'received'
     f.mgr.screens[f.agent('worker-1')['pane']] = WORKING  # the dialog went away: back to work
     f.v2.watchdog.tick(time.time())
@@ -154,7 +186,7 @@ def test_whitelisted_dialog_is_answered_with_screen_saved(wd):
 def test_same_dialog_three_times_becomes_stalled(wd):
     f = wd
     dispatch_one(f)
-    f.mgr.screens[f.agent('worker-1')['pane']] = DIALOG_RM
+    f.mgr.screens[f.agent('worker-1')['pane']] = DIALOG_RM_LITERAL
     now = time.time()
     for i in range(3):
         f.v2.watchdog.tick(now + i)
@@ -179,7 +211,7 @@ def test_unknown_dialog_is_held_not_pressed(wd):
 def test_trust_dialog_is_answered_while_starting(wd):
     f = wd
     f.setf('worker-2', state='starting')  # a new generation before READY: no delivery yet
-    f.mgr.screens[f.agent('worker-2')['pane']] = DIALOG_TRUST
+    f.mgr.screens[f.agent('worker-2')['pane']] = TRUST.format(cwd(f, 'worker-2'))
     f.v2.watchdog.tick(time.time())
     assert keys(f, 'worker-2') == ['Enter'] and f.agent('worker-2')['watch_state'] == 'prompting'
 
@@ -192,10 +224,10 @@ def test_prompt_table_hot_reload_and_bad_edit_keeps_previous(wd, tmp_path):
     f.v2.watchdog = watchdog.Watchdog(f.v2)
     dispatch_one(f)
     pane = f.agent('worker-1')['pane']
-    f.mgr.screens[pane] = 'Allow web fetch of example.com?\n❯ Yes'
+    f.mgr.screens[pane] = 'Allow web fetch of ' + str(cwd(f, 'worker-1')) + '/page.html?\n❯ Yes'
     f.v2.watchdog.tick(time.time())
     assert keys(f, 'worker-1') == []                     # not in the table: nothing pressed
-    table.write_text('prompts:\n  - {name: web_fetch, match: ["allow web fetch"], keys: [Enter]}\n')
+    table.write_text('prompts:\n  - {name: web_fetch, match: ["allow web fetch"], keys: [Enter], verify: paths_in_run}\n')
     f.v2.watchdog.tick(time.time())
     assert keys(f, 'worker-1') == ['Enter']               # edited table in force without restart
     assert json.loads(audits(f, 'watch.table_reloaded')[0]['prompts']) == ['web_fetch']
@@ -377,3 +409,95 @@ def test_forged_release_event_is_rejected(wd):
     assert f.v2.step(10)
     assert audits(f, 'hold.release_rejected')[0]['error'] == 'slot is not held'
     assert f.v2.bus.slot_state('worker-1')['status'] == 'received' and f.agent('worker-1')['state'] == 'busy'
+
+
+# ------------------------------------------------------------------ dialog text is not an authorisation
+def held_unpressed(f, slot, prompt, reason):
+    assert keys(f, slot) == [] and f.agent(slot)['state'] == 'held' and f.paused()
+    unverified, = audits(f, 'watch.prompt_unverified')
+    assert unverified['prompt'] == prompt and reason in unverified['reason']
+    assert any(n.endswith('prompt-' + prompt + '.txt') for n in screens(f))
+    assert audits(f, 'watch.prompt_answered') == []
+
+
+def test_dangerous_rm_on_a_variable_is_held_for_a_human(wd):
+    f = wd
+    dispatch_one(f)
+    f.mgr.screens[f.agent('worker-1')['pane']] = DIALOG_RM   # rm -rf "$OUT/"*: OUT may be empty
+    f.v2.watchdog.tick(time.time())
+    held_unpressed(f, 'worker-1', 'dangerous_rm', 'shell variable')
+    assert f.v2.bus.slot_state('worker-1')['status'] == 'uncertain'
+    f.v2.watchdog.tick(time.time() + 1)                         # held: the next tick presses nothing either
+    assert keys(f, 'worker-1') == []
+
+
+@pytest.mark.parametrize('target', ['../worker-2/out', '/Users', '~/Documents'])
+def test_dangerous_rm_outside_the_slot_directory_is_held(wd, target):
+    f = wd
+    dispatch_one(f)
+    f.mgr.screens[f.agent('worker-1')['pane']] = DIALOG_RM_LITERAL.replace('build/tmp', target)
+    f.v2.watchdog.tick(time.time())
+    held_unpressed(f, 'worker-1', 'dangerous_rm', 'outside the slot directory')
+
+
+def test_read_outside_inside_the_run_workspace_is_answered(wd):
+    f = wd
+    dispatch_one(f)
+    shared = cwd(f, 'worker-1').parent / 'worker-2' / 'notes.md'   # <run>/workspace is granted (--add-dir)
+    f.mgr.screens[f.agent('worker-1')['pane']] = READ.format(shared)
+    f.v2.watchdog.tick(time.time())
+    assert keys(f, 'worker-1') == ['Enter'] and f.agent('worker-1')['state'] == 'busy'
+    assert audits(f, 'watch.prompt_answered')[0]['prompt'] == 'read_outside'
+
+
+@pytest.mark.parametrize('screen,reason', [
+    (READ.format('/Users/someone/.ssh/id_ed25519'), 'outside the granted area'),
+    (READ.format('/Users/justin/Documents/projects/cmux-fleet/cmux_fleet/fleet.py'), 'outside the granted area'),
+    ('Read outside the working directories?\n❯ 1. Yes', 'no path'),   # scope not on the screen
+])
+def test_read_outside_the_run_or_without_a_path_is_held(wd, screen, reason):
+    f = wd
+    dispatch_one(f)
+    f.mgr.screens[f.agent('worker-1')['pane']] = screen
+    f.v2.watchdog.tick(time.time())
+    held_unpressed(f, 'worker-1', 'read_outside', reason)
+
+
+@pytest.mark.parametrize('screen,name,reason', [
+    (DIALOG_TRUST, 'trust_folder_legacy', 'outside the granted area'),   # some other folder than the slot's own
+    ('Trust this folder?\n› 1. Yes', 'trust_folder_legacy', 'no path'),
+    (CLAUDE_TRUST_LIVE, 'trust_folder', 'outside the granted area'),     # the live capture names another directory
+])
+def test_trust_of_a_foreign_or_unnamed_folder_is_held(wd, screen, name, reason):
+    f = wd
+    f.setf('worker-2', state='starting')
+    f.mgr.screens[f.agent('worker-2')['pane']] = screen
+    f.v2.watchdog.tick(time.time())
+    held_unpressed(f, 'worker-2', name, reason)
+
+
+def test_dialog_on_a_pane_outside_this_fleet_registry_is_not_answered(wd):
+    f = wd
+    dispatch_one(f)
+    pane = f.agent('worker-1')['pane']
+    f.mgr.screens[pane] = DIALOG_RM_LITERAL
+    f.mgr.owns = lambda p: False
+    f.v2.watchdog.tick(time.time())
+    held_unpressed(f, 'worker-1', 'dangerous_rm', 'registry')
+
+
+def test_live_claude_trust_dialog_wrapped_path_is_read_whole():
+    table = watchdog.parse_table(watchdog.DEFAULT_TABLE.read_text())
+    entry = watchdog.match_prompt(table, CLAUDE_TRUST_LIVE)[0]
+    assert watchdog.authorize(entry, CLAUDE_TRUST_LIVE, 25, CLAUDE_TRUST_LIVE_CWD, '/nowhere')[0] is True
+    assert watchdog.authorize(entry, CLAUDE_TRUST_LIVE, 25, CLAUDE_TRUST_LIVE_CWD + '-other', '/nowhere')[0] is False
+    assert watchdog.authorize(entry, CLAUDE_TRUST_LIVE, 25, CLAUDE_TRUST_LIVE_CWD.rsplit('/', 1)[0], '/nowhere')[0] is False
+
+
+def test_claude_trust_dialog_for_the_slot_own_directory_is_answered_down_enter(wd):
+    f = wd
+    f.setf('worker-2', state='starting')
+    f.mgr.screens[f.agent('worker-2')['pane']] = claude_trust(str(cwd(f, 'worker-2')))
+    f.v2.watchdog.tick(time.time())
+    assert keys(f, 'worker-2') == ['Down', 'Enter'] and f.agent('worker-2')['state'] == 'starting'
+    assert audits(f, 'watch.prompt_answered')[0]['prompt'] == 'trust_folder'

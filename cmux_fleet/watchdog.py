@@ -17,6 +17,8 @@ Only settlements (hold, queue, publish) go through RuntimeV2.transaction.
 """
 import hashlib
 import os
+import re
+import shlex
 import time
 import uuid
 from pathlib import Path
@@ -25,6 +27,12 @@ STATES = ('idle', 'working', 'stalled', 'frozen', 'prompting')
 DEFAULT_TABLE = Path(__file__).resolve().parent / 'config' / 'watchdog_prompts.yaml'
 KEYS = frozenset(('Enter', 'Escape', 'Tab', 'Up', 'Down', 'Left', 'Right', 'Space',
                   'y', 'n', '1', '2', '3'))
+# How an answered dialog's concrete operation is proven to be inside an authorisation the run already has.
+VERIFY = {
+    'own_cwd': 'every path on the dialog is the slot\'s own working directory (trusted at spawn)',
+    'paths_in_run': 'every path on the dialog is inside the slot directory or the run workspace (--add-dir)',
+    'rm_in_cwd': 'the rm targets are literal (no variable / substitution) and strictly inside the slot directory',
+}
 DEFAULTS = {'stall_grace': 300, 'stall_escapes': 3, 'watch_interval': 5, 'capture_fail_alarm': 3}
 # Slot states the watchdog never touches: someone else owns the next step.
 HANDS_OFF = ('held', 'dead', 'retired', 'delegated', 'handoff')
@@ -60,8 +68,8 @@ def parse_table(raw):
         raise ValueError('max_hits must be an integer 1-20')
     prompts, names = [], set()
     for entry in data.get('prompts') or []:
-        if not isinstance(entry, dict) or set(entry) - {'name', 'match', 'any', 'keys'}:
-            raise ValueError('a prompt entry has exactly name / match / keys (and optional any)')
+        if not isinstance(entry, dict) or set(entry) - {'name', 'match', 'any', 'keys', 'verify'}:
+            raise ValueError('a prompt entry has exactly name / match / keys / verify (and optional any)')
         name = entry.get('name')
         if not isinstance(name, str) or not name or name in names:
             raise ValueError('prompt names must be unique non-empty strings')
@@ -75,8 +83,12 @@ def parse_table(raw):
         keys = entry.get('keys')
         if not isinstance(keys, list) or not keys or not all(k in KEYS for k in keys):
             raise ValueError(name + ': keys must be a non-empty list of ' + ', '.join(sorted(KEYS)))
+        if entry.get('verify') not in VERIFY:
+            # Matching text is not an authorisation: every answered dialog names how its operation is checked.
+            raise ValueError(name + ': verify must be one of ' + ', '.join(sorted(VERIFY)))
         prompts.append({'name': name, 'match': [x.lower() for x in entry['match']],
-                        'any': [x.lower() for x in entry.get('any', [])], 'keys': list(keys)})
+                        'any': [x.lower() for x in entry.get('any', [])], 'keys': list(keys),
+                        'verify': entry['verify']})
     markers = data.get('unknown_markers') or []
     if not isinstance(markers, list) or not all(isinstance(x, str) and x.strip() for x in markers):
         raise ValueError('unknown_markers must be a list of non-empty strings')
@@ -132,6 +144,74 @@ def match_prompt(table, screen):
         if marker in text:
             return None, marker
     return None, None
+
+
+PATH_RE = re.compile(r'(?<![\w$.~/-])(~?/[^\s"\'`<>|;&()]+)')
+
+
+def _real(path):
+    return Path(os.path.realpath(os.path.expanduser(path.rstrip('?.,:!'))))
+
+
+def _inside(path, root, strict=False):
+    return path == root and not strict or root in path.parents
+
+
+def unwrap_paths(text):
+    """Re-join a long path the TUI wrapped over several lines (Claude 2.1.280 wraps at its box width).
+
+    A run of consecutive lines that are each one space-free token, the first starting with '/' or '~/',
+    is one path. Joining two separate paths by mistake yields a path that is in no grant: held, safe.
+    """
+    out, block = [], []
+    for row in text.splitlines() + ['']:
+        token = row.strip()
+        if token and ' ' not in token and (block or token.startswith(('/', '~/'))):
+            block.append(token)
+            continue
+        if block:
+            out.append(''.join(block))
+            block = []
+        out.append(row)
+    return '\n'.join(out[:-1])
+
+
+def authorize(entry, screen, lines, cwd, workspace):
+    """(True, why) only when the dialog's concrete operation is inside an existing grant; else (False, why).
+
+    A dialog whose scope cannot be read off the screen is never authorised: the caller holds it.
+    """
+    text = screen_tail(screen, lines)
+    cwd, workspace = _real(str(cwd)), _real(str(workspace))
+    kind = entry.get('verify')
+    if kind in ('own_cwd', 'paths_in_run'):
+        paths = [_real(m) for m in PATH_RE.findall(unwrap_paths(text))]
+        if not paths:
+            return False, 'no path on the dialog: its scope cannot be checked'
+        roots = (cwd,) if kind == 'own_cwd' else (cwd, workspace)
+        bad = [str(p) for p in paths if not any((p == r) if kind == 'own_cwd' else _inside(p, r) for r in roots)]
+        if bad:
+            return False, 'path outside the granted area: ' + ', '.join(bad[:3])
+        return True, ', '.join(sorted({str(p) for p in paths}))[:300]
+    if kind == 'rm_in_cwd':
+        rows = [row for row in text.splitlines()  # the dialog's own title says 'Dangerous rm'
+                if re.search(r'(^|[\s;&|(])rm\s', row) and 'dangerous rm' not in row.lower()]
+        if len(rows) != 1:
+            return False, 'the rm command is not readable on the dialog'
+        command = rows[0][re.search(r'(^|[\s;&|(])rm\s', rows[0]).end():]
+        if any(c in command for c in '$`') or re.search(r'[;&|<>]', command):
+            return False, 'rm target depends on a shell variable / substitution: its scope cannot be checked'
+        try:
+            targets = [t for t in shlex.split(command) if not t.startswith('-')]
+        except ValueError:
+            return False, 'the rm command does not parse'
+        if not targets:
+            return False, 'rm has no target on the dialog'
+        bad = [t for t in targets if not _inside(_real(str(cwd / t) if not t.startswith(('/', '~')) else t), cwd, strict=True)]
+        if bad:
+            return False, 'rm target outside the slot directory: ' + ', '.join(bad[:3])
+        return True, 'rm ' + ' '.join(targets)[:300]
+    return False, 'no verification rule'
 
 
 def uninterruptible(stats):
@@ -210,6 +290,18 @@ class Watchdog:
         probe = getattr(self.f.mgr, 'process_states', None)
         return probe(pane) if probe else []
 
+    def authorized(self, slot, info, prompt, screen, table):
+        """This run's own pane, and the dialog's concrete operation inside a grant the run already has."""
+        from cmux_fleet import subfleet
+        from cmux_fleet.fleet import agent_cwd
+        owns = getattr(self.f.mgr, 'owns', None)
+        if owns is not None and not owns(info['pane']):
+            return False, 'pane ' + info['pane'] + ' is not in this fleet\'s registry'
+        if subfleet.adopted(self.f.cfg, slot, info.get('generation')):
+            return False, 'adopted pane belongs to the parent fleet'
+        return authorize(prompt, screen, table['tail_lines'], agent_cwd(self.f.cfg, slot),
+                         Path(self.f.cfg['run']) / 'workspace')
+
     def tick(self, now=None):
         now = time.time() if now is None else now
         table = self.cache.get(self.audit)
@@ -255,11 +347,20 @@ class Watchdog:
                          prompt=prompt, unknown=unknown, prompt_hits=hits, max_hits=table['max_hits'], moved=moved)
         if state == 'prompting' and prompt is not None:
             path = self.save_screen(slot, info, screen, 'prompt-' + prompt['name'])
+            allowed, reason = self.authorized(slot, info, prompt, screen, table)
+            if not allowed:
+                # Keep the scene: nothing pressed, slot held, a human reads the saved screen and decides.
+                self.set_state(slot, info, state, prompt=prompt['name'], authorized=False)
+                self.audit('watch.prompt_unverified', slot=slot, level='error', prompt=prompt['name'], reason=reason,
+                           screen=path, delivery_id=lease.get('current_delivery', ''))
+                self.rt.transaction('watch-prompt-' + uuid.uuid4().hex, lambda: self.rt.hold(
+                    slot, 'dialog ' + prompt['name'] + ' not answered: ' + reason + '; nothing pressed, screen saved to ' + path))
+                return
             sent = [k for k in prompt['keys'] if self.f.mgr.send_key(pane, k)]
             self.f.setf(slot, prompt_scope=scope, prompt_hits=hits + 1)
             self.set_state(slot, info, state, prompt=prompt['name'])
             self.audit('watch.prompt_answered', slot=slot, level='warn', prompt=prompt['name'], keys=sent,
-                       hits=hits + 1, screen=path, delivery_id=lease.get('current_delivery', ''))
+                       hits=hits + 1, screen=path, authorized=reason, delivery_id=lease.get('current_delivery', ''))
         elif state == 'prompting':
             path = self.save_screen(slot, info, screen, 'prompt-unknown')
             self.set_state(slot, info, state, marker=unknown)
@@ -307,6 +408,12 @@ class Watchdog:
             rt.transaction('watch-frozen-' + uuid.uuid4().hex, lambda: rt.hold(
                 slot, 'frozen (' + why + '); adopted pane belongs to the parent fleet, not killed'))
             return False
+        owns = getattr(f.mgr, 'owns', None)
+        if owns is not None and not owns(pane):
+            # R18 / default #13: only a pane this fleet's cmux registry proves it spawned is killed.
+            rt.transaction('watch-frozen-' + uuid.uuid4().hex, lambda: rt.hold(
+                slot, 'frozen (' + why + '); pane ' + pane + ' is not in this fleet\'s registry, not killed'))
+            return False
         lease = f.r.hgetall(rt.bus.lease_key(slot))
         msg = rt.bus.message(lease['message_id']) if lease.get('message_id') else {}
         hid = 'frozen-' + uuid.uuid4().hex[:8]
@@ -317,30 +424,66 @@ class Watchdog:
         f.mgr.capture_to(pane, str(snapshot))
         prev = f.label(slot)
         label = (SUPERVISOR_LABEL if slot == 'supervisor' else slot) + '.' + str(generation + 1)
+        # Order (same as respawn / handoff, keeps the layout): start the successor launch-held, put it in
+        # the old tab's place, kill the old process tree, confirm retirement, only then open the launch
+        # gate. Until then the successor cannot run work: it is 'starting' (pump delivers to 'idle'
+        # only), the old lease still holds the delivery (offer needs an idle lease; register_slot
+        # refuses 'busy'), and its READY is refused while launch_ready=0. Every failure below removes
+        # the successor again, so at most one session of this slot is ever left.
         f.setf(slot, generation=generation + 1, label=label, handoff_id='', watch_state='frozen',
                stall_escapes=0, watch_since=0, esc_digest='', proc_frozen=0, prompt_hits=0,
                prev_label='' if slot == 'supervisor' else prev)
         if slot != 'supervisor':
             f.r.hset(NAMES, mapping={label: slot})
-        history.record(f.run_dir, slot=slot, label=prev, generation=generation, handoff=str(note),
-                       snapshot=str(snapshot), source='frozen', timed_out=True)
-        new = f.spawn(slot, '[Same-task takeover] You are ' + label + ' (taking over from ' + prev + ', which froze '
-                      'and was stopped). Read the handoff note ' + str(note) + '. In this turn only read the note, '
-                      'do no task work, and make your final reply exactly READY.', launch_held=True)
-        placed = f.mgr.tab_into(new, pane)
-        if not placed or not f.mgr.kill_pane(pane) or f.mgr.get_pane_status(pane) is not None:
-            f.setf(slot, state='dead', launch_ready=0, retired_pane=pane)
-            self.audit('watch.kill_failed', slot=slot, level='error', pane=pane, screen=path)
-            rt.finish('blocked', 'watchdog could not stop the frozen session ' + prev + '; two sessions hold slot ' + slot)
-            return False
+        try:
+            new = f.spawn(slot, '[Same-task takeover] You are ' + label + ' (taking over from ' + prev + ', which '
+                          'froze and was stopped). Read the handoff note ' + str(note) + '. In this turn only read '
+                          'the note, do no task work, and make your final reply exactly READY.', launch_held=True)
+        except RuntimeError as exc:
+            return self.abort_rotation(slot, info, label, f.agent(slot).get('pane'), path,
+                                       'the next generation did not start (' + str(exc)[:300] + ')')
+        if not f.mgr.tab_into(new, pane):
+            return self.abort_rotation(slot, info, label, new, path, 'the next generation could not take the old tab')
+        if not f.mgr.kill_pane(pane) or f.mgr.get_pane_status(pane) is not None:
+            return self.abort_rotation(slot, info, label, new, path, 'the frozen session ' + prev + ' did not exit')
         rt.confirm_retired(slot)  # the process tree is gone: its delivery is cancelled, execution stopped
         f.setf(slot, launch_ready=1, retired_pane='')
+        history.record(f.run_dir, slot=slot, label=prev, generation=generation, handoff=str(note),
+                       snapshot=str(snapshot), source='frozen', timed_out=True)
         f.refresh_history()
         self.audit('watch.frozen_restarted', slot=slot, level='error', prev=prev, label=label, reason=why,
                    screen=path, handoff=str(note), message_id=msg.get('message_id', ''))
         self.next_check.pop(slot, None)
         self.tell(slot, prev, label, why, msg)
         return True
+
+    def abort_rotation(self, slot, old, label, new, screen, why):
+        """Undo a failed rotation: remove the successor, give the slot back to the frozen session, hold it.
+
+        The old delivery is never cancelled here (only confirm_retired does that, after a confirmed
+        kill), so the held slot still shows the work as uncertain and dispatch stays paused.
+        """
+        from cmux_fleet.fleet import NAMES
+        f, rt = self.f, self.rt
+        gone = not new or new == old.get('pane') or (f.mgr.kill_pane(new) and f.mgr.get_pane_status(new) is None)
+        self.audit('watch.rotate_failed', slot=slot, level='error', reason=why, old_pane=old.get('pane', ''),
+                   new_pane=new or '', successor_removed=gone, screen=screen)
+        if not gone:
+            # Both sessions may still be alive. The slot is held (its delivery uncertain, dispatch paused) and
+            # stays launch-held: the successor's READY is refused, so it can never be offered work.
+            text = ('watchdog could not stop the frozen session of ' + slot + ' (' + why + ') nor remove its '
+                    'successor ' + str(new) + '; two sessions may hold slot ' + slot + '. Close one by hand.')
+            f.setf(slot, launch_ready=0, retired_pane=old.get('pane', ''))
+            rt.transaction('watch-frozen-' + uuid.uuid4().hex, lambda: rt.hold(slot, text))
+            rt.finish('blocked', text)
+            return False
+        f.setf(slot, **{k: v for k, v in old.items() if k != 'watch_state'})
+        f.setf(slot, watch_state='frozen', launch_ready=old.get('launch_ready', '1'))
+        if slot != 'supervisor':
+            f.r.hdel(NAMES, label)
+        rt.transaction('watch-frozen-' + uuid.uuid4().hex, lambda: rt.hold(
+            slot, 'frozen; ' + why + '. Successor removed, frozen session left as it was (screen ' + screen + ')'))
+        return False
 
     def tell(self, slot, prev, label, why, msg):
         """The cancelled work is not re-run: the supervisor (or the request's caller) decides."""
