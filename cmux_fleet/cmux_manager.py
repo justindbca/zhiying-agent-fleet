@@ -499,6 +499,20 @@ class CmuxSessionManager:
     def reload_browser(self, surface: str) -> bool:
         return bool(self._where(surface)) and _run('browser', '--surface', surface, 'reload').returncode == 0
 
+    def browser_url(self, surface: str) -> Optional[str]:
+        """The URL a browser surface of ours shows now (None: not ours / cmux failed)."""
+        if not self._where(surface):
+            return None
+        p = _run('browser', '--surface', surface, 'url')
+        return (p.stdout.strip() or None) if p.returncode == 0 else None
+
+    def browser_goto(self, surface: str, url: str) -> bool:
+        return bool(self._where(surface)) and _run('browser', '--surface', surface, 'goto', url).returncode == 0
+
+    def select_workspace(self, workspace: str) -> bool:
+        """Switch the user's view to ``workspace`` (sub-fleet page links, docs/design.md §19)."""
+        return bool(workspace) and _run('select-workspace', '--workspace', workspace).returncode == 0
+
     # -- handover between fleets (sub-fleets, docs/design.md §19) ----------------
     def claim_run(self, run: str) -> None:
         """Tag this registry with the run that owns it (the lifecycle closer checks it before closing)."""

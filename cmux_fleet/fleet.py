@@ -1360,7 +1360,7 @@ class Fleet:
         if over:
             self.log('capacity.over', level='warning', models=over,
                      reason='card max_concurrent counts slots; later profile switches into these models wait')
-        history.write_page(self.run_dir, self.history_slots())
+        history.write_page(self.run_dir, self.history_slots(), self.history_links())
         # One page: supervisor above history/control on the left, worker tabs on the right.
         self.history_pane = self.mgr.arrange(self.agent('supervisor')['pane'],
                                              [self.agent(w)['pane'] for w in self.workers],
@@ -1372,6 +1372,9 @@ class Fleet:
         retired = [s for s in dict.fromkeys(e.get('slot') for e in history.entries(self.run_dir))
                    if s and s not in self.names]
         return [(n, self.label(n), SUPERVISOR_LABEL if n == 'supervisor' else n) for n in self.names + retired]
+
+    def history_links(self):
+        return subfleet.page_links(self.cfg)
 
     # -- events
     def handle(self, ev, *, _v2_internal=False):
@@ -2744,7 +2747,7 @@ class Fleet:
                  handoff=str(out), source=source, timed_out=timed_out)
 
     def refresh_history(self):
-        history.write_page(self.run_dir, self.history_slots())
+        history.write_page(self.run_dir, self.history_slots(), self.history_links())
         pane = self.r.hget(SERVICE, 'history_pane')
         if pane:
             self.mgr.reload_browser(pane)
@@ -3422,6 +3425,10 @@ class Fleet:
                 raise
             except Exception as exc:
                 self.log('tick.error', part=part, error=repr(exc))
+        try:  # a parent/child page link was clicked: switch to that fleet's workspace (never fatal)
+            subfleet.follow_jump(self)
+        except Exception as exc:
+            self.log('history.jump_error', error=str(exc))
         if self.v2:
             # v2 holds a stalled slot inside RuntimeV2.tick (Fleet.on_stall is v1 only): read the
             # screens of slots about to be held first, so a wall pauses the fleet instead.

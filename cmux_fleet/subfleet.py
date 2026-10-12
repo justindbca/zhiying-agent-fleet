@@ -24,6 +24,8 @@ Internal API
   resume_children(fleet)         root --resume: relaunch children that were running
   delegated_route(cfg, name, generation) -> (cfg, name, generation)  hook re-targeting
   tree(cfg) -> nested status for ``status``
+  page_links(cfg) -> {'parent', 'children'} for the history/control page (both directions)
+  follow_jump(fleet)             daemon tick: a clicked page link switches to that fleet's cmux workspace
 """
 import json
 import re
@@ -33,6 +35,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlsplit
 
 LIMITS = {'max_depth': 2, 'max_children': 3, 'max_agents_total': 12, 'child_workers_max': 3}
 ACTIVE = ('starting', 'running', 'stopping')
@@ -41,6 +44,9 @@ SEP = ' › '
 ROLE_FILES = ('AGENTS.md', 'CLAUDE.md', 'CONTRACTS.md')  # a contract sub-fleet writes its supervisor CONTRACTS.md
 STOP_WAIT = 180  # seconds a tree stop waits for one child daemon to exit
 LAUNCH_GRACE = 120  # seconds a just-launched child daemon has to take its lock before it counts as gone
+JUMP_PARAM = 'fleet-jump'  # query marker a page link click adds (history.py); a plain reload has none
+JUMP_POLL = 1.0  # seconds between two reads of the history pane URL
+JUMP_MAX_AGE = 120  # an older click (daemon was down) only puts the page back, it never moves the view
 
 
 class Refused(ValueError):
@@ -119,6 +125,135 @@ def save_record(child_run, rec):
 
 def active_children(run):
     return [d for d in children_dirs(run) if record(d).get('state') in ACTIVE]
+
+
+def page_links(cfg):
+    """Cross links of this fleet's history page: 'back to the parent fleet' and the sub-fleet list.
+
+    Read-only, from disk (config + subfleet.json); every target is the other fleet's history page.
+    The sidebar title is shown too: a file link moves the browser pane, it cannot switch cmux workspaces."""
+    from cmux_fleet import history
+    fleet = _fleet()
+    parent = None
+    if cfg.get('parent_config'):
+        try:
+            pcfg = fleet.load(cfg['parent_config'])
+        except (OSError, ValueError):
+            pcfg = None
+        if pcfg:
+            parent = {'task_id': pcfg.get('task_id') or '', 'url': history.page_url(pcfg['run']),
+                      'title': pcfg.get('agents_title') or 'Fleet agents'}  # cmux_manager's default title
+    children = []
+    for d in children_dirs(cfg['run']):
+        rec = record(d)
+        children.append({'task_id': rec.get('task_id') or d.name, 'run': d.name, 'state': rec.get('state'),
+                         'outcome': rec.get('outcome'), 'slot': rec.get('slot'), 'attempt': rec.get('attempt'),
+                         'title': rec.get('title') or '', 'url': history.page_url(d)})
+    return {'parent': parent, 'children': children}
+
+
+def _page(url):
+    return unquote(urlsplit(url).path)
+
+
+def _jump_target(f, url, rel):
+    """(verdict, workspace, page to leave in this pane, reason) for a clicked link to page ``url``.
+
+    Only this fleet's registered parent (config ``parent_config``) and its own children
+    (``sub/*/subfleet.json``) are targets, and only with the matching ``rel``. A closed or
+    unregistered target is shown in place (its history page stays readable); anything else
+    puts this fleet's own page back."""
+    from cmux_fleet import history
+    fleet = _fleet()
+    path = _page(url)
+    if path == _page(history.page_url(f.run_dir)):
+        return 'self', None, None, 'link to this fleet'
+    clean = urlsplit(url)._replace(query='', fragment='').geturl()
+    target = None
+    if rel == 'parent' and f.cfg.get('parent_config'):
+        try:
+            pcfg = fleet.load(f.cfg['parent_config'])
+        except (OSError, ValueError):
+            return 'unregistered', None, clean, 'parent config unreadable'
+        if path == _page(history.page_url(pcfg['run'])):
+            target = pcfg
+    elif rel == 'child':
+        for d in children_dirs(f.run_dir):
+            if path != _page(history.page_url(d)):
+                continue
+            if record(d).get('state') not in ACTIVE:
+                return 'closed', None, clean, 'sub-fleet ' + d.name + ' is ' + str(record(d).get('state'))
+            try:
+                target = fleet.load(d / 'config.json')
+            except (OSError, ValueError):
+                return 'unregistered', None, clean, 'sub-fleet config unreadable'
+    if target is None:
+        return 'unrelated', None, None, 'not a registered ' + (rel or 'parent/child') + ' of this fleet'
+    ws = fleet.manager_for(target).workspace_id()
+    if not ws or ws == f.mgr.workspace_id():
+        return 'unregistered', None, clean, 'no cmux workspace registered'
+    return 'jump', ws, None, ''
+
+
+def follow_jump(f, now=None):
+    """Daemon tick: an explicit link click on this fleet's history pane becomes a workspace switch.
+
+    The page's parent/child links reload the shown page as ``…?fleet-jump=<ms36>-<rand>&rel=parent|child&to=<page>``
+    (history.py; the pane stays on the same file because WebKit may not load a file:// page outside the
+    shown page's directory, while ``cmux browser goto`` can). A URL without that marker is never acted on
+    (reload, hash changes). Each marker is
+    handled once and recorded in Redis before acting, so repeated ticks and daemon restarts never
+    switch twice; they only finish restoring the pane. The source pane goes back to this fleet's own
+    page (last seen hash); the target fleet's pane is left alone. Returns the verdict or None."""
+    from cmux_fleet import history
+    fleet = _fleet()
+    now = time.time() if now is None else now
+    if not (f.cfg.get('parent_config') or children_dirs(f.run_dir)):
+        return None  # no links on the page: no cmux call per tick
+    if now < getattr(f, 'jump_next', 0) or not hasattr(f.mgr, 'browser_url'):
+        return None
+    f.jump_next = now + JUMP_POLL
+    pane = f.r.hget(fleet.SERVICE, 'history_pane')
+    url = pane and f.mgr.browser_url(pane)
+    if not url:
+        return None
+    parts = urlsplit(url)
+    query = parse_qs(parts.query)
+    own = history.page_url(f.run_dir)
+    if JUMP_PARAM not in query:
+        if parts.fragment and _page(url) == _page(own):
+            f.r.hset(fleet.SERVICE, 'history_hash', parts.fragment)
+        return None
+    nonce = query[JUMP_PARAM][0]
+    own_shown = _page(url) == _page(own) and parts.fragment  # clicked on our page: its state is in the URL
+    hash_ = parts.fragment if own_shown else f.r.hget(fleet.SERVICE, 'history_hash')
+    home = own + ('#' + hash_ if hash_ else '')
+    try:
+        done = json.loads(f.r.hget(fleet.SERVICE, 'history_jump') or '{}')
+    except ValueError:
+        done = {}
+    if done.get('nonce') == nonce:  # already handled (repeated tick, restart): never switch again
+        f.mgr.browser_goto(pane, done.get('page') or home)
+        return 'repeat'
+    try:
+        age = now - int(nonce.split('-', 1)[0], 36) / 1000
+    except ValueError:
+        age = None
+    rel = (query.get('rel') or [''])[0]
+    to = (query.get('to') or [''])[0]
+    if age is None or not -60 <= age <= JUMP_MAX_AGE or not to.startswith('file:'):
+        verdict, ws, page, why = 'stale', None, None, 'request too old or malformed'
+    else:
+        verdict, ws, page, why = _jump_target(f, to, rel)
+    page = page or home
+    f.r.hset(fleet.SERVICE, 'history_jump', json.dumps({'nonce': nonce, 'verdict': verdict, 'page': page}))
+    if verdict == 'jump' and not f.mgr.select_workspace(ws):
+        verdict, why = 'failed', 'select-workspace ' + ws + ' failed'
+        page = urlsplit(to)._replace(query='', fragment='').geturl()  # the user still sees what they clicked
+        f.r.hset(fleet.SERVICE, 'history_jump', json.dumps({'nonce': nonce, 'verdict': verdict, 'page': page}))
+    f.mgr.browser_goto(pane, page)
+    f.log('history.jump', verdict=verdict, rel=rel, target=_page(to), workspace=ws or '', reason=why)
+    return verdict
 
 
 def root_config(cfg):
@@ -382,6 +517,7 @@ def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, lau
         raise Refused('sub-fleet ' + task_id + ' could not start: ' + str(exc)) from exc
     rec['state'] = 'running'
     save_record(rec_dir, rec)
+    f.refresh_history()  # the sub-fleet list on the parent's page
     f.log('subfleet.spawned', task=task_id, slot=slot, run=str(rec_dir), workers=workers, title=ws_title)
     return rec
 
@@ -446,7 +582,7 @@ def start_adopted(f):
         f.log('subfleet.adopt_failed', pane=sid)
         return f.finish('blocked', 'could not take over the delegated pane of ' + adopt['slot'])
     f.mgr.rename(sid, 'fx-' + f.cfg.get('tab_prefix', '') + fleet.SUPERVISOR_LABEL)
-    history.write_page(f.run_dir, f.history_slots())
+    history.write_page(f.run_dir, f.history_slots(), f.history_links())
     f.history_pane = f.mgr.arrange(sid, [f.agent(w)['pane'] for w in f.workers], history.page_url(f.run_dir))
     f.r.hset(fleet.SERVICE, mapping={'history_pane': f.history_pane or ''})
     if adopt.get('parent_workspace') and hasattr(f.mgr, 'place_after'):
@@ -581,6 +717,7 @@ def tick(f):
                 else 'the sub-fleet daemon exited without writing result.json')
             rec['state'] = 'stopping'
             save_record(d, rec)
+            f.refresh_history()
             post_stop(cfg)  # a crashed child (Redis gone) is collected below all the same
             f.log('subfleet.stopping', task=rec['task_id'], outcome=rec['outcome'])
         if rec['state'] == 'stopping' and not fleet.daemon_running(d):
@@ -648,6 +785,7 @@ def collect(f, child_run, notify=True):
     rec['state'] = 'returned' if ok else 'failed'
     rec['finished'] = time.time()
     save_record(child_run, rec)
+    f.refresh_history()
     f.log('subfleet.' + rec['state'], task=rec['task_id'], slot=slot, outcome=rec.get('outcome'),
           reason=rec.get('reason', ''), attempt=rec.get('attempt'))
     if notify and f.running():
