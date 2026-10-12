@@ -767,7 +767,7 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
     model = cfg.get('worker_model') or 'sonnet'
     # Claude Code compacts on its own near autoCompactWindow (default undisclosed). Pin it to the
     # window fleet rotates against, so fleet's handoff (ratio x window) always fires first (§22).
-    window = handoff_limits('claude', model, dict(DEFAULTS, **cfg))[0]
+    window = handoff_limits('claude', model, cfg)[0]
     settings.write_text(json.dumps({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': hook, 'timeout': timeout}]}]},
                                     'autoCompactWindow': max(100000, min(1000000, window))}))
     argv = [cfg.get('claude') or 'claude', '--dangerously-skip-permissions', '--model', model,
