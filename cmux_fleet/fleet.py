@@ -1267,7 +1267,7 @@ class Fleet:
 
     def contract_report(self, name, text):
         """Apply a worker report to the task table. Returns extra lines for the supervisor,
-        or None when the report ended the task (P1 failed twice)."""
+        or None when the report ended the task."""
         state = self.contract_state()
         if state is None:
             return ''

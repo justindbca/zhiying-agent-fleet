@@ -243,8 +243,8 @@ def p0(decision):
     cycle = find_cycle(edges)
     if cycle:
         errors.append('P0: interface cycle: ' + cycle)
-    if errors:
-        raise ValueError('; '.join(dict.fromkeys(errors)))
+    if errors:  # every P0 gap carries the P0 prefix: P0 rejections never count toward the three strikes
+        raise ValueError('; '.join(x if x.startswith('P0') else 'P0: ' + x for x in dict.fromkeys(errors)))
     for i, e in entries.items():
         e['consumers'] = sorted(consumers[i])
         e.update(status='proposed', approved_by=None, deprecated_by=None)

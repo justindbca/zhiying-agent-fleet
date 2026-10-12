@@ -301,6 +301,16 @@ def test_p0_gap_lists_never_block(cf):
     assert cf.task()['status'] == 'running' and cf.task()['bad_replies'] == '0'
 
 
+def test_p0_entry_field_gaps_never_block(cf):
+    submit(cf, contracts=True)
+    bad = json.loads(json.dumps(p0_reply()))
+    bad['interfaces'][1]['path'] = 'metrics.json'
+    for _ in range(4):
+        sup(cf, bad)
+        assert inbox(cf, 'supervisor')[-1].count('P0') >= 1
+    assert cf.task()['status'] == 'running' and cf.task()['bad_replies'] == '0'
+
+
 def test_skeleton_header_with_literal_pass_fail_is_not_a_failure():
     text = ('IF-x@1 · producer → consumer · PASS/FAIL · evidence\n| interface | verdict (PASS/FAIL) |\n'
             'IF-M0-src@1 · M0 → M2 · PASS · ok\n')
