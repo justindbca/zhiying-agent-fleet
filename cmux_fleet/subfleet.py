@@ -135,7 +135,7 @@ def page_links(cfg):
             pcfg = None
         if pcfg:
             parent = {'task_id': pcfg.get('task_id') or '', 'url': history.page_url(pcfg['run']),
-                      'title': pcfg.get('agents_title') or root_name(pcfg)}
+                      'title': pcfg.get('agents_title') or 'Fleet agents'}  # cmux_manager's default title
     children = []
     for d in children_dirs(cfg['run']):
         rec = record(d)

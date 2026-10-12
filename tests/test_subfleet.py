@@ -430,7 +430,7 @@ def test_history_pages_link_parent_and_children_both_ways(tree):
     cf = child_daemon(t, rec)
     child = page_data(rec['run'])
     assert child['parent']['url'] == history.page_url(f.run_dir) and child['children'] == []
-    assert child['parent']['title'] == (f.cfg.get('agents_title') or subfleet.root_name(f.cfg))
+    assert child['parent']['title'] == (f.cfg.get('agents_title') or 'Fleet agents')
     page = history.page_path(rec['run']).read_text()
     assert 'id="fleets"' in page and '回到父 fleet' in page
     # finished: the parent page shows the outcome without a manual refresh
