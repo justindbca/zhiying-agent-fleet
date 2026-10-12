@@ -25,6 +25,7 @@ Subcommands
   actor     exec the configured CLI for one agent (internal)
 """
 import argparse
+import collections
 import fcntl
 import hashlib
 import json
@@ -528,30 +529,34 @@ def notify(cfg_path, name, generation, payload, sessions=None):
 
 
 def claude_user_prompts(path, count=3):
-    """Last real user prompts of a Claude transcript (not tool results, meta or sidechains)."""
-    out = []
+    """Last real user prompts of a Claude transcript (not tool results, meta or sidechains).
+
+    Scan the whole file like the v1 pointer scan: tool output after the prompt can be
+    megabytes, so a tail read would lose the prompt and silently drop the settlement.
+    """
+    out = collections.deque(maxlen=count)
     try:
-        lines = _tail(Path(path), 1048576)
+        with open(path, errors='replace') as f:
+            for line in f:
+                if '"user"' not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if row.get('type') != 'user' or row.get('isSidechain') or row.get('isMeta'):
+                    continue
+                content = (row.get('message') or {}).get('content')
+                if isinstance(content, list):
+                    content = '\n'.join(p.get('text', '') for p in content if isinstance(p, dict) and p.get('type') == 'text')
+                if isinstance(content, str) and content.strip():
+                    out.append(content)
     except (OSError, TypeError):
-        return out
-    for line in reversed(lines):
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if row.get('type') != 'user' or row.get('isSidechain') or row.get('isMeta'):
-            continue
-        content = (row.get('message') or {}).get('content')
-        if isinstance(content, list):
-            content = '\n'.join(p.get('text', '') for p in content if isinstance(p, dict) and p.get('type') == 'text')
-        if isinstance(content, str) and content.strip():
-            out.append(content)
-            if len(out) >= count:
-                break
-    return out
+        pass
+    return list(out)
 
 
-def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=None):
+def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=None, settle_wait=30):
     """v2 turn end of an official interactive CLI (Codex notify / Claude Stop hook).
 
     First READY turn: bind the session, register the slot and report startup. Later turns:
@@ -567,14 +572,23 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
     bus = runtime_v2.bus_for(cfg, r)
     try:
         info = r.hgetall(key('agent', name))
-        if int(info.get('generation', -1)) != generation or info.get('state') == 'dead':
-            return {'status': 'stale'}
         base = dict(agent=name, generation=generation, run_id=bus.run_id, thread=thread, transcript=transcript)
 
         def call(kind, **fields):
             correlation = 'h-' + uuid.uuid4().hex
             runtime_v2.post_event(bus, dict(base, kind=kind, request_id=correlation, **fields), correlation)
-            return runtime_v2.wait_reply(bus, correlation, timeout=wait)
+            # Events are durable; a long wait only matters for the READY sequence. A turn
+            # end must not freeze a blocking Claude Stop hook for minutes.
+            return runtime_v2.wait_reply(bus, correlation, timeout=wait if kind != 'settled' else settle_wait)
+
+        def skipped(status, reason):
+            # Visible in control/logs: an ignored turn otherwise leaves no trace.
+            r.xadd(bus.audit_key, {'event': 'turn.' + status, 'slot': name, 'run_id': bus.run_id,
+                                   'generation': str(generation), 'error': reason, 'level': 'warn',
+                                   'at': str(int(time.time() * 1000))})
+            return {'status': status, 'reason': reason}
+        if int(info.get('generation', -1)) != generation or info.get('state') == 'dead':
+            return skipped('stale', 'hook generation is not the current runtime')
         if info.get('state') == 'starting':
             if info.get('thread') != thread:
                 answer = call('bridge_session')
@@ -584,12 +598,12 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
             return call('startup', text=text, failed=False, aborted=False)
         lease = r.hgetall(bus.lease_key(name))
         if lease.get('status') != 'received' or not lease.get('message_id'):
-            return {'status': 'ignored', 'reason': 'no received delivery (manual or duplicate turn)'}
+            return skipped('ignored', 'no received delivery (manual or duplicate turn)')
         msg = bus.message(lease['message_id'])
         if msg.get('generation') != generation or msg.get('session_id') != thread:
-            return {'status': 'stale'}
+            return skipped('stale', 'delivery belongs to another generation/session')
         if not runtime_v2.turn_answers(msg['body']['text'], inputs):
-            return {'status': 'ignored', 'reason': 'turn was not started by the typed delivery'}
+            return skipped('ignored', 'turn was not started by the typed delivery')
         return call('settled', delivery={k: msg[k] for k in runtime_v2.IDENTITY},
                     candidates=runtime_v2.tui_candidates(name, msg['body'].get('purpose'), text or ''),
                     failed=False, aborted=False, unfinished=False)

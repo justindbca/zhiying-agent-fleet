@@ -331,3 +331,28 @@ def test_codex_turn_matches_rollout_cwd_through_symlinked_run_dir(tmp_path):
         {'type': 'event_msg', 'payload': {'type': 'task_complete', 'turn_id': 'u1', 'last_agent_message': 'READY'}}])
     data = {'thread-id': thread, 'turn-id': 'u1', 'last-assistant-message': 'READY'}
     assert fleet.completed_turn(fleet.agent_cwd({'run': str(link)}, 'supervisor'), data, sessions)
+
+
+def test_claude_settlement_survives_megabytes_of_tool_output(mixed):
+    f = mixed
+    submit(f)
+    answer_turn(f, 'supervisor', decision(['worker-1']))
+    f.pump()
+    prompt = typed(f, 'worker-1')[-1]
+    thread = f.test_threads['worker-1']
+    transcript = f.test_claude / 'worker-1' / (thread + '.jsonl')
+    report = 'Done:\n- big\nEvidence:\n- worker-1/big.log\nNot done: none\nBlocked: none'
+    rows = [{'type': 'user', 'message': {'role': 'user', 'content': prompt}},
+            {'type': 'user', 'message': {'role': 'user', 'content': [
+                {'type': 'tool_result', 'content': 'x' * 2_000_000}]}},
+            {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': report}]}}]
+    transcript.write_text('\n'.join(json.dumps(x) for x in rows) + '\n')
+    raw = json.dumps({'session_id': thread, 'transcript_path': str(transcript), 'last_assistant_message': report})
+    assert drive(f, lambda: fleet.claude_stop(f.path, 'worker-1', '0', raw))['status'] == 'committed'
+
+
+def test_ignored_turn_is_audited(mixed):
+    f = mixed
+    answer_turn(f, 'worker-1', 'hello', prompt='manual chat')
+    events = [fields for _, fields in f.r.xrange(f.v2.bus.audit_key)]
+    assert any(e.get('event') == 'turn.ignored' and e.get('slot') == 'worker-1' for e in events)
