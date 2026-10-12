@@ -461,7 +461,7 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
   1. roster 该 worker 条目的 `window` / `handoff_ratio`；
   2. roster 顶层 `handoff:` 表，键先 `<cli>:<model>`（模型串精确匹配）再 `<cli>`，值 `{window?, ratio?}`；
   3. `config.json` 的同名 `handoff:` 表（静态，启动时校验，不热载）；
-  4. 内置：Claude 模型名含 `[1m]` / `opus` / `fable`（小写子串）→ 1,000,000，其余 Claude 模型 → `--claude-window`；Codex 取 rollout 自报 `model_context_window`、Pi 取自报 ctx_window（"measured"），只有显式 `window` 才覆盖；
+  4. 内置：Claude 模型名含 `[1m]` / `opus` / `fable` / `sonnet`（小写子串）→ 1,000,000，其余 Claude 模型 → `--claude-window`；Codex 取 rollout 自报 `model_context_window`、Pi 取自报 ctx_window（"measured"），只有显式 `window` 才覆盖；
   5. `--handoff-ratio`。两个旗标保留为最低层缺省，向后兼容。
 - **模型取当前运行值**：`runtime_cfg(name)`（含 profile 切换写入的 `runtime_launch.overrides`）里的 `worker_model`（Claude，监工同）/ `codex_model` / `pi_model`；监工走同一解析，只是没有 worker 条目。
 - **热载**：随 §16 名单检测，下一次投递检查即生效，不重启；`roster.changed` 带 `handoff` 字段记新旧值（表 `table`、各 worker）。校验：ratio 是 (0,1) 内的数、window 是正整数（布尔不算）、表键 CLI 只能 claude/codex/pi、条目只许 window/ratio；任一不合法按 §16 整份拒收，原阈值保留。退役中 worker 保留原阈值直到退役。

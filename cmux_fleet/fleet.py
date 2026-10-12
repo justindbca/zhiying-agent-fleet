@@ -3029,7 +3029,7 @@ def main(argv=None):
     s.add_argument('--worker-model', default=DEFAULTS['worker_model'], help='claude workers: --model value')
     s.add_argument('--worker-kit', help='claude workers: dir with .claude/{agents,skills} and mcp.json copied into each worker cwd')
     s.add_argument('--claude', help='claude binary (default: first on PATH)')
-    s.add_argument('--claude-window', type=int, default=DEFAULTS['claude_window'], help='claude models not in the built-in 1M list ([1m]/opus/fable): context window (§22)')
+    s.add_argument('--claude-window', type=int, default=DEFAULTS['claude_window'], help='claude models not in the built-in 1M list ([1m]/opus/fable/sonnet): context window (§22)')
     s.add_argument('--mode', choices=('task', 'service'), default=DEFAULTS['mode'],
                    help='task: one goal until COMPLETED; service: resident, handles a stream of requests')
     s.add_argument('--worker-names', help='comma-separated worker names (default worker-1..N), e.g. exit,reentry,rung')

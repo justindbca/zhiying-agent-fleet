@@ -207,7 +207,7 @@ separately, first hit wins, using its **current** runtime CLI and model (after a
 1. the roster worker entry: `{name: exit, window: 1000000, handoff_ratio: 0.7}`;
 2. the roster `handoff:` table, key `<cli>:<model>` (exact model string) then `<cli>`;
 3. the same `handoff:` table in `config.json` (static);
-4. built-in: Claude models whose name contains `[1m]`, `opus` or `fable` → 1,000,000; other Claude
+4. built-in: Claude models whose name contains `[1m]`, `opus`, `fable` or `sonnet` → 1,000,000; other Claude
    models → `--claude-window` (default 200,000); Codex / Pi → the window they report themselves;
 5. `--handoff-ratio` (default 0.6).
 
