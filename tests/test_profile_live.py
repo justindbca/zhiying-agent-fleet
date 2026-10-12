@@ -187,13 +187,13 @@ def test_fifo_switches_to_official_claude_and_reuses_ready_runtime(live, monkeyp
     assert f.mgr.spawned[-1]['metadata']['cli_type'] == 'claude'
     assert 'CMUX_FLEET_PI_CALLBACK' not in f.mgr.spawned[-1]['env_vars']
     cfg_path = f.run_dir / 'runtime/worker-1-g2.json'
-    assert fleet.load(cfg_path)['worker_model'] == 'sonnet'
+    assert fleet.load(cfg_path)['worker_model'] == 'opus'
     argv = []
     monkeypatch.setattr(fleet.os, 'chdir', lambda *args: None)
     monkeypatch.setattr(fleet.os, 'execvp', lambda exe, args: argv.append(args))
     fleet.actor(cfg_path, 'worker-1', 'READY', generation=2)
     assert argv[0][0] == 'claude' and '--extension' not in argv[0]
-    assert argv[0][argv[0].index('--model') + 1] == 'sonnet'
+    assert argv[0][argv[0].index('--model') + 1] == 'opus'
     hook = json.loads(Path(argv[0][argv[0].index('--settings') + 1]).read_text())
     assert shlex.split(hook['hooks']['Stop'][0]['hooks'][0]['command'])[-3:] == [str(cfg_path), 'worker-1', '2']
     ready(f)
@@ -270,7 +270,7 @@ def test_launch_mapping_defaults_and_overrides(live, profile):
         assert argv[argv.index('--name') + 1] == 'worker-1.3'
     elif card.cli == 'claude':
         argv = fleet.claude_argv(live.path, cfg, 'worker-1', 3, 'READY')
-        assert argv[:4] == ['claude', '--dangerously-skip-permissions', '--model', 'sonnet']
+        assert argv[:4] == ['claude', '--dangerously-skip-permissions', '--model', 'opus']
     else:
         launch = profile_launch.resolve_launch(replace(card, model='test-model', profile='test-profile'), registry, live.cfg)
         cfg.update(launch['overrides'])

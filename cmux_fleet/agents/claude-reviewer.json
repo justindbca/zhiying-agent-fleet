@@ -7,9 +7,9 @@
     "safety-audit",
     "planning"
   ],
-  "role_file": "worker.md",
+  "role_file": "reviewer.md",
   "cost_rank": 3,
   "latency_rank": 3,
   "risk_rank": 1,
-  "model": "sonnet"
+  "model": "opus"
 }
