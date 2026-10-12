@@ -288,6 +288,7 @@ Fleet agents（一个工作区）
 - `claude`：直接 exec 官方 Claude Code CLI，card model 覆盖 `worker_model`，默认 `sonnet`；不经 Pi。Claude Stop settings 按 generation 保存，避免旧进程读到新代 hook。
 - `codex`：researcher 保持 Codex；card `profile` 覆盖 worker/shared profile，card `model` 可覆盖模型。未填沿用原 defaults。所需 profile 文件必须存在，保留隔离 CODEX_HOME。
 - `profile` 指 Codex 配置档名；Pi/Claude 上填写该字段明确报不支持，不猜测 CLI 参数。`role_file` 按 registry 解析且必须存在，拒绝路径/符号链接逃逸；角色作为附加指令保留基础 fleet 协议。缺省不附加。
+- 独立复核 worker（2026-10-13 用户要求“设置一个验收的 worker 单独去验收”）：`claude-reviewer` card 用 `role_file: reviewer.md`、`model: opus`。`reviewer.md` 是外部项目 `references/multi-round-review.md` 与 `.claude/rules-lib/R-WKF-033.md` 的 fleet 副本（最高原则、只读、只审给定范围、P0/P1/P2、报告模板、PASS=零 P0 零 P1），规范改了两处同步；它按上条附加在 worker 基础协议之后，回报仍是 Done/Evidence/Not done/Blocked，监工的产物验收不变。启用：`start --allow-profile-live-switch` + task `auto_agents: true` 与 `apply_profiles_live: true`，code-change plan 的 review 子任务即排到 `claude-reviewer`；不开 live 时只是 metadata 推荐，worker 仍跑原 CLI/角色。**v2 Codex 监工 + 官方 Claude worker 组合下的 profile 热切换尚未实测**（§11 对应小节“未验收”已列），只有 fake 回归；且该组合下 code-change plan 的 implementation 默认排到 Pi 的 `flashnext-coder`，切换前 `preflight_profile` 按 v2 矩阵拒绝 Codex+Pi 混配，task 会 blocked——要在该组合用 live，实现侧需换成 claude card 或用自定义 `agent_registry`。
 
 ### 元数据的唯一含义
 
