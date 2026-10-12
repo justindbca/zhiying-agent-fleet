@@ -478,10 +478,13 @@ def base36(n):
             return digits
 
 
-def click(url, rel, at=None):
-    """The URL a page link click navigates to (history.py): explicit marker, never a plain reload."""
+def click(url, rel, at=None, shown='file:///shown/history.html#agent=worker-1'):
+    """The URL a page link click leaves in the pane (history.py): the shown page with an explicit marker."""
+    from urllib.parse import urlencode
     ms = int((time.time() if at is None else at) * 1000)
-    return url + '?' + subfleet.JUMP_PARAM + '=' + base36(ms) + '-' + uuid.uuid4().hex[:6] + '&rel=' + rel
+    base, _, hash_ = shown.partition('#')
+    return base + '?' + urlencode({subfleet.JUMP_PARAM: base36(ms) + '-' + uuid.uuid4().hex[:6], 'rel': rel,
+                                   'to': url}) + ('#' + hash_ if hash_ else '')
 
 
 def history_pane(f):
@@ -564,6 +567,8 @@ def test_only_registered_matching_relations_jump(linked, tmp_path):
     other.mkdir()
     assert jump(f, click(history.page_url(other), 'child')) == 'unrelated'  # not ours
     assert jump(f, click(own, 'parent')) == 'self'  # a page link to this fleet itself
+    assert jump(f, click('javascript:alert(1)', 'child')) == 'stale'  # only file pages are targets
+    assert jump(f, own + '?fleet-jump=zz&rel=child') == 'stale'  # malformed marker: page back, no switch
     assert t.world.selected == []
     assert t.world.urls[history_pane(f)] == own
 
@@ -641,7 +646,8 @@ def test_page_links_carry_the_explicit_jump_marker(tmp_path):
              'children': [{'task_id': 'M0', 'url': 'file:///c/history.html', 'title': 'C', 'state': 'failed',
                            'outcome': 'failed'}]}
     page = history.write_page(tmp_path, [], links).read_text()
-    assert "'?fleet-jump='" in page and 'data-rel' in page and subfleet.JUMP_PARAM == 'fleet-jump'
+    assert "'fleet-jump':" in page and 'data-rel' in page and subfleet.JUMP_PARAM == 'fleet-jump'
+    assert "location.href.split(/[?#]/)[0]+'?'" in page  # the marker stays on the shown file
     assert "c.outcome!==c.state" in page  # 'failed (failed)' is shown once
 
 

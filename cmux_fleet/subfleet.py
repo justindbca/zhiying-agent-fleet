@@ -155,7 +155,7 @@ def _page(url):
 
 
 def _jump_target(f, url, rel):
-    """(verdict, workspace, page to leave in this pane, reason) for a clicked link to ``url``.
+    """(verdict, workspace, page to leave in this pane, reason) for a clicked link to page ``url``.
 
     Only this fleet's registered parent (config ``parent_config``) and its own children
     (``sub/*/subfleet.json``) are targets, and only with the matching ``rel``. A closed or
@@ -196,8 +196,10 @@ def _jump_target(f, url, rel):
 def follow_jump(f, now=None):
     """Daemon tick: an explicit link click on this fleet's history pane becomes a workspace switch.
 
-    The page's parent/child links navigate to ``<other page>?fleet-jump=<ms36>-<rand>&rel=parent|child``
-    (history.py). A URL without that marker is never acted on (reload, hash changes). Each marker is
+    The page's parent/child links reload the shown page as ``…?fleet-jump=<ms36>-<rand>&rel=parent|child&to=<page>``
+    (history.py; the pane stays on the same file because WebKit may not load a file:// page outside the
+    shown page's directory, while ``cmux browser goto`` can). A URL without that marker is never acted on
+    (reload, hash changes). Each marker is
     handled once and recorded in Redis before acting, so repeated ticks and daemon restarts never
     switch twice; they only finish restoring the pane. The source pane goes back to this fleet's own
     page (last seen hash); the target fleet's pane is left alone. Returns the verdict or None."""
@@ -235,18 +237,19 @@ def follow_jump(f, now=None):
     except ValueError:
         age = None
     rel = (query.get('rel') or [''])[0]
-    if age is None or not -60 <= age <= JUMP_MAX_AGE:
+    to = (query.get('to') or [''])[0]
+    if age is None or not -60 <= age <= JUMP_MAX_AGE or not to.startswith('file:'):
         verdict, ws, page, why = 'stale', None, None, 'request too old or malformed'
     else:
-        verdict, ws, page, why = _jump_target(f, url, rel)
+        verdict, ws, page, why = _jump_target(f, to, rel)
     page = page or home
     f.r.hset(fleet.SERVICE, 'history_jump', json.dumps({'nonce': nonce, 'verdict': verdict, 'page': page}))
     if verdict == 'jump' and not f.mgr.select_workspace(ws):
         verdict, why = 'failed', 'select-workspace ' + ws + ' failed'
-        page = urlsplit(url)._replace(query='', fragment='').geturl()  # the user still sees what they clicked
+        page = urlsplit(to)._replace(query='', fragment='').geturl()  # the user still sees what they clicked
         f.r.hset(fleet.SERVICE, 'history_jump', json.dumps({'nonce': nonce, 'verdict': verdict, 'page': page}))
     f.mgr.browser_goto(pane, page)
-    f.log('history.jump', verdict=verdict, rel=rel, target=_page(url), workspace=ws or '', reason=why)
+    f.log('history.jump', verdict=verdict, rel=rel, target=_page(to), workspace=ws or '', reason=why)
     return verdict
 
 

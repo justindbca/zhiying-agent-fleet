@@ -6,7 +6,7 @@ screen snapshot and handoff note are). ``write_page`` renders ``<run>/history.ht
 its handoff note, or search all of them at once. The page is self-contained (data embedded), so the
 cmux browser pane only needs a reload after each rotation; the selection lives in the URL hash.
 Sub-fleets (design.md §19): ``links`` adds the sub-fleet list (state + jump) and, on a child's page,
-'back to the parent fleet'. A click navigates with an explicit ``?fleet-jump=`` marker that the daemon
+'back to the parent fleet'. A click reloads this page with an explicit ``?fleet-jump=…&rel=…&to=<target page>`` marker that the daemon
 turns into a cmux workspace switch (``subfleet.follow_jump``); a plain reload carries no marker.
 """
 import json
@@ -167,7 +167,9 @@ function render(){
 function step(d){if(!marks.length)return;if(cur>=0)marks[cur].classList.remove('cur');
   cur=(cur+d+marks.length)%marks.length;marks[cur].classList.add('cur');marks[cur].scrollIntoView({block:'center'})}
 document.addEventListener('click',e=>{const l=e.target.closest('#fleets a[data-rel]');if(!l)return;e.preventDefault();
-  location.href=l.getAttribute('href')+'?fleet-jump='+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8)+'&rel='+l.dataset.rel});
+  // stay on this file (WebKit may not read a file outside this page's directory); the daemon reads the marker
+  location.href=location.href.split(/[?#]/)[0]+'?'+new URLSearchParams({'fleet-jump':Date.now().toString(36)+'-'+
+    Math.random().toString(36).slice(2,8),rel:l.dataset.rel,to:l.getAttribute('href')})+location.hash});
 document.addEventListener('click',e=>{const a=e.target.closest('[data-a]'),v=e.target.closest('[data-v]');
   if(a&&a.dataset.g){st.agent=a.dataset.a;st.gen=a.dataset.g;render()}
   else if(a){st.agent=a.dataset.a;st.gen='';st.q='';$('q').value='';render()}
