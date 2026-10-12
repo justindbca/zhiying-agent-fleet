@@ -641,8 +641,6 @@ def collect(f, child_run, notify=True):
     ph = rec['placeholder']
     returned = bool(back) and back.get('pane') == rec['pane'] and f.mgr.adopt(rec['pane'], ph, back.get('info') or {})
     restore_role(f, rec)
-    if rec.get('outcome') == 'completed':
-        deliver_back(f, rec, cfg)  # before any check below (also on stop/resume collects)
     child_mgr.close_all()
     child_mgr.meta_path.unlink(missing_ok=True)
     f.setf(slot, delegated_pane='', delegated_task='', delegate_cfg='')
@@ -668,6 +666,11 @@ def collect(f, child_run, notify=True):
         f.v2.respawn([slot], True)
         f.log('subfleet.slot_respawned', task=rec['task_id'], slot=slot)
     ok = rec.get('outcome') == 'completed'
+    if ok:  # before the checks below (also on stop/resume collects); never blocks the pane's return
+        try:
+            deliver_back(f, rec, cfg)
+        except (OSError, ValueError) as exc:
+            f.log('subfleet.deliver_failed', task=rec['task_id'], reason=str(exc))
     missing = rec.get('output') and not (Path(rec['output']).is_file() and Path(rec['output']).stat().st_size > 0)
     if ok and missing:
         ok, rec['reason'] = False, 'completed but the deliverable ' + rec['output'] + ' is missing or empty'

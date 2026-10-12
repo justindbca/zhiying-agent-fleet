@@ -188,6 +188,27 @@ def test_written_file_without_the_interfaces_line_tells_the_worker(cf):
     assert row['status'] == 'failed' and 'no line `Interfaces: IF-M0-src@1 provided: ready`' in row['reason']
     hint = inbox(cf, 'worker-1')[-1]
     assert 'did not announce IF-M0-src@1' in hint and 'Interfaces: IF-M0-src@1 provided: ready' in hint
+    assert 'was asked for that line (no re-dispatch needed)' in inbox(cf, 'supervisor')[-1]
     # the corrected report settles M0 (the hint was queued under M0)
     report(cf, 'worker-1', 'Interfaces: IF-M0-src@1 provided: ready\n')
     assert cf.contract_state()['tasks']['M0']['status'] == 'done'
+
+
+def test_a_failing_copy_still_returns_the_pane_and_fails_the_subfleet(tree):
+    t, f = tree, tree.f
+    out = f.workspace() / 'worker-1' / 'm0.md'
+    rec = subfleet.spawn_child(f, 'worker-1', 'M0', 'Research five sources and merge them', 1,
+                               output=str(out), launch=no_launch)
+    cf = child_daemon(t, rec)
+    inside = Path(rec['deliver'][0][0])
+    inside.parent.mkdir(parents=True, exist_ok=True)
+    inside.write_text('merged')
+    out.mkdir(parents=True)  # the parent path cannot take a file: copyfile raises IsADirectoryError
+    cf.v2.finish('completed', 'merged')
+    cf.write_result()
+    f.tick()
+    stop_child_like_daemon(cf)
+    f.tick()
+    rec = subfleet.record(rec['run'])
+    assert rec['state'] == 'failed' and 'missing or empty' in rec['reason']
+    assert f.agent('worker-1')['state'] == 'starting' and f.agent('worker-1')['pane'] == rec['pane']

@@ -1471,6 +1471,8 @@ class Fleet:
                 self.contract_queue(s, name, '[contract] ' + row['id'] + ' is not done: your report did not announce '
                                     + ', '.join(unclaimed) + '. If the file is written, reply in the AGENTS.md format '
                                     'with this exact line: ' + line, row['id'])
+                notes.append('[contract] ' + row['id'] + ': the file passes but the report misses `' + line + '`; '
+                             + self.label(name) + ' was asked for that line (no re-dispatch needed)')
             self.contract_log('task.' + row['status'], task=row['id'], by=name, reason=row['reason'])
             for held in contracts.releasable(s) if not unready else []:
                 held['status'] = 'running'
