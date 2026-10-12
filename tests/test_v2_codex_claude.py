@@ -22,6 +22,8 @@ WORKERS = ['worker-' + str(i) for i in range(1, 7)]
 # ------------------------------------------------------------------ gate matrix
 CLIS = ('pi', 'codex', 'claude')
 ALLOWED = {('pi', 'pi', 'task'), ('pi', 'pi', 'service'), ('codex', 'claude', 'task')}
+# Claude supervisor adapter (A3): unverified pairs, admitted only under --lifecycle smoke.
+SMOKE_ONLY = {('claude', 'pi', 'task'), ('claude', 'pi', 'service'), ('claude', 'claude', 'task')}
 
 
 @pytest.mark.parametrize('mode', ['task', 'service'])
@@ -38,7 +40,10 @@ def test_v2_cli_matrix_allows_only_validated_pairs_with_reason(supervisor, worke
     with pytest.raises(ValueError) as exc:
         runtime_v2.validate_config(cfg)
     reason = str(exc.value)
-    if (supervisor, worker) == ('codex', 'claude'):
+    if (supervisor, worker, mode) in SMOKE_ONLY:
+        assert 'Claude supervisor pairs are unverified' in reason and '--lifecycle smoke' in reason
+        assert runtime_v2.validate_config(dict(cfg, lifecycle='smoke')) == 2
+    elif (supervisor, worker) == ('codex', 'claude'):
         assert 'task mode only' in reason
     elif supervisor == 'claude':
         assert 'no Claude supervisor adapter' in reason

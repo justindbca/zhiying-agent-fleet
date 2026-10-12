@@ -25,14 +25,14 @@ pairs:
   - {supervisor_cli: codex, worker_cli: pi, mode: service, status: unverified, adapter_missing: [], verified_by: null,
      reason: "transport v2 mixed Pi/Codex fleets are unvalidated (supported: all-Pi, or Codex supervisor + Claude workers)"}
   - {supervisor_cli: claude, worker_cli: pi, mode: task, status: unverified,
-     adapter_missing: [claude_supervisor], verified_by: null,
-     reason: "transport v2 has no Claude supervisor adapter (supported: all-Pi, or Codex supervisor + Claude workers)"}
+     adapter_missing: [], verified_by: null,
+     reason: "transport v2 Claude supervisor pairs are unverified (adapter: Stop-hook decision JSON, READY gate, UserPromptSubmit operator queue; live smoke pending)"}
   - {supervisor_cli: claude, worker_cli: pi, mode: service, status: unverified,
-     adapter_missing: [claude_supervisor], verified_by: null,
-     reason: "transport v2 has no Claude supervisor adapter (supported: all-Pi, or Codex supervisor + Claude workers)"}
+     adapter_missing: [], verified_by: null,
+     reason: "transport v2 Claude supervisor pairs are unverified (adapter: Stop-hook decision JSON, READY gate, UserPromptSubmit operator queue; live smoke pending)"}
   - {supervisor_cli: claude, worker_cli: claude, mode: task, status: unverified,
-     adapter_missing: [claude_supervisor], verified_by: null,
-     reason: "transport v2 has no Claude supervisor adapter (supported: all-Pi, or Codex supervisor + Claude workers)",
-     notes: "adopted sub-fleet supervisor (cfg adopt, design.md §19) is allowed in code"}
+     adapter_missing: [], verified_by: null,
+     reason: "transport v2 Claude supervisor pairs are unverified (adapter: Stop-hook decision JSON, READY gate, UserPromptSubmit operator queue; live smoke pending)",
+     notes: "adopted sub-fleet supervisor (cfg adopt, design.md §19) is allowed in code without smoke"}
   - {supervisor_cli: codex, worker_cli: codex, mode: task, status: unverified, adapter_missing: [], verified_by: null,
      reason: "transport v2 Codex workers are unvalidated (supported: all-Pi, or Codex supervisor + Claude workers)"}
