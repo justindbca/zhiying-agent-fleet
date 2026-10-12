@@ -918,7 +918,11 @@ class RuntimeV2:
         page = bool(sup) and self.f.mgr.get_pane_status(sup) is not None
         reattach = [s for s in self.f.workers if page and self.reattachable(s)]
         for slot in self.f.names:
-            self.clear_slot(slot, slot in reattach)
+            if not self.clear_slot(slot, slot in reattach) and slot in reattach:
+                reattach.remove(slot)  # its lease is still held: never leave it silently undeliverable
+        for slot in reattach:
+            self.f.setf(slot, state='idle', bridge_available=0, busy_since=time.time(), report_retries=0)
+            self.audit('resume.reattached', slot=slot, generation=self.f.agent(slot).get('generation'))
         self.respawn([s for s in self.f.names if s not in reattach], page)
         self.f.resume()
         if self.f.service:
@@ -952,10 +956,10 @@ class RuntimeV2:
                 and self.f.mgr.get_pane_status(pane) is not None and self.f.mgr.has_cli_process(pane, RESUME_CLIS))
 
     def clear_slot(self, slot, reattached):
-        """Release the slot's lease and cancel its queue; the work is re-queued afterwards."""
+        """Release the slot's lease and cancel its queue (re-queued afterwards). False: lease still held."""
         state = self.bus.r.hgetall(self.bus.lease_key(slot))
-        inflight = bool(state.get('current_delivery'))
-        if inflight:
+        released = True
+        if state.get('current_delivery'):
             pane = self.f.agent(slot).get('pane')
             if reattached and pane:
                 self.f.mgr.send_key(pane, 'Escape')  # abort the old turn before its instruction is typed again
@@ -966,12 +970,12 @@ class RuntimeV2:
                 self.bus.resolve_uncertain(slot, env, 'cancelled', execution_stopped=True)
             except (BusError, ValueError, KeyError) as exc:
                 self.audit('resume.release_failed', slot=slot, level='error', error=str(exc))
+                released = False
+            if reattached:
+                self.f.setf(slot, idle_confirmed=0)  # Escape is not proof the old turn stopped
         for mid in self.bus.pending(slot):
             self.cancel_queued(slot, {'message_id': mid}, 'start --resume: re-queued after reconcile')
-        if reattached:
-            self.f.setf(slot, state='idle', idle_confirmed=int(not inflight), bridge_available=0,
-                        busy_since=time.time(), report_retries=0)
-            self.audit('resume.reattached', slot=slot, generation=self.f.agent(slot).get('generation'))
+        return released
 
     def respawn(self, slots, page):
         """Next generation of each slot in place; without a supervisor pane, rebuild the whole page."""
