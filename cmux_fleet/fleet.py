@@ -2194,9 +2194,8 @@ class Fleet:
             if (info.get('state') != 'idle' or info.get('idle_confirmed') == '0'
                     or (self.v2 and self.r.hget(self.v2.bus.lease_key(name), 'current_delivery'))):
                 continue  # in-flight turns finish first
-            self.swap_profile(name)
-            if not self.running() and not self.service:
-                return
+            if not self.swap_profile(name):
+                return  # blocked: the task is finished as blocked, leave the other slots alone
         if self.r.hget(night.NIGHT, 'brief_due') == '1' and not self.profile_swaps() and not any(
                 self.agent(w).get('state') == 'starting' for w in self.active_workers()):
             self.r.hset(night.NIGHT, mapping={'brief_due': 0})
@@ -2211,10 +2210,10 @@ class Fleet:
             if launch:
                 self.preflight_profile(launch)
         except (OSError, ValueError, KeyError, SystemExit, subprocess.SubprocessError) as exc:
-            return self.block_profile(name, 'roster profile ' + (profile or 'run default') + ': ' + str(exc))
+            return self.block_profile(name, 'roster profile ' + (profile or 'run default') + ': ' + str(exc)) or False
         generation, old, prev = int(info['generation']), info.get('pane'), self.label(name)
         if not old or self.mgr.get_pane_status(old) is None:
-            return self.block_profile(name, 'roster profile switch: the old runtime tab is missing', dead=True)
+            return self.block_profile(name, 'roster profile switch: the old runtime tab is missing', dead=True) or False
         handoff_id = uuid.uuid4().hex[:8]
         note = self.run_dir / 'handoffs' / (name + '-g' + str(generation) + '-' + handoff_id + '-profile.md')
         note.parent.mkdir(parents=True, exist_ok=True)
@@ -2241,13 +2240,14 @@ class Fleet:
                 raise RuntimeError('could not confirm retirement of the old runtime ' + prev)
         except (Exception, SystemExit) as exc:
             self.setf(name, launch_ready=0, state='dead')
-            return self.block_profile(name, 'roster profile switch failed: ' + str(exc), dead=True)
+            return self.block_profile(name, 'roster profile switch failed: ' + str(exc), dead=True) or False
         if self.v2:
             self.v2.confirm_retired(name)
         self.setf(name, launch_ready=1, retired_pane='')
         self.refresh_history()
         self.log('roster.profile_switched', agent=name, label=label, prev=prev, generation=generation + 1,
                  profile=profile or 'run default', cli=agent_cli(self.runtime_cfg(name), name), handoff=str(note))
+        return True
 
     def breakpoint_brief(self):
         """After a profile/night swap: tell the supervisor where the task stands (resume's summary)."""
@@ -2568,18 +2568,30 @@ def start(args):
         runtime_v2.validate_config(vars(args))
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    roster_path, worker_roles = None, {}
+    roster_path, night_path, worker_roles, worker_profiles, profile_clis = None, None, {}, {}, set()
+    if getattr(args, 'night_roster', None) and not args.roster:
+        raise SystemExit('--night-roster needs --roster (the day roster with the same worker names)')
     if args.roster:  # validate before any provisioning
         if args.workers is not None or args.worker_names:
             raise SystemExit('--roster replaces --workers / --worker-names; pass only one of them')
         roster_path = Path(args.roster).expanduser().resolve()
+        probe = dict(DEFAULTS, **{k: v for k, v in vars(args).items() if v is not None})
         try:
-            workers, worker_roles = roster.load(roster_path)
+            workers, worker_roles, worker_profiles = roster.load_entries(roster_path)
+            launches = list(night.resolve_launches(probe, worker_profiles).values())
         except (OSError, ValueError) as exc:
             raise SystemExit('--roster ' + str(roster_path) + ' rejected:\n' + str(exc)) from exc
+        if getattr(args, 'night_roster', None):
+            night_path = Path(args.night_roster).expanduser().resolve()
+            try:
+                night.check_rosters(probe, roster_path, night_path)
+                launches += night.resolve_launches(probe, roster.load_entries(night_path)[2]).values()
+            except (OSError, ValueError) as exc:
+                raise SystemExit('--night-roster: ' + str(exc)) from exc
+        profile_clis = {launch['overrides']['worker_cli'] for launch in launches}
     if not cmux_available():
         raise SystemExit('run this inside a cmux terminal: cmux only accepts processes started in its windows')
-    clis = {args.supervisor_cli, args.worker_cli}
+    clis = {args.supervisor_cli, args.worker_cli} | profile_clis  # night cards need their CLI at start
     codex = args.codex or shutil.which('codex')
     pi = args.pi or shutil.which('pi')
     redis_server = args.redis_server or shutil.which('redis-server')
@@ -2643,7 +2655,9 @@ def start(args):
     if getattr(args, 'name', None):
         cfg.update(name=args.name.strip(), **titles)
     if roster_path:
-        cfg.update(roster=str(roster_path), worker_roles=worker_roles)
+        cfg.update(roster=str(roster_path), worker_roles=worker_roles, worker_profiles=worker_profiles)
+    if night_path:
+        cfg['roster_night'] = str(night_path)
     if 'pi' in clis:
         cfg['pi_home'] = str(pi_adapter.prepare_home(run / 'pi-home', args.pi_agent_dir))
     save(run / 'config.json', cfg)
@@ -2659,6 +2673,22 @@ def start(args):
     save(LATEST, dict(cfg, config=str(run / 'config.json')))
     print('fleet started (' + args.mode + ' mode): supervisor + ' + str(len(cfg['workers']))
           + ' worker(s) initialising. Run directory:', run)
+
+
+def night_cmd(cfg, state):
+    """`night on|off`: validate both rosters, then write <run>/night.json; the daemon does the rest."""
+    run = cfg.get('run')
+    if not run or not Path(run).is_dir():
+        raise SystemExit('night: no run directory in ' + str(cfg.get('config') or cfg))
+    if state == 'status':
+        return dict(night.read_state(run), roster=night.roster_for(cfg))
+    if not cfg.get('roster_night'):
+        raise SystemExit('night: this run has no night roster (start it with --roster and --night-roster)')
+    try:
+        night.check_rosters(dict(DEFAULTS, **cfg), cfg['roster'], cfg['roster_night'])
+    except (OSError, ValueError) as exc:
+        raise SystemExit('night ' + state + ' refused, nothing changed:\n' + str(exc)) from exc
+    return dict(night.write_state(run, state == 'on'), roster=cfg['roster_night' if state == 'on' else 'roster'])
 
 
 def request(cfg, event, wait=30):
@@ -2767,6 +2797,8 @@ def main(argv=None):
     s.add_argument('--worker-names', help='comma-separated worker names (default worker-1..N), e.g. exit,reentry,rung')
     s.add_argument('--roster', help='worker roster YAML (workers: [{name, role?}]); edits while running add or '
                                     'retire workers. Replaces --workers / --worker-names')
+    s.add_argument('--night-roster', help='night roster YAML: the same worker names as --roster, each with its night '
+                                          'profile; `night on|off` switches between them (docs/design.md §20)')
     s.add_argument('--roles', help='dir of <agent-name>.md files appended to that agent\'s AGENTS.md (one prompt per worker)')
     s.add_argument('--supervisor-profile', help='codex profile for the supervisor (default: --profile)')
     s.add_argument('--worker-profile', help='codex profile for codex workers (default: --profile)')
@@ -2781,6 +2813,9 @@ def main(argv=None):
     s.add_argument('--name', help='human-readable fleet name used in sub-fleet titles (default: task goal or run token)')
     s.add_argument('--max-attempts', type=int,
                    help='times one dispatch/request may run in total across start --resume (default 2)')
+    nt = sub.add_parser('night', help='switch the worker roster to the night (on) or day (off) profiles; status prints it')
+    nt.add_argument('state', choices=('on', 'off', 'status'))
+    nt.add_argument('--config', default=str(LATEST))
     ag = sub.add_parser('agents', help='inspect offline agent profiles without starting or contacting a fleet')
     ag_sub = ag.add_subparsers(dest='agents_cmd', required=True)
     ag_list = ag_sub.add_parser('list', help='list validated agent cards as JSON')
@@ -2875,6 +2910,8 @@ def main(argv=None):
                       runtime_v2.sanitize_text(json.dumps(record, ensure_ascii=False)), flush=True)
         elif args.cmd == 'status':
             status(cfg)
+        elif args.cmd == 'night':
+            print(json.dumps(night_cmd(cfg, args.state), ensure_ascii=False))
         elif args.cmd == 'subfleet':
             print(json.dumps(subfleet.cli_spawn(cfg, args), ensure_ascii=False))
         elif args.cmd == 'chrome':

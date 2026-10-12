@@ -417,3 +417,16 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 **验证**：`python3 -m pytest -q tests` 全套通过（新增 `tests/test_subfleet.py`：两套真私有 Redis + 两个进程内 daemon + 每套登记分开记归属的假 cmux + 真 `claude_stop`/`notify` 入口：移交→子 fleet READY 走父钩子→子监工决策派给子 worker→交卷→release→父收回同会话 READY→父监工收到结果；委派中不投递不判死；产出缺失判 failed 与重试编号；起子 Redis 失败回滚；收回前 Escape；会话丢失原位起下一代；主 resume 保留 delegated slot 并拉起子 fleet；上限四项与编号范围；Pi/忙槽拒绝；请求文件经 tick 执行；status 树；迟到代数不改投；树停无孤儿 Redis；主 resume 拉起子 fleet；子 resume 接回 adopt 窗格；父任务终态停子 fleet；v2 主循环跑 Fleet.tick 回归；cmux_manager 的 release/adopt/place_after/close_all 用假 `_run`）。
 
 **未验收 / 已知缺口**：真实 cmux 上的跨工作区 `move-surface` 移交、`reorder-workspace`、标签标题与 `--name` 的先后，均未实测；一个正在跑的 Claude 会话在中途换掉 CLAUDE.md 后是否真按监工格式只回决策 JSON（提示词层面），未实测——这是本块最大的剩余风险；主 fleet 控制页「子 fleet 一览/跳转」与子 fleet「回到父 fleet」链接未做；委派中的 slot 仍可被父监工派活，消息排队到收回后再投；申请拆解→审批→`spawn_child` 的接线留给 contracts 合并后的下一块；子 fleet 任务的产出只做「文件存在非空」检查，正式验收交 contracts 块；独立复核、合并、部署均未做。
+
+## 20. 夜间切换：名单 profile 列 + `night on|off`（2026-10-13 用户新要求，feat/night-switch，开发中）
+
+用户原话：「夜间模式切换的时候，把 Worker 的任务热载，当前的 Worker 卸载，然后根据从断点的地方，继续用 FlashNext 的免费版继续跑」。总设计 v2 § 4.13。本节在 §16 名单热加载、§17 断点续跑、§12 档案之上增加，不改 slot/generation 标识、一页布局、交接流程与 CLI 边界。
+
+- **名单 `profile` 列**：`workers: [{name, role?, profile?}]`，`profile` 是档案卡 id。启动 / 热加载时 daemon 解析卡（`profile_launch.resolve_launch`），并对该槽合并后的配置调 `runtime_v2.validate_config`（组合表入口，A 项接管后读 `cli_pairs.yaml`）；未知卡或组合被拒 → 整份名单拒收（§16 语义），一条不放宽。
+- **换模型 = 该槽下一代**：槽名不变（换名单名字会被「本 run 已用过」拒，切回日间就做不到）。`profile` 变了的槽：在途回合做完、空闲（无在途投递、空闲已确认）后，按交接同样的方式写机器骨架交接单、存屏、`launch_held` 起下一代（新卡的 CLI/模型）、`tab_into` 原位、关旧 tab、v2 `confirm_retired`；队列不出队，新代 READY 后照常投递。切换待办期间该槽不再接新投递。preflight 或关窗失败 → 按 §12 阻塞 task，不暗换。
+- **断点交底**：本次切换的槽全部 READY 后，给监工一条 `[Night switch <task>]` / `[Day switch <task>]`：各槽新标签与档案、产出已验 / 缺、已完成派发（与 §17 交底同一个 `RuntimeV2.progress()`）、留在槽上的排队指令（明说不要再派），「只补派缺的」。无 running task 时只记审计。
+- **触发**：`start --roster day.yaml --night-roster night.yaml`（两份名单槽名必须一致）；`cmux-fleet night on|off|status --config`：先校验两份名单，再原子写 `<run>/night.json`（即 /sleep 触发文件）。daemon 每拍读它决定跟哪份名单。监工不换（Fable 监工待 Claude 监工适配层）。
+- **刹车占位**：Redis `fx:night {on, brake_card: night|day, since}` + 审计 `night.on/off`；夜卡封顶的判定归刹车项（总设计 v2 2.5）。
+- **与 live profile 的关系**：task `apply_profiles_live` 生效时，名单换卡推迟到该 task 结束（审计 `roster.profile_deferred`），避免两套来源来回切。
+- **v2 按槽 CLI**：v2 运输里判断「官方 CLI 窗口 / Pi 桥」的地方改读该槽本代的配置（`runtime_cfg`），无 profile 的槽与原来完全相同。
+- **未验收**：只有 fake cmux / 真 Redis 回归；`codex+pi` 未被今天的矩阵放行（等 A 的组合表），真实日间 Opus → 夜间 FlashNext → 早上切回的整场验收（总设计 v2 § 4.13 验收句）未做。
