@@ -19,7 +19,7 @@ import redis
 from cmux_fleet import cli_pairs, contracts
 from cmux_fleet.message_bus import BusError, MessageBus, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
-from cmux_fleet import subfleet
+from cmux_fleet import subfleet, tui_cards
 
 
 def v2_cli_problem(cfg):
@@ -70,12 +70,13 @@ def turn_answers(body_text, inputs):
 WORKER_SECTIONS = re.compile(r'^[\s>*#_-]*(done|evidence|not done|blocked)[\s*_]*:[\s*_]*(.*)$', re.I)
 
 
-def tui_candidates(slot, purpose, text):
+def tui_candidates(slot, purpose, text, mode='task'):
     """Map an official CLI's final text to the structured candidate the daemon validates.
 
     The agent-facing reply formats are the original AGENTS.md ones (decision JSON for
-    the supervisor, Done/Evidence/Not done/Blocked for task workers). Unparseable text
-    yields no candidate, so the daemon's existing invalid/blocked paths apply.
+    the supervisor, Done/Evidence/Not done/Blocked for task workers, the request's
+    business JSON object for service workers). Unparseable text yields no candidate,
+    so the daemon's existing invalid/blocked paths apply.
     """
     if purpose == 'handoff':
         return []
@@ -85,6 +86,8 @@ def tui_candidates(slot, purpose, text):
         value = None
     if slot == 'supervisor':
         return [{'tool': 'fleet_decision', 'value': value}] if isinstance(value, dict) else []
+    if mode == 'service':  # the reply schema of the request is checked by the daemon (parse_reply)
+        return [{'tool': 'fleet_result', 'value': value}] if isinstance(value, dict) else []
     if isinstance(value, dict) and 'done' in value and 'evidence' in value:
         return [{'tool': 'fleet_result', 'value': value}]
     # Contract tasks: a trailing JSON object (interface_change) and the Interfaces / Peer notices /
@@ -319,6 +322,7 @@ class RuntimeV2:
         self.pending_cursor = '0-0'
         self.held_events = set()
         self.renewed = {}
+        self.cards_dirty, self.cards_refreshed = False, 0.0
         try:
             fleet.r.xgroup_create(self.events, self.group, '0-0', mkstream=True)
         except redis.ResponseError as exc:
@@ -1256,6 +1260,15 @@ class RuntimeV2:
         self.f.setf(slot, state='dead', runtime_ready=0, bridge_available=0, launch_ready=0)
         return True
 
+    def render_cards(self, refresh_every=5.0):
+        """Official-CLI slots have no UI-only entry: render their cards off-model (tui_cards)."""
+        slots = [slot for slot in self.f.names if tui_slot(self.f.cfg, slot)]
+        if slots and tui_cards.render(self, slots, self.f.run_dir):
+            self.cards_dirty = True
+        if self.cards_dirty and time.monotonic() - self.cards_refreshed >= refresh_every:
+            self.cards_dirty, self.cards_refreshed = False, time.monotonic()
+            self.f.refresh_history()  # history page "Cards" view; reload only, no focus change
+
     def tick(self):
         from cmux_fleet.fleet import REQ, REQQ
         now = time.time()
@@ -1293,6 +1306,7 @@ class RuntimeV2:
                         self.hold(slot, 'agent stalled; execution stop unconfirmed', public_status='stalled')
         self.transaction('tick-' + uuid.uuid4().hex, expire)
         self.renew_tui()
+        self.render_cards()
         for slot in self.f.names:
             info = self.f.agent(slot)
             if info.get('handoff_id') and info.get('state') in ('handoff', 'held') and now >= float(info.get('handoff_deadline') or 0):

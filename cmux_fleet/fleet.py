@@ -667,7 +667,8 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
         if not runtime_v2.turn_answers(msg['body']['text'], inputs):
             return skipped('ignored', 'turn was not started by the typed delivery')
         return call('settled', delivery={k: msg[k] for k in runtime_v2.IDENTITY},
-                    candidates=runtime_v2.tui_candidates(name, msg['body'].get('purpose'), text or ''),
+                    candidates=runtime_v2.tui_candidates(name, msg['body'].get('purpose'), text or '',
+                                                         msg['body'].get('mode') or cfg.get('mode') or 'task'),
                     failed=False, aborted=False, unfinished=False)
     finally:
         r.close(); r.connection_pool.disconnect()
@@ -1693,14 +1694,16 @@ class Fleet:
     def assign(self, rid, slot, instruction=None):
         spec = json.loads(self.r.hget(REQ + rid, 'spec'))
         self.r.hset(REQ + rid, mapping={'status': 'dispatched', 'worker': slot})
-        self.queue(slot, self.request_message(rid, spec, instruction))
+        self.queue(slot, self.request_message(rid, spec, instruction, slot=slot))
 
-    def request_message(self, rid, spec, instruction=None, prefix=''):
+    def request_message(self, rid, spec, instruction=None, prefix='', slot=None):
         reply = spec['reply']
         keys = ', '.join(reply['required'])
         if reply.get('allowed') is not None:
             keys += ' (allowed keys: ' + ', '.join(reply['allowed']) + ')'
-        if self.v2:
+        # Only Pi has the fleet_result tool; official CLIs (Codex/Claude TUIs) keep the
+        # service_worker.md wording and are mapped by runtime_v2.tui_candidates.
+        if self.v2 and not (slot and runtime_v2.tui_slot(self.cfg, slot)):
             return ('[Request ' + rid + '] ' + prefix + (instruction or 'Handle this request as your role describes.').strip()
                     + '\nPayload (JSON):\n' + json.dumps(spec['payload'], ensure_ascii=False, indent=1)
                     + '\nUse fleet_result with a business JSON object with keys: ' + keys + '.')
