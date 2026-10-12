@@ -1051,7 +1051,8 @@ class RuntimeV2:
             if pane:  # the successor takes the old session's place, as in a handoff
                 placed = self.f.mgr.tab_into(new, pane)
                 if not placed or not self.f.mgr.kill_pane(pane) or self.f.mgr.get_pane_status(pane) is not None:
-                    self.f.setf(slot, state='dead', launch_ready=0, retired_pane=pane)
+                    self.f.setf(slot, state='dead', launch_ready=0, retired_pane=pane,
+                                retired_launch=self.f.agent(slot).get('runtime_launch') or '')
                     return self.f.finish('blocked', 'start --resume could not close the old session of ' + slot)
                 self.confirm_retired(slot)
             elif slot != 'supervisor':

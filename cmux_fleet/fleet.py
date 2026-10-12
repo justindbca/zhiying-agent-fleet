@@ -2079,12 +2079,13 @@ class Fleet:
         placed = self.mgr.tab_into(new, old)  # the successor takes the retiring session's place on the page
         if (self.v2 and not placed) or not self.mgr.kill_pane(old) or (self.v2 and self.mgr.get_pane_status(old) is not None):
             if self.v2:
-                self.setf(name, state='dead', launch_ready=0, retired_pane=old)
+                self.setf(name, state='dead', launch_ready=0, retired_pane=old,
+                          retired_launch=self.agent(name).get('runtime_launch') or '')  # same launch: same model
             self.finish('blocked', 'could not close the old session ' + prev + '; two sessions hold slot ' + name)
             return
         if self.v2:
             self.v2.confirm_retired(name)
-            self.setf(name, launch_ready=1, retired_pane='')
+            self.setf(name, launch_ready=1, retired_pane='', retired_launch='')
         self.refresh_history()
         self.log('rotate.done', agent=name, label=label, prev=prev, generation=generation + 1,
                  handoff=str(out), source=source, timed_out=timed_out)

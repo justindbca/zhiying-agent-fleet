@@ -238,3 +238,20 @@ def test_added_rows_on_a_capped_default_model_are_rejected_whole(hot):
     rejected, = audits(f, 'roster.rejected')
     assert any('exceed max_concurrent 1' in e for e in json.loads(rejected['errors']))
     assert f.workers == WORKERS and 'fresh' not in disk_workers(f)
+
+
+def test_rotation_whose_old_tab_survives_records_the_launch_it_ran(hot, monkeypatch):
+    # model_usage: the surviving old tab holds the model of the launch it ran, even after an earlier
+    # switch left retired_launch='' in the hash (that would read as the fleet default).
+    from cmux_fleet import profile_launch
+    f = hot
+    ran = profile_launch.encode_launch({'profile_id': 'claude-coder', 'overrides': {}, 'role_text': ''})
+    draft = f.run_dir / 'draft-h1.md'
+    draft.write_text('x')
+    f.setf('worker-1', runtime_launch=ran, retired_launch='', handoff_id='h1', handoff_draft=str(draft),
+           handoff_mtime=0)
+    monkeypatch.setattr(f.mgr, 'kill_pane', lambda pane: False)
+    old = f.agent('worker-1')['pane']
+    f.finish_rotation('worker-1')
+    info = f.agent('worker-1')
+    assert info['state'] == 'dead' and info['retired_pane'] == old and info['retired_launch'] == ran

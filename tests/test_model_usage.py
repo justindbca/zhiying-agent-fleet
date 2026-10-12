@@ -344,3 +344,12 @@ def test_a_failed_switch_away_keeps_the_old_models_ticket_while_the_old_tab_live
     assert usage.holders('flashnext') == ['worker-1', 'worker-2'] and usage.holders('opus') == []
     f.mgr.kill_pane(info['retired_pane'])  # the old tab goes away later: its ticket is released
     assert f.model_usage(REG).holders('flashnext') == ['worker-2']
+
+
+def test_a_rotation_after_an_earlier_switch_holds_the_switched_model():
+    # After a successful switch the hash keeps retired_launch='' (key present); a later rotation whose
+    # old tab could not be closed records the launch that tab ran, so it is not mistaken for the default.
+    slots = agents(w1=('flashnext-coder', 'dead'), w2='flashnext-coder')
+    slots['w1'].update(retired_pane='old-1', retired_launch=launch('flashnext-coder'))
+    usage = model_usage.Usage.from_agents(slots, {'worker_cli': 'codex'}, REG, alive=lambda p: p == 'old-1')
+    assert usage.holders('flashnext') == ['w1', 'w2']
