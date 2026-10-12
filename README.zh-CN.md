@@ -85,6 +85,23 @@ supervisor 和 worker 一样按「槽位.代数」命名：supervisor-1 → supe
 两边可用不同模型（如本地模型）；`--max-busy N` 限同时干活的 worker 数；`pause` / `resume` 由外部（交易日历等）控制，
 暂停时不投递、不换代，请求照常排队并会超时。命令与字段见英文 README「Service mode」。
 
+## worker 名单 YAML（运行中加 / 卸）
+
+`start --roster roster.yaml`（与 `--workers` / `--worker-names` 二选一）从文件取 worker，fleet 运行中 daemon 会重读这个文件：
+
+```yaml
+workers:
+  - name: exit              # 命名规则同 --worker-names
+    role: roles/exit.md     # 可选，相对 yaml 所在目录；优先于 --roles DIR/exit.md
+  - name: reentry
+```
+
+- **加**：新名字先写进 `config.json`（`latest.json` 指向本 run 时一起写），再用 READY 提示启动，作为标签放到右侧 worker 栏末尾；监工的下一条消息末尾会附上新名单。
+- **卸**：该 worker 不再接新活（派给它会被拒），手上的活做完、队列空了才退役：屏幕存进历史页、关掉标签；工作目录保留。退役前把它写回文件即取消卸载。
+- **只改角色**：在它下一代生效，不重启。
+- **整份拒收**（名单不变，原因记在 control 日志 `roster.rejected`）：YAML 错、未知字段、名字不合法或重复、零个 worker、角色文件不存在、本 run 用过的名字（卸掉的名字不能再加回）。变更记为 `roster.changed`。
+- 跑 daemon 的 Python 需装 PyYAML。
+
 ## pi 监工 + 官方 Claude Code worker（旧 v1 参考，新启动不支持）
 
 pi 可运行 supervisor 或 worker；Claude 侧始终由 fleet **直接启动官方 `claude` CLI**，不是 pi 接 Claude 订阅接口，

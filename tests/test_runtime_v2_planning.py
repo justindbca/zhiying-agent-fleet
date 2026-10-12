@@ -22,7 +22,7 @@ def plan(tmp_path):
     f=fleet.Fleet.__new__(fleet.Fleet)
     f.r=r; f.cfg=dict(fleet.DEFAULTS,run=str(tmp_path),workers=['worker-1'],mode='service',
                      supervisor_cli='pi',worker_cli='pi',transport_version=2,allow_development_v2=True)
-    f.workers=['worker-1']; f.names=['supervisor','worker-1']; f.service=True
+    f.workers=['worker-1']; f.desired=['worker-1']; f.names=['supervisor','worker-1']; f.service=True
     f.run_dir=tmp_path; f.mgr=FakeMgr(); f.stopping=False; f.explicit_stop=False
     v=runtime_v2.RuntimeV2.__new__(runtime_v2.RuntimeV2)
     f.v2=v; v.f=f; v.bus=MessageBus(r,'unit'); v.prefix=v.bus.prefix; v.rotation_pending=set()

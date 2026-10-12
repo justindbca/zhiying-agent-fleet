@@ -43,7 +43,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import handoff, history, pi_adapter, profile_runtime, profile_launch, runtime_v2, redis_runtime  # noqa: E402
+from cmux_fleet import handoff, history, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -55,6 +55,7 @@ HOME = Path(os.environ.get('CMUX_FLEET_HOME') or (Path.home() / '.cmux-fleet'))
 LATEST = HOME / 'latest.json'
 USER_CODEX_HOME = Path(os.environ.get('CODEX_HOME') or (Path.home() / '.codex'))
 EVENTS, TASK, LOG, NAMES = 'fx:events', 'fx:task', 'fx:log', 'fx:names'
+ROSTER = 'fx:roster'  # notify=1: tell the supervisor the current workers with its next message
 # Service mode: a resident fleet that handles a stream of requests instead of one goal.
 REQ, REQQ, RESULT, RESULTS, SERVICE = 'fx:req:', 'fx:reqq', 'fx:result:', 'fx:results', 'fx:service'
 REQ_ID_RE = r'[A-Za-z0-9][A-Za-z0-9:._-]{0,127}'
@@ -715,6 +716,10 @@ class Fleet:
         self.sessions = Path(sessions) if sessions else sessions_dir(self.cfg)
         self.workers = list(self.cfg['workers'])
         self.names = ['supervisor'] + self.workers
+        # Hot roster (start --roster): workers missing from `desired` are retiring. They finish
+        # queued work, then retire; until then they still count as busy but take no new work.
+        self.desired = list(self.workers)
+        self.roster_stamp = self.roster_digest = None
         self.service = self.cfg.get('mode') == 'service'
         self.stopping = False
         self.next_liveness = 0
@@ -742,7 +747,15 @@ class Fleet:
         return self.agent(slot).get('label') or slot
 
     def labels(self):
-        return [self.label(w) for w in self.workers]
+        return [self.label(w) for w in self.active_workers()]
+
+    def active_workers(self):
+        return [w for w in self.workers if w in self.desired]
+
+    def dispatch_targets(self):
+        """Live labels plus older generation names, only for workers not retiring."""
+        active = self.active_workers()
+        return self.labels() + [n for n, slot in self.r.hgetall(NAMES).items() if slot in active]
 
     def resolve(self, name):
         return self.r.hget(NAMES, name) or name
@@ -770,6 +783,10 @@ class Fleet:
         print(time.strftime('%H:%M:%S'), kind, json.dumps(data, ensure_ascii=False)[:180], flush=True)
 
     def queue(self, name, text):
+        if name == 'supervisor' and self.r.hget(ROSTER, 'notify') == '1':
+            # Appended, never prepended: the queue parses request/task headers at the start.
+            self.r.hset(ROSTER, mapping={'notify': 0})
+            text += '\n[Roster change] Workers you can dispatch to now: ' + ', '.join(self.labels())
         if self.v2:
             return self.v2.queue(name, text)
         self.r.rpush(key('inbox', name), text)
@@ -908,7 +925,9 @@ class Fleet:
                                   + ('_v2' if self.v2 and is_pi(cfg, name) else '') + '.md')).read_text()
         if launch.get('role_text') and launch['role_text'].strip() != scope.strip():
             scope += '\n## Assigned profile role\n\n' + launch['role_text']
-        extra = Path(self.cfg['roles']).expanduser() / (name + '.md') if self.cfg.get('roles') else None
+        roles = self.cfg.get('worker_roles') or {}
+        extra = (Path(roles[name]) if name in roles else
+                 Path(self.cfg['roles']).expanduser() / (name + '.md') if self.cfg.get('roles') else None)
         if extra and extra.is_file():  # this agent's own prompt (one per worker in service mode)
             scope += '\n## 4. Your role (' + name + ')\n\n' + extra.read_text()
         scope = scope.replace('{{WORKSPACE}}', str(self.workspace())).replace('{{FLEET_CHROME}}', self.fleet_cmd())
@@ -957,16 +976,22 @@ class Fleet:
         self.log('spawn', agent=name, generation=generation, pane=result.pane_id)
         return result.pane_id
 
+    def init_worker(self, name):
+        self.setf(name, label=name, current_profile='', runtime_profile='', advisory_profile='',
+                  runtime_ready=0, runtime_launch='', profile_task='',
+                  **profile_runtime.ProfileApplication().metadata())
+        self.r.hset(NAMES, mapping={name: name})
+
+    def spawn_ready(self, name):
+        return self.spawn(name, 'You are fleet agent ' + name + '. Read AGENTS.md in the current directory first. '
+                                'There is no task yet: your final reply must be exactly READY.')
+
     def start_all(self):
         self.setf('supervisor', label=SUPERVISOR_LABEL)
         for name in self.workers:
-            self.setf(name, label=name, current_profile='', runtime_profile='', advisory_profile='',
-                      runtime_ready=0, runtime_launch='', profile_task='',
-                      **profile_runtime.ProfileApplication().metadata())
-            self.r.hset(NAMES, mapping={name: name})
+            self.init_worker(name)
         for name in self.names:
-            self.spawn(name, 'You are fleet agent ' + name + '. Read AGENTS.md in the current directory first. '
-                             'There is no task yet: your final reply must be exactly READY.')
+            self.spawn_ready(name)
         history.write_page(self.run_dir, self.history_slots())
         # One page: supervisor above history/control on the left, worker tabs on the right.
         self.history_pane = self.mgr.arrange(self.agent('supervisor')['pane'],
@@ -975,7 +1000,10 @@ class Fleet:
         self.r.hset(SERVICE, mapping={'history_pane': self.history_pane or ''})
 
     def history_slots(self):
-        return [(n, self.label(n), SUPERVISOR_LABEL if n == 'supervisor' else n) for n in self.names]
+        # Workers removed from the roster keep their history (they have entries but no slot).
+        retired = [s for s in dict.fromkeys(e.get('slot') for e in history.entries(self.run_dir))
+                   if s and s not in self.names]
+        return [(n, self.label(n), SUPERVISOR_LABEL if n == 'supervisor' else n) for n in self.names + retired]
 
     # -- events
     def handle(self, ev, *, _v2_internal=False):
@@ -1164,7 +1192,7 @@ class Fleet:
     def on_supervisor(self, text):
         t = self.task()
         try:
-            decision = parse_decision(text, self.labels() + list(self.r.hgetall(NAMES)), self.others_active())
+            decision = parse_decision(text, self.dispatch_targets(), self.others_active())
             # Validate the whole dispatch before queuing any part of it. Rejections
             # use the existing supervisor correction/three-strike blocked path.
             prepared = []
@@ -1241,7 +1269,7 @@ class Fleet:
             registry = AgentRegistry(registry_path)
             plan = build_dispatch_plan(spec['goal'], registry)
             dispatch_plan = plan.to_dict()
-            profile_assignments = assign_profiles(plan, self.workers, registry)
+            profile_assignments = assign_profiles(plan, self.active_workers(), registry)
         task_id = 'task-' + uuid.uuid4().hex[:10]
         self.r.delete(TASK)
         fields = {'id': task_id, 'goal': spec['goal'], 'status': 'running', 'completion': 0,
@@ -1299,7 +1327,7 @@ class Fleet:
     def request(self, spec):
         if not self.service:
             raise ValueError('requests need a fleet started with --mode service')
-        validate_request(spec, self.labels() + list(self.r.hgetall(NAMES)))
+        validate_request(spec, self.dispatch_targets())
         rid = spec['id']
         if (self.r.hgetall(REQ + rid) or self.r.get(RESULT + rid)
                 or (self.v2 and self.r.get(self.v2.prefix + ':public:' + runtime_v2.digest(rid)))):
@@ -1381,7 +1409,7 @@ class Fleet:
 
     def on_service_supervisor(self, text):
         try:
-            decision = parse_service_decision(text, self.labels() + list(self.r.hgetall(NAMES)))
+            decision = parse_service_decision(text, self.dispatch_targets())
         except (ValueError, TypeError, KeyError) as exc:
             bad = self.r.hincrby(SERVICE, 'bad_replies', 1)
             if bad >= 3:
@@ -1642,6 +1670,126 @@ class Fleet:
         if pane:
             self.mgr.reload_browser(pane)
 
+    # -- hot roster (start --roster)
+    def roster_tick(self):
+        path = self.cfg.get('roster')
+        if not path:
+            return
+        try:
+            st = os.stat(path)
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            stamp = None
+        if stamp != self.roster_stamp:
+            self.roster_stamp = stamp
+            self.reload_roster(path)
+        for name in [w for w in self.workers if w not in self.desired]:
+            info = self.agent(name)
+            # Retire only between turns: no queued work and (v2) no delivery in flight.
+            if (info.get('state') in ('idle', 'dead') and not self.inbox_depth(name)
+                    and not (self.v2 and self.r.hget(self.v2.bus.lease_key(name), 'current_delivery'))):
+                self.retire_worker(name)
+
+    def reload_roster(self, path):
+        try:
+            raw = Path(path).read_bytes()
+        except OSError as exc:
+            raw, problem = b'', 'cannot read roster: ' + str(exc)
+        else:
+            problem = None
+        digest = hashlib.sha256(raw).hexdigest() + (problem or '')
+        if digest == self.roster_digest:
+            return  # touched, not changed
+        self.roster_digest = digest
+        try:
+            if problem:
+                raise ValueError(problem)
+            workers, roles = roster.parse(raw, Path(path).parent)
+            # A slot name used earlier in this run still has Redis state and a workspace.
+            used = [n + ': name was already used in this run (agent state or workspace exists); pick a new name'
+                    for n in workers if n not in self.workers
+                    and (self.r.exists(key('agent', n)) or (self.workspace() / n).exists())]
+            if used:
+                raise ValueError('\n'.join(used))
+        except ValueError as exc:
+            self.log('roster.rejected', level='error', path=str(path), errors=str(exc).split('\n'),
+                     kept=self.desired)
+            return
+        before, old_roles = list(self.desired), dict(self.cfg.get('worker_roles') or {})
+        adds = [n for n in workers if n not in self.workers]
+        results = {n: 'retire cancelled' for n in workers if n in self.workers and n not in self.desired}
+        results.update({n: 'retiring when idle' for n in self.desired if n not in workers})
+        results.update({n: 'role changed; applies at its next generation' for n in workers
+                        if n in self.workers and roles.get(n) != old_roles.get(n)})
+        self.desired = workers
+        # Retiring workers keep their role until gone (a handoff successor may still finish work).
+        roles = dict({w: old_roles[w] for w in self.workers if w not in workers and w in old_roles}, **roles)
+        self.cfg['worker_roles'] = roles
+        if adds:
+            self.workers = self.workers + adds
+            self.names = ['supervisor'] + self.workers
+        if adds or roles != old_roles:
+            # Hooks and bridges check membership in the config file: write it before spawning.
+            self.persist_roster()
+        for name in adds:
+            results[name] = self.add_worker(name)
+        if adds or any(n not in workers for n in before) or any(n not in before for n in workers):
+            self.r.hset(ROSTER, mapping={'notify': 1})
+        if results:
+            self.log('roster.changed', before=before, after=self.desired, results=results)
+
+    def persist_roster(self):
+        self.cfg['workers'][:] = self.workers  # in place: the control view holds this list
+        fields = {'workers': list(self.workers), 'worker_roles': self.cfg.get('worker_roles') or {}}
+        save(self.path, dict(load(self.path), **fields))
+        try:
+            latest = load(LATEST)
+            if Path(latest.get('config') or '').resolve() == self.path:
+                save(LATEST, dict(latest, **fields))
+        except (OSError, ValueError):
+            pass  # latest.json belongs to another run or is missing: nothing to update
+
+    def add_worker(self, name):
+        self.init_worker(name)
+        try:
+            pane = self.spawn_ready(name)
+        except (Exception, SystemExit) as exc:
+            self.setf(name, state='dead', launch_ready=0, runtime_ready=0)
+            return 'spawn failed: ' + str(exc)
+        peer = next((p for p in (self.agent(w).get('pane') for w in self.workers if w != name)
+                     if p and self.mgr.get_pane_status(p) is not None), None)
+        placed = (self.mgr.tab_into(pane, peer, before=False) if peer
+                  else self.mgr.place_right_of(pane, self.agent('supervisor').get('pane')))
+        self.refresh_history()
+        return 'added' if placed else 'added; could not move it into the worker column'
+
+    def retire_worker(self, name):
+        info, label = self.agent(name), self.label(name)
+        generation, pane = int(info.get('generation') or 0), info.get('pane')
+        snapshot = ''
+        if pane and self.mgr.get_pane_status(pane) is not None:
+            snapshot = self.run_dir / 'handoffs' / (name + '-g' + str(generation) + '-retired.terminal.txt')
+            snapshot.parent.mkdir(parents=True, exist_ok=True)
+            self.mgr.capture_to(pane, str(snapshot))
+        if not pane:
+            ok = True  # never spawned: nothing to close
+        elif self.v2:
+            ok = self.v2.retire(name, 'removed from roster')  # holds the slot if the close is unconfirmed
+        else:
+            ok = self.mgr.kill_pane(pane) and self.mgr.get_pane_status(pane) is None
+        if not ok:
+            self.log('roster.retire_failed', agent=name, pane=pane)
+            return
+        history.record(self.run_dir, slot=name, label=label, generation=generation, handoff='',
+                       snapshot=str(snapshot), source='retired', timed_out=False)
+        self.setf(name, state='retired', launch_ready=0, runtime_ready=0)
+        self.workers = [w for w in self.workers if w != name]
+        self.names = ['supervisor'] + self.workers
+        (self.cfg.get('worker_roles') or {}).pop(name, None)
+        self.persist_roster()  # its workspace stays: declared artifact paths must still verify
+        self.refresh_history()
+        self.log('roster.retired', agent=name, label=label, workers=self.workers)
+
     # -- stall watchdog
     def last_activity(self, info):
         """Newest of: when we handed the agent its message, and its rollout file's mtime."""
@@ -1707,6 +1855,7 @@ class Fleet:
                         'idle again. Dispatch a smaller, concrete instruction, or reply BLOCKED if a human is needed.')
 
     def tick(self):
+        self.roster_tick()  # the only place the roster changes: never inside per-slot loops
         if self.v2:
             return self.v2.tick()
         now = time.time()
@@ -1783,6 +1932,15 @@ def start(args):
         runtime_v2.validate_config(vars(args))
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    roster_path, worker_roles = None, {}
+    if args.roster:  # validate before any provisioning
+        if args.workers is not None or args.worker_names:
+            raise SystemExit('--roster replaces --workers / --worker-names; pass only one of them')
+        roster_path = Path(args.roster).expanduser().resolve()
+        try:
+            workers, worker_roles = roster.load(roster_path)
+        except (OSError, ValueError) as exc:
+            raise SystemExit('--roster ' + str(roster_path) + ' rejected:\n' + str(exc)) from exc
     if not cmux_available():
         raise SystemExit('run this inside a cmux terminal: cmux only accepts processes started in its windows')
     clis = {args.supervisor_cli, args.worker_cli}
@@ -1806,8 +1964,9 @@ def start(args):
     mgr = CmuxSessionManager(SESSION)
     if mgr.session_exists():
         raise SystemExit('cmux-fleet tabs already exist; run `stop` and close them with the ✕ first')
-    workers = (args.worker_names.split(',') if args.worker_names
-               else ['worker-' + str(i + 1) for i in range(max(1, args.workers))])
+    if not roster_path:
+        workers = (args.worker_names.split(',') if args.worker_names
+                   else ['worker-' + str(i + 1) for i in range(max(1, args.workers or 1))])
     if len(set(workers)) != len(workers) or not all(re.fullmatch(WORKER_NAME_RE, w) and w != 'supervisor'
                                                     for w in workers):
         raise SystemExit('--worker-names: distinct names matching ' + WORKER_NAME_RE + ' (no dots: dots mark generations)')
@@ -1842,6 +2001,8 @@ def start(args):
            'pi_thinking': args.pi_thinking, 'allow_unsandboxed_pi': args.allow_unsandboxed_pi,
            'pi_agent_dir': args.pi_agent_dir, 'allow_profile_live_switch': args.allow_profile_live_switch,
            'transport_version': args.transport_version, 'allow_development_v2': args.allow_development_v2}
+    if roster_path:
+        cfg.update(roster=str(roster_path), worker_roles=worker_roles)
     if 'pi' in clis:
         cfg['pi_home'] = str(pi_adapter.prepare_home(run / 'pi-home', args.pi_agent_dir))
     save(run / 'config.json', cfg)
@@ -1928,7 +2089,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(prog='cmux-fleet', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='cmd', required=True)
     s = sub.add_parser('start', help='provision the private redis + cmux control surface (inside cmux)')
-    s.add_argument('--workers', type=int, default=1)
+    s.add_argument('--workers', type=int, help='number of workers worker-1..N (default 1)')
     s.add_argument('--transport-version', type=int, choices=(2,), default=2,
                    help='new runs require Redis v2; existing v1 runs must be drained and replaced, not hot-flipped')
     s.add_argument('--allow-development-v2', action='store_true',
@@ -1971,6 +2132,8 @@ def main(argv=None):
     s.add_argument('--mode', choices=('task', 'service'), default=DEFAULTS['mode'],
                    help='task: one goal until COMPLETED; service: resident, handles a stream of requests')
     s.add_argument('--worker-names', help='comma-separated worker names (default worker-1..N), e.g. exit,reentry,rung')
+    s.add_argument('--roster', help='worker roster YAML (workers: [{name, role?}]); edits while running add or '
+                                    'retire workers. Replaces --workers / --worker-names')
     s.add_argument('--roles', help='dir of <agent-name>.md files appended to that agent\'s AGENTS.md (one prompt per worker)')
     s.add_argument('--supervisor-profile', help='codex profile for the supervisor (default: --profile)')
     s.add_argument('--worker-profile', help='codex profile for codex workers (default: --profile)')

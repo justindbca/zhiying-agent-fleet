@@ -351,3 +351,16 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - 新 run 的 supervisor 和每个 worker 都必须实际验证 Redis 收件；验收包含无新消息 Markdown、无模型读取消息文件、无机械 supervisor 转述，而不只是检查 config=2。
 - 2026-10-12 起 Codex 监工 + 官方 Claude worker（task）可新建 v2 run（§11 对应小节）；其余原生 Codex/Claude 组合和受保护的在役/生产实例仍明确列阻塞项；通信改造不授权替换 CLI、转移订阅凭证、停止交易服务或写生产 Redis。未验证的组合不宣称已迁移。
 - 只读盘点工具 `python3 -m cmux_fleet.transport_inventory` 报告已扫描机器/目录、配置版本、关联进程和消息文件数量；不连接 Redis、不读取消息正文、不修改任何实例。
+
+## 16. worker 名单热加载（2026-10-12 用户新要求）
+
+用户要求“worker 可以热载也可以卸载，用 yaml 控制”。本节替代“worker 名单在 `start` 时冻结”的旧行为；slot/generation 标识、一页布局、唯一 daemon、task/service 协议不变。
+
+- 入口：`start --roster <yaml>`，与 `--workers/--worker-names` 互斥；schema 为 `workers: [{name, role?}]`，`role` 相对 yaml 目录、优先于 `--roles DIR/<name>.md`。启动时文件不合法直接拒绝启动。不带 `--roster` 的 run 行为不变。
+- 检测：daemon 每次 tick 开头比较文件 mtime/大小，再比内容哈希；名单只在这一处改动，不在逐 slot 循环里改。
+- 整份校验：YAML 错、未知字段、名字不合法/重复、零个 worker、角色文件不存在、本 run 已用过的名字（Redis agent 状态或 workspace 目录已存在）→ 整份拒收，保留当前名单，`roster.rejected` 写入审计（control 可见）并列出每条原因。
+- 加：先写 `config.json`（`latest.json` 指向本 run 时同步）再启动——钩子/桥按配置文件校验成员；Redis 字段与 `start_all` 相同，READY 提示相同，标签放进右侧 worker 栏末尾（无 worker 时放 supervisor 右侧），刷新历史页。
+- 卸：标记退役中——不再是派活目标（决策/请求/路由校验、profile 分配都排除），但仍计入 `max_busy` 与“有 worker 在忙”；空闲且队列空、v2 无在途投递时，按换代同样的方式存屏、关闭旧 tab（v2 `retire`），从名单删除并写回配置。工作目录保留，历史页继续可查。退役完成前写回文件即取消。
+- 只改 `role`：下一代生效，不重启。
+- 通知监工：不单独发一条消息（task 模式下单独一条会让监工回一个无派活的 RUNNING，按原规则判错三次即 blocked）；改为在下一条发给监工的业务消息末尾追加当前可派 worker 名单。
+- 已知边界：新加的 worker 若启动未 READY，按原启动超时规则使在途任务 blocked；退役中 worker 处于 held 时不会退役，需人工处理；暂停中不投递，退役中 worker 的队列不会排空。

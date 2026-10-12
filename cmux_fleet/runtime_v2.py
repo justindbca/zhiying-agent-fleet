@@ -744,9 +744,9 @@ class RuntimeV2:
             if not error:
                 try:
                     if self.f.service:
-                        legacy.parse_service_decision(text, self.f.labels() + list(self.f.r.hgetall(legacy.NAMES)))
+                        legacy.parse_service_decision(text, self.f.dispatch_targets())
                     else:
-                        legacy.parse_decision(text, self.f.labels() + list(self.f.r.hgetall(legacy.NAMES)), self.f.others_active())
+                        legacy.parse_decision(text, self.f.dispatch_targets(), self.f.others_active())
                 except (ValueError, TypeError, KeyError) as exc:
                     error = str(exc)
             if error:

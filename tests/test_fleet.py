@@ -113,7 +113,7 @@ class FakeMgr:
         self.reloaded = getattr(self, 'reloaded', 0) + 1
         return True
 
-    def tab_into(self, pane, peer):
+    def tab_into(self, pane, peer, before=True):
         self.tabbed = getattr(self, 'tabbed', []) + [(pane, peer)]
         return True
 

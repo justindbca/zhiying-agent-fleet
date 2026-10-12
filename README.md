@@ -173,6 +173,30 @@ cmux-fleet pause --reason "market closed"; cmux-fleet resume
 - Callers on the same machine can skip the CLI: push `{"kind": "request", "request_id": ..., "spec": ...}`
   to `fx:events` on the private socket named in `~/.cmux-fleet/latest.json`, then read `fx:result:<id>`.
 
+## Worker roster YAML (hot add / remove)
+
+`start --roster roster.yaml` (instead of `--workers` / `--worker-names`) takes the workers from a file,
+and the daemon re-reads it while the fleet runs:
+
+```yaml
+workers:
+  - name: exit              # same rules as --worker-names
+    role: roles/exit.md     # optional, relative to the yaml; overrides --roles DIR/exit.md
+  - name: reentry
+```
+
+- **Add**: a new name is written to `config.json` (and `latest.json` if it points at this run), then
+  spawned with the READY prompt as a tab at the end of the worker column. The supervisor sees the new
+  list appended to its next message (`[Roster change] Workers you can dispatch to now: ...`).
+- **Remove**: the worker takes no new work (dispatch to it is rejected), finishes what it already has,
+  and when idle with an empty queue its screen goes to the history page and its tab is closed. Its
+  workspace directory stays. Putting it back in the file before that cancels the removal.
+- **Role change** for an existing worker applies at its next generation; it is not restarted.
+- **Rejected as a whole** (roster kept, reasons in the control log as `roster.rejected`): invalid YAML,
+  unknown keys, bad or duplicate names, zero workers, a missing role file, or a name already used in
+  this run (a removed worker's name cannot come back). Changes are logged as `roster.changed`.
+- Needs PyYAML in the Python that runs the daemon.
+
 ## Claude Code workers (optional)
 
 The supervisor defaults to Codex (or select Pi below). Workers can be official [Claude Code](https://claude.com/claude-code) CLI sessions instead:
