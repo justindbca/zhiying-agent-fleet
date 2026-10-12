@@ -508,7 +508,7 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 
 ### E 先于 F：看门的墙闸（`Fleet.wall_gate`）
 
-- 接口：`Fleet.wall_gate(slot, screen, source='watch') -> record | None`。看门（F，`watchdog.Watchdog.check`）每次抓屏后、在弹框白名单 / 未知弹框 hold / stalled 阶梯 / frozen 之前先调它。只看屏幕最后 `brake.GATE_TAIL`=25 行（`brake.screen_wall`）。
+- 接口：`Fleet.wall_gate(slot, screen, source='watch') -> record | None`。看门（F，§24，`watchdog.Watchdog.check`）每次抓屏后、在弹框白名单 / 未知弹框 hold / stalled 阶梯 / frozen 之前先调它。只看屏幕最后 `brake.GATE_TAIL`=25 行（`brake.screen_wall`）。
 - 返回 record：墙已触发刹车（pause、`agent.wall`、审计 `brake.tripped`、`brake.json` source=watch、可选通知；v2 下在一个事务里）。看门本 tick 对该槽**一个键都不按、不 hold、不杀不换代**——墙菜单（如 `❯ 1. Yes, switch…`）永远不当弹框答。同一 agent 的墙已经刹住时再调只返回原记录，不二次触发。返回 None：无墙，看门照自己的表走。
 - hold 出口（F 的 `turn_ended` → `release_held`）只把槽位放回 idle，**不解除暂停**；F 的 hold 会改写暂停原因，但刹车记录在 `fx:brake` 里独立保存，`resume` 每次都按预算卡复核，越线就拒。
 
@@ -530,4 +530,5 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - 弹框表 `cmux_fleet/config/watchdog_prompts.yaml`（`--prompt-table` 可换），按 mtime 热载；坏改动审计 `watch.table_rejected` 并沿用旧表。每条必须写 `verify`：`own_cwd`（对话框上的路径都是本槽目录，spawn 时已信任）、`paths_in_run`（路径都在本槽目录或 `<run>/workspace`，即 `--add-dir` 已授权）、`rm_in_cwd`（rm 目标是字面量、无 `$` / 反引号 / 管道，且严格在本槽目录内）；路径读不出来 → 不按。TUI 折行的长路径按「连续单 token 行」拼回。缺省表：`dangerous_rm`（Enter，变量目标一律 hold）、`read_outside`（Enter）、`trust_folder`（Claude 2.1.280 实录：缺省选中「No, exit」，键 `Down, Enter`，且要求屏上是「❯ No, exit」）、`trust_folder_legacy`（Codex / 旧 Claude，Enter，文案未实录）。
 - 自检：连续 `capture_fail_alarm`（3）次抓屏失败写一条 `watch.capture_fail`（error，每段连续失败只报一次）。
 - **hold 出口**：槽位 held（uncertain / expired）时，若同一会话、同一代、由该投递打字开启的回合结束（Claude Stop / Codex notify 经 `tui_turn`），钩子发 `turn_ended`；daemon 校验身份后 `resolve_uncertain(cancelled, execution_stopped=True)`，槽位回 idle，结果**不采用**，暂停状态不动（审计 `hold.released`）。手打回合 / 旧代 / 未 held 的伪造事件一律拒绝。
+- **墙闸先于看门（集成时接上）**：`Watchdog.check` 抓屏后先调 E 的 `Fleet.wall_gate`（§23「E 先于 F」）；命中墙 → 本 tick 对该槽不按键、不 hold、不杀不换代。F、E 各自分支上都没接这一行，集成分支 integration/batch-20261013 补接（测试 `test_wall_on_screen_trips_the_brake_and_the_watchdog_presses_nothing`）。
 - 参数：`--stall-timeout`（原有，缺省 1800）、`--stall-grace`、`--stall-escapes`、`--prompt-table`；配置非法在 `validate_config` 拒绝。`walled`（墙文案）不在本项，归刹车（E）。

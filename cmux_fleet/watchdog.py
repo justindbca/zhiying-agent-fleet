@@ -328,6 +328,10 @@ class Watchdog:
         pane = info['pane']
         cfg = self.f.cfg
         screen = self.capture(slot, info, pane)
+        if screen and self.f.wall_gate(slot, screen) is not None:
+            # E before F (docs/design.md §23): a usage wall is the brake's. No key, no hold, no kill this
+            # tick; a wall menu (e.g. "❯ 1. Yes, switch…") is never a dialog to answer.
+            return
         digest = hashlib.sha256(screen.encode()).hexdigest()[:16] if screen else ''
         frozen_seen = int(info.get('proc_frozen') or 0) + 1 if uninterruptible(self.proc_stats(pane)) else 0
         self.f.setf(slot, proc_frozen=frozen_seen)

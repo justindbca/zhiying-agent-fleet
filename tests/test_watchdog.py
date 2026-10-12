@@ -1,4 +1,4 @@
-"""Watchdog five states for transport v2 (docs/design.md §20).
+"""Watchdog five states for transport v2 (docs/design.md §24).
 
 Real private Redis + real hook entry points (the `mixed` Codex supervisor + Claude workers fleet);
 fake cmux screens / ps. Time is passed explicitly to Watchdog.tick, never slept.
@@ -501,3 +501,16 @@ def test_claude_trust_dialog_for_the_slot_own_directory_is_answered_down_enter(w
     f.v2.watchdog.tick(time.time())
     assert keys(f, 'worker-2') == ['Down', 'Enter'] and f.agent('worker-2')['state'] == 'starting'
     assert audits(f, 'watch.prompt_answered')[0]['prompt'] == 'trust_folder'
+
+
+# ------------------------------------------------------------------ E x F: wall gate first (§23 / §24)
+def test_wall_on_screen_trips_the_brake_and_the_watchdog_presses_nothing(wd):
+    f = wd
+    dispatch_one(f)
+    pane = f.agent('worker-1')['pane']
+    f.mgr.screens[pane] = ("⎿  You've reached your Fable limit. Run /usage-credits to continue "
+                           "or switch models with /model.\n" + DIALOG_RM_LITERAL)
+    f.v2.watchdog.tick(time.time())
+    assert keys(f, 'worker-1') == [] and audits(f, 'watch.prompt_answered') == []
+    assert f.paused() and f.agent('worker-1')['state'] != 'held'
+    assert any(r.get('event') == 'brake.tripped' for r in audits(f)) or f.r.hget('fx:brake', 'tripped')
