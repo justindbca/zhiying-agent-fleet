@@ -19,7 +19,8 @@ REQUIRED = [
     "From r2 on: review only the previous fix diff",
     "PASS = zero P0 and zero P1",
     "## This round's issues",                   # report template
-    "Done", "Evidence", "Not done", "Blocked",  # base reply format
+    "Use the base reply format (Done / Evidence / Not done / Blocked)",
+    "- Evidence: `<report path> <bytes> bytes; verdict PASS|FAIL",
 ]
 
 
