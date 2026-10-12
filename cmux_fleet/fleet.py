@@ -2066,7 +2066,7 @@ class Fleet:
                     and (self.r.exists(key('agent', n)) or (self.workspace() / n).exists())]
             if used:
                 raise ValueError('\n'.join(used))
-            night.resolve_launches(self.cfg, profiles)  # unknown card or refused CLI pair: reject the whole file
+            night.resolve_launches(self.cfg, profiles, workers)  # unknown card, refused pair, card limits: reject all
         except ValueError as exc:
             self.log('roster.rejected', level='error', path=str(path), errors=str(exc).split('\n'),
                      kept=self.desired)
@@ -2160,6 +2160,14 @@ class Fleet:
             launch = night.resolve_launches(self.cfg, {name: profile})[name]
             self.setf(name, runtime_launch=profile_launch.encode_launch(launch), roster_profile=profile)
 
+    def roster_card_gate(self, name, profile):
+        """Feature C's per-slot card gate (Fleet.card_gate) before a roster swap onto ``profile``:
+        None, ('wait', why) while the model is at max_concurrent elsewhere, ('block', why). Without C: None."""
+        if not hasattr(self, 'card_gate'):
+            return None
+        registry = AgentRegistry(self.cfg.get('agent_registry') or None)
+        return self.card_gate(name, registry.get(profile), registry)
+
     def profile_swaps(self):
         """Active slots whose roster profile differs from the one their generation runs."""
         wanted = self.cfg.get('worker_profiles') or {}
@@ -2179,8 +2187,10 @@ class Fleet:
     def profile_swap_tick(self):
         pending = self.profile_swaps()
         for name in self.active_workers():
-            if name not in pending and self.agent(name).get('roster_swap_deferred') == '1':
-                self.setf(name, roster_swap_deferred=0)  # roster changed back: a later deferral is audited again
+            if name not in pending and (self.agent(name).get('roster_swap_deferred') == '1'
+                                        or self.agent(name).get('roster_capacity_wait')):
+                # roster changed back: a later deferral / capacity wait is audited again
+                self.setf(name, roster_swap_deferred=0, roster_capacity_wait='')
         live = False
         if pending and not self.service:
             try:
@@ -2197,7 +2207,7 @@ class Fleet:
             if (info.get('state') != 'idle' or info.get('idle_confirmed') == '0'
                     or (self.v2 and self.r.hget(self.v2.bus.lease_key(name), 'current_delivery'))):
                 continue  # in-flight turns finish first
-            if not self.swap_profile(name):
+            if self.swap_profile(name) is False:
                 return  # blocked: the task is finished as blocked, leave the other slots alone
         if self.r.hget(night.NIGHT, 'brief_due') == '1' and not self.profile_swaps() and not any(
                 self.agent(w).get('state') == 'starting' for w in self.active_workers()):
@@ -2210,6 +2220,14 @@ class Fleet:
         info = self.agent(name)
         try:
             launch = night.resolve_launches(self.cfg, {name: profile})[name] if profile else None
+            gate = self.roster_card_gate(name, profile) if launch else None
+            if gate and gate[0] == 'wait':
+                if info.get('roster_capacity_wait') != gate[1]:  # audit each new reason once
+                    self.setf(name, roster_capacity_wait=gate[1])
+                    self.log('roster.capacity_wait', agent=name, profile=profile, reason=gate[1])
+                return None  # queue stays held on this slot; retried next tick (no old-card work meanwhile)
+            if gate:
+                raise ValueError(gate[1])  # host mismatch never clears: block, never a silent swap
             if launch:
                 self.preflight_profile(launch)
         except (OSError, ValueError, KeyError, SystemExit, subprocess.SubprocessError) as exc:
@@ -2229,7 +2247,8 @@ class Fleet:
         # Fence old callbacks before the successor exists (same order as an idle profile switch).
         self.setf(name, generation=generation + 1, label=label, prev_label=prev, handoff_id='',
                   runtime_launch=profile_launch.encode_launch(launch) if launch else '', runtime_profile='',
-                  roster_profile=profile, roster_swap_deferred=0, launch_ready=0, retired_pane=old)
+                  roster_profile=profile, roster_swap_deferred=0, roster_capacity_wait='', launch_ready=0,
+                  retired_pane=old)
         self.r.hset(NAMES, mapping={label: name})
         self.r.hset(night.NIGHT, mapping={'brief_due': 1})
         try:
@@ -2581,7 +2600,7 @@ def start(args):
         probe = dict(DEFAULTS, **{k: v for k, v in vars(args).items() if v is not None})
         try:
             workers, worker_roles, worker_profiles = roster.load_entries(roster_path)
-            launches = list(night.resolve_launches(probe, worker_profiles).values())
+            launches = list(night.resolve_launches(probe, worker_profiles, workers).values())
         except (OSError, ValueError) as exc:
             raise SystemExit('--roster ' + str(roster_path) + ' rejected:\n' + str(exc)) from exc
         if getattr(args, 'night_roster', None):

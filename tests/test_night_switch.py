@@ -376,3 +376,114 @@ def test_flashnext_night_swaps_to_pi_when_the_table_admits_codex_pi(hot, monkeyp
     write_profiles(f, 'roster.yaml', {'worker-3': 'flashnext-coder', 'worker-2': 'flashnext-coder'})
     f.tick()
     assert '[adapter_missing]' in audits(f, 'roster.rejected')[-1]['errors']
+
+
+# ------------------------------------------------------------------ card limits (feature C's model cards)
+FLASH = 'flashnext-coder'
+
+
+def with_cards():
+    return pytest.importorskip('cmux_fleet.model_usage', reason="feature C (model cards) is not merged")
+
+
+def flash_ok(pairs):
+    pairs(('codex', 'claude', 'task', 'verified'), ('codex', 'pi', 'task', 'verified'))
+
+
+def test_without_model_cards_max_concurrent_is_not_enforced(pairs):
+    """B alone (C not merged): three FlashNext slots pass; the cap only exists once C is in."""
+    if night.optional_module('model_usage') is not None:
+        pytest.skip('feature C is merged: the cap is enforced (see the tests below)')
+    flash_ok(pairs)
+    slots = ['worker-1', 'worker-2', 'worker-3']
+    assert set(night.resolve_launches(v2cfg(), {s: FLASH for s in slots}, slots)) == set(slots)
+
+
+def test_card_limits_reject_a_whole_roster_over_max_concurrent_or_off_host(pairs, tmp_path):
+    with_cards()
+    flash_ok(pairs)
+    day, other = tmp_path / 'day.yaml', tmp_path / 'night.yaml'
+    day.write_text('workers:\n  - name: worker-1\n  - name: worker-2\n  - name: worker-3\n')
+    other.write_text('workers:\n' + ''.join('  - {name: worker-%d, profile: %s}\n' % (i, FLASH) for i in (1, 2, 3)))
+    with pytest.raises(ValueError, match=r'model flashnext: 3 slots \(worker-1, worker-2, worker-3\) exceed max_concurrent 2'):
+        night.check_rosters(v2cfg(), day, other)
+    other.write_text('workers:\n  - {name: worker-1, profile: %s}\n  - name: worker-2\n  - name: worker-3\n' % FLASH)
+    assert night.check_rosters(v2cfg(), day, other)['night'][2] == {'worker-1': FLASH}
+    with pytest.raises(ValueError, match='profile flashnext-coder runs only on'):
+        night.check_rosters(v2cfg(host='macmini'), day, other)
+
+
+def test_daemon_rejects_an_over_cap_night_roster_whole(hot, pairs):
+    with_cards()
+    f = hot
+    flash_ok(pairs)
+    f.cfg['roster'] = str(write_profiles(f, 'roster.yaml', {w: FLASH for w in WORKERS[:3]}))
+    f.tick()
+    rejected, = audits(f, 'roster.rejected')
+    assert any('exceed max_concurrent 2' in e for e in json.loads(rejected['errors']))
+    assert not f.cfg.get('worker_profiles') and not audits(f, 'roster.profile_switched')
+
+
+def hold_flash(f, name, roster_profile=FLASH, state=None):
+    """``name``'s current generation runs FlashNext (as a live profile task or an earlier roster would leave it)."""
+    from cmux_fleet import profile_launch
+    launch = night.resolve_launches(f.cfg, {name: FLASH})[name]
+    f.setf(name, runtime_launch=profile_launch.encode_launch(launch), roster_profile=roster_profile,
+           **({'state': state} if state else {}))
+
+
+def test_swap_waits_for_a_free_model_slot_holds_its_queue_and_retries(hot, pairs, monkeypatch):
+    with_cards()
+    f = hot
+    flash_ok(pairs)
+    monkeypatch.setattr(f, 'preflight_profile', lambda launch: None)
+    f.cfg['pi_home'] = str(f.run_dir / 'pi-home')
+    hold_flash(f, 'worker-1', state='busy')   # still on FlashNext, mid-turn: cannot swap back yet
+    f.cfg['roster'] = str(write_profiles(f, 'roster.yaml', {'worker-2': FLASH, 'worker-3': FLASH}))
+    f.tick()
+    assert f.agent('worker-2')['label'] == 'worker-2.1'                # 2nd FlashNext slot: admitted
+    assert f.agent('worker-3')['label'] == 'worker-3'                  # 3rd: waits, no spawn
+    waits = audits(f, 'roster.capacity_wait')
+    assert len(waits) == 1 and waits[0]['agent'] == 'worker-3'
+    assert 'max_concurrent 2 for model flashnext reached (running on worker-1, worker-2)' in waits[0]['reason']
+    assert 'worker-3' in f.profile_swaps() and f.agent('worker-3').get('roster_swap_deferred') != '1'  # queue held
+    assert not audits(f, 'profile.blocked') and f.task()['status'] != 'blocked'
+    f.tick()
+    assert len(audits(f, 'roster.capacity_wait')) == 1                 # audited once per reason
+    f.setf('worker-1', state='idle')
+    f.tick()                                                           # worker-1 back to the run default frees a slot
+    assert f.agent('worker-1')['label'] == 'worker-1.1' and f.agent('worker-3')['label'] == 'worker-3.1'
+    assert not f.agent('worker-3').get('roster_capacity_wait')
+    assert [a['agent'] for a in audits(f, 'roster.profile_switched')] == ['worker-2', 'worker-1', 'worker-3']
+
+
+def test_same_slot_reuse_needs_no_extra_model_slot(hot, pairs, monkeypatch):
+    """worker-1 already runs FlashNext; making that its roster card does not count it twice."""
+    with_cards()
+    f = hot
+    flash_ok(pairs)
+    monkeypatch.setattr(f, 'preflight_profile', lambda launch: None)
+    f.cfg['pi_home'] = str(f.run_dir / 'pi-home')
+    hold_flash(f, 'worker-1', roster_profile='')   # e.g. left by a live profile task
+    hold_flash(f, 'worker-2')                      # cap 2 is now full
+    f.cfg['roster'] = str(write_profiles(f, 'roster.yaml', {'worker-1': FLASH, 'worker-2': FLASH}))
+    f.tick()
+    assert not audits(f, 'roster.rejected') and not audits(f, 'roster.capacity_wait')
+    assert f.agent('worker-1')['label'] == 'worker-1.1'
+    assert f.model_usage().counts().get('flashnext') == 2
+
+
+def test_host_mismatch_at_swap_time_blocks_instead_of_swapping(hot, pairs, monkeypatch):
+    with_cards()
+    f = hot
+    flash_ok(pairs)
+    monkeypatch.setattr(f, 'preflight_profile', lambda launch: None)
+    f.cfg['pi_home'] = str(f.run_dir / 'pi-home')
+    f.cfg['roster'] = str(write_profiles(f, 'roster.yaml', {'worker-2': FLASH}))
+    f.cfg['host'] = 'macmini'          # accepted roster, then the host no longer matches the card
+    f.cfg['worker_profiles'] = {'worker-2': FLASH}
+    f.roster_digest = None
+    f.cfg['roster'] = ''               # keep the in-memory roster; only the swap gate runs
+    f.tick()
+    assert f.agent('worker-2')['label'] == 'worker-2' and not audits(f, 'roster.profile_switched')
+    assert 'runs only on' in f.task().get('reason', '') + json.dumps(audits(f, 'profile.blocked'))

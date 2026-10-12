@@ -58,14 +58,19 @@ def same_slots(day, night):
                          '(day: ' + ', '.join(day) + '; night: ' + ', '.join(night) + ')')
 
 
-def pair_module():
-    """Feature A's combination table (cmux_fleet.cli_pairs), or None before A is merged."""
+def optional_module(name):
+    """cmux_fleet.<name>, or None while the feature that adds it is not merged."""
     try:
-        return importlib.import_module('cmux_fleet.cli_pairs')
+        return importlib.import_module('cmux_fleet.' + name)
     except ModuleNotFoundError as exc:
-        if exc.name != 'cmux_fleet.cli_pairs':
+        if exc.name != 'cmux_fleet.' + name:
             raise
         return None
+
+
+def pair_module():
+    """Feature A's combination table (cmux_fleet.cli_pairs), or None before A is merged."""
+    return optional_module('cli_pairs')
 
 
 def pair_refusal(cfg, table=None):
@@ -89,8 +94,12 @@ def pair_refusal(cfg, table=None):
     return sup + '+' + wrk + '/' + mode + ' [' + verdict + ']: ' + problem
 
 
-def resolve_launches(cfg, profiles):
+def resolve_launches(cfg, profiles, workers=None):
     """{slot: launch} for each roster profile, or ValueError listing every problem.
+
+    With ``workers`` (the whole roster) and feature C's model cards present, the roster must also
+    fit the card limits (model_usage.check_slots: max_concurrent per model across slots, hosts).
+    Without C nothing here counts slots: max_concurrent is not enforced.
 
     Before a swap each slot's merged config passes the CLI pair check (pair_refusal on one table
     snapshot per roster, so every slot is judged alike), then runtime_v2.validate_config (which,
@@ -126,6 +135,9 @@ def resolve_launches(cfg, profiles):
             errors.append(slot + ': profile ' + profile + ': ' + str(exc))
             continue
         launches[slot] = launch
+    usage = optional_module('model_usage')
+    if usage is not None and workers is not None:
+        errors += [e for e in usage.check_slots(cfg, workers, profiles, registry) if e not in errors]
     if errors:
         raise ValueError('\n'.join(errors))
     return launches
@@ -138,7 +150,7 @@ def check_rosters(cfg, day_path, night_path):
     for which, path in (('day', day_path), ('night', night_path)):
         try:
             workers, roles, profiles = roster.load_entries(path)
-            resolve_launches(cfg, profiles)
+            resolve_launches(cfg, profiles, workers)
         except (OSError, ValueError) as exc:
             raise ValueError(which + ' roster ' + str(path) + ' rejected:\n' + str(exc)) from exc
         parsed[which] = (workers, roles, profiles)
