@@ -26,6 +26,7 @@ Subcommands
 """
 import argparse
 import collections
+import copy
 import fcntl
 import hashlib
 import json
@@ -43,7 +44,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import handoff, history, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime  # noqa: E402
+from cmux_fleet import contracts, handoff, history, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -77,6 +78,8 @@ DEFAULTS = {'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 100000, 'stal
             'apply_profiles_live': False, 'allow_profile_live_switch': False, 'profile_ready_timeout': 180,
             'transport_version': 1, 'allow_development_v2': False, 'max_attempts': 2}
 CLAUDE_JSON = Path.home() / '.claude.json'
+CONTRACTS = 'fx:contracts'  # contract tasks only: one JSON state document (cmux_fleet/contracts.py)
+CMD_TIMEOUT, CMD_TIMEOUT_MAX = 120, 600  # artifact cmd_exit (contract tasks): seconds the daemon may block
 
 
 def load(path):
@@ -262,7 +265,7 @@ def claude_stop(cfg_path, name, generation, raw):
 
 
 # ---------------------------------------------------------------- trust gate
-def validate_artifacts(artifacts):
+def validate_artifacts(artifacts, extended=False):
     if not isinstance(artifacts, list) or not artifacts:
         raise ValueError('artifacts must be a non-empty list')
     for item in artifacts:
@@ -277,24 +280,66 @@ def validate_artifacts(artifacts):
         contains = item.get('contains', [])
         if not isinstance(contains, list) or not all(isinstance(x, str) for x in contains):
             raise ValueError('contains must be a list of literal strings')
+        if not extended:
+            continue  # contract-only keys (not_contains / cmd_exit) stay ignored, as before
+        banned = item.get('not_contains', [])
+        if not isinstance(banned, list) or not all(isinstance(x, str) and x for x in banned):
+            raise ValueError('not_contains must be a list of literal strings')
+        argv = item.get('cmd_exit')
+        if argv is not None and (not isinstance(argv, list) or not argv
+                                 or not all(isinstance(x, str) and x and '\x00' not in x for x in argv)):
+            raise ValueError('cmd_exit must be a non-empty argv list of strings (no shell)')
+        timeout = item.get('timeout_s', CMD_TIMEOUT)
+        if type(timeout) is not int or not 1 <= timeout <= CMD_TIMEOUT_MAX:
+            raise ValueError('timeout_s must be 1-' + str(CMD_TIMEOUT_MAX) + ' seconds')
 
 
-def check_artifacts(artifacts, root):
-    """Literal file checks only (exists / size / contains); returns failures (empty = pass)."""
+def run_check_command(item, root, path):
+    """Contract tasks: run an artifact's cmd_exit argv (no shell) in the workspace with a hard timeout
+    and write its combined output to the artifact path; the literal checks then read that output.
+    Returns a failure text or None. The daemon is blocked meanwhile, hence the short cap."""
+    timeout = item.get('timeout_s', CMD_TIMEOUT)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        done = subprocess.run(item['cmd_exit'], cwd=root, capture_output=True, text=True, errors='replace',
+                              timeout=timeout, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        path.write_text('timed out after ' + str(timeout) + ' s\n')
+        return 'command timed out after ' + str(timeout) + ' s: ' + item['path']
+    except OSError as exc:
+        return 'command could not start (' + str(exc) + '): ' + item['path']
+    path.write_text(((done.stdout or '') + (done.stderr or ''))[-2_000_000:])
+    return None if done.returncode == 0 else 'command exited ' + str(done.returncode) + ': ' + item['path']
+
+
+def check_artifacts(artifacts, root, extended=False, run_commands=False):
+    """Literal file checks only (exists / size / contains); returns failures (empty = pass).
+    ``extended`` (contract tasks) adds not_contains and cmd_exit; commands run only when
+    ``run_commands`` (the COMPLETED gate), never from result.json / resume re-checks."""
     root = Path(root).resolve()
     failures = []
     for item in artifacts:
         path = (root / item['path']).resolve()
         if not path.is_relative_to(root):
             failures.append('outside workspace: ' + item['path'])
-        elif not path.is_file():
+            continue
+        if extended and run_commands and item.get('cmd_exit'):
+            problem = run_check_command(item, root, path)
+            if problem:
+                failures.append(problem)
+                continue
+        if not path.is_file():
             failures.append('artifact not written: ' + item['path'])
         elif path.stat().st_size > 32_000_000:
             failures.append('artifact too large to check: ' + item['path'])
         else:
             text = path.read_text(errors='replace')
+            banned = [x for x in item.get('not_contains', []) if x in text] if extended else []
             if len(text) < item.get('min_chars', 1) or not all(c in text for c in item.get('contains', [])):
                 failures.append('artifact below requirements (length / required text): ' + item['path'])
+            elif banned:
+                failures.append('artifact contains forbidden text ' + json.dumps(banned, ensure_ascii=False)
+                                + ': ' + item['path'])
     return failures
 
 
@@ -934,6 +979,8 @@ class Fleet:
                  Path(self.cfg['roles']).expanduser() / (name + '.md') if self.cfg.get('roles') else None)
         if extra and extra.is_file():  # this agent's own prompt (one per worker in service mode)
             scope += '\n## 4. Your role (' + name + ')\n\n' + extra.read_text()
+        if self.contract_phase():  # successors / roster-added workers inside a contract task
+            scope += '\n' + self.contract_doc(role)
         scope = scope.replace('{{WORKSPACE}}', str(self.workspace())).replace('{{FLEET_CHROME}}', self.fleet_cmd())
         sandbox_notice = ('You run inside a sandbox. Driving the user\'s browser directly (AppleScript, GUI automation) '
                           'fails there with an error. That error means the sandbox stopped you, not that the browser '
@@ -1102,6 +1149,214 @@ class Fleet:
         self.log('chrome', argv=argv[:2], rc=p.returncode)
         return {'status': 'ok', 'rc': p.returncode, 'out': (p.stdout + p.stderr)[-200000:]}
 
+    # -- interface contracts (task spec "contracts": true; docs/design.md §18)
+    def contract_state(self):
+        raw = None if self.service else self.r.get(CONTRACTS)
+        return json.loads(raw) if raw else None
+
+    def contract_phase(self):
+        state = self.contract_state()
+        return state['phase'] if state and self.running() else None
+
+    def save_contract(self, state):
+        self.r.set(CONTRACTS, json.dumps(state, ensure_ascii=False, separators=(',', ':')))
+        self.sync_contract_files(state)
+
+    def sync_contract_files(self, state=None):
+        """Copy the registry view to <run>/contracts.json and <workspace>/contracts.json.
+        Redis is the truth; tick() re-syncs after a v2 intent replay or a resume."""
+        state = state or self.contract_state()
+        if state is None:
+            return
+        text = json.dumps(contracts.view(state, self.cfg.get('worker_cli') or 'codex'), ensure_ascii=False, indent=2)
+        if text == getattr(self, 'contracts_text', None):
+            return
+        for path in (self.run_dir / 'contracts.json', self.workspace() / 'contracts.json'):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix('.tmp')
+            tmp.write_text(text + '\n')
+            os.replace(tmp, path)
+        self.contracts_text = text
+
+    def contract_log(self, action, **data):
+        with open(self.run_dir / 'contracts.log.jsonl', 'a') as out:
+            out.write(json.dumps(dict(time=time.time(), action=action, **data), ensure_ascii=False) + '\n')
+        self.log('contract.' + action, **data)
+
+    def contract_queue(self, state, slot, text, owner=None):
+        """Queue to a worker and record what its report will answer (a task id, or None for a notice)."""
+        state['owners'].setdefault(slot, []).append(owner)
+        self.queue(slot, text)
+
+    def contract_notify(self, state, task_ids, text):
+        """[contract] notices go to the workers of running tasks only; others read contracts.json."""
+        slots = dict.fromkeys(state['tasks'][m]['to'] for m in task_ids
+                              if m in state['tasks'] and state['tasks'][m]['status'] == 'running')
+        for slot in slots:
+            self.contract_queue(state, slot, text + '\nAct on it per CONTRACTS.md; reply in the AGENTS.md format '
+                                '(Done / Evidence / Not done / Blocked) when done.')
+
+    def contract_doc(self, role):
+        return (HERE / 'agents' / ('contracts_' + role + '.md')).read_text().replace('{{WORKSPACE}}', str(self.workspace()))
+
+    def contract_decision(self, state, decision):
+        """Validate a decision against the contract phase. Returns (state, rows to queue now, held rows,
+        approved/rejected changes, skeleton?) without side effects; ValueError carries the spec texts."""
+        s = copy.deepcopy(state)
+        if 'artifacts' in decision:  # before any status: COMPLETED runs cmd_exit right away
+            validate_artifacts(decision['artifacts'], extended=True)
+        if decision['status'] != 'RUNNING':
+            return s, [], [], [], False
+        if s['phase'] == 'interfaces':
+            s['plan'], s['interfaces'] = contracts.p0(decision)
+            s['tasks'] = {p['id']: {'id': p['id'], 'status': 'pending', 'attempts': 0, 'stale': [],
+                                    'provides': p['provides'], 'consumes': p['consumes'], 'depends_on': []}
+                          for p in s['plan']}
+            s['phase'], s['skeleton_tries'] = 'skeleton', s['skeleton_tries'] + 1
+            return s, [], [], [], True
+        if s['phase'] == 'skeleton':
+            if decision['dispatch'] or decision.get('interfaces') or decision.get('phase'):
+                raise ValueError('P1: the skeleton run is in progress; do not dispatch or change interfaces until '
+                                 '"[contract] interfaces frozen at v1"')
+            return s, [], [], [], False
+        if decision.get('phase') == 'interfaces':
+            raise ValueError('interfaces are frozen at v1: change one with change "compatible" or "breaking"')
+        changes = contracts.supervisor_interfaces(s, decision.get('interfaces'))
+        now, held = contracts.dispatch(s, decision['dispatch'], self.resolve)
+        return s, now, held, changes, False
+
+    def contract_apply(self, t, state, changes, skeleton):
+        """Side effects of an accepted decision: change notices, the P1 skeleton delivery."""
+        for key_, kind, notify in changes:
+            self.contract_log('approved' if kind != 'rejected' else 'rejected', by='supervisor', iface=key_, change=kind)
+            self.contract_notify(state, notify, '[contract] ' + ('rejected ' + key_ if kind == 'rejected'
+                                 else 'approved ' + key_ + ' (' + kind + '); read it in contracts.json'))
+        if skeleton:
+            worker = state['skeleton_worker']
+            self.contract_log('p0.passed', interfaces=sorted(state['interfaces']), attempt=state['skeleton_tries'])
+            self.save_contract(state)  # the skeleton worker reads contracts.json first
+            self.contract_queue(state, worker, '[Supervisor instruction ' + t.get('id', '') + '] [skeleton] '
+                                'P1 skeleton run (interfaces are not frozen yet; no real work). Read '
+                                + str(self.workspace() / 'contracts.json') + '; in dependency order feed each upstream '
+                                'sample into its consumer (code: a minimal stub per interface, real importable '
+                                'signatures with raise NotImplementedError, one call chain; research: walk the outline '
+                                'using the samples). Write ./skeleton.md, one line per interface: '
+                                '`IF-x@1 · producer → consumer · PASS/FAIL · evidence`. Never edit the samples.'
+                                '\nShared output directory: ' + str(self.workspace()) + ' (write only inside your own '
+                                'subdirectory ' + worker + '/). Reply in the AGENTS.md format when done.',
+                                contracts.SKELETON)
+
+    def contract_message(self, task_id, row):
+        def names(k):
+            return ', '.join(row.get(k) or []) or 'none'
+        return ('[Supervisor instruction ' + task_id + '] [' + row['id'] + '] ' + row['instruction']
+                + '\nInterface contracts are on (follow CONTRACTS.md in your directory; shapes in '
+                + str(self.workspace() / 'contracts.json') + '). Task ' + row['id'] + ': provides ' + names('provides')
+                + '; consumes ' + names('consumes') + '; edits ' + names('edits') + '.'
+                + '\nShared output directory: ' + str(self.workspace()) + ' (write only inside your own '
+                'subdirectory ' + row['to'] + '/). Reply in the AGENTS.md format when done.')
+
+    def contract_gate(self, state):
+        """COMPLETED: every non-deprecated interface must be ready."""
+        out = []
+        for key_, e in sorted(state['interfaces'].items()):
+            if e['status'] not in ('ready', 'deprecated'):
+                detail = contracts.file_failures(e, self.workspace()) or ['the producer has not announced ready']
+                out.append(key_ + ' not ready (' + '; '.join(detail) + ')')
+        return out
+
+    def contract_report(self, name, text):
+        """Apply a worker report to the task table. Returns extra lines for the supervisor,
+        or None when the report ended the task."""
+        state = self.contract_state()
+        if state is None:
+            return ''
+        s, ws, notes = copy.deepcopy(state), self.workspace(), []
+        owners = s['owners'].get(name) or []
+        owner = owners.pop(0) if owners else None
+        fields = contracts.report_fields(text)
+        if owner == contracts.SKELETON:
+            path = ws / name / 'skeleton.md'
+            failures = contracts.skeleton_verdict(path.read_text(errors='replace') if path.is_file() else None,
+                                                  s['interfaces'])
+            self.contract_log('skeleton', by=name, attempt=s['skeleton_tries'], failures=failures)
+            if not failures:
+                for e in s['interfaces'].values():
+                    e.update(status='declared', approved_by='supervisor')
+                s['phase'] = 'parallel'
+                notes.append('[contract] interfaces frozen at v1. Dispatch M0…Mn now: every dispatch item has id, '
+                             'provides and consumes (id@version) per the plan; consumers start from the samples.')
+            elif contracts.SKELETON_TRIES and s['skeleton_tries'] >= contracts.SKELETON_TRIES:
+                self.save_contract(s)
+                self.finish('blocked', 'P1: skeleton run failed ' + str(s['skeleton_tries']) + ' times: '
+                            + '; '.join(failures))
+                return None
+            else:
+                s['phase'] = 'interfaces'
+                notes.append('[contract] skeleton run FAILED (try ' + str(s['skeleton_tries'])
+                             + (' of ' + str(contracts.SKELETON_TRIES) if contracts.SKELETON_TRIES else '')
+                             + '): ' + '; '.join(failures)
+                             + '\nFix the interfaces in a new reply with phase "interfaces" (full plan + interfaces, '
+                             'no dispatch).')
+        row = s['tasks'].get(owner) if owner and owner != contracts.SKELETON else None
+        mine = row or next((t for t in s['tasks'].values() if t.get('to') == name and t['status'] == 'running'), None)
+        change = fields.get('interface_change')
+        if change is not None:
+            try:
+                if mine is None:
+                    raise ValueError('interface_change: you have no task in the task table')
+                proposal = contracts.worker_change(s, change, name, mine['id'], ws)
+                p = s['pending'][proposal]
+                self.contract_log('proposed', by=name, iface=proposal, change=p['change'], reason=p['reason'])
+                notes.append('[contract] proposal ' + proposal + ' (' + p['change'] + ') from ' + self.label(name)
+                             + ' / ' + mine['id'] + ': ' + p['reason'] + '\nDecide it in your next JSON: '
+                             'interfaces: [{"id": "' + p['id'] + '", "version": ' + str(p['version'])
+                             + ', "decision": "approve"}] (or "reject").')
+            except ValueError as exc:
+                self.contract_log('rejected', by=name, error=str(exc))
+                self.contract_queue(s, name, '[contract] your interface_change was rejected: ' + str(exc)
+                                    + '\nFix it and propose again; keep working on the current version. Reply in '
+                                    'the AGENTS.md format (Done / Evidence / Not done / Blocked).')
+                notes.append('[contract] rejected interface_change from ' + self.label(name) + ': ' + str(exc))
+        for iface, version in contracts.ready_claims(str(fields.get('interfaces', ''))):
+            key_ = iface + '@' + str(version)
+            e = s['interfaces'].get(key_)
+            producer = s['tasks'].get(e['producer']) if e else None
+            if not e or e['status'] == 'deprecated' or not producer or producer.get('to') != name:
+                notes.append('[contract] not ready ' + key_ + ': only the producer may announce a registered, '
+                             'current interface ready')
+                continue
+            failures = contracts.file_failures(e, ws)
+            if failures:
+                self.contract_notify(s, [e['producer']] + e['consumers'], '[contract] not ready ' + key_ + ': '
+                                     + '; '.join(failures))
+            else:
+                e['status'] = 'ready'
+                self.contract_notify(s, e['consumers'], '[contract] ready ' + key_ + ': switch your input from '
+                                     './stubs/ to ' + e['path'] + ' and re-run.')
+            self.contract_log('ready' if not failures else 'not_ready', by=name, iface=key_, failures=failures)
+            notes.append('[contract] ' + ('ready ' if not failures else 'not ready ') + key_
+                         + ((': ' + '; '.join(failures)) if failures else ''))
+        if row:
+            current = [contracts.current(s, i) for i in row.get('provides') or []]
+            unready = [r for r, e in zip(row.get('provides') or [], current) if not e or e['status'] != 'ready']
+            row['status'] = 'failed' if unready else 'done'
+            row['reason'] = ('reported, but not ready: ' + ', '.join(unready)) if unready else 'outputs verified'
+            self.contract_log('task.' + row['status'], task=row['id'], by=name, reason=row['reason'])
+            for held in contracts.releasable(s) if not unready else []:
+                held['status'] = 'running'
+                held['attempts'] = held.get('attempts', 0) + 1
+                self.contract_queue(s, held['to'], held['message'], held['id'])
+                self.contract_log('task.released', task=held['id'])
+        if fields.get('peer_notices') and str(fields['peer_notices']).strip().lower() != 'none':
+            self.contract_log('peer_notices', by=name, line=str(fields['peer_notices']))
+        question = str(fields.get('question', '')).strip()
+        if question and question.lower() != 'none':
+            notes.append('[worker question] ' + self.label(name) + ': ' + question)
+        notes.append(contracts.table_line(s))
+        self.save_contract(s)
+        return '\n' + '\n'.join(notes)
+
     def pi_metadata(self, name, ev):
         fields = {k: ev[k] for k in ('thread', 'transcript', 'ctx_used', 'ctx_window')
                   if ev.get(k) is not None}
@@ -1188,15 +1443,26 @@ class Fleet:
 
     def report(self, name, text, prev=None):
         tag = '[' + self.label(name) + ' report' + (' (took over from ' + prev + ')' if prev else '') + ']'
-        self.queue('supervisor', tag + '\n' + text + '\n\nReply with the JSON format from AGENTS.md.')
+        extra = self.contract_report(name, text)
+        if extra is None:  # the contract gate ended the task
+            return
+        self.queue('supervisor', tag + '\n' + text + extra + '\n\nReply with the JSON format from AGENTS.md.')
 
     def others_active(self):
+        # Contract tasks: P0 / P1 replies legitimately dispatch nothing (spec §3.0), so the
+        # "no worker is busy: RUNNING must dispatch" rule does not apply in those phases.
+        if self.contract_phase() in ('interfaces', 'skeleton'):
+            return True
         return any(self.agent(w).get('state') != 'idle' or self.inbox_depth(w) for w in self.workers)
 
     def on_supervisor(self, text):
         t = self.task()
         try:
             decision = parse_decision(text, self.dispatch_targets(), self.others_active())
+            state = self.contract_state()
+            if state is not None:
+                state, rows, held, changes, skeleton = self.contract_decision(state, decision)
+                rows = {r['id']: r for r in rows + held}
             # Validate the whole dispatch before queuing any part of it. Rejections
             # use the existing supervisor correction/three-strike blocked path.
             prepared = []
@@ -1205,8 +1471,11 @@ class Fleet:
                 instruction = item['instruction'].strip()
                 prepared.append((slot, instruction, self.prepare_worker_profile(slot, instruction)))
         except (ValueError, TypeError, KeyError) as exc:
-            bad = self.r.hincrby(TASK, 'bad_replies', 1)
-            if bad >= 3:
+            # P0 gap lists never count toward the three-strike limit (user 10/13): the supervisor
+            # keeps fixing interfaces until all checks pass; the task `hours` budget is the bound.
+            p0 = str(exc).startswith('P0')
+            bad = int(self.r.hget(TASK, 'bad_replies') or 0) if p0 else self.r.hincrby(TASK, 'bad_replies', 1)
+            if not p0 and bad >= 3:
                 self.finish('blocked', 'supervisor gave no valid decision JSON three times in a row: ' + str(exc))
             else:
                 self.queue('supervisor', 'Your reply is not a valid decision JSON (' + str(exc)
@@ -1221,8 +1490,9 @@ class Fleet:
             self.finish('blocked', decision.get('reason', 'needs a human'))
             return
         if decision['status'] == 'COMPLETED':
-            failures = (check_artifacts(artifacts, self.workspace()) if artifacts
-                        else ['no artifacts were declared, nothing to verify'])
+            failures = (check_artifacts(artifacts, self.workspace(), state is not None, state is not None)
+                        if artifacts else ['no artifacts were declared, nothing to verify'])
+            failures += self.contract_gate(state) if state is not None else []
             if not failures:
                 self.finish('completed', decision.get('reason', 'artifacts verified'))
                 return
@@ -1234,15 +1504,29 @@ class Fleet:
                 self.queue('supervisor', 'Independent verification failed, the task cannot end: ' + '; '.join(failures)
                            + '\nDispatch corrective instructions to the workers (RUNNING + dispatch).')
             return
-        for slot, instruction, application in prepared:
+        if state is not None:
+            self.contract_apply(t, state, changes, skeleton)
+        for item, (slot, instruction, application) in zip(decision['dispatch'], prepared):
             # Metadata describes the next instruction, not the last appended one.
             # A busy worker records intent only; delivery re-evaluates at idle.
+            advisory = profile_runtime.profile_advisory(slot, application)
+            if state is not None:
+                row = rows[item['id']]
+                row['message'] = advisory + self.contract_message(t.get('id', ''), row)
+                if row['status'] == 'pending':  # held until its depends_on are done
+                    self.contract_log('task.held', task=row['id'], waits=row['depends_on'])
+                    continue
+                row['attempts'] = row.get('attempts', 0) + 1
             if not self.inbox_depth(slot):
                 self.record_worker_profile(slot, application)
-            advisory = profile_runtime.profile_advisory(slot, application)
+            if state is not None:
+                self.contract_queue(state, slot, row['message'], row['id'])
+                continue
             self.queue(slot, advisory + '[Supervisor instruction ' + t.get('id', '') + '] ' + instruction
                        + '\nShared output directory: ' + str(self.workspace()) + ' (write only inside your own '
                        'subdirectory ' + slot + '/). Reply in the AGENTS.md format when done.')
+        if state is not None:
+            self.save_contract(state)
         self.log('dispatch', count=len(decision['dispatch']), completion=decision['completion'])
 
     def submit(self, spec):
@@ -1259,11 +1543,17 @@ class Fleet:
                                               allowed=self.cfg['allow_profile_live_switch'])
         if spec.get('apply_profiles_live') and not auto_agents:
             raise ValueError('apply_profiles_live requires auto_agents and profile assignments')
+        use_contracts = spec.get('contracts', False)
+        if type(use_contracts) is not bool:
+            raise ValueError('contracts must be a boolean')
+        skeleton_worker = spec.get('skeleton_worker', (self.active_workers() or [None])[0])
+        if use_contracts and skeleton_worker not in self.active_workers():
+            raise ValueError('skeleton_worker must be one of ' + ', '.join(self.active_workers()))
         if 'artifacts' in spec:
             # Auto-planned task specs may explicitly say there are no pre-declared artifacts.
             # Keep the legacy non-auto validation unchanged.
             if not (auto_agents and spec['artifacts'] == []):
-                validate_artifacts(spec['artifacts'])
+                validate_artifacts(spec['artifacts'], extended=use_contracts)
         hours = spec.get('hours', 16)
         if isinstance(hours, bool) or not isinstance(hours, (int, float)) or not 0 < hours < 1000:
             raise ValueError('hours must be a positive number')
@@ -1283,6 +1573,8 @@ class Fleet:
                   'reason': '', 'deadline': time.time() + hours * 3600, 'bad_replies': 0,
                   'bounces': 0, 'artifacts': json.dumps(spec.get('artifacts', []), ensure_ascii=False),
                   'apply_profiles_live': json.dumps(spec.get('apply_profiles_live', False))}
+        if use_contracts:
+            fields['contracts'] = 1
         if dispatch_plan is not None:
             fields.update(
                 auto_agents=1,
@@ -1310,6 +1602,19 @@ class Fleet:
                        + (' Live profile switching is enabled for this task.' if spec.get('apply_profiles_live')
                           else ' Profile application is advisory metadata only.')
                        + '\nDo not dispatch dependent subtasks until every id in depends_on has finished.')
+        if use_contracts:
+            self.contracts_text = None
+            self.save_contract(contracts.new_state(skeleton_worker))
+            for name in self.names:
+                cwd = agent_cwd(self.cfg, name)
+                cwd.mkdir(parents=True, exist_ok=True)
+                (cwd / 'CONTRACTS.md').write_text(self.contract_doc('supervisor' if name == 'supervisor' else 'worker'))
+            prompt += ('\nInterface contracts are ON for this task: read CONTRACTS.md in your current directory now '
+                       'and follow it. Your first reply is phase "interfaces": a full plan (M0…Mn) and every '
+                       'interface with its sample, and an empty dispatch. The P1 skeleton worker is '
+                       + skeleton_worker + '.')
+        elif self.r.get(CONTRACTS) is not None:
+            self.r.delete(CONTRACTS)  # an earlier contract task's state never leaks into this one
         self.queue('supervisor', prompt + '\nReply with the JSON format from AGENTS.md.')
         (self.run_dir / 'result.json').unlink(missing_ok=True)  # a new task: this run is not finished
         self.log('task.submitted', task=task_id)
@@ -1875,11 +2180,18 @@ class Fleet:
                 return
         except (OSError, ValueError):
             pass
-        save_result(self.run_dir, t)
+        state = self.contract_state()
+        summary = None if state is None else {
+            'phase': state['phase'], 'interfaces': {k: e['status'] for k, e in sorted(state['interfaces'].items())},
+            'tasks': {m: x['status'] for m, x in sorted(state['tasks'].items())},
+            'pending_user_decisions': [dict(d, interface=k) for k, e in sorted(state['interfaces'].items())
+                                       for d in e.get('decisions') or [] if d.get('status') == 'pending_user']}
+        save_result(self.run_dir, t, contract_summary=summary)
 
     def tick(self):
         self.roster_tick()  # the only place the roster changes: never inside per-slot loops
         self.write_result()
+        self.sync_contract_files()
         if self.v2:
             return self.v2.tick()
         now = time.time()
@@ -1925,14 +2237,18 @@ class Fleet:
 
 
 # ------------------------------------------------------------ operator CLI
-def save_result(run, task, status=None, reason=None):
+def save_result(run, task, status=None, reason=None, contract_summary=None):
     """<run>/result.json (atomic): the run is finished. Artifacts are re-checked on disk here."""
     workspace = Path(run) / 'workspace'
     artifacts = json.loads(task.get('artifacts') or '[]')
-    save(Path(run) / 'result.json', {
+    extended = task.get('contracts') == '1'
+    result = {
         'status': status or task.get('status', ''), 'reason': task.get('reason', '') if reason is None else reason,
         'task_id': task.get('id', ''), 'goal': task.get('goal', ''), 'at': time.time(),
-        'artifacts': [dict(a, problems=check_artifacts([a], workspace)) for a in artifacts]})
+        'artifacts': [dict(a, problems=check_artifacts([a], workspace, extended)) for a in artifacts]}
+    if contract_summary:
+        result['contracts'] = contract_summary
+    save(Path(run) / 'result.json', result)
 
 
 def start_redis(cfg, tries=30):

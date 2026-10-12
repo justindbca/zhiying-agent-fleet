@@ -16,6 +16,7 @@ from pathlib import Path
 
 import redis
 
+from cmux_fleet import contracts
 from cmux_fleet.message_bus import BusError, MessageBus, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
 
@@ -102,8 +103,19 @@ def tui_candidates(slot, purpose, text):
         return [{'tool': 'fleet_decision', 'value': value}] if isinstance(value, dict) else []
     if isinstance(value, dict) and 'done' in value and 'evidence' in value:
         return [{'tool': 'fleet_result', 'value': value}]
+    # Contract tasks: a trailing JSON object (interface_change) and the Interfaces / Peer notices /
+    # Question lines become extra keys, only when present (other reports are unchanged).
+    extra, rest = contracts.last_json_object(text)
+    extra = {k: extra[k] for k in contracts.REPORT_KEYS if k in extra} if isinstance(extra, dict) else {}
+    lines = (rest if extra else text).splitlines()
     sections, current = {}, None
-    for line in text.splitlines():
+    for line in lines:
+        m = contracts.EXTRA_SECTIONS.match(line)
+        if m:
+            current = None
+            extra[{'interfaces': 'interfaces', 'peer notices': 'peer_notices'}.get(m.group(1).lower(), 'question')] \
+                = m.group(2).strip()
+            continue
         m = WORKER_SECTIONS.match(line)
         if m:
             current = m.group(1).lower()
@@ -112,7 +124,7 @@ def tui_candidates(slot, purpose, text):
             sections[current].append(line.strip())
     items = lambda k: [x.lstrip('-*• ').strip() for x in sections.get(k, []) if x.lstrip('-*• ').strip()]
     value = {'done': items('done'), 'evidence': items('evidence'),
-             'not_done': '\n'.join(items('not done')), 'blocked': '\n'.join(items('blocked'))}
+             'not_done': '\n'.join(items('not done')), 'blocked': '\n'.join(items('blocked')), **extra}
     return [{'tool': 'fleet_result', 'value': value}] if value['done'] and value['evidence'] else []
 
 
@@ -1071,7 +1083,9 @@ class RuntimeV2:
                 done.append((msg['committed_at'], '- ' + msg['slot'] + ': ' + head(msg['body']['text'])
                              + '\n  report: ' + dumps(msg.get('result') or {})[:600]))
         artifacts = json.loads(task.get('artifacts') or '[]')
-        checked = [(a['path'], check_artifacts([a], self.f.workspace())) for a in artifacts]
+        checked = [(a['path'], check_artifacts([a], self.f.workspace(), task.get('contracts') == '1'))
+                   for a in artifacts]
+        state = self.f.contract_state()
         self.f.queue('supervisor', '[Resumed task ' + task['id'] + '] This run was interrupted and resumed with '
                      'start --resume. You are a new supervisor generation: earlier decisions are not in your '
                      'context, so rely on this summary and the files on disk.'
@@ -1085,6 +1099,9 @@ class RuntimeV2:
                      + ('\n'.join(x for _, x in sorted(done)) or '- none')
                      + '\nLost dispatches the daemon already re-queued (do NOT dispatch them again):\n'
                      + ('\n'.join(requeued) or '- none')
+                     + (('\nInterface contracts are on: read CONTRACTS.md in your directory and '
+                         + str(self.f.workspace() / 'contracts.json') + '. ' + contracts.table_line(state))
+                        if state else '')
                      + '\nDispatch only work that is still missing. Reply with the JSON format from AGENTS.md.')
 
     def requeue_requests(self):
