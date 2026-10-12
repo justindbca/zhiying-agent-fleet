@@ -23,9 +23,12 @@ for worker, mode in (('pi', 'task'), ('pi', 'service'), ('claude', 'task')):
     cfg = dict(supervisor_cli='claude', worker_cli=worker, mode=mode)
     row = cli_pairs.load_pairs().lookup('claude', worker, mode)
     assert row and row['adapter_missing'] == [], (worker, mode, row)
-    assert cli_pairs.pair_problem(cfg), 'unverified pair must need smoke'
+    if row['status'] == 'verified':   # flipped by a real smoke; verified_by names the run
+        assert row.get('verified_by') and cli_pairs.pair_problem(cfg) is None, row
+    else:
+        assert cli_pairs.pair_problem(cfg), 'unverified pair must need smoke'
     assert cli_pairs.pair_problem(dict(cfg, lifecycle='smoke')) is None
-    print('gate ok: claude+%s/%s status=%s (smoke only)' % (worker, mode, row['status']))
+    print('gate ok: claude+%s/%s status=%s verified_by=%s' % (worker, mode, row['status'], row.get('verified_by')))
 EOF
   "$PY" -m pytest -q tests/test_claude_supervisor.py tests/test_cli_pairs.py
 }

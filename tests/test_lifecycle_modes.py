@@ -156,11 +156,20 @@ def test_pair_check_sees_lifecycle_and_base_mode(monkeypatch):
                     {'lifecycle': 'dev_task', 'mode': 'task', 'supervisor_cli': 'codex', 'worker_cli': 'pi'}]
 
 
-def test_current_pair_rules_still_read_mode_from_lifecycle_base(monkeypatch):
-    # Until A lands, v2_cli_problem keys on cfg['mode']: --lifecycle service must still be refused
-    # for codex+claude (task mode only), i.e. the base reached the unchanged check.
+def test_current_pair_rules_still_read_mode_from_lifecycle_base(monkeypatch, tmp_path):
+    # v2_cli_problem keys on cfg['mode']: --lifecycle service must reach the pair table as mode
+    # service. A x D integration: codex+claude/service is verified now, so a stub table forbids it.
+    import yaml
+    from cmux_fleet import cli_pairs
+    table = yaml.safe_load(cli_pairs.DEFAULT_PATH.read_text())
+    for item in table['pairs']:
+        if (item['supervisor_cli'], item['worker_cli'], item['mode']) == ('codex', 'claude', 'service'):
+            item.update(status='forbidden', reason='service base reached the pair table')
+    path = tmp_path / 'cli_pairs.yaml'
+    path.write_text(yaml.safe_dump(table))
+    monkeypatch.setattr(cli_pairs, 'DEFAULT_PATH', path)
     no_provisioning(monkeypatch)
-    with pytest.raises(SystemExit, match='task mode only'):
+    with pytest.raises(SystemExit, match='service base reached the pair table'):
         fleet.main(['start', '--lifecycle', 'service', '--supervisor-cli', 'codex', '--worker-cli', 'claude',
                     '--allow-development-v2'])
 

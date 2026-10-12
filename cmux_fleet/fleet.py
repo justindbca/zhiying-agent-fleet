@@ -1000,6 +1000,13 @@ class Fleet:
     def preflight_profile(self, launch):
         """Check dependencies before retiring anything. Never select a fallback CLI."""
         cfg = dict(self.cfg, **launch['overrides'])
+        if (self.v2 and cfg.get('worker_cli') != (self.cfg.get('worker_cli') or 'codex')):
+            # The pair table admits whole-run supervisor x worker CLI pairs; a v2 profile live switch
+            # that changes one slot's CLI (claude <-> pi bridge) mixes worker transports in one run,
+            # which no smoke covers. Kept refused explicitly now that mixed pairs can be verified.
+            raise ValueError('transport v2 profile live switch cannot change the worker CLI ('
+                             + str(self.cfg.get('worker_cli')) + ' -> ' + str(cfg.get('worker_cli'))
+                             + '); start a run with that worker CLI instead')
         runtime_v2.validate_config(cfg)  # reject unsupported v2 CLI before retirement
         cli = cfg['worker_cli']
         binary = cfg.get(cli) or cli

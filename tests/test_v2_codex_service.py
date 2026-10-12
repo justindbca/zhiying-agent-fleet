@@ -14,17 +14,19 @@ import pytest
 from test_fleet import FakeMgr
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
 from test_v2_codex_claude import answer_turn, no_message_files, typed
-from cmux_fleet import fleet, runtime_v2, tui_cards
+from cmux_fleet import cli_pairs, fleet, runtime_v2, tui_cards
 
 WORKERS = ['worker-1', 'worker-2']
 
 
-def test_codex_claude_service_is_smoke_only_and_has_no_missing_adapter():
+def test_codex_claude_service_verified_by_real_smoke_and_has_no_missing_adapter():
     cfg = dict(transport_version=2, supervisor_cli='codex', worker_cli='claude', mode='service',
                allow_development_v2=True)
-    with pytest.raises(ValueError, match='smoke'):
-        runtime_v2.validate_config(cfg)
-    assert runtime_v2.validate_config(dict(cfg, lifecycle='smoke')) == 2
+    row = cli_pairs.load_pairs().lookup('codex', 'claude', 'service')
+    assert row['status'] == 'verified' and row['adapter_missing'] == [] and 'smoke_pair.sh' in row['verified_by']
+    assert runtime_v2.validate_config(cfg) == 2
+    with pytest.raises(ValueError, match='allow-development-v2'):
+        runtime_v2.validate_config(dict(cfg, allow_development_v2=False))
 
 
 @pytest.fixture

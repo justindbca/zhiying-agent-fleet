@@ -25,20 +25,18 @@ def test_shipped_table_rows_and_default():
     assert table.default == {'supervisor_cli': 'codex', 'worker_cli': 'claude', 'mode': 'task',
                              'supervisor_profile': 'fleet-astra'}
     assert table.lookup('codex', 'claude', 'task')['status'] == 'verified'
+    # Real smokes (scripts/smoke_pair.sh, 2026-10-12 @8a31c3c7) flipped these rows; each names its run.
+    smoked = [('codex', 'pi', 'task'), ('codex', 'pi', 'service'), ('codex', 'claude', 'service'),
+              ('claude', 'pi', 'task'), ('claude', 'pi', 'service'), ('claude', 'claude', 'task')]
+    for key in smoked:
+        assert table.lookup(*key)['status'] == 'verified', key
+        assert 'smoke_pair.sh' in table.lookup(*key)['verified_by'] and 'PASS' in table.lookup(*key)['verified_by']
     for mode in ('task', 'service'):
         assert table.lookup('pi', 'pi', mode)['status'] == 'verified'
-        assert table.lookup('codex', 'pi', mode)['status'] == 'unverified'
-        assert table.lookup('codex', 'pi', mode)['adapter_missing'] == []
-        # Claude supervisor adapter landed (A3): unverified, smoke-only, nothing missing.
-        assert table.lookup('claude', 'pi', mode)['adapter_missing'] == []
-        assert table.lookup('claude', 'pi', mode)['status'] == 'unverified'
-    assert table.lookup('codex', 'claude', 'service')['adapter_missing'] == []   # A2: tui_cards renderer
-    assert table.lookup('codex', 'claude', 'service')['status'] == 'unverified'
-    assert table.lookup('claude', 'claude', 'task')['adapter_missing'] == []
-    assert table.lookup('claude', 'claude', 'task')['status'] == 'unverified'
     assert table.lookup('claude', 'claude', 'service') is None and table.lookup('claude', 'codex', 'task') is None
     assert not [key for key, r in table.rows.items() if r['adapter_missing']]
-    assert table.lookup('codex', 'codex', 'task')['status'] == 'unverified'
+    assert table.lookup('codex', 'codex', 'task')['status'] == 'unverified'   # no real smoke yet
+    assert table.lookup('codex', 'codex', 'task')['verified_by'] is None
     assert table.lookup('pi', 'codex', 'task') is None
 
 
@@ -48,11 +46,18 @@ def test_verified_runs_and_default_pair_runs():
 
 
 def test_unverified_runs_only_under_smoke_lifecycle():
-    cfg = {'supervisor_cli': 'codex', 'worker_cli': 'pi', 'mode': 'task'}
+    cfg = {'supervisor_cli': 'codex', 'worker_cli': 'codex', 'mode': 'task'}   # the shipped unverified row
     assert '--lifecycle smoke' in cli_pairs.pair_problem(cfg)
     assert cli_pairs.pair_problem(dict(cfg, lifecycle='dev_task'))
     assert cli_pairs.pair_problem(dict(cfg, lifecycle='smoke')) is None
     assert cli_pairs.pair_problem({'supervisor_cli': 'codex', 'worker_cli': 'codex', 'lifecycle': 'smoke'}) is None
+
+
+def test_smoked_pairs_run_without_smoke():
+    for sup, wrk, mode in [('codex', 'pi', 'task'), ('codex', 'pi', 'service'), ('codex', 'claude', 'service'),
+                           ('claude', 'pi', 'task'), ('claude', 'pi', 'service'), ('claude', 'claude', 'task')]:
+        assert cli_pairs.pair_problem({'supervisor_cli': sup, 'worker_cli': wrk, 'mode': mode,
+                                       'lifecycle': 'dev_task' if mode == 'task' else 'service'}) is None
 
 
 def test_adapter_missing_refused_even_for_smoke(tmp_path):
@@ -78,12 +83,15 @@ def test_forbidden_and_unlisted_refused_even_for_smoke(tmp_path):
     assert cli_pairs.pair_problem({'supervisor_cli': 'pi', 'worker_cli': 'pi'}, table) is None
 
 
-def test_adopted_claude_subfleet_exception_is_task_only():
+def test_adopted_claude_subfleet_exception_is_task_only(tmp_path):
+    # Gate logic on a stub table where claude+claude is still unverified (shipped row is verified now).
+    table = cli_pairs.load_pairs(write(tmp_path, [row('claude', 'claude', 'task', 'unverified')]))
     base = {'supervisor_cli': 'claude', 'worker_cli': 'claude', 'mode': 'task'}
-    assert '--lifecycle smoke' in cli_pairs.pair_problem(base)
-    assert cli_pairs.pair_problem(dict(base, lifecycle='smoke')) is None
-    assert cli_pairs.pair_problem(dict(base, adopt={'pane': 'x'})) is None
-    assert cli_pairs.pair_problem(dict(base, adopt={'pane': 'x'}, mode='service'))
+    assert '--lifecycle smoke' in cli_pairs.pair_problem(base, table)
+    assert cli_pairs.pair_problem(dict(base, lifecycle='smoke'), table) is None
+    assert cli_pairs.pair_problem(dict(base, adopt={'pane': 'x'}), table) is None
+    assert cli_pairs.pair_problem(dict(base, adopt={'pane': 'x'}, mode='service'), table)
+    assert cli_pairs.pair_problem(dict(base, adopt={'pane': 'x'}, mode='service'))   # shipped: not listed
 
 
 def test_table_is_reread_on_every_check(tmp_path, monkeypatch):

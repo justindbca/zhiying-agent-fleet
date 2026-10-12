@@ -336,7 +336,7 @@ def test_persistent_bridge_daemon_vertical_with_separate_connections(fx):
 
 
 @pytest.mark.parametrize('cfg', [dict(transport_version=2,supervisor_cli='pi',worker_cli='claude',allow_development_v2=True),
-    dict(transport_version=2,supervisor_cli='codex',worker_cli='pi',allow_development_v2=True),
+    dict(transport_version=2,supervisor_cli='codex',worker_cli='codex',allow_development_v2=True),
     dict(transport_version=2,supervisor_cli='pi',worker_cli='pi')])
 def test_v2_rejects_unsupported_config_before_dependencies_or_provisioning(cfg):
     with pytest.raises(ValueError): runtime_v2.validate_config(cfg)

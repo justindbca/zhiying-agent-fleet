@@ -22,12 +22,14 @@ WORKERS = ['worker-1', 'worker-2']
 
 # ------------------------------------------------------------------ gate
 @pytest.mark.parametrize('mode', ['task', 'service'])
-def test_codex_pi_is_smoke_only_until_verified(mode):
+def test_codex_pi_verified_by_real_smoke(mode):
+    # Real smoke codex+pi/<mode> passed (cli_pairs.yaml verified_by): it runs without smoke now,
+    # and the development opt-in is still required.
     cfg = dict(transport_version=2, supervisor_cli='codex', worker_cli='pi', mode=mode,
                allow_development_v2=True)
-    with pytest.raises(ValueError, match='smoke'):
-        runtime_v2.validate_config(cfg)
-    assert runtime_v2.validate_config(dict(cfg, lifecycle='smoke')) == 2
+    assert runtime_v2.validate_config(cfg) == 2
+    with pytest.raises(ValueError, match='allow-development-v2'):
+        runtime_v2.validate_config(dict(cfg, allow_development_v2=False))
 
 
 # ------------------------------------------------------------------ live wiring

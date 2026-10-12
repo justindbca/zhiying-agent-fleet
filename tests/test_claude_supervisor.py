@@ -14,6 +14,7 @@ import time
 import uuid
 
 import pytest
+import yaml
 
 from test_fleet import FakeMgr
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
@@ -27,10 +28,10 @@ WORKERS = ['worker-1', 'worker-2']
 def test_claude_supervisor_pairs_run_only_under_smoke(worker, mode):
     cfg = dict(transport_version=2, supervisor_cli='claude', worker_cli=worker, mode=mode,
                allow_development_v2=True)
+    # Real smokes passed (cli_pairs.yaml verified_by): the pairs run without smoke now.
     row = cli_pairs.load_pairs().lookup('claude', worker, mode)
-    assert row['status'] == 'unverified' and row['adapter_missing'] == [] and row['verified_by'] is None
-    with pytest.raises(ValueError, match='lifecycle smoke'):
-        runtime_v2.validate_config(cfg)
+    assert row['status'] == 'verified' and row['adapter_missing'] == [] and 'smoke_pair.sh' in row['verified_by']
+    assert runtime_v2.validate_config(cfg) == 2
     assert runtime_v2.validate_config(dict(cfg, lifecycle='smoke')) == 2
     with pytest.raises(ValueError, match='allow-development-v2'):  # smoke never relaxes the dev opt-in
         runtime_v2.validate_config(dict(cfg, lifecycle='smoke', allow_development_v2=False))
@@ -51,11 +52,19 @@ def test_start_accepts_claude_supervisor_cli_and_model(monkeypatch):
     assert seen['supervisor_model'] == fleet.DEFAULTS['supervisor_model']
 
 
-def test_start_refuses_unverified_claude_supervisor_before_provisioning(monkeypatch):
+def test_start_refuses_unverified_claude_supervisor_before_provisioning(monkeypatch, tmp_path):
+    table = yaml.safe_load(cli_pairs.DEFAULT_PATH.read_text())
+    for item in table['pairs']:
+        if (item['supervisor_cli'], item['worker_cli']) == ('claude', 'pi'):
+            item.update(status='unverified', verified_by=None)
+    path = tmp_path / 'cli_pairs.yaml'
+    path.write_text(yaml.safe_dump(table))
+    monkeypatch.setattr(cli_pairs, 'DEFAULT_PATH', path)
     monkeypatch.setattr(cmux_manager, 'cmux_available',
                         lambda: pytest.fail('transport rejection must precede cmux/Redis provisioning'))
     with pytest.raises(SystemExit, match='lifecycle smoke'):
-        fleet.main(['start', '--supervisor-cli', 'claude', '--worker-cli', 'pi', '--allow-development-v2'])
+        fleet.main(['start', '--lifecycle', 'dev_task', '--supervisor-cli', 'claude', '--worker-cli', 'pi',
+                    '--allow-development-v2'])
 
 
 # ------------------------------------------------------------------ launch

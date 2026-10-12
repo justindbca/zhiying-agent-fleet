@@ -69,7 +69,7 @@ def test_explicit_cli_flags_override_the_default(monkeypatch):
 
 def test_one_explicit_cli_fills_only_the_other_from_default(monkeypatch):
     seen = capture_start(monkeypatch)
-    with pytest.raises(SystemExit, match='adapter|unverified|smoke'):
+    with pytest.raises(Reached):   # claude+claude/task is verified by its real smoke
         fleet.main(['start', '--lifecycle', 'dev_task', '--supervisor-cli', 'claude', '--allow-development-v2'])
     assert (seen[0]['supervisor_cli'], seen[0]['worker_cli']) == ('claude', 'claude')
 
@@ -124,7 +124,15 @@ def test_bases_must_include_base(tmp_path):
 
 
 @pytest.mark.parametrize('sup,wrk', [('codex', 'pi'), ('codex', 'claude'), ('claude', 'pi')])
-def test_unverified_service_pairs_reach_provisioning_only_under_smoke(monkeypatch, sup, wrk):
+def test_unverified_service_pairs_reach_provisioning_only_under_smoke(monkeypatch, tmp_path, sup, wrk):
+    # The gate a service pair went through before its real smoke (shipped rows are verified now).
+    table = yaml.safe_load(cli_pairs.DEFAULT_PATH.read_text())
+    for item in table['pairs']:
+        if (item['supervisor_cli'], item['worker_cli'], item['mode']) == (sup, wrk, 'service'):
+            item.update(status='unverified', verified_by=None, reason=sup + '+' + wrk + ' service unverified')
+    path = tmp_path / 'cli_pairs.yaml'
+    path.write_text(yaml.safe_dump(table))
+    monkeypatch.setattr(cli_pairs, 'DEFAULT_PATH', path)
     seen = capture_start(monkeypatch)
     base = ['start', '--supervisor-cli', sup, '--worker-cli', wrk, '--allow-development-v2', '--mode', 'service']
     with pytest.raises(Reached):
@@ -132,6 +140,15 @@ def test_unverified_service_pairs_reach_provisioning_only_under_smoke(monkeypatc
     assert seen[-1] == {'supervisor_cli': sup, 'worker_cli': wrk, 'mode': 'service', 'lifecycle': 'smoke'}
     with pytest.raises(SystemExit, match='only with --lifecycle smoke'):
         fleet.main(base + ['--lifecycle', 'service'])
+
+
+@pytest.mark.parametrize('sup,wrk', [('codex', 'pi'), ('codex', 'claude'), ('claude', 'pi')])
+def test_smoked_service_pairs_start_under_service_lifecycle(monkeypatch, sup, wrk):
+    seen = capture_start(monkeypatch)
+    with pytest.raises(Reached):
+        fleet.main(['start', '--supervisor-cli', sup, '--worker-cli', wrk, '--allow-development-v2',
+                    '--lifecycle', 'service'])
+    assert seen[-1] == {'supervisor_cli': sup, 'worker_cli': wrk, 'mode': 'service', 'lifecycle': 'service'}
 
 
 # ------------------------------------------------------------------ prompt hook fails closed

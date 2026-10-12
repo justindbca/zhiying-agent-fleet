@@ -120,5 +120,5 @@ def test_codex_supervisor_claude_workers_plan_passes_v2_preflight(mixed, monkeyp
     registry = AgentRegistry()
     for profile in ("claude-coder", "claude-reviewer"):
         f.preflight_profile(profile_launch.resolve_launch(registry.get(profile), registry, f.cfg))
-    with pytest.raises(ValueError, match="mixed Pi"):  # the Pi card this replaces is rejected by v2
+    with pytest.raises(ValueError, match="cannot change the worker CLI"):  # the Pi card this replaces is rejected by v2
         f.preflight_profile(profile_launch.resolve_launch(registry.get("flashnext-coder"), registry, f.cfg))
