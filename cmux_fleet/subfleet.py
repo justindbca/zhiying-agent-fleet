@@ -16,9 +16,9 @@ effect transaction. Callers inside a transaction (the parent's decision path) us
 which only writes a request file; ``check`` gives the limit verdict synchronously.
 
 Internal API
-  check(fleet, slot, task_id, workers) -> None | reason
-  request(run_dir, slot, task_id, goal, workers, output=None, proposal=None) -> request id
-  spawn_child(fleet, slot, task_id, goal, workers, output=None, proposal=None, launch=None) -> record
+  check(fleet, slot, task_id, workers, ready=True) -> None | reason   (ready=False: limits only, not the slot state)
+  request(run_dir, slot, task_id, goal, workers, output=None, proposal=None, contracts=False) -> request id
+  spawn_child(fleet, slot, task_id, goal, workers, output=None, proposal=None, launch=None, contracts=False) -> record
   tick(fleet)                    parent daemon loop: requests, completion, return of the pane
   stop_children(fleet)           explicit stop / tree stop (blocking; descendants first)
   resume_children(fleet)         root --resume: relaunch children that were running
@@ -38,7 +38,9 @@ LIMITS = {'max_depth': 2, 'max_children': 3, 'max_agents_total': 12, 'child_work
 ACTIVE = ('starting', 'running', 'stopping')
 TITLE_MAX = 60
 SEP = ' › '
+ROLE_FILES = ('AGENTS.md', 'CLAUDE.md', 'CONTRACTS.md')  # a contract sub-fleet writes its supervisor CONTRACTS.md
 STOP_WAIT = 180  # seconds a tree stop waits for one child daemon to exit
+LAUNCH_GRACE = 120  # seconds a just-launched child daemon has to take its lock before it counts as gone
 
 
 class Refused(ValueError):
@@ -126,13 +128,14 @@ def root_config(cfg):
 
 def limits(cfg):
     """Defaults <- root config 'limits' <- root roster YAML 'limits' (read now: hot)."""
+    import yaml
     from cmux_fleet import roster
     root = root_config(cfg)
     out = dict(LIMITS, **{k: v for k, v in (root.get('limits') or {}).items() if k in LIMITS})
     if root.get('roster'):
         try:
             out.update(roster.load_limits(root['roster']))
-        except (OSError, ValueError):
+        except (OSError, ValueError, yaml.YAMLError):
             pass  # a broken roster is refused by the roster reload itself; keep the last good limits
     return out
 
@@ -149,8 +152,11 @@ def tree_agents(run):
 
 
 # ------------------------------------------------------------------ limits / refusal reasons
-def check(f, slot, task_id, workers):
-    """None when this sub-fleet may start now, else the reason (refusals are enforced by program)."""
+def check(f, slot, task_id, workers, ready=True):
+    """None when this sub-fleet may start now, else the reason (refusals are enforced by program).
+
+    ``ready=False`` (escalate / approve time): limits and slot kind only; the worker is still
+    settling its report, so idle / in-flight are checked again when the spawn runs."""
     fleet = _fleet()
     lim = limits(f.cfg)
     if not valid_child_id(f.cfg.get('task_id'), task_id):
@@ -183,6 +189,8 @@ def check(f, slot, task_id, workers):
     if cli != 'claude' or not f.v2:
         return 'only official Claude Code worker panes of a v2 fleet can become sub-fleet supervisors'
     info = f.agent(slot)
+    if not ready:
+        return None
     if info.get('state') != 'idle' or info.get('runtime_ready') != '1':
         return slot + ' must be idle and READY (state ' + (info.get('state') or '?') + ')'
     if f.r.hget(f.v2.bus.lease_key(slot), 'current_delivery'):
@@ -193,13 +201,14 @@ def check(f, slot, task_id, workers):
 
 
 # ------------------------------------------------------------------ requests (transaction-safe)
-def request(run_dir, slot, task_id, goal, workers, output=None, proposal=None):
+def request(run_dir, slot, task_id, goal, workers, output=None, proposal=None, contracts=False):
     """Queue a spawn for the fleet's next tick. Writes one file; no other side effect."""
     rid = 'sf-' + uuid.uuid4().hex[:12]
     folder = Path(run_dir) / 'subfleet-requests'
     folder.mkdir(parents=True, exist_ok=True)
     _fleet().save(folder / (rid + '.json'), {'id': rid, 'slot': slot, 'task_id': task_id, 'goal': goal,
-                                             'workers': workers, 'output': output, 'proposal': proposal})
+                                             'workers': workers, 'output': output, 'proposal': proposal,
+                                             'contracts': bool(contracts)})
     return rid
 
 
@@ -218,11 +227,12 @@ def process_requests(f):
         try:
             spec = fleet.load(path)
             rec = spawn_child(f, spec['slot'], spec['task_id'], spec['goal'], spec['workers'],
-                              output=spec.get('output'), proposal=spec.get('proposal'))
+                              output=spec.get('output'), proposal=spec.get('proposal'),
+                              contracts=spec.get('contracts', False))
             answer = {'status': 'accepted', 'run': rec['run'], 'task_id': rec['task_id']}
         except Refused as exc:
             answer = {'status': 'rejected', 'reason': str(exc)}
-        except (KeyError, ValueError, OSError) as exc:
+        except Exception as exc:  # one bad request never kills the daemon nor re-crashes every tick
             answer = {'status': 'rejected', 'reason': 'bad request: ' + str(exc)}
         fleet.save(answer_path(f.run_dir, path.stem), answer)
         path.unlink(missing_ok=True)
@@ -269,7 +279,7 @@ def default_launch(child_cfg_path, child_cfg, mgr):
                             start_directory=str(child_cfg['run']))
 
 
-def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, launch=None):
+def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, launch=None, contracts=False):
     """Start sub-fleet ``task_id`` with ``slot``'s live pane as its supervisor. Outside transactions only."""
     fleet = _fleet()
     from cmux_fleet import redis_runtime, runtime_v2
@@ -313,7 +323,7 @@ def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, lau
         backup = rec_dir / 'handover'
         backup.mkdir()
         cwd = fleet.agent_cwd(f.cfg, slot)
-        for fname in ('AGENTS.md', 'CLAUDE.md'):
+        for fname in ROLE_FILES:
             if (cwd / fname).exists():
                 shutil.copy2(cwd / fname, backup / fname)
         save_record(rec_dir, rec)
@@ -327,6 +337,8 @@ def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, lau
             hours = max((deadline - time.time()) / 3600, 0.05)
         bus = runtime_v2.bus_for(cfg, child_r)
         spec = {'goal': goal_text(goal, task_id, output, proposal, f.label(slot)), 'hours': hours}
+        if contracts:  # spec §3.0: a sub-fleet of a contract task runs P0 / P1 first as well
+            spec['contracts'] = True
         runtime_v2.post_event(bus, {'kind': 'task', 'request_id': 'subfleet-' + task_id, 'spec': spec},
                               'subfleet-' + task_id)
         child_r.close(); child_r.connection_pool.disconnect()
@@ -371,7 +383,7 @@ def restore_role(f, rec):
     fleet = _fleet()
     cwd = fleet.agent_cwd(f.cfg, rec['slot'])
     backup = Path(rec['run']) / 'handover'
-    for fname in ('AGENTS.md', 'CLAUDE.md'):
+    for fname in ROLE_FILES:
         if (backup / fname).exists():
             shutil.copy2(backup / fname, cwd / fname)
 
@@ -530,19 +542,36 @@ def tick(f):
     running = f.running()
     for d in active_children(f.run_dir):
         rec = record(d)
-        cfg = fleet.load(d / 'config.json')
+        cfg = child_config_or_fail(f, d, rec)
+        if cfg is None:
+            continue
         if rec['state'] == 'running':
             res = child_result(d)
-            if res is None and running:
+            alive = fleet.daemon_running(d) or time.time() - float(rec.get('launched') or rec.get('created') or 0) < LAUNCH_GRACE
+            if res is None and running and alive:
                 continue
             rec['outcome'] = (res or {}).get('status') or 'cancelled'
-            rec['reason'] = (res or {}).get('reason') or 'main task ended while the sub-fleet was running'
+            rec['reason'] = (res or {}).get('reason') or (
+                'main task ended while the sub-fleet was running' if not running
+                else 'the sub-fleet daemon exited without writing result.json')
             rec['state'] = 'stopping'
             save_record(d, rec)
             post_stop(cfg)  # a crashed child (Redis gone) is collected below all the same
             f.log('subfleet.stopping', task=rec['task_id'], outcome=rec['outcome'])
         if rec['state'] == 'stopping' and not fleet.daemon_running(d):
             collect(f, d, notify=running)
+
+
+def child_config_or_fail(f, d, rec):
+    """A record without config.json is a spawn killed half-way (the spawn itself is synchronous):
+    mark it failed instead of crashing every tick / stop / resume."""
+    try:
+        return _fleet().load(Path(d) / 'config.json')
+    except (OSError, ValueError) as exc:
+        rec.update(state='failed', reason='sub-fleet record without a readable config.json: ' + str(exc))
+        save_record(d, rec)
+        f.log('subfleet.failed', task=rec.get('task_id'), reason=rec['reason'])
+        return None
 
 
 def collect(f, child_run, notify=True):
@@ -597,11 +626,12 @@ def collect(f, child_run, notify=True):
     f.log('subfleet.' + rec['state'], task=rec['task_id'], slot=slot, outcome=rec.get('outcome'),
           reason=rec.get('reason', ''), attempt=rec.get('attempt'))
     if notify and f.running():
+        extra = f.escalation_finished(rec, ok)
         f.queue('supervisor', '[Sub-fleet ' + rec['task_id'] + ' ' + ('completed' if ok else 'failed') + '] '
                 + f.label(slot) + ' ran sub-fleet ' + rec['task_id'] + ' (attempt ' + str(rec.get('attempt', 1))
                 + '): ' + (rec.get('reason') or rec.get('outcome') or '') + '. ' + f.label(slot)
                 + ' is a worker again' + ('' if returned else ' (new generation: the delegated session was lost)')
-                + '. Continue the current task using the AGENTS.md decision JSON.')
+                + '.' + extra + '\nContinue the current task using the AGENTS.md decision JSON.')
     return rec
 
 
@@ -612,7 +642,9 @@ def stop_children(f, wait=STOP_WAIT):
     ok = True
     for d in active_children(f.run_dir):
         rec = record(d)
-        cfg = fleet.load(d / 'config.json')
+        cfg = child_config_or_fail(f, d, rec)
+        if cfg is None:
+            continue
         if rec['state'] != 'stopping':
             rec.update(state='stopping', outcome=rec.get('outcome') or 'stopped', reason='main fleet stopped')
             save_record(d, rec)
@@ -635,10 +667,12 @@ def resume_children(f, launch=None):
         rec = record(d)
         if fleet.daemon_running(d):
             continue
+        cfg = child_config_or_fail(f, d, rec)
+        if cfg is None:
+            continue
         if rec['state'] == 'stopping':
             collect(f, d)
             continue
-        cfg = fleet.load(d / 'config.json')
         if not redis_up(cfg):
             fleet.start_redis(cfg, tries=300)  # reloads its AOF from the same directory
         mgr = fleet.manager_for(cfg)
@@ -647,6 +681,8 @@ def resume_children(f, launch=None):
         else:
             command = [cfg['python'], str(Path(fleet.__file__).resolve()), 'daemon', str(d / 'config.json'), '--resume']
             mgr.spawn_window('control', shlex.join(command), metadata={'type': 'daemon'}, start_directory=str(d))
+        rec['launched'] = time.time()
+        save_record(d, rec)
         f.log('subfleet.resumed', task=rec['task_id'])
 
 
