@@ -2396,7 +2396,14 @@ def resume(run, args):
         try:  # the lifecycle hold stopped it on purpose: the operator's --resume reopens the task
             lifecycle_hold.reopen(r, task, getattr(args, 'extend_hours', None))
         except ValueError as exc:
-            raise SystemExit('cannot resume ' + str(run) + ': ' + str(exc)) from exc
+            if args.resume != 'auto':
+                raise SystemExit('cannot resume ' + str(run) + ': ' + str(exc)) from exc
+            try:  # auto: like a finished run, start a new one (Redis down again, AOF directory kept)
+                r.shutdown()
+            except Exception:
+                pass  # redis closes the socket while acknowledging shutdown
+            print('--resume auto: ' + str(run) + ': ' + str(exc) + '; starting a new run')
+            return False
         (run / 'result.json').unlink()
         task = r.hgetall(TASK)
         print('reopened ' + task.get('id', '') + ' (stopped by the lifecycle hold) for --resume')
@@ -2426,6 +2433,7 @@ def resume(run, args):
 
 def daemon(cfg_path, resume=False):
     cfg = load(cfg_path)
+    fleet = None
     with (Path(cfg['run']) / 'daemon.lock').open('a+') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         # cmux creates a fresh login shell: it does not inherit the start command's
@@ -2445,7 +2453,8 @@ def daemon(cfg_path, resume=False):
                     fleet.r.shutdown()
                 except Exception:
                     pass  # redis closes the socket while acknowledging shutdown
-    lifecycle_close.after_daemon(fleet)  # lock released, Redis down: close this run's workspace
+    if fleet is not None:
+        lifecycle_close.after_daemon(fleet)  # lock released, Redis down: close this run's workspace
 
 
 def start(args):

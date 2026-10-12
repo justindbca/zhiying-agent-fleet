@@ -502,3 +502,48 @@ def test_stop_keep_resumable_run_is_picked_up_again_by_resume(fx, table, notes):
         assert again.lifecycle_close is None and not again.stopping
     finally:
         again.v2.close()
+
+
+class NoShutdown:
+    """The fixture's Redis must survive resume()'s shutdown on the auto fallback."""
+    def __init__(self, r):
+        self.r, self.shut = r, False
+
+    def __getattr__(self, name):
+        return getattr(self.r, name)
+
+    def shutdown(self):
+        self.shut = True
+
+
+def test_resume_of_budget_exhausted_resumable_run(fx, table, notes, monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from cmux_fleet import cmux_manager
+    # never reach the real cmux registry or the operator's latest.json
+    launched = []
+    monkeypatch.setattr(fleet, 'manager_for', lambda cfg: SimpleNamespace(
+        spawn_window=lambda *a, **k: launched.append(a) or SimpleNamespace(success=True)))
+    monkeypatch.setattr(fleet, 'LATEST', tmp_path / 'latest.json')
+    monkeypatch.setattr(cmux_manager, 'cmux_available', lambda: True)
+    f = as_task(fx, 'program')
+    fleet.save(f.path, dict(fleet.load(f.path), mode='task', lifecycle='program'))  # what start writes
+    submit(f, {'goal': 'x', 'hours': 1})
+    f.finish('budget_exhausted', 'time budget exhausted')
+    f.r.hset(fleet.TASK, mapping={'deadline': time.time() - 1})
+    f.tick()
+    lifecycle_close.tick(f, now=result_json(f)['at'] + 13 * 3600)
+    stop_tail(f)
+    assert result_json(f)['resumable']
+    client = NoShutdown(f.r)
+    monkeypatch.setattr(fleet, 'connect', lambda cfg: client)
+    args = SimpleNamespace(resume=str(f.run_dir), extend_hours=None, max_attempts=None, roster=None)
+    with pytest.raises(SystemExit, match='--extend-hours'):
+        fleet.resume(f.run_dir, args)
+    args.resume = 'auto'
+    assert fleet.resume(f.run_dir, args) is False and client.shut  # auto: a new run instead
+    assert f.task()['status'] == 'budget_exhausted' and (f.run_dir / 'result.json').exists() and not launched
+    args.resume, args.extend_hours = str(f.run_dir), 3
+    assert fleet.resume(f.run_dir, args) is True and len(launched) == 1
+    assert f.task()['status'] == 'running' and float(f.task()['deadline']) > time.time() + 3 * 3600 - 60
+    assert not (f.run_dir / 'result.json').exists()
+    assert fleet.load(tmp_path / 'latest.json')['run'] == str(f.run_dir)
