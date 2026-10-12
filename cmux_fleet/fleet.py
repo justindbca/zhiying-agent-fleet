@@ -764,8 +764,13 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
     settings = cwd / ('.fleet-settings-g' + str(generation) + '.json')
     # v2: the READY hook waits for the daemon, which may still be spawning other tabs.
     timeout = 30 if cfg.get('transport_version') != 2 else int(float(cfg.get('profile_ready_timeout') or 180)) + 30
-    settings.write_text(json.dumps({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': hook, 'timeout': timeout}]}]}}))
-    argv = [cfg.get('claude') or 'claude', '--dangerously-skip-permissions', '--model', cfg.get('worker_model') or 'sonnet',
+    model = cfg.get('worker_model') or 'sonnet'
+    # Claude Code compacts on its own near autoCompactWindow (default undisclosed). Pin it to the
+    # window fleet rotates against, so fleet's handoff (ratio x window) always fires first (§22).
+    window = handoff_limits('claude', model, cfg)[0]
+    settings.write_text(json.dumps({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': hook, 'timeout': timeout}]}]},
+                                    'autoCompactWindow': max(100000, min(1000000, window))}))
+    argv = [cfg.get('claude') or 'claude', '--dangerously-skip-permissions', '--model', model,
             '--settings', str(settings), '--add-dir', str(Path(cfg['run']) / 'workspace')]
     if name != 'supervisor':  # stable per slot across generations (peer messages address it)
         argv += ['--name', claude_session_name(cfg, name)]

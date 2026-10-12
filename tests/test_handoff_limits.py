@@ -124,3 +124,12 @@ def test_control_view_shows_effective_handoff(cfx):
     assert agent['handoff_window'] == '1000000' and agent['handoff_ratio'] == '0.6'
     assert agent['handoff_source'] == 'window: built-in opus; ratio: --handoff-ratio'
     assert not control_view._secret_key('handoff_window') and not control_view._secret_key('handoff_source')
+
+
+def test_claude_settings_pin_autocompact_to_handoff_window(tmp_path):
+    for model, expect in (('opus', 1000000), ('sonnet', 200000)):
+        cfg = dict(fleet.DEFAULTS, run=str(tmp_path), python='python3', worker_model=model)
+        fleet.agent_cwd(cfg, 'worker-1').mkdir(parents=True, exist_ok=True)
+        fleet.claude_argv(tmp_path / 'config.json', cfg, 'worker-1', 0, 'READY')
+        settings = json.loads((fleet.agent_cwd(cfg, 'worker-1') / '.fleet-settings-g0.json').read_text())
+        assert settings['autoCompactWindow'] == expect and 'Stop' in settings['hooks']

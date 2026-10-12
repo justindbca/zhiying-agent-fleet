@@ -469,3 +469,5 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - **已知边界**：内置表按子串判断，`opus` 一律当 1M 依据用户陈述（未在 API 层核实具体模型的真实窗口，若某个 opus 变体实为 200k 用 `claude:<model>` 覆盖）；模型串精确匹配，别名（`opus`）与全名（`claude-opus-…`）是不同键；adopt 的子 fleet 监工仍不换代（§19）。
 
 **验证**：`python3 -m pytest -q tests` 全套通过（新增 `tests/test_handoff_limits.py`：内置表与旗标、五层顺序、opus 300k 不换代 / sonnet 120k 换代、profile 运行模型、worker 覆盖 + 不重启热载改变阈值、坏值整份拒收保留原阈值、config 表校验、Codex 实测窗口不动除非显式覆盖、状态字段；`tests/test_roster.py` 新增坏值参数与 v2 热载进 `status`）。独立复核、合并、部署均未做。
+
+**Claude 自动压缩（2026-10-13 补）**：官方文档 `code.claude.com/docs/en/model-config.md`：裸 `opus` 指 Opus 5.5，原生 1M；`autoCompactWindow`（settings，10 万–100 万，缺省值未公开）决定 Claude Code 自己何时压缩。fleet 为每代 Claude worker 生成的 `.fleet-settings-g<N>.json` 现写入 `autoCompactWindow = clamp(内置 / config 解析出的 window, 100000, 1000000)`，保证 fleet 的换代（ratio × window）先于 Claude 自压缩触发、交接单能写出。roster 的 worker 级 window 覆盖不进这个文件（只会更小，fleet 仍先换代）。
