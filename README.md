@@ -89,7 +89,8 @@ Nothing else: the fleet creates its own Codex home for the agents and answers Co
 ## Use
 
 Open a cmux terminal, configure your Pi provider/model and replace `local/my-model` below.
-New starts require Redis v2 and an explicit development opt-in; native Codex/Claude v2 is not yet supported.
+New starts require Redis v2 and an explicit development opt-in. Supported v2 CLI pairs: all-Pi, or a Codex
+supervisor with official Claude Code workers in task mode (see "Redis v2 development runtime"); every other pair is refused.
 The Codex-specific setup and launch examples below are retained only as legacy v1 reference.
 
 ```bash
@@ -251,7 +252,25 @@ This tests READY, JSON request/result and handoff to a new generation. It is not
 V2 now connects the existing Fleet dispatcher to persistent Pi bridges. Select it explicitly
 on a fresh isolated development run with `--transport-version 2 --allow-development-v2`
 and `--supervisor-cli pi --worker-cli pi`, plus the existing explicit model/permission options.
-Claude/Codex v2 combinations are rejected before provisioning or profile retirement.
+
+Codex supervisor + official Claude Code workers (task mode, user decision 2026-10-12) also run on v2.
+The daemon receives each delivery from Redis and types only its business text into the official
+TUI (Claude panes get a bracketed paste); no `.inbox` file and no transport ID reach the model.
+The Codex `notify` / Claude `Stop` hooks bind the session on READY and then settle only the delivery
+this generation received, only when the typed text started that turn; the daemon validates it as for Pi.
+Agents keep the original AGENTS.md reply formats. Six parallel Claude workers with an Astra supervisor:
+
+```bash
+# once: a Codex profile file for the supervisor model (Codex >= 0.156 reads ~/.codex/<name>.config.toml)
+printf 'model = "gpt-6-astra"\nmodel_reasoning_effort = "high"\n' > ~/.codex/fleet-astra.config.toml
+cmux-fleet start --supervisor-cli codex --supervisor-profile fleet-astra \
+  --worker-cli claude --worker-model sonnet --workers 6 --max-busy 0 \
+  --allow-development-v2
+cmux-fleet task goal.json
+```
+
+Service mode, Claude supervisors, Codex workers and Pi/official-CLI mixes stay refused with a reason
+before provisioning or profile retirement.
 New `start` commands now require Redis v2 (the default); `--transport-version 1` is rejected. Existing v1 configs remain readable for draining/status/stop only: do not edit their transport version in place. The file-delivery and native-Codex/Claude startup descriptions above are legacy behavior, not a supported new v2 launch path. Unsupported CLI combinations fail rather than silently falling back to files. The development opt-in is still required.
 
 V2 deliveries use run-scoped Redis Streams and full business context rather than message files

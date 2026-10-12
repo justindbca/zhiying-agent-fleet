@@ -117,7 +117,9 @@ cmux-fleet start --mode service --workers 2 \
 新 `start` 默认且只允许 Redis v2，须带 `--allow-development-v2`；`--transport-version 1` 明确拒绝。旧配置仍可 status/收束/stop，但不可原地修改版本冒充迁移。上文 Codex/Claude 启动示例属于旧版；未支持的 v2 CLI 组合直接失败，不回退文件信箱或暗换 CLI。
 v2 已接到原 Fleet 的队列/分派/验收链，常驻 Python bridge 阻塞读 Redis，把业务正文直接送给 Pi；不写消息 Markdown、不粘贴收件。
 结果工具只暂存候选，settled 后由 daemon 验证；简单 reply/失败/超时为 appendEntry UI-only 卡，不增加监工机械转述回合。
-task 报告仍另送监工判断，产物仍独立验收。Claude/Codex v2 在 provisioning/退役前拒绝；官方 Claude v1 保留。
+task 报告仍另送监工判断，产物仍独立验收。
+
+2026-10-12 用户新增：**Codex 监工 + 官方 Claude Code worker（仅 task 模式）**也走 v2。daemon 从 Redis 收件后只把业务正文打进官方 TUI（Claude 窗格用 bracketed 粘贴），不写 `.inbox`、不带运输 ID；Codex notify / Claude Stop 钩子在 READY 时绑定会话，之后只结算本代已收的投递且须由打进去的正文发起该回合，再由 daemon 按原规则校验。启动示例见英文 README “Redis v2 development runtime”。service 模式、Claude 监工、Codex worker、Pi 与官方 CLI 混配仍在 provisioning/退役前带原因拒绝；官方 Claude v1 保留。
 
 timeout/中止/通信失联保留槽位和 PEL，未确认停止不重新派活。daemon 同 run 重启先 held/paused，不重起 agents、不因异常关闭 Redis。
 显式 v2 stop 确认各 runtime 退役后才关 Redis。AOF everysec 仍有约 1 秒主机崩溃丢失窗口。`logs --config ... --request ... --json --follow` 为只读详情导出。
