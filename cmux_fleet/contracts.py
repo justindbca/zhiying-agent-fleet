@@ -13,7 +13,7 @@ and copies a read-only view to ``<run>/contracts.json`` and ``<workspace>/contra
              "owners": {"worker-1": ["M0", null, ...]}}  # what each queued message expects back
 
 Models only propose; every rule here is a literal check the daemon can repeat.
-Not in this chunk: peer notices (SendMessage / {{FLEET_PEER}}), sub-fleets, escalate, veto.
+Not in this chunk: peer notices (SendMessage / {{FLEET_PEER}}). Escalate / sub-fleet interfaces: fleet.py (§20).
 """
 import copy
 import json
@@ -346,8 +346,12 @@ def supervisor_interfaces(state, raws):
     for raw in raws:
         if isinstance(raw, dict) and 'decision' in raw:
             key = str(raw.get('id')) + '@' + str(raw.get('version'))
-            if raw['decision'] == 'veto':
-                raise ValueError('veto applies to sub-fleet interfaces, which this fleet does not run')
+            if raw['decision'] == 'veto':  # spec §4.2: a sub-fleet's own interfaces are in effect until vetoed
+                origin = (state.get('child_interfaces') or {}).pop(key, None)
+                if origin is None:
+                    raise ValueError('veto applies only to interfaces a sub-fleet registered; ' + key + ' is not one')
+                out.append((key, 'veto', {'run': origin, 'note': str(raw.get('note', ''))}))
+                continue
             if raw['decision'] not in ('approve', 'reject'):
                 raise ValueError('decision must be approve or reject')
             if key not in state['pending']:

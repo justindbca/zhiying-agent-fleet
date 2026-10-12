@@ -1276,6 +1276,12 @@ class Fleet:
     def contract_apply(self, t, state, changes, skeleton):
         """Side effects of an accepted decision: change notices, the P1 skeleton delivery."""
         for key_, kind, notify in changes:
+            if kind == 'veto':  # the sub-fleet that registered it withdraws it on its next tick
+                folder = Path(notify['run']) / 'subfleet-vetoes'
+                folder.mkdir(parents=True, exist_ok=True)
+                save(folder / (uuid.uuid4().hex[:12] + '.json'), {'ref': key_, 'note': notify['note']})
+                self.contract_log('vetoed', by='supervisor', iface=key_, run=notify['run'], note=notify['note'])
+                continue
             self.contract_log('approved' if kind != 'rejected' else 'rejected', by='supervisor', iface=key_, change=kind)
             self.contract_notify(state, notify, '[contract] ' + ('rejected ' + key_ if kind == 'rejected'
                                  else 'approved ' + key_ + ' (' + kind + '); read it in contracts.json'))
@@ -1293,6 +1299,7 @@ class Fleet:
                                 '\nShared output directory: ' + str(self.workspace()) + ' (write only inside your own '
                                 'subdirectory ' + worker + '/). Reply in the AGENTS.md format when done.',
                                 contracts.SKELETON)
+        self.notify_parent(state, [(k, kind) for k, kind, _ in changes if kind not in ('rejected', 'veto')])
 
     def contract_message(self, task_id, row):
         def names(k):
@@ -1332,6 +1339,7 @@ class Fleet:
                 for e in s['interfaces'].values():
                     e.update(status='declared', approved_by='supervisor')
                 s['phase'] = 'parallel'
+                self.notify_parent(s, [(k, 'new') for k in sorted(s['interfaces'])])
                 notes.append('[contract] interfaces frozen at v1. Dispatch M0…Mn now: every dispatch item has id, '
                              'provides and consumes (id@version) per the plan; consumers start from the samples.')
             elif contracts.SKELETON_TRIES and s['skeleton_tries'] >= contracts.SKELETON_TRIES:
@@ -1617,6 +1625,67 @@ class Fleet:
         notes.append(contracts.table_line(state))
         self.save_contract(state)
         return '\n' + '\n'.join(notes)
+
+    # ------------------------------------------------------------ sub-fleet interfaces: notify the top, veto (§20)
+    def notify_parent(self, state, changes):
+        """A sub-fleet's interfaces take effect at once; the top supervisor is told and may veto."""
+        if not changes or not self.cfg.get('parent_config'):
+            return
+        folder = Path(load(self.cfg['parent_config'])['run']) / 'subfleet-notices'
+        folder.mkdir(parents=True, exist_ok=True)
+        items = [{'ref': k, 'change': kind, 'path': state['interfaces'][k]['path'],
+                  'producer': state['interfaces'][k]['producer']} for k, kind in changes if k in state['interfaces']]
+        save(folder / (uuid.uuid4().hex[:12] + '.json'),
+             {'origin_run': str(self.run_dir), 'task': self.cfg.get('task_id'), 'interfaces': items})
+
+    def relay_notices(self):
+        """Parent tick: pass a sub-fleet notice up the tree; the top fleet tells its supervisor."""
+        folder = self.run_dir / 'subfleet-notices'
+        for path in sorted(folder.glob('*.json')) if folder.is_dir() else []:
+            if self.cfg.get('parent_config'):
+                up = Path(load(self.cfg['parent_config'])['run']) / 'subfleet-notices'
+                up.mkdir(parents=True, exist_ok=True)
+                os.replace(path, up / path.name)
+                continue
+            try:
+                note = load(path)
+            except (OSError, ValueError):
+                note = None
+            path.unlink(missing_ok=True)
+            if not note or not self.running():
+                continue
+            state = self.contract_state()
+            if state is not None:
+                state.setdefault('child_interfaces', {}).update({i['ref']: note['origin_run'] for i in note['interfaces']})
+                self.save_contract(state)
+            self.log('subfleet.interfaces', task=note.get('task'), interfaces=[i['ref'] for i in note['interfaces']])
+            self.queue('supervisor', '[sub-fleet interfaces] sub-fleet ' + str(note.get('task')) + ' registered: '
+                       + '; '.join(i['ref'] + ' (' + i['change'] + ', ' + i['path'] + ')' for i in note['interfaces'])
+                       + '\nThey are in effect already. To withdraw one, add to your next JSON "interfaces": [{"id": '
+                       '"<id>", "version": <n>, "decision": "veto", "note": "<why>"}]. Reply with the JSON format '
+                       'from AGENTS.md.')
+
+    def apply_vetoes(self):
+        """Sub-fleet tick: the top supervisor vetoed one of our interfaces: withdraw it (deprecated)."""
+        folder = self.run_dir / 'subfleet-vetoes'
+        for path in sorted(folder.glob('*.json')) if folder.is_dir() else []:
+            try:
+                veto = load(path)
+            except (OSError, ValueError):
+                veto = None
+            path.unlink(missing_ok=True)
+            state = self.contract_state() if veto and self.running() else None
+            e = state['interfaces'].get(veto['ref']) if state else None
+            if not e or e['status'] == 'deprecated':
+                continue
+            e.update(status='deprecated', deprecated_by='veto by the top supervisor')
+            self.contract_log('vetoed', by='top supervisor', iface=veto['ref'], note=veto.get('note', ''))
+            self.contract_notify(state, [e['producer']] + e['consumers'], '[contract] ' + veto['ref']
+                                 + ' was vetoed by the top supervisor: ' + (veto.get('note') or '-') + '. Stop using it.')
+            self.queue('supervisor', '[contract] the top supervisor vetoed ' + veto['ref'] + ': ' + (veto.get('note') or '-')
+                       + '\nIt is withdrawn (deprecated). Re-plan the tasks that provide or consume it (declare a '
+                       'replacement under a new id). Reply with the JSON format from AGENTS.md.')
+            self.save_contract(state)
 
     def pi_metadata(self, name, ev):
         fields = {k: ev[k] for k in ('thread', 'transcript', 'ctx_used', 'ctx_window')
@@ -2478,7 +2547,8 @@ class Fleet:
         for part, run in (('roster', self.roster_tick),  # the only place the roster changes
                           ('result', self.write_result), ('contracts', self.sync_contract_files),
                           ('subfleet', lambda: subfleet.tick(self)),  # side effects, outside any v2 transaction
-                          ('escalations', self.escalation_tick)):
+                          ('escalations', self.escalation_tick), ('notices', self.relay_notices),
+                          ('vetoes', self.apply_vetoes)):
             try:
                 run()
             except BusError:

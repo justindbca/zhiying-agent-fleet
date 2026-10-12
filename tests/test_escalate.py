@@ -296,3 +296,51 @@ def test_child_daemon_gone_without_result_counts_as_failed(tree):
     assert rec['state'] == 'failed' and rec['outcome'] == 'cancelled'
     assert rec['reason'] == 'the sub-fleet daemon exited without writing result.json'
     assert f.agent('worker-1')['state'] == 'starting'  # the pane came back to the parent
+
+
+# ------------------------------------------------------------------ sub-fleet interfaces: notify the top, veto
+def test_child_interfaces_notify_the_parent_and_the_top_can_veto(cf, tmp_path):
+    parent_run = tmp_path / 'parent-run'
+    parent_run.mkdir()
+    fleet.save(tmp_path / 'parent.json', {'run': str(parent_run)})
+    cf.cfg.update(parent_config=str(tmp_path / 'parent.json'), task_id='M0')
+    to_parallel(cf)  # the child's skeleton passes: every interface is in effect and reported up
+    notes = list((parent_run / 'subfleet-notices').glob('*.json'))
+    note = fleet.load(notes[0])
+    assert len(notes) == 1 and note['origin_run'] == str(cf.run_dir) and note['task'] == 'M0'
+    assert [i['ref'] for i in note['interfaces']] == ['IF-M0-src@1', 'IF-M1-metrics@1']
+    # this fleet as the top: the notice reaches its supervisor, which vetoes one interface
+    cf.cfg.pop('parent_config')
+    (cf.run_dir / 'subfleet-notices').mkdir()
+    fleet.save(cf.run_dir / 'subfleet-notices' / 'n1.json', dict(note, origin_run=str(cf.run_dir)))
+    cf.relay_notices()
+    up = inbox(cf, 'supervisor')[-1]
+    assert up.startswith('[sub-fleet interfaces] sub-fleet M0 registered: IF-M0-src@1 (new, worker-1/sources.md)')
+    assert '"decision": "veto"' in up and not (cf.run_dir / 'subfleet-notices' / 'n1.json').exists()
+    sup(cf, {'status': 'RUNNING', 'completion': 5, 'interfaces': [
+        {'id': 'IF-M0-src', 'version': 1, 'decision': 'veto', 'note': 'duplicates M1'}],
+        'dispatch': [item('M1', 'worker-2', provides=['IF-M1-metrics'])]})
+    assert cf.task()['bad_replies'] == '0', inbox(cf, 'supervisor')
+    vetoes = list((cf.run_dir / 'subfleet-vetoes').glob('*.json'))
+    assert fleet.load(vetoes[0]) == {'ref': 'IF-M0-src@1', 'note': 'duplicates M1'}
+    # the sub-fleet (here the same fleet) withdraws it on its next tick
+    cf.apply_vetoes()
+    e = cf.contract_state()['interfaces']['IF-M0-src@1']
+    assert e['status'] == 'deprecated' and e['deprecated_by'] == 'veto by the top supervisor'
+    assert 'the top supervisor vetoed IF-M0-src@1: duplicates M1' in inbox(cf, 'supervisor')[-1]
+    assert not list((cf.run_dir / 'subfleet-vetoes').glob('*.json'))
+    # a veto of an interface no sub-fleet registered (or already vetoed) is a correction
+    sup(cf, {'status': 'RUNNING', 'completion': 5, 'interfaces': [
+        {'id': 'IF-M0-src', 'version': 1, 'decision': 'veto'}], 'dispatch': []})
+    assert 'veto applies only to interfaces a sub-fleet registered' in inbox(cf, 'supervisor')[-1]
+
+
+def test_a_middle_fleet_passes_notices_up(cf, tmp_path):
+    top = tmp_path / 'top-run'
+    top.mkdir()
+    fleet.save(tmp_path / 'top.json', {'run': str(top)})
+    cf.cfg['parent_config'] = str(tmp_path / 'top.json')
+    (cf.run_dir / 'subfleet-notices').mkdir()
+    fleet.save(cf.run_dir / 'subfleet-notices' / 'n2.json', {'origin_run': '/grandchild', 'task': 'M0.1', 'interfaces': []})
+    cf.relay_notices()
+    assert fleet.load(top / 'subfleet-notices' / 'n2.json')['origin_run'] == '/grandchild'

@@ -36,7 +36,9 @@ You are the top supervisor of this fleet: your own interface declarations are th
 | A report shows `M<x> ... stale on IF-...@<v>` | Your next dispatch of that task id must `consumes` the new version | — |
 | A report shows a task `failed` (reported, outputs not ready) | Re-dispatch the same id with a corrective instruction | — |
 | Received "Independent verification failed ... not ready" | Dispatch the producer to fix the named file and report `Interfaces: IF-x@n provided: ready` again | — |
-<!-- TODO(next chunk): peer notices ([peer CC], fleet peer broker) and sub-fleet escalation / veto. -->
+| A report carries `[escalate] worker-N asks to split M0` | `"escalations": [{"task": "M0", "decision": "approve" / "revise" / "reject", "workers": n, "note": "..."}]`; approve marks M0 `delegated` and the sub-fleet runs its own P0 / P1 first; its result closes M0 (`done` only when M0's provided interfaces pass) | `[escalate] ... refused by the program`: answer again within the limits |
+| Received `[sub-fleet interfaces] ...` | They are in effect already. To withdraw one: `"interfaces": [{"id": "IF-M0.0-x", "version": 1, "decision": "veto", "note": "..."}]` | — |
+<!-- TODO(next chunk): peer notices ([peer CC], fleet peer broker). -->
 
 ### Reply format additions
 ```json
