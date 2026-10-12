@@ -102,6 +102,16 @@ workers:
 - **整份拒收**（名单不变，原因记在 control 日志 `roster.rejected`）：YAML 错、未知字段、名字不合法或重复、零个 worker、角色文件不存在、本 run 用过的名字（卸掉的名字不能再加回）。变更记为 `roster.changed`。
 - 跑 daemon 的 Python 需装 PyYAML。
 
+## 断点续跑（`start --resume`）
+
+`cmux-fleet start --resume <run 目录>` 接上一个没结束的 Redis v2 run，不新建；`--resume auto` 取 `~/.cmux-fleet/latest.json` 指向的 run，它已结束（有 `<run>/result.json`）或不存在就照常新建。daemon 还活着则什么都不做，可由定时器反复调用。
+
+- 私有 Redis 用原目录、原 socket 重启，AOF 恢复到最后一次落盘（约 1 秒内）；Redis 还活着就直接用。
+- 窗口还在且 CLI 进程还在的官方 Claude worker 接回原窗口；其余（task 监工、Pi、窗口没了的）在原位起下一代（`worker-1` → `worker-1.1`）。
+- task：已验过的产出与已接受的回报不重做；排队中或在途的派发由 daemon 重新排队，新监工收到一份交底（目标、产出已验/缺、已完成派发及回报摘要、已重排的派发）。service：已受理但没有结果的请求重新分派；请求里写 `"replay": false` 的记 `timeout`。
+- `--max-attempts N`（缺省 2，存进 config，续跑时可改）：同一条派发 / 请求最多跑 N 次，超限 task 判 `blocked`、请求记 `timeout`，写明是哪条。
+- task 终结（任一终态）或显式 `stop` 会写 `<run>/result.json`，这样的 run 不再续跑。不带 `--resume` 的 daemon 重启仍按原规则：不确定的在途消息挂起、整套暂停，不重做。详见 design.md §17。
+
 ## pi 监工 + 官方 Claude Code worker（旧 v1 参考，新启动不支持）
 
 pi 可运行 supervisor 或 worker；Claude 侧始终由 fleet **直接启动官方 `claude` CLI**，不是 pi 接 Claude 订阅接口，

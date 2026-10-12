@@ -197,6 +197,26 @@ workers:
   this run (a removed worker's name cannot come back). Changes are logged as `roster.changed`.
 - Needs PyYAML in the Python that runs the daemon.
 
+## Resume an interrupted run (`start --resume`)
+
+`cmux-fleet start --resume <run-dir>` reattaches an unfinished Redis v2 run instead of creating one;
+`--resume auto` takes the run in `~/.cmux-fleet/latest.json` and starts a new run when that one is
+finished (`<run>/result.json` exists) or missing. A live daemon makes it a no-op, so a timer may call
+`start --resume auto` repeatedly.
+
+- Redis restarts from the run's own directory and socket; AOF brings back everything up to the last
+  fsync (about 1 s). A Redis that is still up is reused.
+- Official Claude workers whose tab still runs the CLI are reattached; every other agent (the task
+  supervisor, Pi agents, closed tabs) starts as its next generation (`worker-1` -> `worker-1.1`) in place.
+- Task: verified artifacts and accepted reports are kept; dispatches that were queued or in flight are
+  re-queued by the daemon, and the new supervisor gets a summary (goal, artifacts verified/missing,
+  completed dispatches with report excerpts, re-queued dispatches). Service: accepted requests without a
+  result are routed again; a request with `"replay": false` is published as `timeout`.
+- `--max-attempts N` (default 2, stored in config, can be changed on resume): one dispatch / request runs
+  at most N times in total; over the cap the task is `blocked` / the request is `timeout`, naming the item.
+- A finished task (any terminal status) or an explicit `stop` writes `<run>/result.json`; such a run is
+  never resumed. Without `--resume`, a restarted daemon still holds uncertain work and pauses (no replay).
+
 ## Claude Code workers (optional)
 
 The supervisor defaults to Codex (or select Pi below). Workers can be official [Claude Code](https://claude.com/claude-code) CLI sessions instead:

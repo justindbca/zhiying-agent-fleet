@@ -66,6 +66,7 @@ WORKER_NAME_RE = r'[a-z][a-z0-9-]{0,30}'
 # (same <slot>.<generation> pattern as worker-1 -> worker-1.1). Redis keys and the cwd stay 'supervisor'.
 SUPERVISOR_LABEL = 'supervisor-1'
 RESULT_TTL = 7 * 86400
+RESUME_CLIS = ('codex', 'claude', 'pi', 'node')  # process names that prove a reattachable CLI pane
 # Sandboxed agents cannot drive the user's browser themselves (and must never be allowed
 # to kill it). If the operator supplies a broker script, the daemon runs these verbs for them.
 CHROME_VERBS = {'check', 'tabs', 'newtab', 'go', 'url', 'js'}
@@ -74,7 +75,7 @@ DEFAULTS = {'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 100000, 'stal
             'chrome_min_interval': 20, 'profile': 'fleet', 'worker_cli': 'codex', 'worker_model': 'sonnet',
             'claude_window': 200000, 'mode': 'task', 'max_busy': 0, 'request_timeout': 900,
             'apply_profiles_live': False, 'allow_profile_live_switch': False, 'profile_ready_timeout': 180,
-            'transport_version': 1, 'allow_development_v2': False}
+            'transport_version': 1, 'allow_development_v2': False, 'max_attempts': 2}
 CLAUDE_JSON = Path.home() / '.claude.json'
 
 
@@ -362,6 +363,8 @@ def validate_request(spec, workers):
     if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
                                 or not 10 <= timeout <= 86400):
         raise ValueError('timeout_s must be a number of seconds between 10 and 86400')
+    if 'replay' in spec and type(spec['replay']) is not bool:
+        raise ValueError('replay must be true or false (false: never re-run it on start --resume)')
 
 
 def parse_reply(text, reply):
@@ -725,6 +728,7 @@ class Fleet:
         self.next_liveness = 0
         self.last_chrome = 0
         self.explicit_stop = False
+        self.resume_requested = False  # set by `daemon --resume` (operator ran start --resume)
         self.v2 = runtime_v2.RuntimeV2(self) if self.transport_version == 2 else None
 
     # -- small helpers
@@ -1304,6 +1308,7 @@ class Fleet:
                           else ' Profile application is advisory metadata only.')
                        + '\nDo not dispatch dependent subtasks until every id in depends_on has finished.')
         self.queue('supervisor', prompt + '\nReply with the JSON format from AGENTS.md.')
+        (self.run_dir / 'result.json').unlink(missing_ok=True)  # a new task: this run is not finished
         self.log('task.submitted', task=task_id)
         return task_id
 
@@ -1335,6 +1340,11 @@ class Fleet:
         self.r.hset(REQ + rid, mapping={'spec': json.dumps(spec, ensure_ascii=False), 'status': 'routing',
                                         'created': time.time(), 'attempts': 0, 'worker': ''})
         self.r.rpush(REQQ, rid)
+        self.route(rid, spec)
+        self.log('request', id=rid, to=spec.get('to') or 'supervisor')
+        return rid
+
+    def route(self, rid, spec):
         if spec.get('to'):
             self.assign(rid, self.resolve(spec['to']), spec.get('instruction'))
         else:
@@ -1343,8 +1353,6 @@ class Fleet:
                        + '\nWorkers: ' + ', '.join(self.labels()) + '\nPayload (JSON):\n'
                        + json.dumps(spec['payload'], ensure_ascii=False, indent=1)
                        + '\nReply with the service decision JSON from AGENTS.md.')
-        self.log('request', id=rid, to=spec.get('to') or 'supervisor')
-        return rid
 
     def assign(self, rid, slot, instruction=None):
         spec = json.loads(self.r.hget(REQ + rid, 'spec'))
@@ -1854,8 +1862,21 @@ class Fleet:
             self.report(name, 'STALLED: no activity for ' + minutes + ' min, its turn was aborted. The worker is '
                         'idle again. Dispatch a smaller, concrete instruction, or reply BLOCKED if a human is needed.')
 
+    def write_result(self):
+        """Task terminal: write <run>/result.json once per task (start --resume refuses a finished run)."""
+        t = {} if self.service else self.task()
+        if t.get('status', 'running') == 'running':
+            return
+        try:
+            if load(self.run_dir / 'result.json').get('task_id') == t.get('id', ''):
+                return
+        except (OSError, ValueError):
+            pass
+        save_result(self.run_dir, t)
+
     def tick(self):
         self.roster_tick()  # the only place the roster changes: never inside per-slot loops
+        self.write_result()
         if self.v2:
             return self.v2.tick()
         now = time.time()
@@ -1901,7 +1922,125 @@ class Fleet:
 
 
 # ------------------------------------------------------------ operator CLI
-def daemon(cfg_path):
+def save_result(run, task, status=None, reason=None):
+    """<run>/result.json (atomic): the run is finished. Artifacts are re-checked on disk here."""
+    workspace = Path(run) / 'workspace'
+    artifacts = json.loads(task.get('artifacts') or '[]')
+    save(Path(run) / 'result.json', {
+        'status': status or task.get('status', ''), 'reason': task.get('reason', '') if reason is None else reason,
+        'task_id': task.get('id', ''), 'goal': task.get('goal', ''), 'at': time.time(),
+        'artifacts': [dict(a, problems=check_artifacts([a], workspace)) for a in artifacts]})
+
+
+def start_redis(cfg, tries=30):
+    """Start the run's private Redis on its pinned socket and directory. v2 has AOF on, so a
+    restart with the same --dir reloads everything written up to the last fsync (about 1 s)."""
+    redis_dir = Path(cfg['redis_runtime_dir'])
+    subprocess.run([cfg['redis_server'], '--port', '0', '--unixsocket', cfg['redis_socket'],
+                    '--unixsocketperm', '700', '--dir', str(redis_dir), '--dbfilename', 'fleet.rdb',
+                    '--appendonly', 'yes' if cfg.get('transport_version') == 2 else 'no',
+                    '--appendfsync', 'everysec', '--save', '60 1', '--daemonize', 'yes',
+                    '--pidfile', str(redis_dir / 'redis.pid'), '--logfile', str(redis_dir / 'redis.log')], check=True)
+    for _ in range(tries):
+        try:
+            return connect(cfg)
+        except Exception:
+            time.sleep(.1)
+    raise SystemExit('private Redis did not become ready')
+
+
+def daemon_running(run):
+    """True while a daemon holds the run's exclusive lock."""
+    try:
+        with (Path(run) / 'daemon.lock').open('a+') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    return False
+
+
+def resume_target(value):
+    """The run to reattach for start --resume, or None: 'auto' with nothing unfinished starts a new run."""
+    auto = value == 'auto'
+    try:
+        run = Path(load(LATEST)['run']) if auto else Path(value).expanduser().resolve()
+    except (OSError, ValueError, KeyError, TypeError):
+        print('--resume auto: no latest run; starting a new run')
+        return None
+    if run.name == 'config.json':
+        run = run.parent
+    problem = None
+    if (run / 'result.json').exists():
+        problem = 'run already finished (result.json exists)'
+    else:
+        try:
+            if load(run / 'config.json').get('transport_version') != 2:
+                problem = 'only Redis v2 runs can be resumed'
+        except (OSError, ValueError):
+            problem = 'no readable config.json'
+    if problem and not auto:
+        raise SystemExit('cannot resume ' + str(run) + ': ' + problem)
+    if problem:
+        print('--resume auto: ' + str(run) + ': ' + problem + '; starting a new run')
+        return None
+    return run
+
+
+def resume(run, args):
+    """start --resume: reattach an unfinished v2 run. False when it turned out finished (auto starts anew)."""
+    from cmux_fleet.cmux_manager import CmuxSessionManager, cmux_available
+    path = run / 'config.json'
+    cfg = load(path)
+    try:
+        runtime_v2.validate_config(cfg)
+    except ValueError as exc:
+        raise SystemExit('cannot resume ' + str(run) + ': ' + str(exc)) from exc
+    if daemon_running(run):
+        print('this run still has a live daemon; nothing to resume:', run)
+        return True
+    if args.max_attempts is not None:
+        cfg['max_attempts'] = args.max_attempts
+    if args.roster:  # applied by the normal hot-reload on the daemon's first tick
+        roster_path = Path(args.roster).expanduser().resolve()
+        try:
+            roster.load(roster_path)
+        except (OSError, ValueError) as exc:
+            raise SystemExit('--roster ' + str(roster_path) + ' rejected:\n' + str(exc)) from exc
+        cfg['roster'] = str(roster_path)
+    if not cmux_available():
+        raise SystemExit('run this inside a cmux terminal: cmux only accepts processes started in its windows')
+    try:
+        r = connect(cfg)  # only the daemon died: its Redis is still up
+    except Exception:
+        if not Path(cfg['redis_runtime_dir']).is_dir():
+            raise SystemExit('cannot resume ' + str(run) + ': its Redis runtime directory is gone')
+        r = start_redis(cfg, tries=300)  # reloads the AOF from the same directory
+    task = {} if cfg.get('mode') == 'service' else r.hgetall(TASK)
+    if task.get('status', 'running') != 'running':
+        save_result(run, task)
+        try:
+            r.shutdown()
+        except Exception:
+            pass  # redis closes the socket while acknowledging shutdown
+        if args.resume != 'auto':
+            raise SystemExit('cannot resume ' + str(run) + ': task already ' + task['status'])
+        print('--resume auto: ' + str(run) + ': task already ' + task['status'] + '; starting a new run')
+        return False
+    save(path, cfg)
+    mgr = CmuxSessionManager(SESSION, state_dir=cfg.get('cmux_state_dir'))
+    command = [cfg['python'], str(Path(__file__).resolve()), 'daemon', str(path), '--resume']
+    caffeinate = shutil.which('caffeinate')
+    if caffeinate:
+        command = [caffeinate, '-i'] + command
+    result = mgr.spawn_window('control', shlex.join(command), metadata={'type': 'daemon'}, start_directory=str(run))
+    if not result.success:
+        raise SystemExit(result.error)  # Redis stays up: start --resume can be retried
+    save(LATEST, dict(cfg, config=str(path)))
+    print('fleet resumed (' + cfg.get('mode', 'task') + ' mode). Run directory:', run)
+    return True
+
+
+def daemon(cfg_path, resume=False):
     from cmux_fleet.cmux_manager import CmuxSessionManager
     cfg = load(cfg_path)
     with (Path(cfg['run']) / 'daemon.lock').open('a+') as lock:
@@ -1909,6 +2048,7 @@ def daemon(cfg_path):
         # cmux creates a fresh login shell: it does not inherit the start command's
         # CMUX_FLEET_STATE. Pin the registry in config, never fall back for new runs.
         fleet = Fleet(cfg_path, connect(cfg), CmuxSessionManager(SESSION, state_dir=cfg.get('cmux_state_dir')))
+        fleet.resume_requested = resume
 
         def stop(signum, frame):
             fleet.stopping = True
@@ -1926,6 +2066,12 @@ def daemon(cfg_path):
 
 def start(args):
     from cmux_fleet.cmux_manager import CmuxSessionManager, cmux_available
+    if getattr(args, 'max_attempts', None) is not None and args.max_attempts < 1:
+        raise SystemExit('--max-attempts must be at least 1')
+    if getattr(args, 'resume', None):
+        run = resume_target(args.resume)
+        if run and resume(run, args):
+            return
     if args.transport_version != 2:
         raise SystemExit('new fleet instances require Redis transport v2; v1 is only readable for existing runs')
     try:
@@ -1983,7 +2129,6 @@ def start(args):
         redis_cfg = redis_runtime.prepare(args.redis_runtime_dir, token)
     except (OSError, ValueError) as exc:
         raise SystemExit('cannot prepare private Redis runtime: ' + str(exc)) from exc
-    redis_dir = Path(redis_cfg['redis_runtime_dir'])
     run = Path(args.runs_dir).expanduser() / ('fleet-' + time.strftime('%Y%m%d-%H%M%S-') + token)
     (run / 'workspace').mkdir(parents=True)
     cfg = {'run': str(run), 'python': sys.executable, **redis_cfg,
@@ -2000,25 +2145,14 @@ def start(args):
            'supervisor_cli': args.supervisor_cli, 'pi': pi, 'pi_model': args.pi_model,
            'pi_thinking': args.pi_thinking, 'allow_unsandboxed_pi': args.allow_unsandboxed_pi,
            'pi_agent_dir': args.pi_agent_dir, 'allow_profile_live_switch': args.allow_profile_live_switch,
-           'transport_version': args.transport_version, 'allow_development_v2': args.allow_development_v2}
+           'transport_version': args.transport_version, 'allow_development_v2': args.allow_development_v2,
+           'max_attempts': args.max_attempts or DEFAULTS['max_attempts']}
     if roster_path:
         cfg.update(roster=str(roster_path), worker_roles=worker_roles)
     if 'pi' in clis:
         cfg['pi_home'] = str(pi_adapter.prepare_home(run / 'pi-home', args.pi_agent_dir))
     save(run / 'config.json', cfg)
-    subprocess.run([redis_server, '--port', '0', '--unixsocket', cfg['redis_socket'],
-                    '--unixsocketperm', '700', '--dir', str(redis_dir), '--dbfilename', 'fleet.rdb',
-                    '--appendonly', 'yes' if args.transport_version == 2 else 'no',
-                    '--appendfsync', 'everysec', '--save', '60 1', '--daemonize', 'yes',
-                    '--pidfile', str(redis_dir / 'redis.pid'), '--logfile', str(redis_dir / 'redis.log')], check=True)
-    for _ in range(30):
-        try:
-            connect(cfg)
-            break
-        except Exception:
-            time.sleep(.1)
-    else:
-        raise SystemExit('private Redis did not become ready')
+    start_redis(cfg)
     command = [cfg['python'], str(Path(__file__).resolve()), 'daemon', str(run / 'config.json')]
     caffeinate = shutil.which('caffeinate')
     if caffeinate:
@@ -2141,6 +2275,12 @@ def main(argv=None):
                    help='at most this many workers working at once (0 = no limit)')
     s.add_argument('--request-timeout', type=float, default=DEFAULTS['request_timeout'],
                    help='service mode: seconds before an unanswered request is published as timeout')
+    s.add_argument('--resume', metavar='RUN_DIR|auto',
+                   help='reattach an unfinished v2 run instead of creating one (auto: the run in latest.json; '
+                        'a finished or missing run starts a new one). Other start flags except --roster / '
+                        '--max-attempts are ignored when a run is reattached')
+    s.add_argument('--max-attempts', type=int,
+                   help='times one dispatch/request may run in total across start --resume (default 2)')
     ag = sub.add_parser('agents', help='inspect offline agent profiles without starting or contacting a fleet')
     ag_sub = ag.add_subparsers(dest='agents_cmd', required=True)
     ag_list = ag_sub.add_parser('list', help='list validated agent cards as JSON')
@@ -2155,7 +2295,9 @@ def main(argv=None):
     pl.add_argument('--registry', help='agent card directory (default: project or package agents/)')
     pl.add_argument('--workers', help='comma-separated stable worker slots; include profile assignments when supplied')
     pl.add_argument('--json', action='store_true', help='JSON output (already the default)')
-    sub.add_parser('daemon', help='run the coordinator (internal)').add_argument('cfg')
+    dm = sub.add_parser('daemon', help='run the coordinator (internal)')
+    dm.add_argument('cfg')
+    dm.add_argument('--resume', action='store_true', help='reconcile and replay (internal; from start --resume)')
     t = sub.add_parser(
         'task', help='submit a goal: JSON file or - for stdin '
         '({"goal":..., "hours":..., "artifacts":[...], "auto_agents":true, "agent_registry":...})')
@@ -2201,7 +2343,7 @@ def main(argv=None):
     if args.cmd == 'start':
         start(args)
     elif args.cmd == 'daemon':
-        daemon(args.cfg)
+        daemon(args.cfg, args.resume)
     elif args.cmd == 'notify':
         notify(args.cfg, args.agent, args.generation, args.payload)
     elif args.cmd == 'claude-stop':
