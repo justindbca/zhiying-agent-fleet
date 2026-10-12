@@ -492,3 +492,18 @@ def test_v2_wall_gate_trips_in_a_transaction_without_holding_the_slot(fx):
     assert f.r.hget(f.v2.bus.lease_key('supervisor'), 'status') == 'received' and f.mgr.keys == []
     audit = [x for _, x in f.r.xrange(f.v2.bus.audit_key) if x['event'] == 'brake.tripped']
     assert len(audit) == 1 and json.loads((f.run_dir / 'brake.json').read_text())['source'] == 'watch'
+
+
+def test_frozen_task_rejects_a_supervisor_cmd_exit_and_runs_only_the_callers(tmp_path):
+    caller, added = tmp_path / 'caller', tmp_path / 'added'
+    run = lambda m: [sys.executable, '-c', 'open(%r, "a").write("x"); print("7 passed")' % str(m)]
+    check = {'path': 'checks/tests.txt', 'cmd_exit': run(caller), 'contains': ['passed']}
+    f = make(tmp_path, {'goal': 'x', 'contract': {'artifacts_frozen': True}, 'artifacts': [check]})
+    f.pump()
+    f.handle(turn('supervisor', decision('COMPLETED', 100, [], artifacts=[
+        {'path': 'checks/extra.txt', 'cmd_exit': run(added)}])))
+    assert 'was not declared by the caller' in f.r.lrange('fx:inbox:supervisor', 0, -1)[-1]
+    assert not caller.exists() and not added.exists() and f.task()['status'] == 'running'
+    f.pump()
+    f.handle(turn('supervisor', decision('COMPLETED', 100, [], artifacts=[check])))
+    assert f.task()['status'] == 'completed' and caller.read_text() == 'x' and not added.exists()

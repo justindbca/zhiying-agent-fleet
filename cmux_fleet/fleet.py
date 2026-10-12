@@ -341,10 +341,11 @@ def json_key_failures(text, keys):
     return ['missing JSON key ' + k for k in keys if k not in obj]
 
 
-def check_artifacts(artifacts, root, extended=False, run_commands=False):
+def check_artifacts(artifacts, root, extended=False, run_commands=False, commands=None):
     """Literal file checks only (exists / size / contains); returns failures (empty = pass).
     ``extended`` (contract tasks and frozen artifacts) adds not_contains, json_keys and cmd_exit;
-    commands run only when ``run_commands`` (the COMPLETED gate), never from result.json / resume re-checks."""
+    commands run only when ``run_commands`` (the COMPLETED gate), never from result.json / resume re-checks,
+    and only those whose command_key is in ``commands`` (the caller's declared set); any other is reported, not run."""
     root = Path(root).resolve()
     failures = []
     for item in artifacts:
@@ -353,6 +354,9 @@ def check_artifacts(artifacts, root, extended=False, run_commands=False):
             failures.append('outside workspace: ' + item['path'])
             continue
         if extended and run_commands and item.get('cmd_exit'):
+            if command_key(item) not in (commands or ()):
+                failures.append('cmd_exit not declared by the caller, not run: ' + item['path'])
+                continue
             problem = run_check_command(item, root, path)
             if problem:
                 failures.append(problem)
@@ -377,6 +381,29 @@ def check_artifacts(artifacts, root, extended=False, run_commands=False):
 def extended_checks(task):
     """Contract tasks and caller-frozen artifacts use the extended checks (not_contains / json_keys / cmd_exit)."""
     return task.get('contracts') == '1' or task.get('artifacts_frozen') == '1'
+
+
+def command_key(item):
+    """Identity of an artifact's acceptance command: path + argv + timeout (all three are what runs)."""
+    return json.dumps([item.get('path'), item.get('cmd_exit'), item.get('timeout_s', CMD_TIMEOUT)])
+
+
+def caller_commands(task):
+    """The cmd_exit commands the CALLER declared in the task spec (stored apart from the merged artifacts
+    list at submit). A task stored without that field (older daemon) has none: nothing runs."""
+    return {command_key(a) for a in json.loads(task.get('caller_artifacts') or '[]')
+            if isinstance(a, dict) and a.get('cmd_exit')}
+
+
+def command_guard(task, decision):
+    """Supervisor decisions may not add or replace a cmd_exit: only an artifact identical to one the caller
+    declared may carry one. Raises ValueError (the normal correction / three-strike path)."""
+    allowed = caller_commands(task)
+    for item in decision.get('artifacts') or []:
+        if isinstance(item, dict) and 'cmd_exit' in item and command_key(item) not in allowed:
+            raise ValueError('cmd_exit on ' + str(item.get('path')) + ' was not declared by the caller: a '
+                             'supervisor decision may not add or replace acceptance commands (drop cmd_exit, or '
+                             'repeat the caller\'s artifact unchanged)')
 
 
 def validate_contract(raw):
@@ -1543,6 +1570,7 @@ class Fleet:
             if state is not None:
                 state, rows, held, changes, skeleton = self.contract_decision(state, decision)
                 rows = {r['id']: r for r in rows + held}
+            command_guard(t, decision)  # after the shape checks: a malformed cmd_exit keeps its own message
             # Validate the whole dispatch before queuing any part of it. Rejections
             # use the existing supervisor correction/three-strike blocked path.
             prepared = []
@@ -1577,7 +1605,7 @@ class Fleet:
             return
         if decision['status'] == 'COMPLETED':
             extended = state is not None or t.get('artifacts_frozen') == '1'
-            failures = (check_artifacts(artifacts, self.workspace(), extended, extended)
+            failures = (check_artifacts(artifacts, self.workspace(), extended, extended, caller_commands(t))
                         if artifacts else ['no artifacts were declared, nothing to verify'])
             failures += self.contract_gate(state) if state is not None else []
             if not failures:
@@ -1663,6 +1691,7 @@ class Fleet:
         fields = {'id': task_id, 'goal': spec['goal'], 'status': 'running', 'completion': 0,
                   'reason': '', 'deadline': time.time() + hours * 3600, 'bad_replies': 0,
                   'bounces': 0, 'artifacts': json.dumps(spec.get('artifacts', []), ensure_ascii=False),
+                  'caller_artifacts': json.dumps(spec.get('artifacts', []), ensure_ascii=False),
                   'apply_profiles_live': json.dumps(spec.get('apply_profiles_live', False))}
         if use_contracts:
             fields['contracts'] = 1
