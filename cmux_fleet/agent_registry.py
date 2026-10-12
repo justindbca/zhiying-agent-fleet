@@ -19,10 +19,13 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 CARD_SUFFIXES = (".json", ".yaml", ".yml")
 MODELS_SUBDIR = "models"
 JUDGEMENTS = ("high", "mid", "low-mid", "low")
-LIST_FIELDS = ("hosts", "domains", "roles_allowed", "roles_denied")
+LIST_FIELDS = ("hosts", "domains", "roles_allowed", "roles_denied", "unverified")
 # Assessment fields shared by model cards and profile cards (profile value wins).
 ASSESSMENT_FIELDS = ("quota_pool", "hosts", "domains", "context_window", "handoff_ratio", "max_concurrent",
-                     "roles_allowed", "roles_denied", "judgement", "night_ok", "measured", "evidence")
+                     "roles_allowed", "roles_denied", "judgement", "night_ok", "measured", "evidence", "unverified")
+# `unverified` names the fields whose value still lacks an outside fact (shown, never guessed).
+UNVERIFIABLE = ("model", "quota_pool", "hosts", "domains", "context_window", "handoff_ratio", "max_concurrent",
+                "roles_allowed", "roles_denied", "judgement", "night_ok")
 AGENT_ID_RE = re.compile(r"[a-z][a-z0-9-]{0,63}$")
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = PACKAGE_DIR.parent
@@ -57,6 +60,7 @@ class AgentCard:
     night_ok: Optional[bool] = None
     measured: Optional[Mapping[str, Any]] = field(default=None, compare=False, hash=False)
     evidence: Optional[str] = None
+    unverified: Optional[Tuple[str, ...]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -86,6 +90,7 @@ class ModelCard:
     night_ok: Optional[bool] = None
     measured: Optional[Mapping[str, Any]] = field(default=None, compare=False, hash=False)
     evidence: Optional[str] = None
+    unverified: Optional[Tuple[str, ...]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -210,6 +215,9 @@ def _assessment(data: Mapping[str, Any], path: Path) -> Dict[str, Any]:
     if evidence is not None and (not isinstance(evidence, str) or not evidence.strip()):
         raise AgentRegistryError("agent card %s evidence must be a non-empty string" % path)
     out = {name: _optional_list(data, name, path) for name in LIST_FIELDS}
+    unknown = sorted(set(out["unverified"] or ()) - set(UNVERIFIABLE))
+    if unknown:
+        raise AgentRegistryError("agent card %s unverified lists unknown fields: %s" % (path, ", ".join(unknown)))
     overlap = set(out["roles_allowed"] or ()).intersection(out["roles_denied"] or ())
     if overlap:
         raise AgentRegistryError("agent card %s lists roles both allowed and denied: %s"

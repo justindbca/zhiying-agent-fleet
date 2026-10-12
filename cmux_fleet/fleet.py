@@ -44,7 +44,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import contracts, handoff, history, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
+from cmux_fleet import contracts, handoff, history, model_usage, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -1071,6 +1071,13 @@ class Fleet:
             self.init_worker(name)
         for name in self.names:
             self.spawn_ready(name)
+        try:  # the fleet default is accepted as started; say when it is over a model card's ticket count
+            over = model_usage.over_cap(self.model_usage(), AgentRegistry())
+        except (AgentRegistryError, OSError):
+            over = []
+        if over:
+            self.log('capacity.over', level='warning', models=over,
+                     reason='card max_concurrent counts slots; later profile switches into these models wait')
         history.write_page(self.run_dir, self.history_slots())
         # One page: supervisor above history/control on the left, worker tabs on the right.
         self.history_pane = self.mgr.arrange(self.agent('supervisor')['pane'],
@@ -1591,12 +1598,16 @@ class Fleet:
             registry = AgentRegistry(registry_path)
             # Official Claude workers: prefer claude cards so a live switch never leaves the CLI
             # (v2 Codex supervisor + Claude workers rejects Pi/Codex workers). Pi/Codex fleets unchanged.
-            # Card hosts filter only when the operator named this machine (config 'host').
+            # Card hosts filter only when the operator named this machine (config 'host');
+            # max_concurrent counts the models the slots run now (a slot that already runs one is reused).
+            usage = self.model_usage(registry)
             plan = build_dispatch_plan(spec['goal'], registry,
                                        'claude' if self.cfg.get('worker_cli') == 'claude' else None,
-                                       host=self.cfg.get('host') or None)
+                                       host=self.cfg.get('host') or None,
+                                       occupancy=usage.for_planning(self.active_workers()))
             dispatch_plan = plan.to_dict()
-            profile_assignments = assign_profiles(plan, self.active_workers(), registry)
+            profile_assignments = assign_profiles(plan, self.active_workers(), registry,
+                                                  running={s: m for s, (_, m) in usage.slots.items()})
         task_id = 'task-' + uuid.uuid4().hex[:10]
         self.r.delete(TASK)
         fields = {'id': task_id, 'goal': spec['goal'], 'status': 'running', 'completion': 0,
@@ -1823,6 +1834,20 @@ class Fleet:
         self.setf(name, ctx_used=used, ctx_window=window)
         return used, window
 
+    def model_usage(self, registry=None):
+        """Which model each live worker slot runs (model_usage: one slot counts once, per model)."""
+        registry = registry or AgentRegistry(self.task().get('agent_registry') or None)
+        return model_usage.Usage.from_agents({w: self.agent(w) for w in self.workers}, self.cfg, registry)
+
+    def card_gate(self, name, card, registry):
+        """Before ``name`` starts a generation on ``card``: ('block', why) if this machine may never
+        run it, ('wait', why) while its model is at max_concurrent on other slots, else None."""
+        problem = model_usage.host_problem(card, self.cfg.get('host') or None)
+        if problem:
+            return 'block', problem
+        problem = self.model_usage(registry).admit(name, card)
+        return ('wait', problem) if problem else None
+
     def handoff_ratio(self, name):
         """The slot's profile card ratio (own or from its model card), else the fleet's --handoff-ratio."""
         profile = self.agent(name).get('runtime_profile')
@@ -1875,6 +1900,17 @@ class Fleet:
                         registry = AgentRegistry(self.task().get('agent_registry') or None)
                         launch = profile_launch.resolve_launch(registry.get(application.desired_profile), registry, self.cfg)
                         if application.state == 'switching':
+                            gate = self.card_gate(name, registry.get(application.desired_profile), registry)
+                            if gate and gate[0] == 'block':
+                                raise ValueError(gate[1])
+                            if gate:  # keep the message queued; retried every tick until a slot frees up
+                                if info.get('capacity_wait') != gate[1]:
+                                    self.log('profile.capacity_wait', agent=name,
+                                             profile=application.desired_profile, reason=gate[1])
+                                self.setf(name, profile_state='pending', profile_reason=gate[1], capacity_wait=gate[1])
+                                return
+                            if info.get('capacity_wait'):
+                                self.setf(name, capacity_wait='')
                             self.switch_profile(name, launch)
                             return  # never pop/deliver until this generation returns READY
                         if profile_launch.encode_launch(launch) != info.get('runtime_launch'):

@@ -24,5 +24,8 @@
   "judgement": "high",
   "night_ok": true,
   "measured": null,
-  "evidence": "design v2 §3（2026-10-13 初评）：R-WKF-033 约 28 个复核系列 1–2 轮 PASS，假 P0 1 例；能力上限 1M、预算 200K；fleet 监工零样本，Claude 监工适配层不存在（runtime_v2.py:40），夜间监工先补适配；CLI --model fable 未验（★2）。夜间只做监工或一次性会诊。不审自己写的方案。"
+  "evidence": "design v2 §3（2026-10-13 初评）：R-WKF-033 约 28 个复核系列 1–2 轮 PASS，假 P0 1 例；能力上限 1M、预算 200K；fleet 监工零样本，Claude 监工适配层不存在（runtime_v2.py:40），夜间监工先补适配；CLI --model fable 未验（★2）。夜间只做监工或一次性会诊。不审自己写的方案。 model=fable 未在 CLI 上验过 --model fable（★2，未核实）。",
+  "unverified": [
+    "model"
+  ]
 }

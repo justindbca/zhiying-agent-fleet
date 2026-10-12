@@ -76,8 +76,9 @@ def _excluded(card: AgentCard, host: Optional[str], role: Optional[str],
         if card.roles_allowed is not None and role not in card.roles_allowed:
             return "role %s not allowed" % role
     if occupancy is not None and card.max_concurrent is not None:
-        if int(occupancy.get(card.id, 0)) >= card.max_concurrent:
-            return "max_concurrent %d reached" % card.max_concurrent
+        key = card.model_card or card.id  # counted per model (model_usage.limit_key)
+        if int(occupancy.get(key, 0)) >= card.max_concurrent:
+            return "max_concurrent %d reached for model %s" % (card.max_concurrent, key)
     return None
 
 
@@ -104,8 +105,8 @@ def route_task(text: str, registry: Optional[AgentRegistry] = None, *,
     keywords do not affect eligibility or ranking. Omitting it preserves legacy routing.
     ``preferred_cli`` ranks cards on that CLI first among equally capable cards; None keeps legacy order.
     Filters (each None = off, the legacy behaviour): ``host`` keeps cards whose ``hosts`` include it;
-    ``role`` drops cards that deny it or whose ``roles_allowed`` omit it; ``occupancy`` ({profile id:
-    slots now running it}) drops cards at their ``max_concurrent``. Filtering happens before ranking.
+    ``role`` drops cards that deny it or whose ``roles_allowed`` omit it; ``occupancy`` ({model id:
+    slots that would hold it}, see model_usage.Usage.for_planning) drops cards at their ``max_concurrent``. Filtering happens before ranking.
     """
     registry = registry or AgentRegistry()
     hints = classify_task(text)

@@ -53,6 +53,7 @@ def write(directory, data, name='x.json'):
     ({'roles_allowed': ['a'], 'roles_denied': ['a']}, 'both allowed and denied'),
     ({'measured': [1]}, 'measured'), ({'evidence': ' '}, 'evidence'), ({'quota_pool': 3}, 'quota_pool'),
     ({'model_card': 'nope'}, 'model_card nope not found'),
+    ({'unverified': ['colour']}, 'unverified lists unknown fields: colour'),
 ])
 def test_bad_card_fields_are_rejected(tmp_path, extra, match):
     write(tmp_path, card(**extra))
@@ -141,3 +142,14 @@ def test_start_host_is_written_to_config_only_when_given(tmp_path, monkeypatch, 
         spawn_window=lambda *a, **k: SimpleNamespace(success=True)))
     fleet.main(args + extra)
     assert fleet.load(tmp_path / 'latest.json')['host'] == expected
+
+
+def test_fields_without_an_outside_fact_are_marked_unverified():
+    registry = AgentRegistry()
+    marked = {m.id: m.unverified for m in registry.models}
+    assert marked['sol'] == marked['astra'] == ('context_window',)
+    assert registry.model('sol').context_window is None  # left empty, not guessed
+    assert marked['fable'] == ('model',) and marked['haiku'] == ('judgement',)
+    assert marked['flashnext'] == ('hosts', 'roles_allowed')
+    assert registry.get('flashnext-coder').unverified == ('hosts', 'roles_allowed')  # inherited
+    assert marked['opus'] is None
