@@ -545,3 +545,17 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - **hold 出口**：槽位 held（uncertain / expired）时，若同一会话、同一代、由该投递打字开启的回合结束（Claude Stop / Codex notify 经 `tui_turn`），钩子发 `turn_ended`；daemon 校验身份后 `resolve_uncertain(cancelled, execution_stopped=True)`，槽位回 idle，结果**不采用**，暂停状态不动（审计 `hold.released`）。手打回合 / 旧代 / 未 held 的伪造事件一律拒绝。
 - **墙闸先于看门（集成时接上）**：`Watchdog.check` 抓屏后先调 E 的 `Fleet.wall_gate`（§23「E 先于 F」）；命中墙 → 本 tick 对该槽不按键、不 hold、不杀不换代。F、E 各自分支上都没接这一行，集成分支 integration/batch-20261013 补接（测试 `test_wall_on_screen_trips_the_brake_and_the_watchdog_presses_nothing`）。
 - 参数：`--stall-timeout`（原有，缺省 1800）、`--stall-grace`、`--stall-escapes`、`--prompt-table`；配置非法在 `validate_config` 拒绝。`walled`（墙文案）不在本项，归刹车（E）。
+
+## 25. 夜间切换：名单 profile 列 + `night on|off`（2026-10-13 用户新要求，feat/night-switch，开发中；集成分支 integration/batch-20261013 时由 §20 顺延为 §25）
+
+用户原话：「夜间模式切换的时候，把 Worker 的任务热载，当前的 Worker 卸载，然后根据从断点的地方，继续用 FlashNext 的免费版继续跑」。总设计 v2 § 4.13。本节在 §16 名单热加载、§17 断点续跑、§12 档案之上增加，不改 slot/generation 标识、一页布局、交接流程与 CLI 边界。
+
+- **名单 `profile` 列**：`workers: [{name, role?, profile?}]`，`profile` 是档案卡 id。启动 / 热加载时 daemon 解析卡（`profile_launch.resolve_launch`），并对该槽合并后的配置调 `runtime_v2.validate_config`（组合表入口，A 项接管后读 `cli_pairs.yaml`）；未知卡或组合被拒 → 整份名单拒收（§16 语义），一条不放宽。
+- **换模型 = 该槽下一代**：槽名不变（换名单名字会被「本 run 已用过」拒，切回日间就做不到）。`profile` 变了的槽：在途回合做完、空闲（无在途投递、空闲已确认）后，按交接同样的方式写机器骨架交接单、存屏、`launch_held` 起下一代（新卡的 CLI/模型）、`tab_into` 原位、关旧 tab、v2 `confirm_retired`；队列不出队，新代 READY 后照常投递。切换待办期间该槽不再接新投递。preflight 或关窗失败 → 按 §12 阻塞 task，不暗换。
+- **断点交底**：本次切换的槽全部 READY 后，给监工一条 `[Night switch <task>]` / `[Day switch <task>]`：各槽新标签与档案、产出已验 / 缺、已完成派发（与 §17 交底同一个 `RuntimeV2.progress()`）、留在槽上的排队指令（明说不要再派），「只补派缺的」。无 running task 时只记审计。
+- **触发**：`start --roster day.yaml --night-roster night.yaml`（两份名单槽名必须一致）；`cmux-fleet night on|off|status --config`：先校验两份名单，再原子写 `<run>/night.json`（即 /sleep 触发文件）。daemon 每拍读它决定跟哪份名单。监工不换（Fable 监工待 Claude 监工适配层）。
+- **刹车占位**：Redis `fx:night {on, brake_card: night|day, since}` + 审计 `night.on/off`；夜卡封顶的判定归刹车项（总设计 v2 2.5）。
+- **与 live profile 的关系**：task `apply_profiles_live` 生效时，名单换卡推迟到该 task 结束（审计 `roster.profile_deferred`），避免两套来源来回切。
+- **v2 按槽 CLI**：v2 运输里判断「官方 CLI 窗口 / Pi 桥」的地方改读该槽本代的配置（`runtime_cfg`），无 profile 的槽与原来完全相同。
+- **未验收**：只有 fake cmux / 真 Redis 回归；`codex+pi` 未被今天的矩阵放行（等 A 的组合表），真实日间 Opus → 夜间 FlashNext → 早上切回的整场验收（总设计 v2 § 4.13 验收句）未做。
+- **与 §22 换代阈值、§12 模型卡、§23 刹车的统一（集成时定）**：只有一套「按模型」机制——夜间切换只改该槽的 `profile`（即 `runtime_launch` 覆盖），不另带阈值；换代阈值在每次投递前由 §22 `handoff_limits` 按该槽**本代运行模型**重新解析（名单 worker 行 > 名单 `handoff:` 表 > config 表 > 档案卡 `handoff_ratio`（§12，3b 层）> 内置 / 旗标），所以切到 FlashNext 的槽自动用 FlashNext 卡的 0.5、切回 Opus 自动回 1M 窗口。`profile` 列与 §22 的 `window` / `handoff_ratio` 列、`handoff:` 表在**同一份名单、同一个解析器**（`roster.parse_entries` + `roster.handoff`）里校验，任一不合法整份拒收；daemon 跟哪份名单（日 / 夜，`night.json` 决定），就用那份名单的 `handoff:` 表。名单热加的新行：带 `profile` 的由 `night.resolve_launches`（C 在时含 `model_usage.check_slots`）计票，不带的由 C 的 `default_capacity_problem` 按缺省模型计票，同一行不重复计。E 的分池墙降档遇到被本节换过卡的槽作废（§23 `brake.downgrade_superseded`）；E 的夜间现金封顶读本节的 `fx:night.brake_card`。

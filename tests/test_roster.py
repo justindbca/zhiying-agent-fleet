@@ -158,7 +158,7 @@ def test_role_change_applies_at_next_generation_without_respawn(hot):
     ('workers:\n  - name: worker.2\n', 'no dots'),
     ('workers:\n  - name: supervisor\n', 'not be "supervisor"'),
     ('workers:\n  - {name: worker-1, role: nope.md}\n', 'role file not found: nope.md'),
-    ('workers:\n  - {name: worker-1, model: x}\n', 'optional "role", "window", "handoff_ratio" only'),
+    ('workers:\n  - {name: worker-1, model: x}\n', 'optional "role", "profile", "window", "handoff_ratio" only'),
     ('workers:\n  - {name: worker-1, handoff_ratio: 1.0}\n', 'workers[0]: handoff_ratio must be a number between 0 and 1'),
     ('workers:\n  - {name: worker-1, window: 0}\n', 'workers[0]: window must be a positive integer'),
     ('workers:\n  - {name: worker-1, window: true}\n', 'workers[0]: window must be a positive integer'),
@@ -166,6 +166,8 @@ def test_role_change_applies_at_next_generation_without_respawn(hot):
     ('workers:\n  - name: worker-1\nhandoff: {claude:opus: {window: 1.5}}\n', 'handoff[claude:opus]: window must be'),
     ('workers:\n  - name: worker-1\nhandoff: {gemini: {window: 10}}\n', 'handoff[gemini]: key must be'),
     ('workers:\n  - name: worker-1\nhandoff: {codex: {limit: 10}}\n', '"window" and/or "ratio" only'),
+    ('workers:\n  - {name: worker-1, profile: Bad_Id}\n', 'profile must be an agent card id'),
+    ('workers:\n  - {name: worker-1, profile: no-such-card}\n', 'worker-1: unknown agent profile no-such-card'),
     ('agents: []\n', 'only a "workers" list'),
 ])
 def test_invalid_roster_is_rejected_whole_and_roster_kept(hot, text, reason):

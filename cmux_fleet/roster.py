@@ -6,21 +6,31 @@
       - name: reentry
         window: 1000000       # optional handoff overrides for this worker (docs/design.md §22)
         handoff_ratio: 0.7
+        profile: flashnext-coder  # optional agent card id: this slot's next generation runs that card
     handoff:                  # optional: per CLI / CLI:model (exact runtime model string)
       claude:opus: {window: 1000000}
       codex: {ratio: 0.6}
 
 The daemon re-reads the file while running (hot add / graceful remove). A file with any
 problem is rejected as a whole, with one reason per problem; the running roster stays.
+A changed `profile` swaps that slot to its next generation once it is idle (same slot name,
+docs/design.md §25 night switch); the card itself is resolved and checked by the daemon.
 """
 import re
 from pathlib import Path
 
 NAME_RE = r'[a-z][a-z0-9-]{0,30}'  # same as fleet.WORKER_NAME_RE: no dots (dots mark generations)
+PROFILE_RE = r'[a-z][a-z0-9-]{0,63}'  # same as agent_registry.AGENT_ID_RE
 
 
 def parse(raw, base):
     """Return (workers, roles): ordered names and {name: absolute role path}. ValueError lists every problem."""
+    workers, roles, _ = parse_entries(raw, base)
+    return workers, roles
+
+
+def parse_entries(raw, base):
+    """Return (workers, roles, profiles); profiles is {name: agent card id} for rows that set one."""
     try:
         import yaml
     except ImportError as exc:
@@ -35,11 +45,11 @@ def parse(raw, base):
     parse_limits(data.get('limits'))
     if not data['workers']:
         raise ValueError('the roster needs at least one worker')
-    errors, workers, roles = handoff_errors(data), [], {}
+    errors, workers, roles, profiles = handoff_errors(data), [], {}, {}
     for i, item in enumerate(data['workers']):
         where = 'workers[' + str(i) + ']'
-        if not isinstance(item, dict) or not set(item) <= {'name', 'role'} | set(WORKER_HANDOFF) or 'name' not in item:
-            errors.append(where + ': must be a mapping with "name" and optional "role", "window", "handoff_ratio" only')
+        if not isinstance(item, dict) or not set(item) <= {'name', 'role', 'profile'} | set(WORKER_HANDOFF) or 'name' not in item:
+            errors.append(where + ': must be a mapping with "name" and optional "role", "profile", "window", "handoff_ratio" only')
             continue
         name = item['name']
         if not isinstance(name, str) or not re.fullmatch(NAME_RE, name) or name == 'supervisor':
@@ -49,6 +59,12 @@ def parse(raw, base):
             errors.append(where + ': duplicate worker name ' + name)
             continue
         workers.append(name)
+        if item.get('profile') is not None:
+            profile = item['profile']
+            if not isinstance(profile, str) or not re.fullmatch(PROFILE_RE, profile):
+                errors.append(where + ' (' + name + '): profile must be an agent card id matching ' + PROFILE_RE)
+                continue
+            profiles[name] = profile
         if item.get('role') is not None:
             role = item['role']
             path = (Path(base) / Path(role).expanduser()) if isinstance(role, str) and role.strip() else None
@@ -58,7 +74,7 @@ def parse(raw, base):
             roles[name] = str(path.resolve())
     if errors:
         raise ValueError('\n'.join(errors))
-    return workers, roles
+    return workers, roles, profiles
 
 
 CLIS = ('claude', 'codex', 'pi')
@@ -132,3 +148,8 @@ def load_limits(path):
 def load(path):
     path = Path(path).expanduser().resolve()
     return parse(path.read_bytes(), path.parent)
+
+
+def load_entries(path):
+    path = Path(path).expanduser().resolve()
+    return parse_entries(path.read_bytes(), path.parent)
