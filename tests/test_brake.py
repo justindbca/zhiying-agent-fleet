@@ -711,3 +711,39 @@ def test_v2_claude_startup_wall_then_resume_retries_the_same_launch(mixed):
     f.tick()
     assert f.agent('worker-2')['generation'] == '2' and f.agent('worker-2')['state'] == 'starting'
     assert answer_turn(f, 'worker-2', 'READY', startup=True)['status'] == 'ready'
+
+
+def test_account_wall_at_the_downgraded_startup_is_retried_after_resume(tmp_path):
+    f = make(tmp_path, {'goal': 'x'}, worker_cli='claude', worker_model='fable')
+    busy_worker(f)
+    f.handle(dict(turn('worker-1', REAL_FABLE_WALL), msg_id='m1'))
+    f.tick()  # downgrade: generation 1 starting on sonnet
+    f.handle(turn('worker-1', CLAUDE_ACCOUNT_WALL, generation=1))
+    assert f.agent('worker-1')['state'] == 'walled' and f.agent('worker-1')['wall_downgrade'] == ''
+    f.tick()
+    assert f.agent('worker-1')['generation'] == '1'
+    assert control(f, 'resume', 'c1')['status'] == 'accepted'
+    f.tick()
+    assert f.agent('worker-1')['generation'] == '2' and f.runtime_cfg('worker-1')['worker_model'] == 'claude-sonnet-5'
+
+
+def test_screen_trip_then_turn_trip_still_lifts_the_walls_own_pause(tmp_path):
+    f = make(tmp_path, {'goal': 'x'}, worker_cli='claude', worker_model='fable')
+    busy_worker(f)
+    assert f.wall_gate('worker-1', 'thinking\n⎿  You\'ve reached your Fable limit · resets 6pm')  # F screen first
+    f.handle(dict(turn('worker-1', REAL_FABLE_WALL), msg_id='m1'))  # then the turn text (another line)
+    f.tick()
+    f.handle(turn('worker-1', 'READY', generation=1))
+    f.tick()
+    assert not f.paused() and f.agent('worker-1')['generation'] == '1'
+
+
+def test_pending_downgrade_never_undoes_a_profile_swap(tmp_path):
+    f = make(tmp_path, {'goal': 'x'}, worker_cli='claude', worker_model='fable')
+    busy_worker(f)
+    f.handle(dict(turn('worker-1', REAL_FABLE_WALL), msg_id='m1'))
+    f.setf('worker-1', runtime_launch=json.dumps({'profile_id': 'flashnext-coder', 'role_text': '',
+                                                  'overrides': {'worker_cli': 'pi', 'pi_model': 'omlx/flashnext'}}))
+    f.tick()  # B's night swap got there first
+    assert f.agent('worker-1')['generation'] == '0' and f.agent('worker-1')['wall_downgrade'] == ''
+    assert any(json.loads(x)['kind'] == 'brake.downgrade_superseded' for x in f.r.lrange(fleet.LOG, 0, -1))

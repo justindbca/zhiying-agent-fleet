@@ -2365,6 +2365,9 @@ class Fleet:
         self.r.hset(BRAKE, mapping={'tripped': json.dumps(record, ensure_ascii=False)})
         if not self.paused():
             self.pause('brake: ' + reason)
+            # The pause this brake owns (the first trip's reason and agent): later trips overwrite `tripped`.
+            self.r.hset(BRAKE, mapping={'paused_by': json.dumps({'reason': 'brake: ' + reason, 'kind': kind,
+                                                                 'agent': detail.get('agent', '')})})
         self.log('brake.tripped', **{('brake' if k == 'kind' else k): v for k, v in record.items() if k != 'at'})
         return record
 
@@ -2405,6 +2408,7 @@ class Fleet:
             self.log('brake.raised', budget=budget)
         if tripped:
             self.r.hset(BRAKE, mapping={'tripped': ''})
+        self.r.hset(BRAKE, mapping={'paused_by': ''})
 
     def on_wall(self, name, text, source):
         """A wall on a turn text or a stalled screen: decide (downgrade / stop), record, pause."""
@@ -2421,6 +2425,8 @@ class Fleet:
             action = {'action': 'stop', 'cli': cli, 'from': model,
                       'advice': 'supervisor slot: no automatic downgrade; resume after the reset or restart it'}
         self.setf(name, wall=json.dumps(dict(wall, **action), ensure_ascii=False))
+        if action['action'] == 'stop' and name in self.workers:
+            self.setf(name, wall_downgrade='', wall_switch='')  # a stop wins over an earlier pending downgrade
         if action['action'] == 'downgrade':
             pending = json.loads(self.agent(name).get('wall_downgrade') or 'null')
             if not pending or pending.get('to') != action['to']:
@@ -2459,6 +2465,13 @@ class Fleet:
                     self.wall_switched(name, req)
                 continue
             in_flight = self.v2 and self.r.hget(self.v2.bus.lease_key(name), 'current_delivery')
+            current = self.runtime_cfg(name)
+            if req and (agent_cli(current, name) != req['cli'] or (current.get(req['key']) or '') != (req['from'] or '')):
+                # The slot already runs something else (B's roster / night swap, a live profile): never undo it.
+                self.setf(name, wall_downgrade='', wall_switch='')
+                self.log('brake.downgrade_superseded', agent=name, wanted=req, cli=agent_cli(current, name),
+                         model=current.get(req['key'], ''))
+                req = None
             if req and info.get('state') in ('idle', 'walled') and not in_flight:
                 launch = json.loads(info.get('runtime_launch') or '{}')
                 launch = {'profile_id': launch.get('profile_id') or 'wall-downgrade', 'role_text': launch.get('role_text', ''),
@@ -2471,9 +2484,9 @@ class Fleet:
 
     def wall_switched(self, name, req):
         self.setf(name, wall_downgrade='', wall_switch='')
-        tripped = json.loads(self.r.hget(BRAKE, 'tripped') or 'null') or {}
-        ours = (tripped.get('kind') == 'wall' and tripped.get('agent') == name
-                and self.r.hget(SERVICE, 'reason') == 'brake: ' + tripped.get('reason', ''))
+        owner = json.loads(self.r.hget(BRAKE, 'paused_by') or 'null') or {}
+        ours = (owner.get('kind') == 'wall' and owner.get('agent') == name
+                and self.r.hget(SERVICE, 'reason') == owner.get('reason'))
         budget = self.brake_budget()
         over = budget and brake.trips(self.brake_card(budget), brake.counters(
             self.r.hgetall(BRAKE), brake.read_quota(self.cfg.get('quota_file'))))
@@ -2481,7 +2494,7 @@ class Fleet:
                  resumed=bool(self.paused() and ours and not over))
         if self.paused() and ours and not over:
             # Only the wall's own pause: an operator pause, an F hold or a budget line keeps the fleet paused.
-            self.r.hset(BRAKE, mapping={'tripped': ''})
+            self.r.hset(BRAKE, mapping={'tripped': '', 'paused_by': ''})
             self.resume()
 
     def wall_rotate(self, name, launch, why):
