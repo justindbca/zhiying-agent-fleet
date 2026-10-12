@@ -46,8 +46,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import brake, cli_pairs, contracts, handoff, history, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, watchdog  # noqa: E402
-from cmux_fleet.agent_registry import AgentRegistry  # noqa: E402
+from cmux_fleet import brake, cli_pairs, contracts, handoff, history, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, watchdog  # noqa: E402
+from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
 from cmux_fleet.message_bus import BusError  # noqa: E402
@@ -1201,7 +1201,8 @@ class Fleet:
         # Fence old callbacks before touching shared role files or creating a successor.
         self.setf(name, state='starting', generation=generation + 1, label=label, prev_label=prev,
                   runtime_launch=profile_launch.encode_launch(launch), current_profile='', runtime_ready=0,
-                  runtime_profile='', profile_state='switching', launch_ready=0, retired_pane=old)
+                  runtime_profile='', profile_state='switching', launch_ready=0, retired_pane=old,
+                  retired_launch=info.get('runtime_launch') or '')
         self.r.hset(NAMES, mapping={label: name})
         new = None
         try:
@@ -1212,7 +1213,7 @@ class Fleet:
                 raise RuntimeError('could not place successor in the worker pane')
             if not self.mgr.kill_pane(old) or self.mgr.get_pane_status(old) is not None:
                 raise RuntimeError('could not confirm retirement of old runtime ' + prev)
-            self.setf(name, retired_pane='', launch_ready=1)
+            self.setf(name, retired_pane='', retired_launch='', launch_ready=1)
             self.refresh_history()
             self.log('profile.switch', agent=name, label=label, generation=generation + 1,
                      profile=launch['profile_id'], cli=launch['overrides']['worker_cli'])
@@ -1222,12 +1223,26 @@ class Fleet:
             new = new or self.agent(name).get('pane')
             if new == old:
                 new = None
+            cleaned = True
             if new:
                 try:
                     if not self.mgr.kill_pane(new):
+                        cleaned = False
                         self.log('profile.cleanup_failed', agent=name, pane=new)
                 except Exception as cleanup:
+                    cleaned = False
                     self.log('profile.cleanup_failed', agent=name, pane=new, reason=str(cleanup))
+            # Roll back the reservation (model_usage): with the new tab gone the slot holds only what
+            # its old generation runs, and only while that tab is still alive. A new tab that could
+            # not be closed keeps holding the new model.
+            if cleaned:
+                self.setf(name, runtime_launch=info.get('runtime_launch') or '')
+            try:
+                gone = self.mgr.get_pane_status(old) is None
+            except Exception:
+                gone = False
+            if gone:
+                self.setf(name, retired_pane='', retired_launch='')
             self.block_profile(name, 'profile switch failed: ' + str(exc), dead=True)
 
     def workspace(self):
@@ -1333,6 +1348,13 @@ class Fleet:
             self.init_worker(name)
         for name in self.names:
             self.spawn_ready(name)
+        try:  # the fleet default is accepted as started; say when it is over a model card's ticket count
+            over = model_usage.over_cap(self.model_usage(), AgentRegistry())
+        except (AgentRegistryError, OSError):
+            over = []
+        if over:
+            self.log('capacity.over', level='warning', models=over,
+                     reason='card max_concurrent counts slots; later profile switches into these models wait')
         history.write_page(self.run_dir, self.history_slots())
         # One page: supervisor above history/control on the left, worker tabs on the right.
         self.history_pane = self.mgr.arrange(self.agent('supervisor')['pane'],
@@ -2199,10 +2221,16 @@ class Fleet:
             registry = AgentRegistry(registry_path)
             # Official Claude workers: prefer claude cards so a live switch never leaves the CLI
             # (v2 Codex supervisor + Claude workers rejects Pi/Codex workers). Pi/Codex fleets unchanged.
+            # Card hosts filter only when the operator named this machine (config 'host');
+            # max_concurrent counts the models the slots run now (a slot that already runs one is reused).
+            usage = self.model_usage(registry)
             plan = build_dispatch_plan(spec['goal'], registry,
-                                       'claude' if self.cfg.get('worker_cli') == 'claude' else None)
+                                       'claude' if self.cfg.get('worker_cli') == 'claude' else None,
+                                       host=self.cfg.get('host') or None,
+                                       occupancy=usage.for_planning(self.active_workers()))
             dispatch_plan = plan.to_dict()
-            profile_assignments = assign_profiles(plan, self.active_workers(), registry)
+            profile_assignments = assign_profiles(plan, self.active_workers(), registry,
+                                                  running={s: m for s, (_, m) in usage.slots.items()})
         task_id = 'task-' + uuid.uuid4().hex[:10]
         self.r.delete(TASK)
         fields = {'id': task_id, 'goal': spec['goal'], 'status': 'running', 'completion': 0,
@@ -2459,6 +2487,45 @@ class Fleet:
         self.setf(name, ctx_used=used, ctx_window=window)
         return used, window
 
+    def model_usage(self, registry=None):
+        """Which models each worker slot holds (model_usage: one slot counts once per model; a tab
+        still alive keeps its model, also an old generation's or a dead slot's)."""
+        registry = registry or AgentRegistry(self.task().get('agent_registry') or None)
+
+        def alive(pane):
+            try:
+                return self.mgr.get_pane_status(pane) is not None
+            except Exception:
+                return True  # unknown: keep holding rather than free a ticket early
+        return model_usage.Usage.from_agents({w: self.agent(w) for w in self.workers}, self.cfg, registry,
+                                             alive=alive)
+
+    def card_gate(self, name, card, registry):
+        """Before ``name`` starts a generation on ``card`` (None = the fleet default runtime):
+        ('block', why) if this machine may never run it, ('wait', why) while its model is at
+        max_concurrent on other slots, else None. An unmapped default is not capped."""
+        if card is None:
+            card = model_usage.default_card(self.cfg, registry)
+            if card is None:
+                return None
+        problem = model_usage.host_problem(card, self.cfg.get('host') or None)
+        if problem:
+            return 'block', problem
+        problem = self.model_usage(registry).admit(name, card)
+        return ('wait', problem) if problem else None
+
+    def handoff_ratio(self, name):
+        """The slot's profile card ratio (own or from its model card), else the fleet's --handoff-ratio."""
+        profile = self.agent(name).get('runtime_profile')
+        if profile:
+            try:
+                card = AgentRegistry(self.task().get('agent_registry') or None).get(profile)
+            except (AgentRegistryError, KeyError, OSError):
+                card = None
+            if card is not None and card.handoff_ratio is not None:
+                return card.handoff_ratio
+        return float(self.cfg['handoff_ratio'])
+
     def deliver(self, name):
         info = self.agent(name)
         if info.get('state') != 'idle':
@@ -2499,6 +2566,17 @@ class Fleet:
                         registry = AgentRegistry(self.task().get('agent_registry') or None)
                         launch = profile_launch.resolve_launch(registry.get(application.desired_profile), registry, self.cfg)
                         if application.state == 'switching':
+                            gate = self.card_gate(name, registry.get(application.desired_profile), registry)
+                            if gate and gate[0] == 'block':
+                                raise ValueError(gate[1])
+                            if gate:  # keep the message queued; retried every tick until a slot frees up
+                                if info.get('capacity_wait') != gate[1]:
+                                    self.log('profile.capacity_wait', agent=name,
+                                             profile=application.desired_profile, reason=gate[1])
+                                self.setf(name, profile_state='pending', profile_reason=gate[1], capacity_wait=gate[1])
+                                return
+                            if info.get('capacity_wait'):
+                                self.setf(name, capacity_wait='')
                             self.switch_profile(name, launch)
                             return  # never pop/deliver until this generation returns READY
                         if profile_launch.encode_launch(launch) != info.get('runtime_launch'):
@@ -2640,12 +2718,13 @@ class Fleet:
         placed = self.mgr.tab_into(new, old)  # the successor takes the retiring session's place on the page
         if (self.v2 and not placed) or not self.mgr.kill_pane(old) or (self.v2 and self.mgr.get_pane_status(old) is not None):
             if self.v2:
-                self.setf(name, state='dead', launch_ready=0, retired_pane=old)
+                self.setf(name, state='dead', launch_ready=0, retired_pane=old,
+                          retired_launch=self.agent(name).get('runtime_launch') or '')  # same launch: same model
             self.finish('blocked', 'could not close the old session ' + prev + '; two sessions hold slot ' + name)
             return
         if self.v2:
             self.v2.confirm_retired(name)
-            self.setf(name, launch_ready=1, retired_pane='')
+            self.setf(name, launch_ready=1, retired_pane='', retired_launch='')
         self.refresh_history()
         self.log('rotate.done', agent=name, label=label, prev=prev, generation=generation + 1,
                  handoff=str(out), source=source, timed_out=timed_out)
@@ -2698,6 +2777,11 @@ class Fleet:
                     and (self.r.exists(key('agent', n)) or (self.workspace() / n).exists())]
             if used:
                 raise ValueError('\n'.join(used))
+            adds = [n for n in workers if n not in self.workers]
+            if adds:  # added rows run the fleet default: its model card caps them with the live slots
+                problem = self.default_capacity_problem(adds)
+                if problem:
+                    raise ValueError(problem)
         except ValueError as exc:
             self.log('roster.rejected', level='error', path=str(path), errors=str(exc).split('\n'),
                      kept=self.desired)
@@ -2736,6 +2820,18 @@ class Fleet:
         for name in self.names:  # status shows the effective values without waiting for a delivery
             if self.agent(name):
                 self.handoff_limits(name)
+
+    def default_capacity_problem(self, adds):
+        """None if new default slots ``adds`` fit the default model's card next to the live slots."""
+        try:
+            registry = AgentRegistry(self.task().get('agent_registry') or None)
+        except (AgentRegistryError, OSError) as exc:
+            return 'cannot read agent cards to check the default model: ' + str(exc)
+        key = model_usage.default_model(self.cfg, registry)
+        if key is None:
+            return None
+        usage = self.model_usage(registry)
+        return model_usage.default_problem(self.cfg, sorted(set(usage.holders(key)) | set(adds)), registry)
 
     def persist_roster(self):
         self.cfg['workers'][:] = self.workers  # in place: the control view holds this list
@@ -3443,6 +3539,18 @@ def start(args):
         initiator = lifecycle_close.initiator_for_start(getattr(args, 'initiator', None))
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    # A start without profiles runs every worker on the fleet default: its model card caps it too.
+    try:
+        problem = model_usage.default_problem(
+            {'worker_cli': args.worker_cli, 'worker_model': args.worker_model, 'pi_model': args.pi_model,
+             'host': args.host.strip().lower() if args.host and args.host.strip() else None},
+            workers if roster_path else (args.worker_names.split(',') if args.worker_names else
+                                         ['worker-' + str(i + 1) for i in range(max(1, args.workers or 1))]),
+            AgentRegistry())
+    except (AgentRegistryError, OSError) as exc:
+        raise SystemExit('cannot read agent cards: ' + str(exc)) from exc
+    if problem:
+        raise SystemExit(problem)
     if not cmux_available():
         raise SystemExit('run this inside a cmux terminal: cmux only accepts processes started in its windows')
     clis = {args.supervisor_cli, args.worker_cli}
@@ -3506,6 +3614,7 @@ def start(args):
            'worker_model': args.worker_model, 'worker_kit': args.worker_kit,
            'supervisor_model': args.supervisor_model,
            'claude': args.claude or shutil.which('claude'), 'claude_window': args.claude_window,
+           'host': args.host.strip().lower() if args.host and args.host.strip() else None,
            'supervisor_cli': args.supervisor_cli, 'pi': pi, 'pi_model': args.pi_model,
            'pi_thinking': args.pi_thinking, 'allow_unsandboxed_pi': args.allow_unsandboxed_pi,
            'pi_agent_dir': args.pi_agent_dir, 'allow_profile_live_switch': args.allow_profile_live_switch,
@@ -3652,6 +3761,8 @@ def main(argv=None):
     s.add_argument('--lifecycle', metavar='MODE',
                    help='required: ' + ' | '.join(lifecycle.MODE_NAMES) + ' (config/fleet_modes.yaml); '
                         'decides what done means, how the run is closed, and --mode')
+    s.add_argument('--host', default=None,
+                   help='this machine for agent-card hosts (e.g. studio); unset = cards are not filtered by host')
     s.add_argument('--mode', choices=('task', 'service'), default=None,
                    help='transport mode, derived from --lifecycle (base); passing a different one is refused')
     s.add_argument('--worker-names', help='comma-separated worker names (default worker-1..N), e.g. exit,reentry,rung')

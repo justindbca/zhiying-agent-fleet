@@ -1,0 +1,27 @@
+{
+  "id": "sol",
+  "display_name": "Codex Sol",
+  "cli": "codex",
+  "model": "gpt-6.1-sol",
+  "quota_pool": "codex",
+  "hosts": null,
+  "domains": null,
+  "context_window": null,
+  "handoff_ratio": null,
+  "max_concurrent": 1,
+  "roles_allowed": [
+    "supervisor",
+    "reviewer",
+    "researcher"
+  ],
+  "roles_denied": [
+    "plan-reviewer"
+  ],
+  "judgement": "high",
+  "night_ok": true,
+  "measured": null,
+  "evidence": "design v2 §3（2026-10-13 初评）：R-WKF-033 约 20 个系列；板块轮动定时研究监工 10/7 起稳定；代码验收首轮、两轮内修复复审；第 3 轮以后钻边角；方案审样本少。上下文未核实（Codex 界面值 400K）。reasoning high。",
+  "unverified": [
+    "context_window"
+  ]
+}

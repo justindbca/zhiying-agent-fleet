@@ -377,6 +377,16 @@ def test_usage_over_ratio_rotates_before_delivery_and_drops_stale(fx):
     assert 'write a test report' in last_to(fx, 'supervisor') and fx.agent('supervisor')['state'] == 'busy'
 
 
+@pytest.mark.parametrize('profile,state', [('', 'busy'), ('flashnext-coder', 'handoff')])
+def test_handoff_ratio_comes_from_the_running_profile_card(fx, profile, state):
+    # 50k of 95k = 0.53: under the fleet's 0.6, over the FlashNext card's 0.5 (design.md §12 model cards)
+    seasoned(fx, 'supervisor')
+    fx.setf('supervisor', runtime_profile=profile)
+    write_rollout(fx.sessions, THREADS['supervisor'], fleet.agent_cwd(fx.cfg, 'supervisor'), used=50000)
+    fx.pump()
+    assert fx.agent('supervisor')['state'] == state
+
+
 def test_window_comes_from_rollout_not_config(fx):
     cwd = fleet.agent_cwd(fx.cfg, 'supervisor')
     write_rollout(fx.sessions, THREADS['supervisor'], cwd, used=60000, window=400000)  # 15% of a 400k model

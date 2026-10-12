@@ -1,0 +1,36 @@
+{
+  "id": "flashnext",
+  "display_name": "FlashNext (Qwen3.8 Flash Next)",
+  "cli": "pi",
+  "model": "flashnext/Qwen3.8-Flash-Next-Uncensored-oQ4e-100K-MTP",
+  "quota_pool": "free-studio",
+  "hosts": [
+    "studio"
+  ],
+  "domains": [
+    "futures",
+    "fleet"
+  ],
+  "context_window": 100000,
+  "handoff_ratio": 0.5,
+  "max_concurrent": 2,
+  "roles_allowed": [
+    "implementer",
+    "material",
+    "proposal-expert",
+    "reconciler"
+  ],
+  "roles_denied": [
+    "supervisor",
+    "reviewer",
+    "final-writer"
+  ],
+  "judgement": "low-mid",
+  "night_ok": true,
+  "measured": null,
+  "evidence": "design v2 §3（2026-10-13 初评）：memory flashnext-fleet-20260925、cmux-fleet-service-mode（Studio 三 agent READY、换代通过）；夜间 worker 缺省（用户 10/13）；机械实现待影子验证（批 3.2）；空回复会被当成功（E15），READY 都会跑偏（E14）；oMLX 预填充闸 2 票（E15 E19）；只在 Studio；美股代码不碰（T-36 / ★10 缺省）；skills.include_instructions=false 必带。 implementer 在 roles_allowed 只是现状（已部署的 pi 路由与「夜间 worker 全部 FlashNext」）；总设计 §5 批 3.2 要求影子验证通过前先列 roles_denied，两处矛盾，待拍板，未核实。hosts 的 studio 是机器叫法，Studio 的真实主机名未核实。",
+  "unverified": [
+    "hosts",
+    "roles_allowed"
+  ]
+}

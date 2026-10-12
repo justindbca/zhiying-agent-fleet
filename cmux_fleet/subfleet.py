@@ -182,6 +182,16 @@ def check(f, slot, task_id, workers, ready=True):
                 + ' agents, ' + str(workers) + ' more would exceed it')
     if slot not in f.active_workers():
         return slot + ' is not an active worker of this fleet'
+    # The child's workers run this fleet's default worker runtime: its model card caps them (per fleet).
+    try:
+        from cmux_fleet import model_usage
+        from cmux_fleet.agent_registry import AgentRegistry
+        problem = model_usage.default_problem(f.cfg, ['worker-' + str(i + 1) for i in range(workers)],
+                                              AgentRegistry())
+    except Exception as exc:  # unreadable cards: refuse rather than start uncapped
+        problem = 'cannot read agent cards: ' + str(exc)
+    if problem:
+        return problem
     cli = fleet.agent_cli(f.runtime_cfg(slot), slot)
     if cli == 'pi':
         return ('pi worker panes cannot be handed over: the Pi bridge is bound to this fleet\'s Redis '

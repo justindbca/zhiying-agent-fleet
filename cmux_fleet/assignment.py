@@ -14,6 +14,7 @@ def assign_profiles(
         plan: DispatchPlan,
         workers: Sequence[str],
         registry: Optional[AgentRegistry] = None,
+        running: Optional[Dict[str, Optional[str]]] = None,
 ) -> Dict[str, Any]:
     """Map planned profile recommendations onto stable worker slots.
 
@@ -21,6 +22,10 @@ def assign_profiles(
     later profiles reuse workers round-robin.  Repeated uses of one profile stay
     on its first assigned worker.  Dependencies are copied as metadata and are
     deliberately not executed here.
+
+    ``running`` ({slot: model id it runs now}, model_usage) lets a new profile take a free slot
+    that already runs its model first (same-slot reuse: no extra max_concurrent ticket). None keeps
+    the plain order. Needs ``registry`` to know each profile's model.
     """
     if isinstance(workers, (str, bytes)):
         raise ValueError("workers must be a non-empty list of stable slot names")
@@ -51,10 +56,15 @@ def assign_profiles(
     by_profile = {}
     next_slot = 0
     assignments = []
+    order = list(slots)
     for subtask in plan.subtasks:
         worker = by_profile.get(subtask.agent_id)
         if worker is None:
-            worker = slots[next_slot % len(slots)]
+            worker = _reuse(subtask.agent_id, order[next_slot:], running, registry)
+            if worker is not None:
+                order.remove(worker)
+                order.insert(next_slot, worker)
+            worker = order[next_slot % len(order)]
             by_profile[subtask.agent_id] = worker
             next_slot += 1
         assignments.append({
@@ -65,3 +75,15 @@ def assign_profiles(
             "depends_on": list(subtask.depends_on),
         })
     return {"assignments": assignments}
+
+
+def _reuse(profile_id, free, running, registry):
+    """A not yet assigned slot already running this profile's model, if any."""
+    if not running or registry is None:
+        return None
+    from cmux_fleet.model_usage import limit_key
+    try:
+        key = limit_key(registry.get(profile_id))
+    except KeyError:
+        return None
+    return next((slot for slot in free if running.get(slot) == key), None)
