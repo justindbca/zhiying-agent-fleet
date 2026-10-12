@@ -2540,12 +2540,16 @@ def start(args):
             return
     if args.transport_version != 2:
         raise SystemExit('new fleet instances require Redis transport v2; v1 is only readable for existing runs')
-    if getattr(args, 'supervisor_cli', None) is None or getattr(args, 'worker_cli', None) is None:
-        # A new run without an explicit CLI takes the pair table's default combination; the
-        # config written below always names both CLIs (the codex fallback is for old configs only).
-        default = cli_pairs.load_pairs().default
-        args.supervisor_cli = getattr(args, 'supervisor_cli', None) or default['supervisor_cli']
-        args.worker_cli = getattr(args, 'worker_cli', None) or default['worker_cli']
+    # A new run without an explicit CLI takes the pair table's default combination (codex+claude,
+    # Codex supervisor on the table's profile, e.g. fleet-astra); the config written below always
+    # names both CLIs, so the codex fallback in pair_problem only serves old configs.
+    default = cli_pairs.load_pairs().default
+    args.supervisor_cli = getattr(args, 'supervisor_cli', None) or default.get('supervisor_cli') or 'codex'
+    args.worker_cli = getattr(args, 'worker_cli', None) or default.get('worker_cli') or 'codex'
+    if (args.supervisor_cli == 'codex' and default.get('supervisor_profile')
+            and not getattr(args, 'supervisor_profile', None) and not getattr(args, 'profile', None)):
+        args.supervisor_profile = default['supervisor_profile']
+    args.profile = getattr(args, 'profile', None) or DEFAULTS['profile']
     lifecycle_problem = None
     try:  # --lifecycle decides cfg['mode'] (its base) before the CLI-pair check reads both keys
         args.lifecycle, args.mode = lifecycle.resolve_start(getattr(args, 'lifecycle', None), getattr(args, 'mode', None))
@@ -2723,7 +2727,9 @@ def main(argv=None):
                    help='new runs require Redis v2; existing v1 runs must be drained and replaced, not hot-flipped')
     s.add_argument('--allow-development-v2', action='store_true',
                    help='opt into incomplete v2 acceptance; no production-readiness claim')
-    s.add_argument('--profile', default=DEFAULTS['profile'], help='codex config profile for every agent (default: fleet)')
+    s.add_argument('--profile', default=None,
+                   help='codex config profile for every agent (default: fleet; the supervisor takes '
+                        'cli_pairs.yaml default.supervisor_profile unless --profile/--supervisor-profile is given)')
     s.add_argument('--codex', help='codex binary (default: first on PATH)')
     s.add_argument('--redis-server', help='redis-server binary (default: first on PATH)')
     s.add_argument('--redis-runtime-dir', default=str(redis_runtime.DEFAULT_ROOT),

@@ -21,6 +21,8 @@ class PairTable:
         if not isinstance(data, dict) or data.get('version') != 1:
             raise ValueError(f'{path}: cli pair table needs version: 1')
         self.default = dict(data.get('default') or {})
+        if not isinstance(self.default.get('supervisor_profile', ''), str):
+            raise ValueError(f'{path}: default.supervisor_profile must be a Codex profile name')
         self.rows = {}
         for row in data.get('pairs') or []:
             key = (row.get('supervisor_cli'), row.get('worker_cli'), row.get('mode'))

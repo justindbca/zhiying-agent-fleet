@@ -7,7 +7,7 @@
 #   reason: the refusal text shown to the user (unverified / forbidden / adapter_missing rows)
 # Exception kept in code: claude+claude task with cfg adopt (docs/design.md §19 sub-fleet).
 version: 1
-default: {supervisor_cli: codex, worker_cli: claude, mode: task}
+default: {supervisor_cli: codex, worker_cli: claude, mode: task, supervisor_profile: fleet-astra}  # start fills unset --supervisor-cli/--worker-cli (and the Codex supervisor profile) from here
 pairs:
   - {supervisor_cli: pi, worker_cli: pi, mode: task, status: verified, adapter_missing: [],
      verified_by: "design.md §11 §14", notes: "all-Pi bridge"}

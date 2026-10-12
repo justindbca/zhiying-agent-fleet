@@ -22,7 +22,8 @@ def row(sup, wrk, mode, status='verified', missing=(), **extra):
 
 def test_shipped_table_rows_and_default():
     table = cli_pairs.load_pairs()
-    assert table.default == {'supervisor_cli': 'codex', 'worker_cli': 'claude', 'mode': 'task'}
+    assert table.default == {'supervisor_cli': 'codex', 'worker_cli': 'claude', 'mode': 'task',
+                             'supervisor_profile': 'fleet-astra'}
     assert table.lookup('codex', 'claude', 'task')['status'] == 'verified'
     for mode in ('task', 'service'):
         assert table.lookup('pi', 'pi', mode)['status'] == 'verified'

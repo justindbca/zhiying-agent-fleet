@@ -16,13 +16,18 @@ class Reached(Exception):
     pass
 
 
+profiles = []  # (supervisor_profile, profile) per start, filled by capture_start
+
+
 def capture_start(monkeypatch):
     """Run the real start argument path up to provisioning; return the cfgs the pair check saw."""
     seen = []
+    profiles.clear()
     real = runtime_v2.v2_cli_problem
 
     def check(cfg):
         seen.append({k: cfg.get(k) for k in ('supervisor_cli', 'worker_cli', 'mode', 'lifecycle')})
+        profiles.append((cfg.get('supervisor_profile'), cfg.get('profile')))
         return real(cfg)
     monkeypatch.setattr(runtime_v2, 'v2_cli_problem', check)
 
@@ -67,6 +72,35 @@ def test_one_explicit_cli_fills_only_the_other_from_default(monkeypatch):
     with pytest.raises(SystemExit, match='adapter|unverified|smoke'):
         fleet.main(['start', '--lifecycle', 'dev_task', '--supervisor-cli', 'claude', '--allow-development-v2'])
     assert (seen[0]['supervisor_cli'], seen[0]['worker_cli']) == ('claude', 'claude')
+
+
+@pytest.mark.parametrize('extra,expected', [
+    ([], ('fleet-astra', 'fleet')),                                   # table default: Astra supervisor
+    (['--supervisor-profile', 'mine'], ('mine', 'fleet')),             # explicit supervisor profile wins
+    (['--profile', 'shared'], (None, 'shared')),                       # explicit shared profile wins
+])
+def test_codex_supervisor_profile_comes_from_table_default(monkeypatch, extra, expected):
+    capture_start(monkeypatch)
+    with pytest.raises(Reached):
+        fleet.main(['start', '--lifecycle', 'dev_task', '--allow-development-v2'] + extra)
+    assert profiles == [expected]
+
+
+def test_non_codex_supervisor_gets_no_codex_profile(monkeypatch):
+    capture_start(monkeypatch)
+    with pytest.raises(Reached):
+        fleet.main(['start', '--lifecycle', 'dev_task', '--supervisor-cli', 'pi', '--worker-cli', 'pi',
+                    '--allow-development-v2', '--allow-unsandboxed-pi'])
+    assert profiles == [(None, 'fleet')]
+
+
+def test_default_supervisor_profile_must_be_a_name(tmp_path):
+    table = yaml.safe_load(cli_pairs.DEFAULT_PATH.read_text())
+    table['default']['supervisor_profile'] = 5
+    path = tmp_path / 'cli_pairs.yaml'
+    path.write_text(yaml.safe_dump(table))
+    with pytest.raises(ValueError, match='supervisor_profile'):
+        cli_pairs.load_pairs(path)
 
 
 # ------------------------------------------------------------------ smoke on task and service
