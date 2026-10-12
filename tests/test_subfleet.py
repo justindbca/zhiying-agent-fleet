@@ -342,7 +342,10 @@ def test_worker_pane_becomes_subfleet_supervisor_and_comes_back(tree):
     assert f.agent('worker-1')['state'] == 'delegated'
     step(t)
     task_msg = [x for p, x in t.world.sent if p == sid][-1]
-    assert 'Research five sources and merge them' in task_msg and str(out) in task_msg
+    assert 'Research five sources and merge them' in task_msg
+    # §23: the child writes the deliverable inside its own workspace, never the parent's path
+    inside = Path(rec['run']) / 'workspace' / 'worker-1' / 'm0.md'
+    assert rec['deliver'] == [[str(inside), str(out)]] and str(inside) in task_msg and str(out) not in task_msg
     decision = json.dumps({'status': 'RUNNING', 'completion': 10, 'reason': 'split', 'dispatch': [
         {'to': w, 'instruction': 'Write ' + w + '/part.md with two sources each'} for w in cf.workers]})
     assert parent_hook(t, decision, task_msg)['status'] == 'committed'
@@ -351,7 +354,8 @@ def test_worker_pane_becomes_subfleet_supervisor_and_comes_back(tree):
         assert any('part.md' in x for p, x in t.world.sent if p == cf.agent(w)['pane'])
     assert not any('part.md' in x for p, x in t.world.sent if p == f.agent('worker-2')['pane'])
     # the sub-fleet finishes: deliverable written, task completed, result.json written
-    out.write_text('merged findings')
+    inside.parent.mkdir(parents=True, exist_ok=True)
+    inside.write_text('merged findings')
     cf.v2.finish('completed', 'all parts merged')
     cf.write_result()
     subfleet.tick(f)  # parent sees result.json and asks the child to stop
@@ -362,6 +366,7 @@ def test_worker_pane_becomes_subfleet_supervisor_and_comes_back(tree):
     subfleet.tick(f)  # parent collects: pane back in place of the placeholder, child tabs closed
     rec = subfleet.record(rec['run'])
     assert rec['state'] == 'returned' and rec['outcome'] == 'completed'
+    assert out.read_text() == 'merged findings'  # the parent daemon copied it back before checking
     assert t.world.owner[sid] == 'cmux-fleet' and rec['placeholder'] not in t.world.alive
     assert 'cmux-fleet:M0' in t.world.closed and redis_down(child_cfg)
     assert (fleet.agent_cwd(f.cfg, 'worker-1') / 'CLAUDE.md').read_text() == worker_rules

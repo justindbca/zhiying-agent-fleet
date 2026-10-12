@@ -17,8 +17,9 @@ which only writes a request file; ``check`` gives the limit verdict synchronousl
 
 Internal API
   check(fleet, slot, task_id, workers, ready=True) -> None | reason   (ready=False: limits only, not the slot state)
-  request(run_dir, slot, task_id, goal, workers, output=None, proposal=None, contracts=False) -> request id
-  spawn_child(fleet, slot, task_id, goal, workers, output=None, proposal=None, launch=None, contracts=False) -> record
+  request(run_dir, slot, task_id, goal, workers, output=None, proposal=None, contracts=False, outputs=None) -> request id
+  spawn_child(fleet, slot, task_id, goal, workers, output=None, proposal=None, launch=None, contracts=False,
+              outputs=None) -> record   (outputs: parent paths; the child writes them in its own workspace)
   tick(fleet)                    parent daemon loop: requests, completion, return of the pane
   stop_children(fleet)           explicit stop / tree stop (blocking; descendants first)
   resume_children(fleet)         root --resume: relaunch children that were running
@@ -212,14 +213,14 @@ def check(f, slot, task_id, workers, ready=True):
 
 
 # ------------------------------------------------------------------ requests (transaction-safe)
-def request(run_dir, slot, task_id, goal, workers, output=None, proposal=None, contracts=False):
+def request(run_dir, slot, task_id, goal, workers, output=None, proposal=None, contracts=False, outputs=None):
     """Queue a spawn for the fleet's next tick. Writes one file; no other side effect."""
     rid = 'sf-' + uuid.uuid4().hex[:12]
     folder = Path(run_dir) / 'subfleet-requests'
     folder.mkdir(parents=True, exist_ok=True)
     _fleet().save(folder / (rid + '.json'), {'id': rid, 'slot': slot, 'task_id': task_id, 'goal': goal,
                                              'workers': workers, 'output': output, 'proposal': proposal,
-                                             'contracts': bool(contracts)})
+                                             'contracts': bool(contracts), 'outputs': outputs})
     return rid
 
 
@@ -239,7 +240,7 @@ def process_requests(f):
             spec = fleet.load(path)
             rec = spawn_child(f, spec['slot'], spec['task_id'], spec['goal'], spec['workers'],
                               output=spec.get('output'), proposal=spec.get('proposal'),
-                              contracts=spec.get('contracts', False))
+                              contracts=spec.get('contracts', False), outputs=spec.get('outputs'))
             answer = {'status': 'accepted', 'run': rec['run'], 'task_id': rec['task_id']}
         except Refused as exc:
             answer = {'status': 'rejected', 'reason': str(exc)}
@@ -269,15 +270,50 @@ def child_config(f, slot, task_id, workers, rec_dir, sid, info, redis_cfg, name)
     return cfg
 
 
-def goal_text(goal, task_id, output, proposal, parent_label):
+def deliverables(parent_ws, slot, child_ws, outputs):
+    """[[child path, parent path]] for the parent's deliverables of a sub-fleet.
+
+    The child never writes outside its own workspace (its rules, the dispatch suffix): each parent
+    path ``<parent ws>/<slot>/<rest>`` becomes ``<child ws>/worker-1/<rest>`` (worker-1 always exists;
+    any other path: worker-1/<file name>). ``collect`` copies them back before the parent checks."""
+    out = []
+    for p in outputs or []:
+        p = Path(p)
+        try:
+            rest = p.relative_to(Path(parent_ws) / slot)
+        except ValueError:
+            rest = Path(p.name)
+        out.append([str(Path(child_ws) / 'worker-1' / rest), str(p)])
+    return out
+
+
+def goal_text(goal, task_id, deliver, proposal, parent_label):
     text = ('Sub-fleet ' + task_id + ' (delegated by ' + parent_label + '). Original instruction:\n' + goal)
     if proposal:
         text += '\nApproved split (dispatch these to your workers): ' + json.dumps(proposal, ensure_ascii=False)
-    if output:
-        text += ('\nThe final deliverable of ' + task_id + ' must be written to ' + str(output)
-                 + ' (absolute path, outside your own workspace). Dispatch a worker to write it; '
-                 'verify it exists before COMPLETED.')
+    if deliver:
+        text += ('\nDeliverables of ' + task_id + ': have worker-1 write ' + ', '.join(c for c, _ in deliver)
+                 + ' (inside this sub-fleet\'s workspace; in a contract task declare each as a final interface '
+                 'at that path). Nobody writes outside this sub-fleet\'s workspace: when this sub-fleet ends '
+                 'COMPLETED, the parent fleet\'s daemon copies these files to the paths the parent checks. '
+                 'Verify they exist before COMPLETED.')
     return text
+
+
+def deliver_back(f, rec, child_cfg):
+    """Trusted copy of a completed sub-fleet's deliverables to the parent's paths. A file the child
+    wrote under another of its workers' directories (same relative path) counts when it is the only one."""
+    child_ws = Path(child_cfg['run']) / 'workspace'
+    for child, parent in rec.get('deliver') or []:
+        rest = Path(child).relative_to(child_ws / 'worker-1')
+        found = [p for p in [Path(child)] + [child_ws / w / rest for w in child_cfg.get('workers') or []
+                                             if w != 'worker-1']
+                 if p.is_file() and not p.is_symlink() and p.stat().st_size > 0]
+        if not found or (found[0] != Path(child) and len(found) > 1):
+            continue  # missing / ambiguous: the parent's own check reports the missing deliverable
+        Path(parent).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(found[0], parent)
+        f.log('subfleet.delivered', task=rec['task_id'], source=str(found[0]), target=parent)
 
 
 def default_launch(child_cfg_path, child_cfg, mgr):
@@ -290,7 +326,8 @@ def default_launch(child_cfg_path, child_cfg, mgr):
                             start_directory=str(child_cfg['run']))
 
 
-def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, launch=None, contracts=False):
+def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, launch=None, contracts=False,
+                outputs=None):
     """Start sub-fleet ``task_id`` with ``slot``'s live pane as its supervisor. Outside transactions only."""
     fleet = _fleet()
     from cmux_fleet import redis_runtime, runtime_v2
@@ -324,8 +361,9 @@ def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, lau
             f.mgr.kill_pane(ph.pane_id)
         raise Refused('could not open the placeholder tab for ' + slot)
     f.mgr.rename(ph.pane_id, placeholder_label(slot, task_id, ws_title))
+    deliver = deliverables(f.workspace(), slot, rec_dir / 'workspace', outputs or ([output] if output else []))
     rec = {'task_id': task_id, 'slot': slot, 'run': str(rec_dir), 'state': 'starting', 'attempt': attempt,
-           'workers': workers, 'output': output, 'created': time.time(), 'title': ws_title,
+           'workers': workers, 'output': output, 'deliver': deliver, 'created': time.time(), 'title': ws_title,
            'placeholder': ph.pane_id, 'pane': sid, 'generation': int(info_now.get('generation') or 0)}
     cfg = released = None
     try:  # anything below fails -> rollback; SystemExit too (start_redis), never the parent daemon
@@ -347,7 +385,7 @@ def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, lau
         if deadline:
             hours = max((deadline - time.time()) / 3600, 0.05)
         bus = runtime_v2.bus_for(cfg, child_r)
-        spec = {'goal': goal_text(goal, task_id, output, proposal, f.label(slot)), 'hours': hours}
+        spec = {'goal': goal_text(goal, task_id, deliver, proposal, f.label(slot)), 'hours': hours}
         if contracts:  # spec §3.0: a sub-fleet of a contract task runs P0 / P1 first as well
             spec['contracts'] = True
         runtime_v2.post_event(bus, {'kind': 'task', 'request_id': 'subfleet-' + task_id, 'spec': spec},
@@ -603,6 +641,8 @@ def collect(f, child_run, notify=True):
     ph = rec['placeholder']
     returned = bool(back) and back.get('pane') == rec['pane'] and f.mgr.adopt(rec['pane'], ph, back.get('info') or {})
     restore_role(f, rec)
+    if rec.get('outcome') == 'completed':
+        deliver_back(f, rec, cfg)  # before any check below (also on stop/resume collects)
     child_mgr.close_all()
     child_mgr.meta_path.unlink(missing_ok=True)
     f.setf(slot, delegated_pane='', delegated_task='', delegate_cfg='')

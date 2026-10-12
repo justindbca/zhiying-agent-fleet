@@ -1586,19 +1586,20 @@ class Fleet:
                            + '. ' + task_id + ' still waits for your answer (approve with fewer workers / revise / '
                            'reject). Reply with the JSON format from AGENTS.md.')
                 return
-            output, goal = None, rec['instruction']
+            output, outputs, goal = None, None, rec['instruction']
             if row is not None:
-                paths = [e['path'] for e in (contracts.current(state, i) for i in row.get('provides') or []) if e]
-                output = str(self.workspace() / paths[0]) if paths else None
-                if paths:
+                entries = [e for e in (contracts.current(state, i) for i in row.get('provides') or []) if e]
+                outputs = [str(self.workspace() / e['path']) for e in entries]  # parent paths stay parent paths
+                output = outputs[0] if outputs else None
+                if entries:  # refs only: the child writes inside its own workspace (subfleet.goal_text)
                     goal += ('\nThe parent fleet verifies these interfaces of ' + task_id + ' (shapes in '
-                             + str(self.workspace() / 'contracts.json') + '): '
-                             + ', '.join(str(self.workspace() / x) for x in paths))
+                             + str(self.workspace() / 'contracts.json') + ', read only): '
+                             + ', '.join(contracts.ref(e) for e in entries))
                 row.update(status='delegated', attempts=row.get('attempts', 0) + 1, reason='sub-fleet ' + task_id)
             if note:
                 goal += '\nSupervisor note: ' + note
             rid = subfleet.request(self.run_dir, slot, task_id, goal, workers, output=output,
-                                   proposal=rec['proposal'], contracts=state is not None)
+                                   proposal=rec['proposal'], contracts=state is not None, outputs=outputs)
             rec.update(status='approved', rid=rid, workers=workers, note=note)
             esc[task_id] = rec
             self.log('escalate.approved', task=task_id, request=rid, workers=workers)
@@ -1693,7 +1694,7 @@ class Fleet:
             return
         folder = Path(load(self.cfg['parent_config'])['run']) / 'subfleet-notices'
         folder.mkdir(parents=True, exist_ok=True)
-        items = [{'ref': k, 'change': kind, 'path': state['interfaces'][k]['path'],
+        items = [{'ref': k, 'change': kind, 'path': str(self.workspace() / state['interfaces'][k]['path']),
                   'producer': state['interfaces'][k]['producer']} for k, kind in changes if k in state['interfaces']]
         save(folder / (uuid.uuid4().hex[:12] + '.json'),
              {'origin_run': str(self.run_dir), 'task': self.cfg.get('task_id'), 'interfaces': items})
