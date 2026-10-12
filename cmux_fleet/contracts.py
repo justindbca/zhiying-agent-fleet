@@ -26,7 +26,7 @@ FIELDS = ('id', 'version', 'producer', 'consumers', 'path', 'min_chars', 'contai
           'sample', 'writers', 'decisions', 'final')
 SAMPLE_MAX = 4000
 SAMPLE_RULE = 'sample is required and must itself satisfy min_chars / contains / json_keys'
-SKELETON_TRIES = 2
+SKELETON_TRIES = None  # user 10/13: fix interfaces until everything passes; only the task `hours` budget bounds it
 SKELETON = '__skeleton__'  # owner marker of the P1 skeleton delivery
 READY_RE = re.compile(r'(' + IF_RE + r')@(\d+) provided: ready\b')
 REPORT_KEYS = ('interface_change', 'escalate', 'proposal', 'workers')
@@ -256,7 +256,9 @@ def skeleton_verdict(text, interfaces):
     if text is None:
         return ['skeleton.md was not written']
     lines = text.splitlines()
-    out = ['FAIL line: ' + ' '.join(x.split()) for x in lines if re.search(r'\bFAIL\b', x)]
+    # A literal 'PASS/FAIL' (header or legend copied from the instruction) is not a verdict.
+    out = ['FAIL line: ' + ' '.join(x.split()) for x in lines
+           if re.search(r'\bFAIL\b', re.sub(r'PASS\s*/\s*FAIL', '', x))]
     for r in sorted(interfaces):
         if not any(r in x and re.search(r'\bPASS\b', x) for x in lines):
             out.append('no PASS line for ' + r)

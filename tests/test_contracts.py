@@ -246,7 +246,7 @@ def test_p0_gate_then_skeleton_then_frozen(cf):
         assert '## 4. Interface contracts' in (fleet.agent_cwd(cf.cfg, name) / 'CONTRACTS.md').read_text()
     # P0: a dispatch is refused with the spec text; an empty-dispatch RUNNING is not "idle".
     sup(cf, p0_reply(dispatch=[{'to': 'worker-1', 'instruction': 'Fetch sources into worker-1/sources.md'}]))
-    assert 'P0: interfaces are not fixed yet' in inbox(cf, 'supervisor')[-1] and cf.task()['bad_replies'] == '1'
+    assert 'P0: interfaces are not fixed yet' in inbox(cf, 'supervisor')[-1] and cf.task()['bad_replies'] == '0'
     bad = json.loads(json.dumps(p0_reply()))
     bad['interfaces'][0]['sample'] = 'nothing'
     sup(cf, bad)
@@ -276,18 +276,36 @@ def test_p0_gate_then_skeleton_then_frozen(cf):
     assert [x['action'] for x in log] == ['p0.passed', 'skeleton']
 
 
-def test_skeleton_fail_returns_to_p0_and_second_fail_blocks(cf):
+def test_skeleton_fail_returns_to_p0_without_cap(cf):
     submit(cf, contracts=True)
     sup(cf, p0_reply())
     write(cf, 'worker-1/skeleton.md', 'IF-M0-src@1 · M0 → M2 · FAIL · column missing\n')
     report(cf, 'worker-1')
     assert cf.contract_state()['phase'] == 'interfaces'
     msg = inbox(cf, 'supervisor')[-1]
-    assert '[contract] skeleton run FAILED (try 1 of 2)' in msg and 'column missing' in msg
+    assert '[contract] skeleton run FAILED (try 1)' in msg and 'column missing' in msg
     assert 'no PASS line for IF-M1-metrics@1' in msg
-    sup(cf, p0_reply())
-    report(cf, 'worker-1')
-    assert cf.task()['status'] == 'blocked' and 'P1: skeleton run failed 2 times' in cf.task()['reason']
+    for _ in range(3):  # user 10/13: no retry cap; only the hours budget bounds it
+        sup(cf, p0_reply())
+        report(cf, 'worker-1')
+        assert cf.task()['status'] == 'running' and cf.contract_state()['phase'] == 'interfaces'
+
+
+def test_p0_gap_lists_never_block(cf):
+    submit(cf, contracts=True)
+    bad = json.loads(json.dumps(p0_reply()))
+    bad['interfaces'][0]['sample'] = 'nothing'
+    for _ in range(5):
+        sup(cf, bad)
+        assert 'P0: IF-M0-src sample fails its own check' in inbox(cf, 'supervisor')[-1]
+    assert cf.task()['status'] == 'running' and cf.task()['bad_replies'] == '0'
+
+
+def test_skeleton_header_with_literal_pass_fail_is_not_a_failure():
+    text = ('IF-x@1 · producer → consumer · PASS/FAIL · evidence\n| interface | verdict (PASS/FAIL) |\n'
+            'IF-M0-src@1 · M0 → M2 · PASS · ok\n')
+    assert contracts.skeleton_verdict(text, ['IF-M0-src@1']) == []
+    assert contracts.skeleton_verdict('IF-M0-src@1 · M0 → M2 · FAIL · bad\n', ['IF-M0-src@1'])
 
 
 def test_parallel_dispatch_ready_notices_and_release(cf):

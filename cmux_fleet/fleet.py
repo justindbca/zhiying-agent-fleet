@@ -1286,15 +1286,16 @@ class Fleet:
                 s['phase'] = 'parallel'
                 notes.append('[contract] interfaces frozen at v1. Dispatch M0…Mn now: every dispatch item has id, '
                              'provides and consumes (id@version) per the plan; consumers start from the samples.')
-            elif s['skeleton_tries'] >= contracts.SKELETON_TRIES:
+            elif contracts.SKELETON_TRIES and s['skeleton_tries'] >= contracts.SKELETON_TRIES:
                 self.save_contract(s)
                 self.finish('blocked', 'P1: skeleton run failed ' + str(s['skeleton_tries']) + ' times: '
                             + '; '.join(failures))
                 return None
             else:
                 s['phase'] = 'interfaces'
-                notes.append('[contract] skeleton run FAILED (try ' + str(s['skeleton_tries']) + ' of '
-                             + str(contracts.SKELETON_TRIES) + '): ' + '; '.join(failures)
+                notes.append('[contract] skeleton run FAILED (try ' + str(s['skeleton_tries'])
+                             + (' of ' + str(contracts.SKELETON_TRIES) if contracts.SKELETON_TRIES else '')
+                             + '): ' + '; '.join(failures)
                              + '\nFix the interfaces in a new reply with phase "interfaces" (full plan + interfaces, '
                              'no dispatch).')
         row = s['tasks'].get(owner) if owner and owner != contracts.SKELETON else None
@@ -1470,8 +1471,11 @@ class Fleet:
                 instruction = item['instruction'].strip()
                 prepared.append((slot, instruction, self.prepare_worker_profile(slot, instruction)))
         except (ValueError, TypeError, KeyError) as exc:
-            bad = self.r.hincrby(TASK, 'bad_replies', 1)
-            if bad >= 3:
+            # P0 gap lists never count toward the three-strike limit (user 10/13): the supervisor
+            # keeps fixing interfaces until all checks pass; the task `hours` budget is the bound.
+            p0 = str(exc).startswith('P0')
+            bad = int(self.r.hget(TASK, 'bad_replies') or 0) if p0 else self.r.hincrby(TASK, 'bad_replies', 1)
+            if not p0 and bad >= 3:
                 self.finish('blocked', 'supervisor gave no valid decision JSON three times in a row: ' + str(exc))
             else:
                 self.queue('supervisor', 'Your reply is not a valid decision JSON (' + str(exc)
