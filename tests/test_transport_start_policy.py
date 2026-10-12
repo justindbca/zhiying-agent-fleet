@@ -39,11 +39,17 @@ def test_new_all_pi_start_still_requires_development_opt_in(monkeypatch):
         fleet.main(['start', '--supervisor-cli', 'pi', '--worker-cli', 'pi'])
 
 
-@pytest.mark.parametrize('supervisor,worker', [('codex', 'pi'), ('pi', 'codex'), ('pi', 'claude')])
-def test_unsupported_cli_is_not_silently_replaced(monkeypatch, supervisor, worker):
+@pytest.mark.parametrize('supervisor,worker,mode,reason', [
+    ('codex', 'pi', 'task', 'mixed Pi/Codex fleets are unvalidated'),
+    ('pi', 'codex', 'task', 'mixed Pi/Codex fleets are unvalidated'),
+    ('pi', 'claude', 'task', 'mixed Pi/Claude fleets are unvalidated'),
+    ('codex', 'codex', 'task', 'Codex workers are unvalidated'),
+    ('codex', 'claude', 'service', 'task mode only')])
+def test_unsupported_cli_is_not_silently_replaced(monkeypatch, supervisor, worker, mode, reason):
+    # 2026-10-12 user decision: v2 also admits Codex supervisor + Claude workers (task mode).
     no_provisioning(monkeypatch)
-    with pytest.raises(SystemExit, match='all-Pi'):
-        fleet.main(['start', '--supervisor-cli', supervisor, '--worker-cli', worker,
+    with pytest.raises(SystemExit, match=reason):
+        fleet.main(['start', '--supervisor-cli', supervisor, '--worker-cli', worker, '--mode', mode,
                     '--allow-development-v2'])
 
 

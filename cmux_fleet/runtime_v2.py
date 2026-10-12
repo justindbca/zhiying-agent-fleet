@@ -9,6 +9,7 @@ Lua does not roll back failed writes. No model/tool side effect is ever replayed
 import copy
 import hashlib
 import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -19,17 +20,98 @@ from cmux_fleet.message_bus import BusError, MessageBus, _json, _short, _request
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
 
 
+# Supported v2 CLI combinations. Everything else is refused with its reason, never
+# silently replaced by another CLI/model or by the old file mailbox.
+V2_PI = ('pi', 'pi')
+V2_TUI = ('codex', 'claude')  # Codex supervisor + official Claude Code workers, task mode only
+
+
+def v2_cli_problem(cfg):
+    """None when this supervisor/worker CLI pair and mode may run transport v2."""
+    pair = (cfg.get('supervisor_cli') or 'codex', cfg.get('worker_cli') or 'codex')
+    mode = cfg.get('mode') or 'task'
+    if pair == V2_PI:
+        return None
+    if pair == V2_TUI:
+        if mode != 'task':
+            return ('transport v2 Codex supervisor + Claude workers supports task mode only: '
+                    'service-mode result cards have no Codex renderer and request routing is unvalidated')
+        return None
+    if pair[0] == 'claude':
+        return 'transport v2 has no Claude supervisor adapter (supported: all-Pi, or Codex supervisor + Claude workers)'
+    if pair == ('codex', 'codex'):
+        return 'transport v2 Codex workers are unvalidated (supported: all-Pi, or Codex supervisor + Claude workers)'
+    return ('transport v2 mixed Pi/' + ('Codex' if 'codex' in pair else 'Claude') + ' fleets are unvalidated '
+            '(supported: all-Pi, or Codex supervisor + Claude workers)')
+
+
 def validate_config(cfg):
     version = cfg.get('transport_version', 1)
     if type(version) is not int or version not in (1, 2):
         raise ValueError('transport_version must be 1 or 2')
     if version == 2:
-        if (cfg.get('supervisor_cli', 'codex') != 'pi'
-                or cfg.get('worker_cli', 'codex') != 'pi'):
-            raise ValueError('transport v2 currently supports all-Pi fleets only; Claude/Codex capabilities unvalidated')
+        problem = v2_cli_problem(cfg)
+        if problem:
+            raise ValueError(problem)
         if cfg.get('allow_development_v2') is not True:
             raise ValueError('transport v2 requires --allow-development-v2; real SDK/TUI acceptance is pending')
     return version
+
+
+def tui_slot(cfg, slot):
+    """Official interactive CLIs (Codex/Claude) have no in-process bridge: the daemon
+    receives their delivery and types the business text into the TUI; the CLI's own
+    turn-end hook (Codex notify / Claude Stop) settles it."""
+    return cfg.get('transport_version') == 2 and (
+        cfg.get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') or 'codex') != 'pi'
+
+
+IDENTITY = ('run_id', 'slot', 'generation', 'session_id', 'message_id', 'delivery_id',
+            'stream_id', 'fence', 'consumer', 'request_id')
+
+
+def _norm(text):
+    return ' '.join(str(text).split())
+
+
+def turn_answers(body_text, inputs):
+    """The turn must have been started by the typed delivery text (not a manual turn)."""
+    head = _norm(body_text)[:120]
+    return bool(head) and any(head in _norm(item) for item in inputs if isinstance(item, str))
+
+
+WORKER_SECTIONS = re.compile(r'^[\s>*#_-]*(done|evidence|not done|blocked)[\s*_]*:[\s*_]*(.*)$', re.I)
+
+
+def tui_candidates(slot, purpose, text):
+    """Map an official CLI's final text to the structured candidate the daemon validates.
+
+    The agent-facing reply formats are the original AGENTS.md ones (decision JSON for
+    the supervisor, Done/Evidence/Not done/Blocked for task workers). Unparseable text
+    yields no candidate, so the daemon's existing invalid/blocked paths apply.
+    """
+    if purpose == 'handoff':
+        return []
+    try:
+        value = json.loads(text[text.index('{'):text.rindex('}') + 1])
+    except ValueError:
+        value = None
+    if slot == 'supervisor':
+        return [{'tool': 'fleet_decision', 'value': value}] if isinstance(value, dict) else []
+    if isinstance(value, dict) and 'done' in value and 'evidence' in value:
+        return [{'tool': 'fleet_result', 'value': value}]
+    sections, current = {}, None
+    for line in text.splitlines():
+        m = WORKER_SECTIONS.match(line)
+        if m:
+            current = m.group(1).lower()
+            sections[current] = [m.group(2).strip()]
+        elif current:
+            sections[current].append(line.strip())
+    items = lambda k: [x.lstrip('-*• ').strip() for x in sections.get(k, []) if x.lstrip('-*• ').strip()]
+    value = {'done': items('done'), 'evidence': items('evidence'),
+             'not_done': '\n'.join(items('not done')), 'blocked': '\n'.join(items('blocked'))}
+    return [{'tool': 'fleet_result', 'value': value}] if value['done'] and value['evidence'] else []
 
 
 def bus_for(cfg, r):
@@ -238,6 +320,7 @@ class RuntimeV2:
         self.rotation_pending = set()
         self.pending_cursor = '0-0'
         self.held_events = set()
+        self.renewed = {}
         try:
             fleet.r.xgroup_create(self.events, self.group, '0-0', mkstream=True)
         except redis.ResponseError as exc:
@@ -305,9 +388,11 @@ class RuntimeV2:
         deadline_at = deadline_at or int(time.time()*1000) + 3600000
         kind = kind or ('supervisor' if slot == 'supervisor' else 'worker')
         # Prompt instructions remain business content. Transport labels are metadata.
-        text = text.replace('Reply with the service decision JSON from AGENTS.md.', 'Use fleet_decision to route this request.')
-        text = text.replace('Reply with the JSON format from AGENTS.md.', 'Use fleet_decision when you have decided.')
-        text = text.replace('Continue the current task using the AGENTS.md decision JSON.', 'Continue the current task using fleet_decision.')
+        # Only Pi has the fleet_decision tool; official CLIs keep the AGENTS.md wording.
+        if not tui_slot(self.f.cfg, slot):
+            text = text.replace('Reply with the service decision JSON from AGENTS.md.', 'Use fleet_decision to route this request.')
+            text = text.replace('Reply with the JSON format from AGENTS.md.', 'Use fleet_decision when you have decided.')
+            text = text.replace('Continue the current task using the AGENTS.md decision JSON.', 'Continue the current task using fleet_decision.')
         self.queue_index += 1
         mid = 'm-' + digest(self.context['intent_id'] + ':' + str(self.queue_index))[:32]
         body = {'text': text, 'title': '派工任务' if slot != 'supervisor' else '待处理业务',
@@ -451,7 +536,10 @@ class RuntimeV2:
                 # Fixed session binding: do not adopt a different same-generation Pi session.
                 if info.get('thread') and info['thread'] != ev.get('thread'):
                     raise ValueError('same-generation session replacement is unsupported')
-                pi_adapter.event(self.f.cfg, slot, ev['generation'], dict(ev, kind='pi_session'))
+                if tui_slot(self.f.cfg, slot):
+                    self.tui_session(slot, ev)
+                else:
+                    pi_adapter.event(self.f.cfg, slot, ev['generation'], dict(ev, kind='pi_session'))
                 self.effects.hset(legacy.key('agent', slot), {'thread': ev['thread'],
                     'transcript': ev['transcript'], 'bridge_available': 0})
                 # Slot registration is completed by bridge only after this durable reply.
@@ -535,6 +623,16 @@ class RuntimeV2:
         if answer.get('status') == 'accepted':
             self.audit('accepted', request_id=answer.get('id') or answer.get('task_id') or spec.get('id') or '',
                        correlation_id=ev['request_id'], slot=slot or '', generation=ev.get('generation'), detail=answer)
+
+    def tui_session(self, slot, ev):
+        """Codex notify / Claude Stop binding: session id, and Claude's transcript only."""
+        _short(ev.get('thread'), 'session_id')
+        transcript = ev.get('transcript')
+        if (self.f.cfg.get('supervisor_cli' if slot == 'supervisor' else 'worker_cli')) == 'claude':
+            if not isinstance(transcript, str) or not transcript.endswith('.jsonl') or not Path(transcript).is_absolute():
+                raise ValueError('Claude session binding requires its absolute transcript path')
+        elif transcript != '':
+            raise ValueError('Codex usage comes from its rollout files; transcript must be empty')
 
     def reply(self, ev, answer):
         correlation = ev.get('request_id')
@@ -803,6 +901,55 @@ class RuntimeV2:
                         bridge_available=0)
             self.audit('deliver', slot=slot, request_id=env['request_id'], message_id=env['message_id'],
                        delivery_id=env['delivery_id'], generation=env['generation'], detail=env['body'])
+            if tui_slot(self.f.cfg, slot):
+                self.type_into(slot, env)
+
+    def type_into(self, slot, env):
+        """Receive an offered delivery for an official CLI and type only its business text.
+
+        No message file and no transport IDs reach the model. The CLI's own turn-end hook
+        settles against this delivery in Redis. Any failure holds the slot (fail closed).
+        """
+        consumer = 'tui-' + slot + '-g' + str(env['generation'])
+        reason = 'TUI input not confirmed; prompt state unknown'
+        try:
+            got = self.bus.receive(slot, consumer, 1, generation=env['generation'],
+                                   session_id=env['session_id'], reader=self.reader)
+            if not got or got['delivery_id'] != env['delivery_id'] or not got['execution_allowed']:
+                raise BusError('offered delivery was not received by this generation')
+            self.renewed[slot] = time.monotonic()
+            pane = self.f.agent(slot).get('pane')
+            if pane and self.f.mgr.send_prompt_to_idle(pane, got['body']['text']):
+                self.audit('tui.typed', slot=slot, message_id=env['message_id'], delivery_id=env['delivery_id'])
+                return True
+        except (BusError, ValueError, KeyError, OSError) as exc:
+            reason += ': ' + str(exc)[:500]
+        self.transaction('tui-input-' + env['delivery_id'], lambda: self.hold(slot, reason, public_status='failed'))
+        return False
+
+    def renew_tui(self):
+        """The daemon is the receiving consumer for official CLIs, so it renews their
+        received leases while the runtime tab exists (stall/liveness checks still hold)."""
+        period = min(10.0, self.bus.lease_ms / 3000.0)
+        for slot in self.f.names:
+            if not tui_slot(self.f.cfg, slot) or time.monotonic() - self.renewed.get(slot, 0) < period:
+                continue
+            state = self.bus.r.hgetall(self.bus.lease_key(slot))
+            if state.get('status') != 'received' or not state.get('consumer', '').startswith('tui-'):
+                continue
+            pane = self.f.agent(slot).get('pane')
+            if not pane or self.f.mgr.get_pane_status(pane) is None:
+                continue  # liveness tick holds a missing tab
+            self.renewed[slot] = time.monotonic()
+            try:
+                renewed = self.bus.renew(slot, self.bus.message(state['message_id']))
+            except BusError as exc:
+                renewed, why = False, str(exc)
+            else:
+                why = 'lease expired'
+            if not renewed:
+                self.transaction('tui-renew-' + uuid.uuid4().hex,
+                                 lambda slot=slot, why=why: self.hold(slot, why + '; execution stop unconfirmed'))
 
     def cancel_queued(self, slot, msg, reason):
         r = self.effects or self.bus.r
@@ -842,6 +989,8 @@ class RuntimeV2:
         env = self.bus.offer(slot, mid)
         if env:
             self.f.setf(slot, msg_id=mid, bridge_available=0)
+            if tui_slot(self.f.cfg, slot):
+                self.type_into(slot, env)
 
     def confirm_retired(self, slot):
         """Call only after cmux confirmed the old runtime process-tree/tab retirement."""
@@ -899,6 +1048,7 @@ class RuntimeV2:
                     elif float(self.f.cfg['stall_timeout']) > 0 and now-self.f.last_activity(info) >= float(self.f.cfg['stall_timeout']):
                         self.hold(slot, 'agent stalled; execution stop unconfirmed', public_status='stalled')
         self.transaction('tick-' + uuid.uuid4().hex, expire)
+        self.renew_tui()
         for slot in self.f.names:
             info = self.f.agent(slot)
             if info.get('handoff_id') and info.get('state') in ('handoff', 'held') and now >= float(info.get('handoff_deadline') or 0):

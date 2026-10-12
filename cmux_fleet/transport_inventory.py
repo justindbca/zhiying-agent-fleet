@@ -10,6 +10,8 @@ import shlex
 import socket
 import subprocess
 
+from cmux_fleet.runtime_v2 import v2_cli_problem
+
 
 def inventory():
     home = Path.home()
@@ -87,7 +89,9 @@ def inventory():
         item['configs'].append(str(path))
         item['processes'].extend(p for p in processes if p not in item['processes'])
         item['observed_running'] = bool(item['processes'])
-        item['v2_cli_supported'] = item['supervisor_cli'] == item['worker_cli'] == 'pi'
+        problem = v2_cli_problem(item)
+        item['v2_cli_supported'] = problem is None
+        item['v2_cli_reason'] = problem or ''
     registry_paths = set((home/'.local/state/cmux-fleet').glob('*.json'))
     for root in roots:
         registry_paths.update((root/'state').glob('*.json'))

@@ -231,6 +231,11 @@ def claude_stop(cfg_path, name, generation, raw):
                         break
         except (OSError, ValueError):
             pass
+    cfg = load(cfg_path)
+    if cfg.get('transport_version') == 2:
+        return tui_turn(cfg, name, int(generation), thread=data.get('session_id'),
+                        transcript=data.get('transcript_path', ''), text=text,
+                        inputs=claude_user_prompts(data.get('transcript_path', '')))
     # Which delivery this turn answers: the last user message in the transcript that points at an
     # .inbox/msg-*.md file. User messages are written when the turn starts, so they are present even
     # when the final assistant message has not been flushed yet.
@@ -244,7 +249,6 @@ def claude_stop(cfg_path, name, generation, raw):
                         msg_id = m.group(1)
     except OSError:
         pass
-    cfg = load(cfg_path)
     r = connect(cfg)
     # No hook-side de-dup: the Stop payload carries no turn id and the transcript may lag the final
     # message. The daemon drops a turn for a claude worker that is already idle (see on_turn).
@@ -509,11 +513,87 @@ def notify(cfg_path, name, generation, payload, sessions=None):
     digest = hashlib.sha256((name + str(generation) + payload).encode()).hexdigest()
     if not r.set('fx:seen:' + digest, '1', nx=True, ex=86400):
         return False
+    if cfg.get('transport_version') == 2:
+        r.close(); r.connection_pool.disconnect()
+        inputs = data.get('input-messages') or data.get('input_messages') or []
+        return tui_turn(cfg, name, int(generation), thread=data.get('thread-id') or data.get('thread_id'),
+                        transcript='', text=data.get('last-assistant-message') or data.get('last_assistant_message') or '',
+                        inputs=inputs if isinstance(inputs, list) else [])
     r.rpush(EVENTS, json.dumps({'kind': 'turn', 'agent': name, 'generation': int(generation),
                                 'thread': data.get('thread-id') or data.get('thread_id'),
                                 'text': data.get('last-assistant-message') or data.get('last_assistant_message') or '',
                                 'at': time.time()}, ensure_ascii=False))
     return True
+
+
+def claude_user_prompts(path, count=3):
+    """Last real user prompts of a Claude transcript (not tool results, meta or sidechains)."""
+    out = []
+    try:
+        lines = _tail(Path(path), 1048576)
+    except (OSError, TypeError):
+        return out
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get('type') != 'user' or row.get('isSidechain') or row.get('isMeta'):
+            continue
+        content = (row.get('message') or {}).get('content')
+        if isinstance(content, list):
+            content = '\n'.join(p.get('text', '') for p in content if isinstance(p, dict) and p.get('type') == 'text')
+        if isinstance(content, str) and content.strip():
+            out.append(content)
+            if len(out) >= count:
+                break
+    return out
+
+
+def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=None):
+    """v2 turn end of an official interactive CLI (Codex notify / Claude Stop hook).
+
+    First READY turn: bind the session, register the slot and report startup. Later turns:
+    settle only the delivery this generation received, only if the typed delivery text
+    started the turn. The daemon validates identity, lease, fence and schema as for Pi.
+    """
+    if name not in ['supervisor'] + cfg['workers'] or not runtime_v2.tui_slot(cfg, name):
+        raise ValueError('turn hook must name an official-CLI v2 agent in this fleet')
+    # Events are durable either way; waiting long only keeps this generation's startup
+    # sequence (bind -> register -> READY) intact while the daemon is still spawning tabs.
+    wait = float(cfg.get('profile_ready_timeout') or 180) if wait is None else wait
+    r = connect(cfg)
+    bus = runtime_v2.bus_for(cfg, r)
+    try:
+        info = r.hgetall(key('agent', name))
+        if int(info.get('generation', -1)) != generation or info.get('state') == 'dead':
+            return {'status': 'stale'}
+        base = dict(agent=name, generation=generation, run_id=bus.run_id, thread=thread, transcript=transcript)
+
+        def call(kind, **fields):
+            correlation = 'h-' + uuid.uuid4().hex
+            runtime_v2.post_event(bus, dict(base, kind=kind, request_id=correlation, **fields), correlation)
+            return runtime_v2.wait_reply(bus, correlation, timeout=wait)
+        if info.get('state') == 'starting':
+            if info.get('thread') != thread:
+                answer = call('bridge_session')
+                if answer.get('status') != 'registered':
+                    return answer
+            bus.register_slot(name, generation, thread)
+            return call('startup', text=text, failed=False, aborted=False)
+        lease = r.hgetall(bus.lease_key(name))
+        if lease.get('status') != 'received' or not lease.get('message_id'):
+            return {'status': 'ignored', 'reason': 'no received delivery (manual or duplicate turn)'}
+        msg = bus.message(lease['message_id'])
+        if msg.get('generation') != generation or msg.get('session_id') != thread:
+            return {'status': 'stale'}
+        if not runtime_v2.turn_answers(msg['body']['text'], inputs):
+            return {'status': 'ignored', 'reason': 'turn was not started by the typed delivery'}
+        return call('settled', delivery={k: msg[k] for k in runtime_v2.IDENTITY},
+                    candidates=runtime_v2.tui_candidates(name, msg['body'].get('purpose'), text or ''),
+                    failed=False, aborted=False, unfinished=False)
+    finally:
+        r.close(); r.connection_pool.disconnect()
 
 
 def agent_profile(cfg, name):
@@ -548,7 +628,9 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
     cwd = agent_cwd(cfg, name)
     hook = shlex.join([cfg['python'], str(Path(__file__).resolve()), 'claude-stop', str(cfg_path), name, str(generation)])
     settings = cwd / ('.fleet-settings-g' + str(generation) + '.json')
-    settings.write_text(json.dumps({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': hook, 'timeout': 30}]}]}}))
+    # v2: the READY hook waits for the daemon, which may still be spawning other tabs.
+    timeout = 30 if cfg.get('transport_version') != 2 else int(float(cfg.get('profile_ready_timeout') or 180)) + 30
+    settings.write_text(json.dumps({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': hook, 'timeout': timeout}]}]}}))
     argv = [cfg.get('claude') or 'claude', '--dangerously-skip-permissions', '--model', cfg.get('worker_model') or 'sonnet',
             '--settings', str(settings), '--add-dir', str(Path(cfg['run']) / 'workspace')]
     if (cwd / 'mcp.json').exists():
@@ -808,7 +890,7 @@ class Fleet:
         cwd.mkdir(parents=True, exist_ok=True)
         role = 'supervisor' if name == 'supervisor' else 'worker'
         scope = (HERE / 'agents' / (('service_' if self.service else '') + role
-                                  + ('_v2' if self.v2 else '') + '.md')).read_text()
+                                  + ('_v2' if self.v2 and is_pi(cfg, name) else '') + '.md')).read_text()
         if launch.get('role_text') and launch['role_text'].strip() != scope.strip():
             scope += '\n## Assigned profile role\n\n' + launch['role_text']
         extra = Path(self.cfg['roles']).expanduser() / (name + '.md') if self.cfg.get('roles') else None
@@ -1356,7 +1438,7 @@ class Fleet:
         info = self.agent(name)
         if info.get('state') != 'idle':
             return
-        if self.v2 and info.get('bridge_available') != '1':
+        if self.v2 and not runtime_v2.tui_slot(self.cfg, name) and info.get('bridge_available') != '1':
             return
         pending = self.v2.pending_text(name) if self.v2 else self.r.lrange(key('inbox', name), 0, 0)
         if not pending:
