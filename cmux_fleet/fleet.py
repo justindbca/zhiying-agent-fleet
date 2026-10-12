@@ -728,7 +728,8 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
             return skipped('ignored', 'turn was not started by the typed delivery')
         return call('settled', delivery={k: msg[k] for k in runtime_v2.IDENTITY},
                     candidates=runtime_v2.tui_candidates(name, msg['body'].get('purpose'), text or ''),
-                    failed=False, aborted=False, unfinished=False)
+                    failed=False, aborted=False, unfinished=False,
+                    wall_text=(text or '') if len((text or '').strip()) <= brake.TURN_WALL_MAX else '')
     finally:
         r.close(); r.connection_pool.disconnect()
 
@@ -861,6 +862,7 @@ class Fleet:
         argv = self.cfg.get('brake_notify')
         if argv is not None and (not isinstance(argv, list) or not argv or not all(isinstance(x, str) and x for x in argv)):
             raise ValueError('brake_notify must be an argv list of strings (no shell)')
+        self.pending_notify = []  # brake trips recorded inside a v2 event transaction (notified on tick)
         self.v2 = runtime_v2.RuntimeV2(self) if self.transport_version == 2 else None
 
     # -- small helpers
@@ -1478,6 +1480,10 @@ class Fleet:
                 self.log('turn.launch_held', agent=name, generation=ev.get('generation'))
                 return
             if ev.get('failed') or ev.get('aborted') or ev.get('text', '').strip() != 'READY':
+                record = self.startup_wall(name, ev.get('text', ''))
+                if record:
+                    self.brake_notify(record)
+                    return
                 self.block_profile(name, 'startup did not return READY; check its terminal', dead=True)
                 return
         if (is_claude(self.runtime_cfg(name), name) or is_pi(self.runtime_cfg(name), name)) and info.get('state') in ('busy', 'handoff', 'idle'):
@@ -1513,9 +1519,10 @@ class Fleet:
         text = ev.get('text', '')
         if self.running() and len(text.strip()) <= brake.TURN_WALL_MAX:
             record = self.on_wall(name, text, 'turn')
-            if record:  # a wall message is not a report: keep the message for after resume
-                if info.get('last_msg'):
+            if record:  # a wall message is not a report: keep the message for after resume (once per message)
+                if info.get('last_msg') and info.get('wall_requeued') != (ev.get('msg_id') or info.get('msg_id') or '-'):
                     self.r.lpush(key('inbox', name), info['last_msg'])
+                    self.setf(name, wall_requeued=ev.get('msg_id') or info.get('msg_id') or '-')
                 self.brake_notify(record)
                 return
         if not text.strip() and info.get('last_msg'):
@@ -2344,10 +2351,14 @@ class Fleet:
             if base is not None:  # the first known reading is the baseline: spend before it is not ours
                 self.r.hset(BRAKE, mapping={'usd_base': base})
                 state['usd_base'] = base
-        found = brake.trips(budget, brake.counters(state, quota, now))
+        found = brake.trips(self.brake_card(budget), brake.counters(state, quota, now))
         if found:
             return self.brake_trip('budget', 'budget line reached: ' + brake.describe(found), lines=found)
         return None
+
+    def brake_card(self, budget):
+        """The card as evaluated (default pool-a cash cap, day or night per B's fx:night)."""
+        return brake.effective(budget, self.r.hget('fx:night', 'brake_card') == 'night')
 
     def brake_trip(self, kind, reason, **detail):
         record = dict(kind=kind, reason=reason, at=time.time(), task=self.task().get('id', ''), **detail)
@@ -2360,7 +2371,8 @@ class Fleet:
     def brake_notify(self, record):
         """Side effects of a trip, outside any v2 transaction: <run>/brake.json and the operator's notify argv."""
         state = self.r.hgetall(BRAKE)
-        save(self.run_dir / 'brake.json', dict(record, budget=json.loads(state.get('budget') or 'null'),
+        card = json.loads(state.get('budget') or 'null')
+        save(self.run_dir / 'brake.json', dict(record, budget=card, effective_budget=self.brake_card(card),
              counters=brake.counters(state, brake.read_quota(self.cfg.get('quota_file')))))
         argv = self.cfg.get('brake_notify')
         if argv:
@@ -2384,7 +2396,7 @@ class Fleet:
             if budget.get('pool') != json.loads(state['budget']).get('pool'):
                 raise ValueError('--raise cannot change the pool')
         if budget:  # any resume, whatever paused the run (a later wall trip or a hold can overwrite the record)
-            found = brake.trips(budget, brake.counters(state, brake.read_quota(self.cfg.get('quota_file'))))
+            found = brake.trips(self.brake_card(budget), brake.counters(state, brake.read_quota(self.cfg.get('quota_file'))))
             if found:
                 raise ValueError('budget still over the line (' + brake.describe(found)
                                  + '); resume with --raise LIMIT=<higher value>')
@@ -2404,11 +2416,113 @@ class Fleet:
         model = (cfg.get('pi_model') if cli == 'pi' else cfg.get('codex_model') if cli == 'codex'
                  else cfg.get('supervisor_model') if name == 'supervisor' else cfg.get('worker_model')) or ''
         action = brake.wall_action(wall, cli, model)
+        if action['action'] == 'downgrade' and name not in self.workers:
+            # Master design v2 binding table: a supervisor wall is not answered by swapping its model.
+            action = {'action': 'stop', 'cli': cli, 'from': model,
+                      'advice': 'supervisor slot: no automatic downgrade; resume after the reset or restart it'}
         self.setf(name, wall=json.dumps(dict(wall, **action), ensure_ascii=False))
+        if action['action'] == 'downgrade':
+            pending = json.loads(self.agent(name).get('wall_downgrade') or 'null')
+            if not pending or pending.get('to') != action['to']:
+                self.setf(name, wall_downgrade=json.dumps(dict(action, key=brake.MODEL_KEY[cli], source=source,
+                                                               at=uuid.uuid4().hex[:12]), ensure_ascii=False))
         what = ('same CLI one tier down: ' + action['from'] + ' -> ' + action['to'] if action['action'] == 'downgrade'
                 else action['advice'])
         return self.brake_trip('wall', self.label(name) + ' hit a ' + wall['scope'] + ' wall ("' + wall['line'][:120]
                                + '"); ' + what, agent=name, source=source, wall=wall, decision=action)
+
+    def notify_later(self, record):
+        """A trip recorded inside a v2 event transaction: brake.json / notify argv run on the next tick."""
+        if record:
+            self.pending_notify.append(record)
+
+    def startup_wall(self, name, text):
+        """A new generation answered its startup prompt with a wall instead of READY: walled (not dead),
+        fleet paused resumable. A model-pool wall is downgraded by wall_tick; any other wall is retried
+        (same launch) once the operator resumes."""
+        if len((text or '').strip()) > brake.TURN_WALL_MAX:
+            return None
+        record = self.on_wall(name, text, 'startup')
+        if record:
+            self.setf(name, state='walled', runtime_ready=0, bridge_available=0)
+        return record
+
+    def wall_tick(self):
+        """Wall side effects (spawn / kill), outside any v2 transaction. At an idle boundary run the pending
+        same-CLI downgrade as the slot's next generation; once that generation is READY lift the wall's own
+        pause; retry a startup-walled slot after the operator resumed."""
+        for name in self.active_workers():
+            info = self.agent(name)
+            req = json.loads(info.get('wall_downgrade') or 'null')
+            if req and info.get('wall_switch') == req['at']:
+                if info.get('state') == 'idle' and info.get('runtime_ready') == '1':
+                    self.wall_switched(name, req)
+                continue
+            in_flight = self.v2 and self.r.hget(self.v2.bus.lease_key(name), 'current_delivery')
+            if req and info.get('state') in ('idle', 'walled') and not in_flight:
+                launch = json.loads(info.get('runtime_launch') or '{}')
+                launch = {'profile_id': launch.get('profile_id') or 'wall-downgrade', 'role_text': launch.get('role_text', ''),
+                          'overrides': dict(launch.get('overrides', {}), worker_cli=req['cli'], **{req['key']: req['to']})}
+                self.setf(name, wall_switch=req['at'])
+                self.wall_rotate(name, launch, 'same-CLI downgrade after a model-pool wall: ' + str(req['from'])
+                                 + ' -> ' + req['to'])
+            elif info.get('state') == 'walled' and not self.paused():
+                self.wall_rotate(name, json.loads(info.get('runtime_launch') or 'null'), 'retry after the wall pause was resumed')
+
+    def wall_switched(self, name, req):
+        self.setf(name, wall_downgrade='', wall_switch='')
+        tripped = json.loads(self.r.hget(BRAKE, 'tripped') or 'null') or {}
+        ours = (tripped.get('kind') == 'wall' and tripped.get('agent') == name
+                and self.r.hget(SERVICE, 'reason') == 'brake: ' + tripped.get('reason', ''))
+        budget = self.brake_budget()
+        over = budget and brake.trips(self.brake_card(budget), brake.counters(
+            self.r.hgetall(BRAKE), brake.read_quota(self.cfg.get('quota_file'))))
+        self.log('brake.downgraded', agent=name, label=self.label(name), cli=req['cli'], to=req['to'],
+                 resumed=bool(self.paused() and ours and not over))
+        if self.paused() and ours and not over:
+            # Only the wall's own pause: an operator pause, an F hold or a budget line keeps the fleet paused.
+            self.r.hset(BRAKE, mapping={'tripped': ''})
+            self.resume()
+
+    def wall_rotate(self, name, launch, why):
+        """Same slot, next generation (optionally another launch), queue kept on the slot. Like B's
+        roster profile swap: skeleton handoff, saved screen, held launch, tab into place, old tab killed,
+        v2 delivery confirmed retired. Failure blocks the task like any profile switch failure."""
+        info = self.agent(name)
+        generation, old, prev = int(info['generation']), info.get('pane'), self.label(name)
+        if not old or self.mgr.get_pane_status(old) is None:
+            return self.block_profile(name, why + ': the old runtime tab is missing', dead=True) or False
+        handoff_id = uuid.uuid4().hex[:8]
+        note = self.run_dir / 'handoffs' / (name + '-g' + str(generation) + '-' + handoff_id + '-wall.md')
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text(self.skeleton(name, dict(info, handoff_id=handoff_id)))
+        snapshot = note.with_suffix('.terminal.txt')
+        self.mgr.capture_to(old, str(snapshot))
+        history.record(self.run_dir, slot=name, label=prev, generation=generation, handoff=str(note),
+                       snapshot=str(snapshot), source='wall', timed_out=False)
+        label = name + '.' + str(generation + 1)
+        self.setf(name, generation=generation + 1, label=label, prev_label=prev, handoff_id='',
+                  runtime_launch=profile_launch.encode_launch(launch) if launch else '', runtime_profile='',
+                  launch_ready=0, runtime_ready=0, retired_pane=old)
+        self.r.hset(NAMES, mapping={label: name})
+        try:
+            new = self.spawn(name, '[Same-task takeover] You are ' + label + ' (taking over from ' + prev + ': ' + why
+                             + '). Read the handoff note ' + str(note) + ' and continue from it. In this turn only '
+                             'read the note, do no task work, and make your final reply exactly READY.', launch_held=True)
+            if not self.mgr.tab_into(new, old):
+                raise RuntimeError('could not place the successor in the worker pane')
+            if not self.mgr.kill_pane(old) or self.mgr.get_pane_status(old) is not None:
+                raise RuntimeError('could not confirm retirement of the old runtime ' + prev)
+        except (Exception, SystemExit) as exc:
+            self.setf(name, launch_ready=0, state='dead')
+            return self.block_profile(name, why + ' failed: ' + str(exc), dead=True) or False
+        if self.v2:
+            self.v2.confirm_retired(name)
+        self.setf(name, launch_ready=1, retired_pane='')
+        self.refresh_history()
+        self.log('brake.wall_rotated', agent=name, label=label, prev=prev, generation=generation + 1, why=why,
+                 cli=agent_cli(self.runtime_cfg(name), name), handoff=str(note))
+        return True
 
     def wall_gate(self, name, screen, source='watch'):
         """E before F: the watchdog calls this on every screen it captures, BEFORE the prompt whitelist,
@@ -2482,8 +2596,10 @@ class Fleet:
                 or self.brake_tick(time.time()))
         else:
             record = self.brake_tick(time.time())
-        if record:
-            self.brake_notify(record)
+        for done in [r for r in self.pending_notify + [record] if r]:
+            self.brake_notify(done)
+        self.pending_notify = []
+        self.wall_tick()  # spawn / kill: outside any v2 transaction
         if self.v2:
             return self.v2.tick()
         now = time.time()

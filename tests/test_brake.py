@@ -11,8 +11,8 @@ import pytest
 
 from test_fleet import THREADS, FakeMgr, FakeRedis, decision, turn, write_rollout
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
-from test_runtime_v2 import fx, receive, settle, event  # noqa: F401  (fx: real-Redis v2 fleet)
-from cmux_fleet import brake, fleet
+from test_runtime_v2 import fx, receive, req, session, settle, event  # noqa: F401  (fx: real-Redis v2 fleet)
+from cmux_fleet import brake, fleet, runtime_v2
 
 REAL_FABLE_WALL = ("⎿  You've reached your Fable limit. Run /usage-credits to continue "
                    "or switch models with /model.")
@@ -507,3 +507,207 @@ def test_frozen_task_rejects_a_supervisor_cmd_exit_and_runs_only_the_callers(tmp
     f.pump()
     f.handle(turn('supervisor', decision('COMPLETED', 100, [], artifacts=[check])))
     assert f.task()['status'] == 'completed' and caller.read_text() == 'x' and not added.exists()
+
+
+# ------------------------------------------------------------------ walls: startup, downgrade, requeue once
+CLAUDE_ACCOUNT_WALL = 'Claude usage limit reached. Your limit will reset at 5pm (America/New_York).'
+
+
+def busy_worker(f):
+    f.pump(); f.handle(turn('supervisor', decision())); f.pump()
+    f.setf('worker-1', msg_id='m1')
+    return f.agent('worker-1')['last_msg']
+
+
+def test_v1_model_pool_wall_runs_the_downgrade_and_lifts_its_own_pause(tmp_path):
+    f = make(tmp_path, {'goal': 'x'}, worker_cli='claude', worker_model='fable')
+    sent = busy_worker(f)
+    f.handle(dict(turn('worker-1', REAL_FABLE_WALL), msg_id='m1'))
+    f.handle(dict(turn('worker-1', REAL_FABLE_WALL), msg_id='m1'))  # duplicate hook: dropped, not requeued twice
+    assert f.paused() and f.r.lrange('fx:inbox:worker-1', 0, -1) == [sent]
+    assert json.loads(f.agent('worker-1')['wall_downgrade'])['to'] == 'claude-sonnet-5'
+    old = f.agent('worker-1')['pane']
+    f.tick()  # idle boundary: next generation on the lower tier
+    info = f.agent('worker-1')
+    assert info['generation'] == '1' and info['label'] == 'worker-1.1' and info['state'] == 'starting'
+    assert f.runtime_cfg('worker-1')['worker_model'] == 'claude-sonnet-5' and old in f.mgr.killed
+    assert f.paused() and f.r.lrange('fx:inbox:worker-1', 0, -1) == [sent]  # queue kept for the new generation
+    f.handle(turn('worker-1', 'READY', generation=1))
+    f.tick()
+    assert not f.paused() and f.agent('worker-1')['wall_downgrade'] == ''
+    assert any(json.loads(x)['kind'] == 'brake.downgraded' and json.loads(x)['resumed'] for x in f.r.lrange(fleet.LOG, 0, -1))
+    f.pump()
+    assert f.agent('worker-1')['state'] == 'busy' and f.r.llen('fx:inbox:worker-1') == 0
+
+
+def test_downgrade_keeps_a_pause_that_is_not_the_walls_own(tmp_path):
+    f = make(tmp_path, {'goal': 'x'}, worker_cli='claude', worker_model='fable')
+    busy_worker(f)
+    f.handle(dict(turn('worker-1', REAL_FABLE_WALL), msg_id='m1'))
+    f.pause('worker-1: unknown confirmation dialog on screen; nothing pressed')  # F's hold rewrites the reason
+    f.tick()
+    f.handle(turn('worker-1', 'READY', generation=1))
+    f.tick()
+    assert f.agent('worker-1')['wall_downgrade'] == '' and f.paused()  # downgraded, still paused for the human
+
+
+def test_supervisor_and_account_walls_stop_without_a_downgrade(tmp_path):
+    f = make(tmp_path, {'goal': 'x'}, worker_cli='claude', worker_model='fable', supervisor_model='fable')
+    busy_worker(f)
+    f.handle(dict(turn('worker-1', CLAUDE_ACCOUNT_WALL), msg_id='m1'))
+    assert f.paused() and json.loads(f.agent('worker-1')['wall'])['action'] == 'stop'
+    assert not f.agent('worker-1').get('wall_downgrade')
+    f.tick()
+    assert f.agent('worker-1')['generation'] == '0' and f.paused()  # account wall: stays paused, nothing spawned
+    f.on_wall('supervisor', REAL_FABLE_WALL, 'turn')
+    assert json.loads(f.agent('supervisor')['wall'])['action'] == 'stop' and not f.agent('supervisor').get('wall_downgrade')
+
+
+def test_v1_startup_wall_is_walled_paused_and_retried_after_resume(tmp_path):
+    f = make(tmp_path, {'goal': 'x'}, worker_cli='claude', worker_model='claude-haiku-4-5')
+    f.setf('worker-1', state='starting')  # a new generation answering its startup prompt
+    f.handle(turn('worker-1', CLAUDE_ACCOUNT_WALL))
+    assert f.agent('worker-1')['state'] == 'walled' and f.paused() and f.task()['status'] == 'running'
+    assert json.loads((f.run_dir / 'brake.json').read_text())['source'] == 'startup'
+    f.tick()
+    assert f.agent('worker-1')['generation'] == '0'  # paused: no retry yet
+    assert control(f, 'resume', 'c1')['status'] == 'accepted'
+    f.tick()
+    assert f.agent('worker-1')['generation'] == '1' and f.agent('worker-1')['state'] == 'starting'
+    f.handle(turn('worker-1', 'READY', generation=1))
+    assert f.agent('worker-1')['state'] == 'idle'
+
+
+def test_v1_startup_non_wall_failure_still_blocks(tmp_path):
+    f = make(tmp_path, {'goal': 'x'})
+    f.setf('worker-1', state='starting')
+    f.handle(turn('worker-1', 'I could not find AGENTS.md'))
+    assert f.task()['status'] == 'blocked' and not f.paused()
+
+
+def test_default_pool-a_cash_cap_day_and_night(tmp_path):
+    assert brake.effective({'pool': 'pool-a'}) == {'pool': 'pool-a', 'max_usd': 40}
+    assert brake.effective({'pool': 'pool-a'}, night=True)['max_usd'] == 10
+    assert brake.effective({'pool': 'pool-a', 'max_usd': 5}, night=True)['max_usd'] == 5
+    assert brake.effective({'pool': 'pool-b'}) == {'pool': 'pool-b'}
+    f = make(tmp_path, {'goal': 'x', 'budget': {'pool': 'pool-a'}})
+    f.tick()
+    assert not f.paused()  # no quota.json: unknown, never trips
+    quota(tmp_path, pool-a={'cash_used_usd': 100}); f.tick()
+    quota(tmp_path, pool-a={'cash_used_usd': 111}); f.r.hset('fx:night', mapping={'brake_card': 'night'}); f.tick()
+    assert f.paused() and 'max_usd 11.0/10' in f.r.hget('fx:service', 'reason')
+    assert json.loads((f.run_dir / 'brake.json').read_text())['effective_budget']['max_usd'] == 10
+
+
+# ---- v2 (real Redis): Pi model error event, startup wall
+PI_WALL = '429 Too Many Requests: usage limit reached for this account'
+
+
+def test_v2_pi_model_error_wall_commits_walled_and_requeues_once(fx):
+    f = fx
+    req(f, 'r1'); f.pump(); slot = 'worker-1'
+    env = receive(f, slot)
+    event(f, dict(session(f, slot), kind='candidate', delivery=env, candidate={'tool': 'model', 'error': PI_WALL}))
+    ident = event(f, dict(session(f, slot), kind='settled', delivery=env, candidates=[], failed=True, aborted=False,
+                          unfinished=False))
+    msg = f.v2.bus.message(env['message_id'])
+    assert msg['status'] == 'committed' and msg['outcome'] == 'walled'
+    assert f.agent(slot)['state'] == 'idle' and f.paused()  # not an unconfirmed hold: the turn ended
+    assert f.v2.depth(slot) == 1
+    event(f, dict(session(f, slot), kind='settled', delivery=env, candidates=[], failed=True, aborted=False,
+                  unfinished=False))  # replay: settle.late
+    assert f.v2.depth(slot) == 1
+    f.tick()
+    assert json.loads((f.run_dir / 'brake.json').read_text())['source'] == 'turn'
+    audit = [x['event'] for _, x in f.r.xrange(f.v2.bus.audit_key)]
+    assert 'brake.wall_requeued' in audit and 'execution.held' not in audit and ident
+
+
+def test_v2_pi_failure_without_a_wall_still_holds(fx):
+    f = fx
+    req(f, 'r1'); f.pump(); slot = 'worker-1'
+    env = receive(f, slot)
+    event(f, dict(session(f, slot), kind='candidate', delivery=env, candidate={'tool': 'model', 'error': 'socket hang up'}))
+    event(f, dict(session(f, slot), kind='settled', delivery=env, candidates=[], failed=True, aborted=False, unfinished=False))
+    assert f.agent(slot)['state'] == 'held'
+
+
+def test_v2_startup_wall_is_walled_not_blocked(fx):
+    f = fx
+    f.service = False; f.cfg['mode'] = 'task'
+    event(f, dict(kind='task', request_id='new-task', spec={'goal': 'write an evidence report'}))
+    f.setf('worker-2', state='starting', launch_ready=1)
+    event(f, dict(session(f, 'worker-2'), kind='startup', request_id='ready-again', text='', failed=True,
+                  aborted=False, error=PI_WALL))
+    assert f.agent('worker-2')['state'] == 'walled' and f.paused() and f.task()['status'] == 'running'
+    f.tick()
+    assert json.loads((f.run_dir / 'brake.json').read_text())['source'] == 'startup'
+
+
+# ---- v2 integration: Codex supervisor + official Claude workers, real hook entry points
+from test_v2_codex_claude import mixed, answer_turn, typed  # noqa: E402,F401
+from test_v2_codex_claude import submit as mixed_submit, decision as mixed_decision  # noqa: E402
+
+
+def test_v2_claude_pool_wall_short_reply_downgrades_once_and_resumes(mixed):
+    f = mixed
+    f.cfg['worker_model'] = 'fable'
+    mixed_submit(f)
+    answer_turn(f, 'supervisor', mixed_decision(['worker-1']))
+    f.pump()
+    instruction = typed(f, 'worker-1')[-1]
+    env = f.v2.bus.slot_state('worker-1')
+    assert answer_turn(f, 'worker-1', REAL_FABLE_WALL)['status'] == 'committed'  # short reply, no stall wait
+    msg = f.v2.bus.message(env['message_id'])
+    assert msg['outcome'] == 'walled' and f.paused() and f.agent('worker-1')['state'] == 'idle'
+    assert answer_turn(f, 'worker-1', REAL_FABLE_WALL, prompt=instruction)['status'] == 'ignored'  # late duplicate
+    assert f.v2.depth('worker-1') == 1 and not any('[worker-1 report]' in t for t in typed(f, 'supervisor'))
+    old = f.agent('worker-1')['pane']
+    f.tick()
+    assert f.agent('worker-1')['generation'] == '1' and old in f.mgr.killed
+    assert f.runtime_cfg('worker-1')['worker_model'] == 'claude-sonnet-5'
+    assert 'claude-sonnet-5' in json.dumps(f.mgr.spawned[-1], default=str)
+    assert answer_turn(f, 'worker-1', 'READY', startup=True)['status'] == 'ready'
+    f.tick()
+    assert not f.paused()
+    f.pump()
+    resent = typed(f, 'worker-1')
+    assert len(resent) == 1 and resent[0].startswith('[Resumed after a usage wall]')
+    assert 'Write worker-1/part.md' in resent[0]
+    report = 'Done:\n- wrote part.md\nEvidence:\n- worker-1/part.md\nNot done: none\nBlocked: none'
+    assert answer_turn(f, 'worker-1', report)['status'] == 'committed'
+    f.pump()
+    reports = [t for t in typed(f, 'supervisor') if t.startswith('[worker-1')]
+    assert len(reports) == 1  # one report for the instruction: the wall turn never became one
+
+
+def test_v2_claude_account_wall_stays_paused_and_hold_release_cannot_resume(mixed):
+    f = mixed
+    mixed_submit(f)
+    answer_turn(f, 'supervisor', mixed_decision(['worker-1', 'worker-2']))
+    f.pump()
+    assert answer_turn(f, 'worker-1', CLAUDE_ACCOUNT_WALL)['status'] == 'committed'
+    assert f.paused() and json.loads(f.agent('worker-1')['wall'])['action'] == 'stop'
+    f.tick()
+    assert f.agent('worker-1')['generation'] == '0' and f.paused()  # no downgrade for an account wall
+    # F's unknown-dialog hold on worker-2, then its turn_ended release: the slot frees, the pause stays.
+    f.v2.transaction('hold-test', lambda: f.v2.hold('worker-2', 'unknown confirmation dialog'))
+    f.setf('worker-2', state='idle', idle_confirmed=1)
+    f.tick(); f.pump()
+    assert f.paused() and len(typed(f, 'worker-1')) == 1
+    assert f.wall_gate('worker-2', 'Do you trust the files in this folder?\n❯ 1. Yes') is None
+
+
+def test_v2_claude_startup_wall_then_resume_retries_the_same_launch(mixed):
+    f = mixed
+    mixed_submit(f)
+    assert f.wall_rotate('worker-2', None, 'test rotation')
+    assert answer_turn(f, 'worker-2', CLAUDE_ACCOUNT_WALL, startup=True)['status'] == 'rejected'
+    assert f.agent('worker-2')['state'] == 'walled' and f.paused() and f.task()['status'] == 'running'
+    f.tick()
+    assert f.agent('worker-2')['generation'] == '1'
+    runtime_v2.post_event(f.v2.bus, dict(kind='resume', request_id='res-1'), 'res-1')
+    assert f.v2.step(10) and not f.paused()
+    f.tick()
+    assert f.agent('worker-2')['generation'] == '2' and f.agent('worker-2')['state'] == 'starting'
+    assert answer_turn(f, 'worker-2', 'READY', startup=True)['status'] == 'ready'

@@ -34,6 +34,11 @@ NUM_LIMITS = ('max_usd', 'max_week_pct', 'max_hours')
 LINES = (('max_calls', 'calls'), ('max_rounds', 'rounds'), ('max_hours', 'hours'),
          ('max_usd', 'usd'), ('max_week_pct', 'week_pct'))
 TURN_WALL_MAX = 400  # a turn text longer than this is a report, not a wall message
+DEFAULT_USD = {'day': 40, 'night': 10}  # master design v2 ★3 default: pool-a cash cap per scene (USD)
+MODEL_KEY = {'claude': 'worker_model', 'codex': 'codex_model', 'pi': 'pi_model'}  # launch override per CLI
+WALL_RESUME = ('[Resumed after a usage wall] Your previous turn on this instruction was cut off by a usage wall '
+               'before it reported. Files you already wrote stay. Check your directory first and continue from where '
+               'it stopped; do not redo finished steps.\n\n')
 GATE_TAIL = 25  # screen lines the watchdog wall gate reads (same bottom-of-screen window as F's prompt table)
 
 
@@ -64,6 +69,14 @@ def validate_budget(raw):
             raise ValueError('budget ' + limit + ' applies only to pool ' + owner
                              + ' (pool-a: walls + equivalent USD; pool-b: walls + weekly quota %)')
     return dict(raw)
+
+
+def effective(budget, night=False):
+    """The card the brake evaluates: a pool-a card without max_usd gets the master-design default cap
+    (day 40 / night 10 USD per scene; night = B's fx:night brake_card). A caller's own max_usd always wins."""
+    if not budget or budget.get('pool') != 'pool-a' or 'max_usd' in budget:
+        return budget
+    return dict(budget, max_usd=DEFAULT_USD['night' if night else 'day'])
 
 
 def parse_raise(items, budget):
