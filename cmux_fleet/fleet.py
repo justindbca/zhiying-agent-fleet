@@ -43,7 +43,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import handoff, history, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime  # noqa: E402
+from cmux_fleet import handoff, history, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -100,12 +100,23 @@ def connect(cfg):
 
 
 def agent_cwd(cfg, name):
+    if name == 'supervisor' and cfg.get('supervisor_cwd'):
+        return Path(cfg['supervisor_cwd'])  # sub-fleet: the adopted worker pane keeps its own directory
     run = Path(cfg['run'])
     return run / 'agents' / name if name == 'supervisor' else run / 'workspace' / name
 
 
 def key(kind, name):
     return 'fx:' + kind + ':' + name
+
+
+def manager_for(cfg):
+    """The cmux registry of one fleet: the main fleet is 'cmux-fleet', a sub-fleet 'cmux-fleet:<task id>'."""
+    from cmux_fleet.cmux_manager import CmuxSessionManager
+    extra = {k: cfg[k] for k in ('agents_title', 'control_title') if cfg.get(k)}
+    if 'cmux_state_dir' in cfg:
+        extra['state_dir'] = cfg['cmux_state_dir']
+    return CmuxSessionManager(cfg.get('session') or SESSION, **extra)
 
 
 def codex_home(cfg):
@@ -236,6 +247,7 @@ def claude_stop(cfg_path, name, generation, raw):
             pass
     cfg = load(cfg_path)
     if cfg.get('transport_version') == 2:
+        cfg, name, generation = subfleet.delegated_route(cfg, name, int(generation))
         return tui_turn(cfg, name, int(generation), thread=data.get('session_id'),
                         transcript=data.get('transcript_path', ''), text=text,
                         inputs=claude_user_prompts(data.get('transcript_path', '')))
@@ -522,6 +534,7 @@ def notify(cfg_path, name, generation, payload, sessions=None):
     if cfg.get('transport_version') == 2:
         r.close(); r.connection_pool.disconnect()
         inputs = data.get('input-messages') or data.get('input_messages') or []
+        cfg, name, generation = subfleet.delegated_route(cfg, name, int(generation))
         return tui_turn(cfg, name, int(generation), thread=data.get('thread-id') or data.get('thread_id'),
                         transcript='', text=data.get('last-assistant-message') or data.get('last_assistant_message') or '',
                         inputs=inputs if isinstance(inputs, list) else [])
@@ -652,9 +665,16 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
     settings.write_text(json.dumps({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': hook, 'timeout': timeout}]}]}}))
     argv = [cfg.get('claude') or 'claude', '--dangerously-skip-permissions', '--model', cfg.get('worker_model') or 'sonnet',
             '--settings', str(settings), '--add-dir', str(Path(cfg['run']) / 'workspace')]
+    if name != 'supervisor':  # stable per slot across generations (peer messages address it)
+        argv += ['--name', claude_session_name(cfg, name)]
     if (cwd / 'mcp.json').exists():
         argv += ['--mcp-config', str(cwd / 'mcp.json')]
     return argv + ['--', prompt]  # --add-dir / --mcp-config are variadic: end options first
+
+
+def claude_session_name(cfg, name):
+    """f<main run token>[-<sub-fleet task id>]-<worker slot>, e.g. f1a2b3c4d-M0-worker-2."""
+    return 'f' + subfleet.token(cfg) + ('-' + cfg['task_id'] if cfg.get('task_id') else '') + '-' + name
 
 
 def pi_event(cfg_path, name, generation, raw):
@@ -912,18 +932,8 @@ class Fleet:
     def fleet_cmd(self):
         return shlex.join([self.cfg['python'], str(Path(__file__).resolve()), 'chrome', '--config', str(self.path)])
 
-    # -- actors
-    def spawn(self, name, prompt, *, launch_held=False):
-        cfg = self.runtime_cfg(name)
-        info = self.agent(name)
-        generation = int(info.get('generation', 0))
-        launch = json.loads(info.get('runtime_launch') or '{}')
-        cfg_path = self.path
-        if launch:
-            cfg_path = self.run_dir / 'runtime' / (name + '-g' + str(generation) + '.json')
-            save(cfg_path, cfg)  # generation-specific callback config; never edit old snapshots
-        cwd = agent_cwd(self.cfg, name)
-        cwd.mkdir(parents=True, exist_ok=True)
+    def role_scope(self, name, cfg, launch):
+        """The AGENTS.md text of one agent (also written by a sub-fleet over its adopted pane)."""
         role = 'supervisor' if name == 'supervisor' else 'worker'
         scope = (HERE / 'agents' / (('service_' if self.service else '') + role
                                   + ('_v2' if self.v2 and is_pi(cfg, name) else '') + '.md')).read_text()
@@ -942,6 +952,22 @@ class Fleet:
                               else pi_adapter.UNSANDBOXED_SCOPE)
         if is_pi(cfg, name):
             scope += '\n## Runtime permissions\n\n' + pi_adapter.UNSANDBOXED_SCOPE + '\n'
+        return scope
+
+    # -- actors
+    def spawn(self, name, prompt, *, launch_held=False):
+        cfg = self.runtime_cfg(name)
+        info = self.agent(name)
+        generation = int(info.get('generation', 0))
+        launch = json.loads(info.get('runtime_launch') or '{}')
+        cfg_path = self.path
+        if launch:
+            cfg_path = self.run_dir / 'runtime' / (name + '-g' + str(generation) + '.json')
+            save(cfg_path, cfg)  # generation-specific callback config; never edit old snapshots
+        cwd = agent_cwd(self.cfg, name)
+        cwd.mkdir(parents=True, exist_ok=True)
+        role = 'supervisor' if name == 'supervisor' else 'worker'
+        scope = self.role_scope(name, cfg, launch)
         (cwd / 'AGENTS.md').write_text(scope)
         if is_claude(cfg, name):
             (cwd / 'CLAUDE.md').write_text(scope)  # Claude Code reads CLAUDE.md, not AGENTS.md
@@ -962,7 +988,7 @@ class Fleet:
         prompt_file.parent.mkdir(parents=True, exist_ok=True)
         prompt_file.write_text(prompt)
         result = self.mgr.spawn_interactive_cli(
-            window_name='fx-' + self.label(name), prompt_file=str(prompt_file), start_directory=str(cwd),
+            window_name='fx-' + self.cfg.get('tab_prefix', '') + self.label(name), prompt_file=str(prompt_file), start_directory=str(cwd),
             cli_command=shlex.join([self.cfg['python'], str(Path(__file__).resolve()), 'actor', str(cfg_path), name,
                                     '--generation', str(generation)]),
             output_file=str(self.run_dir / 'prompts' / (name + '-g' + str(generation) + '.terminal.log')),
@@ -991,6 +1017,8 @@ class Fleet:
                                 'There is no task yet: your final reply must be exactly READY.')
 
     def start_all(self):
+        if self.cfg.get('adopt'):
+            return subfleet.start_adopted(self)  # sub-fleet: the delegated worker pane is the supervisor
         self.setf('supervisor', label=SUPERVISOR_LABEL)
         for name in self.workers:
             self.init_worker(name)
@@ -1540,6 +1568,8 @@ class Fleet:
         # Leave the original message queued across handoff; READY triggers another
         # idle-boundary validation. This daemon remains the sole inbox consumer.
         used, window = self.usage(name)
+        if subfleet.adopted(self.cfg, name, info.get('generation')):
+            window = 0  # an adopted pane goes back to its parent fleet: never replace it with a successor
         if window and used >= float(self.cfg['handoff_ratio']) * window:
             if int(info.get('delivered') or 0) == 0:
                 # A fresh session (only its READY turn so far) is already over the ratio: its
@@ -1880,6 +1910,7 @@ class Fleet:
     def tick(self):
         self.roster_tick()  # the only place the roster changes: never inside per-slot loops
         self.write_result()
+        subfleet.tick(self)  # sub-fleet spawns/returns: side effects, outside any v2 transaction
         if self.v2:
             return self.v2.tick()
         now = time.time()
@@ -2030,7 +2061,7 @@ def resume(run, args):
         print('--resume auto: ' + str(run) + ': task already ' + task['status'] + '; starting a new run')
         return False
     save(path, cfg)
-    mgr = CmuxSessionManager(SESSION, state_dir=cfg.get('cmux_state_dir'))
+    mgr = manager_for(cfg)
     command = [cfg['python'], str(Path(__file__).resolve()), 'daemon', str(path), '--resume']
     caffeinate = shutil.which('caffeinate')
     if caffeinate:
@@ -2044,13 +2075,12 @@ def resume(run, args):
 
 
 def daemon(cfg_path, resume=False):
-    from cmux_fleet.cmux_manager import CmuxSessionManager
     cfg = load(cfg_path)
     with (Path(cfg['run']) / 'daemon.lock').open('a+') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         # cmux creates a fresh login shell: it does not inherit the start command's
         # CMUX_FLEET_STATE. Pin the registry in config, never fall back for new runs.
-        fleet = Fleet(cfg_path, connect(cfg), CmuxSessionManager(SESSION, state_dir=cfg.get('cmux_state_dir')))
+        fleet = Fleet(cfg_path, connect(cfg), manager_for(cfg))
         fleet.resume_requested = resume
 
         def stop(signum, frame):
@@ -2110,7 +2140,10 @@ def start(args):
         match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', version)
         if not match or tuple(map(int, match.groups())) < (1, 1, 0):
             raise SystemExit('pi >= 1.1.0 is required (agent_settled); found: ' + version)
-    mgr = CmuxSessionManager(SESSION)
+    if getattr(args, 'name', None) is not None and not args.name.strip():
+        raise SystemExit('--name must not be empty')
+    titles = {'agents_title': 'Fleet ' + args.name.strip()} if getattr(args, 'name', None) else {}
+    mgr = manager_for(titles)
     if mgr.session_exists():
         raise SystemExit('cmux-fleet tabs already exist; run `stop` and close them with the ✕ first')
     if not roster_path:
@@ -2149,7 +2182,9 @@ def start(args):
            'pi_thinking': args.pi_thinking, 'allow_unsandboxed_pi': args.allow_unsandboxed_pi,
            'pi_agent_dir': args.pi_agent_dir, 'allow_profile_live_switch': args.allow_profile_live_switch,
            'transport_version': args.transport_version, 'allow_development_v2': args.allow_development_v2,
-           'max_attempts': args.max_attempts or DEFAULTS['max_attempts']}
+           'max_attempts': args.max_attempts or DEFAULTS['max_attempts'], 'token': token}
+    if getattr(args, 'name', None):
+        cfg.update(name=args.name.strip(), **titles)
     if roster_path:
         cfg.update(roster=str(roster_path), worker_roles=worker_roles)
     if 'pi' in clis:
@@ -2197,7 +2232,11 @@ def request(cfg, event, wait=30):
 def status(cfg):
     if cfg.get('transport_version', 1) == 2:
         from cmux_fleet.control_view import snapshot
-        print(json.dumps(snapshot(cfg), ensure_ascii=False, indent=2))
+        out = snapshot(cfg)
+        children = subfleet.tree(cfg)
+        if children:
+            out['subfleets'] = children  # the whole tree under this fleet
+        print(json.dumps(out, ensure_ascii=False, indent=2))
         return
     r = connect(cfg)
     print(json.dumps({'mode': cfg.get('mode', 'task'), 'task': r.hgetall(TASK), 'service': r.hgetall(SERVICE),
@@ -2282,6 +2321,7 @@ def main(argv=None):
                    help='reattach an unfinished v2 run instead of creating one (auto: the run in latest.json; '
                         'a finished or missing run starts a new one). Other start flags except --roster / '
                         '--max-attempts are ignored when a run is reattached')
+    s.add_argument('--name', help='human-readable fleet name used in sub-fleet titles (default: task goal or run token)')
     s.add_argument('--max-attempts', type=int,
                    help='times one dispatch/request may run in total across start --resume (default 2)')
     ag = sub.add_parser('agents', help='inspect offline agent profiles without starting or contacting a fleet')
@@ -2298,6 +2338,15 @@ def main(argv=None):
     pl.add_argument('--registry', help='agent card directory (default: project or package agents/)')
     pl.add_argument('--workers', help='comma-separated stable worker slots; include profile assignments when supplied')
     pl.add_argument('--json', action='store_true', help='JSON output (already the default)')
+    sf = sub.add_parser('subfleet', help='sub-fleets (operator/test entry; the daemon executes it)')
+    sf_sub = sf.add_subparsers(dest='subfleet_cmd', required=True)
+    sp = sf_sub.add_parser('spawn', help='hand a worker pane over as supervisor of a new sub-fleet')
+    sp.add_argument('--slot', required=True, help='worker slot of the owning fleet, e.g. worker-1')
+    sp.add_argument('--task-id', required=True, help='M<n> under the main fleet, M0.<n> under sub-fleet M0')
+    sp.add_argument('--goal', required=True)
+    sp.add_argument('--workers', type=int, default=2)
+    sp.add_argument('--output', help='absolute path of the deliverable the parent expects')
+    sp.add_argument('--config', default=str(LATEST))
     dm = sub.add_parser('daemon', help='run the coordinator (internal)')
     dm.add_argument('cfg')
     dm.add_argument('--resume', action='store_true', help='reconcile and replay (internal; from start --resume)')
@@ -2369,6 +2418,8 @@ def main(argv=None):
                       runtime_v2.sanitize_text(json.dumps(record, ensure_ascii=False)), flush=True)
         elif args.cmd == 'status':
             status(cfg)
+        elif args.cmd == 'subfleet':
+            print(json.dumps(subfleet.cli_spawn(cfg, args), ensure_ascii=False))
         elif args.cmd == 'chrome':
             ans = request(cfg, {'kind': 'chrome', 'argv': args.argv}, wait=150)
             print(ans.get('out') or ans.get('reason') or json.dumps(ans, ensure_ascii=False))

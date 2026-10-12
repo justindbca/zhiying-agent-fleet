@@ -18,6 +18,7 @@ import redis
 
 from cmux_fleet.message_bus import BusError, MessageBus, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
+from cmux_fleet import subfleet
 
 
 # Supported v2 CLI combinations. Everything else is refused with its reason, never
@@ -36,6 +37,9 @@ def v2_cli_problem(cfg):
         if mode != 'task':
             return ('transport v2 Codex supervisor + Claude workers supports task mode only: '
                     'service-mode result cards have no Codex renderer and request routing is unvalidated')
+        return None
+    if pair == ('claude', 'claude') and cfg.get('adopt') and mode == 'task':
+        # Sub-fleet (docs/design.md §19): the supervisor is an adopted official-Claude worker pane.
         return None
     if pair[0] == 'claude':
         return 'transport v2 has no Claude supervisor adapter (supported: all-Pi, or Codex supervisor + Claude workers)'
@@ -916,7 +920,10 @@ class RuntimeV2:
         lost = self.lost_dispatches()
         sup = self.f.agent('supervisor').get('pane')
         page = bool(sup) and self.f.mgr.get_pane_status(sup) is not None
-        reattach = [s for s in self.f.workers if page and self.reattachable(s)]
+        # A sub-fleet's adopted supervisor pane belongs to its parent fleet: reattach it like a worker.
+        slots = self.f.workers + (['supervisor'] if subfleet.adopted(self.f.cfg, 'supervisor', self.f.agent(
+            'supervisor').get('generation')) else [])
+        reattach = [s for s in slots if page and self.reattachable(s)]
         for slot in self.f.names:
             if not self.clear_slot(slot, slot in reattach) and slot in reattach:
                 reattach.remove(slot)  # its lease is still held: never leave it silently undeliverable
@@ -930,6 +937,7 @@ class RuntimeV2:
         elif self.f.task().get('status') == 'running':
             self.transaction('resume-task-' + uuid.uuid4().hex, lambda: self.brief(lost))
         self.audit('daemon.resumed', level='warn', reattached=reattach, lost=len(lost), previous_pause=previous or '')
+        subfleet.resume_children(self.f)  # children whose daemon is gone run again (--resume)
 
     def lost_dispatches(self):
         """Task-mode worker instructions of the running task that were queued or in flight."""
@@ -1236,6 +1244,12 @@ class RuntimeV2:
     def retire(self, slot, reason):
         info = self.f.agent(slot)
         pane = info.get('pane')
+        if subfleet.adopted(self.f.cfg, slot, info.get('generation')) and pane:
+            if not subfleet.hand_back(self.f):  # the pane goes back to the parent fleet, never killed
+                return False
+            self.confirm_retired(slot)
+            self.f.setf(slot, state='dead', runtime_ready=0, bridge_available=0, launch_ready=0)
+            return True
         if not pane or not self.f.mgr.kill_pane(pane) or self.f.mgr.get_pane_status(pane) is not None:
             self.transaction('retire-failed-' + uuid.uuid4().hex, lambda: self.hold(slot, reason + '; retirement unconfirmed'))
             return False
@@ -1312,9 +1326,10 @@ class RuntimeV2:
                 self.bus.r.set('fx:daemon:beat', str(time.time()))
                 self.step()
                 self.f.pump()
-                self.tick()
+                self.f.tick()  # Fleet.tick: roster reload, result.json, sub-fleets, then this tick
             if self.f.explicit_stop:
-                all_stopped = all([self.retire(slot, 'explicit fleet stop') for slot in self.f.names])
+                children_stopped = subfleet.stop_children(self.f)  # descendants first, panes taken back
+                all_stopped = all([self.retire(slot, 'explicit fleet stop') for slot in self.f.names]) and children_stopped
                 if all_stopped:
                     self.bus.r.set(marker, 'stopped')
                     # An explicit stop finishes the run: start --resume refuses it, auto starts anew.
