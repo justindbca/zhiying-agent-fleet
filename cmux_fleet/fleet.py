@@ -44,7 +44,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import contracts, handoff, history, lifecycle, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
+from cmux_fleet import contracts, handoff, history, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -794,6 +794,9 @@ class Fleet:
         self.last_chrome = 0
         self.explicit_stop = False
         self.resume_requested = False  # set by `daemon --resume` (operator ran start --resume)
+        self.lifecycle_close = None  # set by lifecycle_close.request_close: why/how this run is being closed
+        self.close_workspace_pending = False
+        self.notifier = None  # tests: replaces the TG / parent channels (lifecycle_close.notify)
         self.v2 = runtime_v2.RuntimeV2(self) if self.transport_version == 2 else None
 
     # -- small helpers
@@ -1585,6 +1588,14 @@ class Fleet:
         hours = spec.get('hours', 16)
         if isinstance(hours, bool) or not isinstance(hours, (int, float)) or not 0 < hours < 1000:
             raise ValueError('hours must be a positive number')
+        life_spec = {}
+        if not self.cfg.get('parent_config'):  # a sub-fleet's deliverable is checked by its parent
+            if self.cfg.get('lifecycle') == 'dev_task':
+                life_spec['deliver'] = lifecycle_deliver.validate_deliver(spec.get('deliver'))
+            elif self.cfg.get('lifecycle') == 'review_loop':
+                if 'review_file' not in spec:
+                    raise ValueError('review_loop needs "review_file": the reviewer verdict JSON it reads each round')
+                life_spec['review_file'] = lifecycle_deliver.validate_review_file(spec['review_file'])
         registry_path = validate_agent_registry_path(spec.get('agent_registry'))
         dispatch_plan = profile_assignments = None
         if auto_agents:
@@ -1598,6 +1609,7 @@ class Fleet:
         task_id = 'task-' + uuid.uuid4().hex[:10]
         self.r.delete(TASK)
         fields = {'id': task_id, 'goal': spec['goal'], 'status': 'running', 'completion': 0,
+                  'lifecycle_spec': json.dumps(life_spec, ensure_ascii=False),
                   'reason': '', 'deadline': time.time() + hours * 3600, 'bad_replies': 0,
                   'bounces': 0, 'artifacts': json.dumps(spec.get('artifacts', []), ensure_ascii=False),
                   'apply_profiles_live': json.dumps(spec.get('apply_profiles_live', False))}
@@ -2220,6 +2232,7 @@ class Fleet:
 
     def tick(self):
         self.roster_tick()  # the only place the roster changes: never inside per-slot loops
+        lifecycle_close.tick(self)  # mode policy (done gate, hold, timeouts, idle); before result.json
         self.write_result()
         self.sync_contract_files()
         subfleet.tick(self)  # sub-fleet spawns/returns: side effects, outside any v2 transaction
@@ -2325,7 +2338,7 @@ def resume_target(value):
     if run.name == 'config.json':
         run = run.parent
     problem = None
-    if (run / 'result.json').exists():
+    if (run / 'result.json').exists() and not resumable(run):
         problem = 'run already finished (result.json exists)'
     else:
         try:
@@ -2339,6 +2352,14 @@ def resume_target(value):
         print('--resume auto: ' + str(run) + ': ' + problem + '; starting a new run')
         return None
     return run
+
+
+def resumable(run):
+    """True when the run was stopped by a lifecycle hold timeout (stop_keep_resumable)."""
+    try:
+        return load(Path(run) / 'result.json').get('resumable') is True
+    except (OSError, ValueError):
+        return False
 
 
 def resume(run, args):
@@ -2371,6 +2392,14 @@ def resume(run, args):
             raise SystemExit('cannot resume ' + str(run) + ': its Redis runtime directory is gone')
         r = start_redis(cfg, tries=300)  # reloads the AOF from the same directory
     task = {} if cfg.get('mode') == 'service' else r.hgetall(TASK)
+    if task.get('status', 'running') != 'running' and resumable(run):
+        try:  # the lifecycle hold stopped it on purpose: the operator's --resume reopens the task
+            lifecycle_hold.reopen(r, task, getattr(args, 'extend_hours', None))
+        except ValueError as exc:
+            raise SystemExit('cannot resume ' + str(run) + ': ' + str(exc)) from exc
+        (run / 'result.json').unlink()
+        task = r.hgetall(TASK)
+        print('reopened ' + task.get('id', '') + ' (stopped by the lifecycle hold) for --resume')
     if task.get('status', 'running') != 'running':
         save_result(run, task)
         try:
@@ -2416,6 +2445,7 @@ def daemon(cfg_path, resume=False):
                     fleet.r.shutdown()
                 except Exception:
                     pass  # redis closes the socket while acknowledging shutdown
+    lifecycle_close.after_daemon(fleet)  # lock released, Redis down: close this run's workspace
 
 
 def start(args):
@@ -2454,6 +2484,10 @@ def start(args):
     gate = lifecycle.clock_gate_problem(args.lifecycle)
     if gate:
         raise SystemExit(gate)
+    try:
+        initiator = lifecycle_close.initiator_for_start(getattr(args, 'initiator', None))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if not cmux_available():
         raise SystemExit('run this inside a cmux terminal: cmux only accepts processes started in its windows')
     clis = {args.supervisor_cli, args.worker_cli}
@@ -2516,7 +2550,8 @@ def start(args):
            'pi_thinking': args.pi_thinking, 'allow_unsandboxed_pi': args.allow_unsandboxed_pi,
            'pi_agent_dir': args.pi_agent_dir, 'allow_profile_live_switch': args.allow_profile_live_switch,
            'transport_version': args.transport_version, 'allow_development_v2': args.allow_development_v2,
-           'max_attempts': args.max_attempts or DEFAULTS['max_attempts'], 'token': token}
+           'max_attempts': args.max_attempts or DEFAULTS['max_attempts'], 'token': token,
+           'initiator': initiator}
     if getattr(args, 'name', None):
         cfg.update(name=args.name.strip(), **titles)
     if roster_path:
@@ -2533,6 +2568,8 @@ def start(args):
     if not result.success:
         connect(cfg).shutdown()
         raise SystemExit(result.error)
+    if hasattr(mgr, 'claim_run'):
+        mgr.claim_run(str(run))  # the lifecycle closer only closes a registry tagged with this run
     save(LATEST, dict(cfg, config=str(run / 'config.json')))
     print('fleet started (' + (args.lifecycle or '-') + ' lifecycle, ' + args.mode + ' mode): supervisor + ' + str(len(cfg['workers']))
           + ' worker(s) initialising. Run directory:', run)
@@ -2661,6 +2698,11 @@ def main(argv=None):
     s.add_argument('--name', help='human-readable fleet name used in sub-fleet titles (default: task goal or run token)')
     s.add_argument('--max-attempts', type=int,
                    help='times one dispatch/request may run in total across start --resume (default 2)')
+    s.add_argument('--initiator', metavar='KIND:ID',
+                   help='who started this run, notified when it closes (claude:<session>, launchd:<label>, '
+                        'program:<id>; default $CMUX_FLEET_INITIATOR or the launchd label)')
+    s.add_argument('--extend-hours', type=float,
+                   help='with --resume of a run the lifecycle hold stopped for its time budget: hours to add')
     ag = sub.add_parser('agents', help='inspect offline agent profiles without starting or contacting a fleet')
     ag_sub = ag.add_subparsers(dest='agents_cmd', required=True)
     ag_list = ag_sub.add_parser('list', help='list validated agent cards as JSON')
@@ -2684,6 +2726,8 @@ def main(argv=None):
     sp.add_argument('--workers', type=int, default=2)
     sp.add_argument('--output', help='absolute path of the deliverable the parent expects')
     sp.add_argument('--config', default=str(LATEST))
+    lc = sub.add_parser('lifecycle-close', help='close a stopped run\'s cmux workspace (internal; detached)')
+    lc.add_argument('cfg')
     dm = sub.add_parser('daemon', help='run the coordinator (internal)')
     dm.add_argument('cfg')
     dm.add_argument('--resume', action='store_true', help='reconcile and replay (internal; from start --resume)')
@@ -2733,6 +2777,8 @@ def main(argv=None):
         start(args)
     elif args.cmd == 'daemon':
         daemon(args.cfg, args.resume)
+    elif args.cmd == 'lifecycle-close':
+        lifecycle_close.close_workspace(args.cfg)
     elif args.cmd == 'notify':
         notify(args.cfg, args.agent, args.generation, args.payload)
     elif args.cmd == 'claude-stop':

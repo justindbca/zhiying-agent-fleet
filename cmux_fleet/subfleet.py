@@ -230,6 +230,19 @@ def process_requests(f):
 
 
 # ------------------------------------------------------------------ spawn
+def child_lifecycle(parent):
+    """A sub-fleet runs the lifecycle its parent's mode names (child_mode), default dev_task, never the
+    parent's own (a service parent must not hand a task-mode child lifecycle service). Closing it stays
+    with the parent (tick/collect); None for a parent without a lifecycle (older runs)."""
+    from cmux_fleet import lifecycle
+    if not parent.get('lifecycle'):
+        return None
+    child = lifecycle.mode_policy(parent['lifecycle'], 'child_mode', 'dev_task')
+    if lifecycle.base_mode(child) != 'task':
+        raise ValueError('child_mode ' + child + ' is not a task lifecycle')
+    return child
+
+
 def child_config(f, slot, task_id, workers, rec_dir, sid, info, redis_cfg, name):
     fleet = _fleet()
     parent = f.cfg
@@ -238,7 +251,9 @@ def child_config(f, slot, task_id, workers, rec_dir, sid, info, redis_cfg, name)
     cfg = {k: v for k, v in parent.items() if k not in ('roster', 'worker_roles', 'roles', 'adopt',
                                                           'redis_socket', 'redis_runtime_dir')}
     cfg.update(redis_cfg)
+    life = child_lifecycle(parent)
     cfg.update(run=str(rec_dir), workers=['worker-' + str(i + 1) for i in range(workers)], mode='task',
+               lifecycle=life, initiator={'kind': 'fleet', 'id': str(f.path)},
                session=session_name(task_id), task_id=task_id, parent_config=str(f.path),
                root_config=root_path, root_token=token(parent), name=name, title_path=path,
                agents_title=title(path), control_title='Fleet control · ' + task_id, tab_prefix=task_id + '/',

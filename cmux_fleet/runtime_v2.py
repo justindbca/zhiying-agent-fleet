@@ -19,7 +19,7 @@ import redis
 from cmux_fleet import contracts
 from cmux_fleet.message_bus import BusError, MessageBus, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
-from cmux_fleet import subfleet
+from cmux_fleet import lifecycle_close, subfleet
 
 
 # Supported v2 CLI combinations. Everything else is refused with its reason, never
@@ -1263,6 +1263,9 @@ class RuntimeV2:
     def retire(self, slot, reason):
         info = self.f.agent(slot)
         pane = info.get('pane')
+        if info.get('state') == 'reclaimed' and not pane:  # already retired by the idle reclaim
+            self.confirm_retired(slot)
+            return True
         if subfleet.adopted(self.f.cfg, slot, info.get('generation')) and pane:
             if not subfleet.hand_back(self.f):  # the pane goes back to the parent fleet, never killed
                 return False
@@ -1355,10 +1358,12 @@ class RuntimeV2:
                     from cmux_fleet.fleet import save_result
                     self.f.write_result()
                     if not (self.f.run_dir / 'result.json').exists():
-                        save_result(self.f.run_dir, {}, 'stopped', 'explicit fleet stop')
+                        save_result(self.f.run_dir, {}, 'stopped',
+                                    (self.f.lifecycle_close or {}).get('reason') or 'explicit fleet stop')
                 else:
                     self.f.explicit_stop = False  # preserve Redis/evidence for unconfirmed stop
                     self.audit('stop.unconfirmed', level='error')
+                lifecycle_close.finalize(self.f, all_stopped)  # closed_by/closed_at, notifications
         finally:
             if control:
                 try:
