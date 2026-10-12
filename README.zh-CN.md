@@ -19,6 +19,7 @@ daemon 独立于模型的自述做这几件事：
 - **模型不能提交宿主命令。** 监工只能声明要检查的文件，不能提交要跑的命令。Codex agent 跑在沙盒里（可写工作区、开网络）；pi 和可选的 Claude worker 没有这一层沙盒。
 - **上下文满之前先轮换。** 每次投递前 daemon 从 Codex 自己的 rollout 文件读 token 用量。到 `--handoff-ratio`（默认 60%）就让会话写三节交接单，
   并进机器骨架，旧屏幕存进历史页，在原位置起接班者（`worker-1` → `worker-1.1` → `worker-1.2`）读交接单继续。模型不写就用骨架，不会单因缺交接文本阻塞；窗口/进程错误仍按原故障语义处理。
+  窗口和比例按每个 agent 当前的 CLI / 模型分别取（docs/design.md §22）：roster 的 worker 条目 `window` / `handoff_ratio` ＞ roster `handoff:` 表（`<cli>:<model>` 再 `<cli>`）＞ config 同名表 ＞ 内置（Claude 模型名含 `[1m]`/`opus`/`fable`/`sonnet` → 1,000,000，其余 → `--claude-window`；Codex / Pi 用自报窗口）＞ `--handoff-ratio`。roster 改了下一次投递检查即生效，不重启；`status` 显示每个 agent 的生效值和来源。
 - **卡死看门。** 忙碌中的 agent 若 rollout 文件 `--stall-timeout` 秒（默认 30 分钟）没动，就中止该轮并报给监工；监工自己卡死给一次重试，再卡就判阻塞交人。
 - **过期回调一律丢弃。** 每次拉起会话都把代数烘进 notify 钩子参数，退役会话的迟到回调会被忽略。
 

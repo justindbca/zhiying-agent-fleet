@@ -489,7 +489,11 @@ def _snapshot(client, settings, cfg, redactor):
             "state": agent.get("state") or lease.get("status") or None,
             "transport_state": lease.get("status"),
             "context": {"used": used, "window": window,
-                        "ratio": used / window if used is not None and window and window > 0 else None},
+                        "ratio": used / window if used is not None and window and window > 0 else None,
+                        # effective handoff threshold and where it came from (docs/design.md §22)
+                        "handoff_window": agent.get("handoff_window"),
+                        "handoff_ratio": _number(agent.get("handoff_ratio")),
+                        "handoff_source": agent.get("handoff_source")},
             "queue_depth": client.llen(settings.prefix + ":pending:" + slot),
             "current_request": request_id, "current_message": mid or None,
             "current_delivery": lease.get("current_delivery") or None,
@@ -558,8 +562,9 @@ def _render(record, width):
         if state["socket"].get("error"):
             lines.append(state["socket"]["error"])
         for slot, item in state["slots"].items():
-            lines.append("%s label=%s state=%s context=%s queue=%s request=%s elapsed=%s deadline=%s" % (
-                slot, item["label"], item["state"], item["context"]["ratio"], item["queue_depth"],
+            lines.append("%s label=%s state=%s context=%s handoff=%s@%s queue=%s request=%s elapsed=%s deadline=%s" % (
+                slot, item["label"], item["state"], item["context"]["ratio"], item["context"].get("handoff_ratio"),
+                item["context"].get("handoff_window"), item["queue_depth"],
                 item["current_request"], item["elapsed_s"], item["deadline_at"]))
         return _wrap(_display("\n".join(lines)), width)
     if str(record.get("event", "")).startswith("control."):

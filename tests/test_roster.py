@@ -158,7 +158,14 @@ def test_role_change_applies_at_next_generation_without_respawn(hot):
     ('workers:\n  - name: worker.2\n', 'no dots'),
     ('workers:\n  - name: supervisor\n', 'not be "supervisor"'),
     ('workers:\n  - {name: worker-1, role: nope.md}\n', 'role file not found: nope.md'),
-    ('workers:\n  - {name: worker-1, model: x}\n', 'optional "role" only'),
+    ('workers:\n  - {name: worker-1, model: x}\n', 'optional "role", "window", "handoff_ratio" only'),
+    ('workers:\n  - {name: worker-1, handoff_ratio: 1.0}\n', 'workers[0]: handoff_ratio must be a number between 0 and 1'),
+    ('workers:\n  - {name: worker-1, window: 0}\n', 'workers[0]: window must be a positive integer'),
+    ('workers:\n  - {name: worker-1, window: true}\n', 'workers[0]: window must be a positive integer'),
+    ('workers:\n  - name: worker-1\nhandoff: {claude: {ratio: 0}}\n', 'handoff[claude]: ratio must be a number'),
+    ('workers:\n  - name: worker-1\nhandoff: {claude:opus: {window: 1.5}}\n', 'handoff[claude:opus]: window must be'),
+    ('workers:\n  - name: worker-1\nhandoff: {gemini: {window: 10}}\n', 'handoff[gemini]: key must be'),
+    ('workers:\n  - name: worker-1\nhandoff: {codex: {limit: 10}}\n', '"window" and/or "ratio" only'),
     ('agents: []\n', 'only a "workers" list'),
 ])
 def test_invalid_roster_is_rejected_whole_and_roster_kept(hot, text, reason):
@@ -226,3 +233,20 @@ def test_start_roster_validation_precedes_provisioning(monkeypatch, tmp_path):
     bad.write_text('workers:\n  - name: exit\n  - name: exit\n')
     with pytest.raises(SystemExit, match='duplicate worker name exit'):
         fleet.main(base + ['--roster', str(bad)])
+
+
+def test_handoff_table_hot_reloads_into_status(hot):
+    """docs/design.md §22: a handoff-only edit is applied by the running daemon and shown by status."""
+    f = hot
+    path = write_roster(f, WORKERS)
+    path.write_text(path.read_text().replace('  - name: worker-2\n', '  - {name: worker-2, handoff_ratio: 0.8}\n')
+                    + 'handoff:\n  claude: {window: 1000000}\n')
+    os.utime(path, ns=(f.test_stamp + 1, f.test_stamp + 1))
+    f.tick()
+    changed, = audits(f, 'roster.changed')
+    assert json.loads(changed['handoff'])['worker-2'] == {'before': {}, 'after': {'ratio': 0.8}}
+    assert f.workers == WORKERS and disk_workers(f) == WORKERS  # nothing else changed
+    slots = control_view.snapshot(fleet.load(f.path))['slots']
+    assert slots['worker-2']['context']['handoff_ratio'] == 0.8
+    assert slots['worker-1']['context']['handoff_window'] == '1000000'
+    assert slots['worker-1']['context']['handoff_source'] == 'window: roster claude; ratio: --handoff-ratio'

@@ -195,7 +195,32 @@ workers:
 - **Rejected as a whole** (roster kept, reasons in the control log as `roster.rejected`): invalid YAML,
   unknown keys, bad or duplicate names, zero workers, a missing role file, or a name already used in
   this run (a removed worker's name cannot come back). Changes are logged as `roster.changed`.
+- **Handoff threshold per model** (docs/design.md §22): optional `handoff:` table and per-worker
+  `window` / `handoff_ratio`; edits apply at the next delivery check, no restart.
 - Needs PyYAML in the Python that runs the daemon.
+
+## Handoff window and ratio per model
+
+The session is rotated when `used >= ratio × window`. Each agent resolves `window` and `ratio`
+separately, first hit wins, using its **current** runtime CLI and model (after a profile switch too):
+
+1. the roster worker entry: `{name: exit, window: 1000000, handoff_ratio: 0.7}`;
+2. the roster `handoff:` table, key `<cli>:<model>` (exact model string) then `<cli>`;
+3. the same `handoff:` table in `config.json` (static);
+4. built-in: Claude models whose name contains `[1m]`, `opus`, `fable` or `sonnet` → 1,000,000; other Claude
+   models → `--claude-window` (default 200,000); Codex / Pi → the window they report themselves;
+5. `--handoff-ratio` (default 0.6).
+
+```yaml
+handoff:
+  claude:opus: {window: 1000000}
+  claude: {window: 200000, ratio: 0.6}
+  codex: {ratio: 0.6}
+```
+
+A bad value (ratio not in (0, 1), window not a positive integer, unknown key or CLI) rejects the
+whole roster change. `status` shows `context.handoff_window` / `handoff_ratio` / `handoff_source`
+per agent; the control view prints `handoff=<ratio>@<window>`.
 
 ## Resume an interrupted run (`start --resume`)
 
