@@ -275,7 +275,7 @@ Fleet agents（一个工作区）
 | 启动 | `start --supervisor-cli claude [--supervisor-model M]`（缺省 `opus`）；fleet 直接起官方 `claude`，监工规则照原 `supervisor.md` / `service_supervisor.md` 写成 AGENTS.md + CLAUDE.md，不带 `fleet_decision` 改写。 |
 | 投递 / 决策 JSON / READY / 纠错 | 全用上文 Codex+Claude 小节的 TUI 通路：daemon 以 `tui-supervisor-g<N>` 收件、bracketed 粘贴进 Claude；Stop 钩子 → `tui_turn` → `fleet_decision` 候选 → 原 `on_supervisor` / `on_service_supervisor`。READY 闸、三次纠错（task 判 blocked，service 暂停）均为原逻辑。 |
 | 人工输入入队（§5） | 只给非 adopt 的 v2 Claude 监工加 `UserPromptSubmit` 钩子（`claude-prompt`）。放行：daemon 打进去的本代投递正文、本代起始提示（仅 READY 前）、`/` 命令、空文本；拒绝并说明：未 READY、旧代、图片占位（请改用文件路径）。其余人工文字一律发 `operator_input` 事件（原 submit / `[Operator instruction]` / `ui-<uuid>` 请求语义，生成 ID 的仍是 Python），然后**挡住**这条提示不进模型，原因里显示「已排队（ID）」/「被拒绝：原因」/「未确认，请先看 control」。被接受的输入随后作为正式投递打回监工。钩子通过时 stdout 为空（其输出会进模型上下文）。 |
-| 已知降级 | 钩子 30 秒超时按非阻塞错误处理、该提示会被放行（按 Claude Code 钩子语义推断，未实测）：此时人工文字进模型、Stop 只记 `turn.ignored`，不会结算；daemon 等待上限 20 秒留在钩子超时内。被挡的人工文字不进入 Claude 转录，留存在钩子提示、Redis 审计和随后的投递里。Claude 监工与 Codex 监工一样没有 UI-only 卡渲染器：service 模式的简单结果只在 control 可见。 |
+| 已知降级 | 钩子 30 秒超时按非阻塞错误处理、该提示会被放行（按 Claude Code 钩子语义推断，未实测）：此时人工文字进模型、Stop 只记 `turn.ignored`，不会结算；daemon 等待上限 20 秒留在钩子超时内。被挡的人工文字不进入 Claude 转录，留存在钩子提示、Redis 审计和随后的投递里。官方 TUI 监工（Codex / Claude）没有 UI-only 会话条目：daemon 用 `tui_cards` 把卡片渲染到 `<run>/cards/supervisor.log` 与历史页 Cards 视图（A2），不进模型上下文。 |
 
 **验证**：`tests/test_claude_supervisor.py`（真私有 Redis + 真 Stop / UserPromptSubmit 钩子与 `claude-prompt` 入口 + 假 cmux；worker 分别为官方 Claude TUI 与 Pi bridge）；`scripts/smoke_claude_supervisor.sh` 离线档跑组合表与回归，`--live pi|claude` 档需 cmux、真模型和 `start --lifecycle`（D 块）后才能跑。**未验收**：真实 Claude TUI 上的 UserPromptSubmit 拦截与粘贴排队、真实 smoke、Fable 监工念稿预演。
 

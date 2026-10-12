@@ -319,6 +319,30 @@ def test_service_invalid_decisions_pause_after_three(service_fleet):
     assert f.paused()
 
 
+def test_service_result_card_rendered_off_model_never_typed(service_fleet):
+    """A Claude supervisor has no UI-only session entry: its cards go to cards/supervisor.log (A2 tui_cards)."""
+    f = service_fleet
+    spec = dict(id='r1', payload={'message': 'say OK'}, reply={'required': ['reply'], 'allowed': ['reply']})
+    event(f, dict(kind='request', request_id='cmd-r1', spec=spec))
+    f.pump()
+    assert 'Reply with the service decision JSON from AGENTS.md.' in typed(f, 'supervisor')[-1]
+    route = json.dumps({'status': 'RUNNING', 'skip': [],
+                        'dispatch': [{'to': 'worker-1', 'request_id': 'r1', 'instruction': 'Reply OK in the reply field.'}]})
+    assert stop_hook(f, 'supervisor', route)['status'] == 'committed'
+    f.pump()
+    env = f.v2.bus.receive('worker-1', 'bridge-worker-1-g0', generation=0, session_id=f.agent('worker-1')['thread'])
+    sent = len(f.mgr.sent)
+    event(f, dict(pi_session(f, 'worker-1'), kind='settled', delivery=env, failed=False, aborted=False,
+                  unfinished=False, candidates=[{'tool': 'fleet_result', 'value': {'reply': 'OK'}}]))
+    assert json.loads(f.r.get(fleet.RESULT + 'r1'))['result'] == {'reply': 'OK'}
+    f.v2.render_cards()
+    assert 'worker-1：OK' in (f.run_dir / 'cards' / 'supervisor.log').read_text()
+    assert 'worker-1：OK' in (f.run_dir / 'history.html').read_text()   # history page "Cards" view
+    assert not (f.run_dir / 'cards' / 'worker-1.log').exists()          # Pi shows its own cards
+    assert len(f.mgr.sent) == sent and not f.v2.depth('supervisor')     # never typed into Claude or queued
+    assert not any('worker-1：OK' in text for text in typed(f, 'supervisor'))
+
+
 # ------------------------------------------------------------------ operator input (design.md §5)
 def test_operator_text_without_task_submits_a_task_and_is_blocked_from_the_turn(task_fleet):
     f = task_fleet
