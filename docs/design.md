@@ -119,7 +119,7 @@ Fleet agents（一个工作区）
 
 | 角色 | 可选 CLI | 完成通知 |
 |---|---|---|
-| supervisor | 原 Codex / pi | Codex notify / pi agent_settled |
+| supervisor | 原 Codex / pi；官方 Claude（仅 v2，见 §11 2026-10-13 小节） | Codex notify / pi agent_settled / Claude Stop |
 | worker | 原 Codex / 官方 Claude Code CLI / pi | notify / Claude Stop / agent_settled |
 
 用户明确要求：**Claude 必须由 fleet 直接启动官方 `claude` CLI。**
