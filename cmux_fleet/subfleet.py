@@ -41,6 +41,7 @@ SEP = ' › '
 ROLE_FILES = ('AGENTS.md', 'CLAUDE.md', 'CONTRACTS.md')  # a contract sub-fleet writes its supervisor CONTRACTS.md
 STOP_WAIT = 180  # seconds a tree stop waits for one child daemon to exit
 LAUNCH_GRACE = 120  # seconds a just-launched child daemon has to take its lock before it counts as gone
+EXHAUSTED = 'max-attempts'  # prefix of the refusal once a task used up its sub-fleet spawns
 
 
 class Refused(ValueError):
@@ -117,6 +118,11 @@ def save_record(child_run, rec):
     _fleet().save(Path(child_run) / 'subfleet.json', rec)
 
 
+def attempts_used(run, task_id):
+    """Sub-fleets ever started for ``task_id`` here (``sub/M0``, ``sub/M0-attempt-<n>``; failed ones too)."""
+    return sum(1 for d in children_dirs(run) if record(d).get('task_id') == task_id)
+
+
 def active_children(run):
     return [d for d in children_dirs(run) if record(d).get('state') in ACTIVE]
 
@@ -172,6 +178,11 @@ def check(f, slot, task_id, workers, ready=True):
     live = active_children(f.run_dir)
     if any(record(d).get('task_id') == task_id for d in live):
         return 'sub-fleet ' + task_id + ' is already running'
+    cap = int(f.cfg.get('max_attempts') or fleet.DEFAULTS['max_attempts'])
+    used = attempts_used(f.run_dir, task_id)
+    if used >= cap:  # acceptance 10/13 P1-4: escalate -> approve must not retry a sub-fleet forever
+        return (EXHAUSTED + ' ' + str(cap) + ': sub-fleet ' + task_id + ' already started ' + str(used)
+                + ' time(s); no new sub-fleet for it')
     if len(live) >= lim['max_children']:
         return ('max_children ' + str(lim['max_children']) + ': this fleet already runs '
                 + ', '.join(record(d).get('task_id', '?') for d in live))

@@ -1410,7 +1410,11 @@ class Fleet:
         if fields.get('escalate') is not None:
             task_id, ok, note, reply = self.escalate_intake(name, fields, s)
             hold = task_id if task_id in s['tasks'] else (mine or {}).get('id')
-            if hold:
+            if hold and ok is None:  # sub-fleet attempts used up (escalate_intake): no new spawn
+                s['tasks'][hold].update(status='failed', reason='escalate refused: ' + subfleet.EXHAUSTED
+                                        + ' reached, no new sub-fleet')
+                self.contract_log('task.failed', task=hold, by='program', reason=s['tasks'][hold]['reason'])
+            elif hold:
                 s['tasks'][hold].update(status='escalated' if ok else 'running',
                                         reason='asked to split' if ok else 'escalate refused; worker continues')
             if reply:
@@ -1526,6 +1530,11 @@ class Fleet:
             task_id, rec = self.escalate_check(name, fields, state)
         except ValueError as exc:
             self.log('escalate.refused', agent=name, reason=str(exc))
+            if state is not None and str(exc).startswith(subfleet.EXHAUSTED):
+                # Contract task out of sub-fleet attempts: the task fails here, the supervisor decides.
+                return None, None, ('\n[escalate] refused for ' + self.label(name) + ': ' + str(exc)
+                                    + '. The task is marked failed; re-dispatch it (another approach or worker) '
+                                    'or end the task.'), None
             return None, False, ('\n[escalate] refused for ' + self.label(name) + ': ' + str(exc)
                                  + ' (the worker was told and continues its task)'), \
                 ('[escalate] your split request was refused by the program: ' + str(exc)

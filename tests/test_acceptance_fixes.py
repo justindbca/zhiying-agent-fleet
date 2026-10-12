@@ -3,8 +3,11 @@
 Same two-fleet v2 world as test_subfleet / test_escalate: real private Redis, in-process daemons,
 real ``claude_stop`` hooks, a fake cmux world.
 """
+from pathlib import Path
 
-from test_subfleet import child_daemon, hook, no_launch, step, tree  # noqa: F401  (fixture + helpers)
+from test_contracts import cf, inbox, report  # noqa: F401  (fixture + helpers)
+from test_escalate import escalate, ok_check, parallel_m0  # noqa: F401
+from test_subfleet import child_daemon, hook, no_launch, step, tree  # noqa: F401
 from cmux_fleet import runtime_v2, subfleet
 
 
@@ -43,3 +46,34 @@ def test_second_bad_startup_reply_blocks(tree):
     assert hook(t, cf, 'worker-1', 'still not', prompt=runtime_v2.STARTUP_NUDGE)['status'] == 'rejected'
     assert cf.agent('worker-1')['state'] == 'dead'
     assert cf.task()['status'] == 'blocked'
+
+
+# ------------------------------------------------------------------ P1-4: sub-fleet attempts are capped
+def old_attempts(run, task_id, n):
+    for i in range(n):
+        d = Path(run) / 'sub' / (task_id if i == 0 else task_id + '-attempt-' + str(i + 1))
+        d.mkdir(parents=True)
+        subfleet.save_record(d, {'task_id': task_id, 'slot': 'worker-1', 'state': 'failed', 'attempt': i + 1})
+
+
+def test_escalate_after_max_attempts_fails_the_task(cf, ok_check):
+    parallel_m0(cf)
+    old_attempts(cf.run_dir, 'M0', 2)  # max_attempts defaults to 2
+    report(cf, 'worker-1', escalate())
+    row = cf.contract_state()['tasks']['M0']
+    assert row['status'] == 'failed' and subfleet.EXHAUSTED in row['reason']
+    up = inbox(cf, 'supervisor')[-1]
+    assert 'max-attempts 2: sub-fleet M0 already started 2 time(s)' in up and 'marked failed' in up
+    assert not inbox(cf, 'worker-1') and cf.escalation_state() == {}
+    assert not (cf.run_dir / 'subfleet-requests').exists()  # no spawn was requested
+
+
+def test_spawn_refused_once_attempts_are_used(tree):
+    f = tree.f
+    old_attempts(f.run_dir, 'M0', 1)
+    rec = subfleet.spawn_child(f, 'worker-1', 'M0', 'Research five sources and merge them', 1, launch=no_launch)
+    assert rec['attempt'] == 2 and subfleet.attempts_used(f.run_dir, 'M0') == 2
+    reason = subfleet.check(f, 'worker-2', 'M0', 1, ready=False)  # also the cap, before any slot state
+    assert reason.startswith('sub-fleet M0 is already running')
+    subfleet.save_record(rec['run'], dict(subfleet.record(rec['run']), state='failed'))
+    assert subfleet.check(f, 'worker-2', 'M0', 1, ready=False).startswith('max-attempts 2: sub-fleet M0 already')
