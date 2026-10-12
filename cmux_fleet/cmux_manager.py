@@ -130,6 +130,18 @@ def kill_process_tree(pid: int, term_timeout: float = 3.0) -> None:
             pass
 
 
+def _exe(comm: str) -> str:
+    """Executable basename without ``.exe`` (the native Claude installer runs ``.../bin/claude.exe``)."""
+    name = Path(comm.strip()).name
+    return name[:-4] if name.endswith('.exe') else name
+
+
+def _node_runs(args: str, names: Tuple[str, ...]) -> bool:
+    """``node <script>`` whose script path names one of the CLIs (npm installs); not any node process."""
+    words = args.split()
+    return len(words) > 1 and _exe(words[0]) == 'node' and any(n in words[1] for n in names)
+
+
 class CmuxSessionManager:
     """Agents in one workspace; dock the daemon into an inactive history-pane tab."""
 
@@ -330,8 +342,17 @@ class CmuxSessionManager:
         tty = self._surfaces(ws)[pane_id].get('tty')
         if not tty:
             return False
+        # comm: one executable path per line (may contain spaces); a bare shell never matches.
         result = subprocess.run(['ps', '-t', tty, '-o', 'comm='], capture_output=True, text=True)
-        return result.returncode == 0 and any(Path(line.strip()).name in names for line in result.stdout.splitlines())
+        if result.returncode != 0:
+            return False
+        exes = [_exe(line) for line in result.stdout.splitlines() if line.strip()]
+        if any(e in names for e in exes):
+            return True
+        if 'node' not in exes:
+            return False
+        result = subprocess.run(['ps', '-t', tty, '-o', 'args='], capture_output=True, text=True)
+        return result.returncode == 0 and any(_node_runs(line, names) for line in result.stdout.splitlines())
 
     def capture_output(self, pane_id: str, lines: int = 2000) -> str:
         ws = self._where(pane_id)

@@ -85,3 +85,25 @@ def test_no_owned_control_does_not_move_unrelated_surface(layout):
     mgr._save_meta(meta)
     assert not mgr.dock_control('history')
     assert not calls
+
+
+# acceptance 10/13 P1-2: resume must recognise the native Claude binary (claude.exe), never a bare shell
+@pytest.mark.parametrize('comm,args,live', [
+    ('/opt/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe', '', True),
+    ('/usr/local/bin/codex', '', True),
+    ('node', 'node /opt/lib/node_modules/@anthropic-ai/claude-code/cli.js --name f1-worker-1', True),
+    ('-zsh', '', False),
+    ('node', 'node /srv/app/server.js', False),
+    ('/bin/bash', '', False),
+])
+def test_cli_process_matches_native_claude_and_npm_node_only(tmp_path, monkeypatch, comm, args, live):
+    mgr = cm.CmuxSessionManager('test')
+    monkeypatch.setattr(mgr, '_where', lambda pane: 'ws')
+    monkeypatch.setattr(mgr, '_surfaces', lambda ws: {'p': {'tty': 'ttys030'}})
+
+    def ps(argv, **kw):
+        out = ('-zsh\n' + comm + '\n') if argv[-1] == 'comm=' else ('-zsh\n' + args + '\n')
+        return SimpleNamespace(returncode=0, stdout=out, stderr='')
+    monkeypatch.setattr(cm.subprocess, 'run', ps)
+    from cmux_fleet.fleet import RESUME_CLIS
+    assert mgr.has_cli_process('p', RESUME_CLIS) is live

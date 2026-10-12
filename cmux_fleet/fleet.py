@@ -68,7 +68,7 @@ WORKER_NAME_RE = r'[a-z][a-z0-9-]{0,30}'
 # (same <slot>.<generation> pattern as worker-1 -> worker-1.1). Redis keys and the cwd stay 'supervisor'.
 SUPERVISOR_LABEL = 'supervisor-1'
 RESULT_TTL = 7 * 86400
-RESUME_CLIS = ('codex', 'claude', 'pi', 'node')  # process names that prove a reattachable CLI pane
+RESUME_CLIS = ('codex', 'claude')  # CLIs whose live process proves a reattachable pane (cmux_manager._is_cli)
 # Sandboxed agents cannot drive the user's browser themselves (and must never be allowed
 # to kill it). If the operator supplies a broker script, the daemon runs these verbs for them.
 CHROME_VERBS = {'check', 'tabs', 'newtab', 'go', 'url', 'js'}
