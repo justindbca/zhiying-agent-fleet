@@ -1089,8 +1089,11 @@ class Fleet:
     def role_scope(self, name, cfg, launch):
         """The AGENTS.md text of one agent (also written by a sub-fleet over its adopted pane)."""
         role = 'supervisor' if name == 'supervisor' else 'worker'
-        scope = (HERE / 'agents' / (('service_' if self.service else '') + role
-                                  + ('_v2' if self.v2 and is_pi(cfg, name) else '') + '.md')).read_text()
+        # v2 strips the [Request <id>] header (a transport id) before delivery and binds the id in
+        # code, so an official-CLI service supervisor gets the JSON-text role without request ids.
+        variant = ('_v2' if self.v2 and is_pi(cfg, name) else
+                   '_tui_v2' if self.v2 and self.service and role == 'supervisor' else '')
+        scope = (HERE / 'agents' / (('service_' if self.service else '') + role + variant + '.md')).read_text()
         if launch.get('role_text') and launch['role_text'].strip() != scope.strip():
             scope += '\n## Assigned profile role\n\n' + launch['role_text']
         roles = self.cfg.get('worker_roles') or {}

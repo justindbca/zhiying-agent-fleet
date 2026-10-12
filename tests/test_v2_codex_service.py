@@ -137,3 +137,21 @@ def test_service_smoke_gate_still_requires_development_flag():
     cfg = dict(transport_version=2, supervisor_cli='codex', worker_cli='claude', mode='service', lifecycle='smoke')
     with pytest.raises(ValueError, match='allow-development-v2'):
         runtime_v2.validate_config(cfg)
+
+
+def test_tui_service_supervisor_routes_without_seeing_request_ids(service):
+    # Real smoke finding (codex+pi/service): v2 strips the [Request <id>] header before typing, so
+    # the official-CLI supervisor's role must not ask for request ids; the daemon binds the id.
+    f = service
+    role = (fleet.agent_cwd(f.cfg, 'supervisor') / 'AGENTS.md').read_text()
+    assert '[Request <id>]' not in role and '"request_id"' not in role
+    assert 'The daemon binds its id' in role
+    request(f, 'r9')
+    assert '[Request' not in typed(f, 'supervisor')[-1] and 'r9' not in typed(f, 'supervisor')[-1]
+    bare = json.dumps({'status': 'RUNNING', 'skip': [],
+                       'dispatch': [{'to': 'worker-1', 'instruction': 'Answer in the reply field.'}]})
+    assert answer_turn(f, 'supervisor', bare)['status'] == 'committed'
+    f.pump()
+    assert 'Answer in the reply field.' in typed(f, 'worker-1')[-1]
+    assert answer_turn(f, 'worker-1', '{"reply": "bound"}')['status'] == 'committed'
+    assert json.loads(f.r.get(fleet.RESULT + 'r9'))['result'] == {'reply': 'bound'}
