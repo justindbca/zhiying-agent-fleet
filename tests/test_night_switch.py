@@ -211,8 +211,9 @@ def test_night_off_swaps_back_to_the_run_default(nightly):
     assert audits(f, 'night.brief_skipped')                              # no running task: nothing to brief
 
 
-def test_live_profile_task_defers_the_roster_swap(nightly):
+def test_live_profile_task_defers_the_roster_swap_and_keeps_delivering(nightly):
     f = nightly
+    submit(f)
     f.r.hset(fleet.TASK, mapping={'apply_profiles_live': 'true'})
     f.cfg['allow_profile_live_switch'] = True
     fleet.night_cmd(fleet.load(f.path), 'on')
@@ -221,6 +222,19 @@ def test_live_profile_task_defers_the_roster_swap(nightly):
     assert len(audits(f, 'roster.profile_deferred')) == len(WORKERS)
     f.tick()
     assert len(audits(f, 'roster.profile_deferred')) == len(WORKERS)    # logged once per slot
+    # The task goes on with the day runtime: a deferred slot still takes its delivery.
+    monkey = fleet.profile_runtime.prepare_profile
+    fleet.profile_runtime.prepare_profile = lambda *a, **k: fleet.profile_runtime.ProfileApplication()
+    try:
+        assert answer_turn(f, 'supervisor', decision(['worker-1']))['status'] == 'committed'
+        f.pump()
+    finally:
+        fleet.profile_runtime.prepare_profile = monkey
+    assert 'Write worker-1/part.md' in typed(f, 'worker-1')[-1] and f.agent('worker-1')['label'] == 'worker-1'
+    # Night off while deferred: the flag clears, so a later deferral is audited again.
+    fleet.night_cmd(fleet.load(f.path), 'off')
+    f.tick()
+    assert all(f.agent(w).get('roster_swap_deferred') == '0' for w in WORKERS)
 
 
 def test_failed_preflight_blocks_and_keeps_the_old_runtime(nightly, monkeypatch):

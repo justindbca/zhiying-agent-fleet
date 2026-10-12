@@ -1827,8 +1827,8 @@ class Fleet:
         info = self.agent(name)
         if info.get('state') != 'idle':
             return
-        if name != 'supervisor' and name in self.profile_swaps():
-            return  # the next generation (new profile) takes this queue once READY
+        if name != 'supervisor' and info.get('roster_swap_deferred') != '1' and name in self.profile_swaps():
+            return  # the next generation (new profile) takes this queue once READY (a deferred swap keeps working)
         if self.v2 and not runtime_v2.tui_slot(self.runtime_cfg(name), name) and info.get('bridge_available') != '1':
             return
         pending = self.v2.pending_text(name) if self.v2 else self.r.lrange(key('inbox', name), 0, 0)
@@ -2178,6 +2178,9 @@ class Fleet:
 
     def profile_swap_tick(self):
         pending = self.profile_swaps()
+        for name in self.active_workers():
+            if name not in pending and self.agent(name).get('roster_swap_deferred') == '1':
+                self.setf(name, roster_swap_deferred=0)  # roster changed back: a later deferral is audited again
         live = False
         if pending and not self.service:
             try:
