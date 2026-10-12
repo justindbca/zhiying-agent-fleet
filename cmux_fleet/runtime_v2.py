@@ -601,6 +601,19 @@ class RuntimeV2:
         if kind in ('turn', 'pi_session'):
             self.audit('event.v1_rejected', slot=slot or '')
             return
+        if kind == 'peer':  # §21 broker verb: Redis-only effects (queue + lists), plannable unlike chrome
+            from cmux_fleet import peer
+            self.reply(ev, peer.broker(self.f, ev))
+            return
+        if kind == 'unsolicited':  # §21: a worker turn no delivery started; never a settlement
+            from cmux_fleet import peer
+            info = self.f.agent(slot) if slot in self.f.workers else {}
+            if (not info or ev.get('run_id') != self.bus.run_id or ev.get('thread') != info.get('thread')
+                    or ev.get('generation') != int(info.get('generation', -1))):
+                self.audit('event.stale', slot=slot or '')
+                return
+            peer.unsolicited(self.f, slot, str(ev.get('text') or ''))
+            return
         if kind == 'chrome':
             # An external broker call is a side effect and cannot be planned/replayed.
             self.reply(ev, {'status': 'rejected', 'reason': 'browser broker v2 transaction support is not implemented'})

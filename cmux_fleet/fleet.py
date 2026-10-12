@@ -44,7 +44,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import contracts, handoff, history, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
+from cmux_fleet import contracts, handoff, history, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -678,14 +678,20 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
                     return answer
             bus.register_slot(name, generation, thread)
             return call('startup', text=text, failed=False, aborted=False)
+        def ignored(reason):
+            # §21: a turn no delivery started (a peer SendMessage woke it, or the operator typed):
+            # the daemon records it as unsolicited and forwards its Peer notices / question lines.
+            if name != 'supervisor' and (text or '').strip():
+                runtime_v2.post_event(bus, dict(base, kind='unsolicited', text=text[-8000:]))
+            return skipped('ignored', reason)
         lease = r.hgetall(bus.lease_key(name))
         if lease.get('status') != 'received' or not lease.get('message_id'):
-            return skipped('ignored', 'no received delivery (manual or duplicate turn)')
+            return ignored('no received delivery (manual or duplicate turn)')
         msg = bus.message(lease['message_id'])
         if msg.get('generation') != generation or msg.get('session_id') != thread:
             return skipped('stale', 'delivery belongs to another generation/session')
         if not runtime_v2.turn_answers(msg['body']['text'], inputs):
-            return skipped('ignored', 'turn was not started by the typed delivery')
+            return ignored('turn was not started by the typed delivery')
         return call('settled', delivery={k: msg[k] for k in runtime_v2.IDENTITY},
                     candidates=runtime_v2.tui_candidates(name, msg['body'].get('purpose'), text or ''),
                     failed=False, aborted=False, unfinished=False)
@@ -876,6 +882,8 @@ class Fleet:
             # Appended, never prepended: the queue parses request/task headers at the start.
             self.r.hset(ROSTER, mapping={'notify': 0})
             text += '\n[Roster change] Workers you can dispatch to now: ' + ', '.join(self.labels())
+        if name == 'supervisor':
+            text += peer.drain(self)  # [peer CC] / unsolicited / violation notes (docs/design.md §21)
         if self.v2:
             return self.v2.queue(name, text)
         self.r.rpush(key('inbox', name), text)
@@ -1010,7 +1018,7 @@ class Fleet:
         if extra and extra.is_file():  # this agent's own prompt (one per worker in service mode)
             scope += '\n## 4. Your role (' + name + ')\n\n' + extra.read_text()
         if self.contract_phase():  # successors / roster-added workers inside a contract task
-            scope += '\n' + self.contract_doc(role)
+            scope += '\n' + self.contract_doc(role, name)
         scope = scope.replace('{{WORKSPACE}}', str(self.workspace())).replace('{{FLEET_CHROME}}', self.fleet_cmd())
         sandbox_notice = ('You run inside a sandbox. Driving the user\'s browser directly (AppleScript, GUI automation) '
                           'fails there with an error. That error means the sandbox stopped you, not that the browser '
@@ -1162,6 +1170,8 @@ class Fleet:
             self.r.set('fx:reply:' + ev['request_id'], json.dumps({'status': 'accepted'}), ex=86400)
         elif kind == 'chrome':
             self.r.set('fx:reply:' + ev['request_id'], json.dumps(self.chrome(ev.get('argv')), ensure_ascii=False), ex=3600)
+        elif kind == 'peer':
+            self.r.set('fx:reply:' + ev['request_id'], json.dumps(peer.broker(self, ev), ensure_ascii=False), ex=3600)
         elif kind == 'pi_session':
             name = ev.get('agent')
             info = self.agent(name or '')
@@ -1216,7 +1226,8 @@ class Fleet:
         state = state or self.contract_state()
         if state is None:
             return
-        text = json.dumps(contracts.view(state, self.cfg.get('worker_cli') or 'codex'), ensure_ascii=False, indent=2)
+        text = json.dumps(contracts.view(state, self.cfg.get('worker_cli') or 'codex', peer.runtime(self)),
+                          ensure_ascii=False, indent=2)
         if text == getattr(self, 'contracts_text', None):
             return
         for path in (self.run_dir / 'contracts.json', self.workspace() / 'contracts.json'):
@@ -1244,8 +1255,10 @@ class Fleet:
             self.contract_queue(state, slot, text + '\nAct on it per CONTRACTS.md; reply in the AGENTS.md format '
                                 '(Done / Evidence / Not done / Blocked) when done.')
 
-    def contract_doc(self, role):
-        return (HERE / 'agents' / ('contracts_' + role + '.md')).read_text().replace('{{WORKSPACE}}', str(self.workspace()))
+    def contract_doc(self, role, name=None):
+        text = (HERE / 'agents' / ('contracts_' + role + '.md')).read_text()
+        text += peer.doc(self, role, name)  # §21: 5-A (Claude) or 5-B (Pi / Codex) by this agent's CLI
+        return text.replace('{{WORKSPACE}}', str(self.workspace()))
 
     def contract_decision(self, state, decision):
         """Validate a decision against the contract phase. Returns (state, rows to queue now, held rows,
@@ -1416,6 +1429,7 @@ class Fleet:
                 self.contract_log('task.released', task=held['id'])
         if fields.get('peer_notices') and str(fields['peer_notices']).strip().lower() != 'none':
             self.contract_log('peer_notices', by=name, line=str(fields['peer_notices']))
+            notes += peer.violations(self, name, fields['peer_notices'])
         question = str(fields.get('question', '')).strip()
         if question and question.lower() != 'none':
             notes.append('[worker question] ' + self.label(name) + ': ' + question)
@@ -1715,6 +1729,8 @@ class Fleet:
             # takeover prompt is a CLI argument without a msg id: that turn is accepted in 'starting'.)
             if info.get('state') == 'idle' or ev.get('msg_id') != info.get('msg_id') or info.get('msg_done') == info.get('msg_id'):
                 self.log('turn.duplicate', agent=name, msg_id=ev.get('msg_id'), current=info.get('msg_id'))
+                if name != 'supervisor' and is_claude(self.runtime_cfg(name), name) and ev.get('text', '').strip():
+                    peer.unsolicited(self, name, ev['text'][-8000:])  # e.g. woken by a peer SendMessage
                 return
             self.setf(name, msg_done=ev.get('msg_id'))
         if is_pi(self.runtime_cfg(name), name):
@@ -1956,7 +1972,7 @@ class Fleet:
             for name in self.names:
                 cwd = agent_cwd(self.cfg, name)
                 cwd.mkdir(parents=True, exist_ok=True)
-                (cwd / 'CONTRACTS.md').write_text(self.contract_doc('supervisor' if name == 'supervisor' else 'worker'))
+                (cwd / 'CONTRACTS.md').write_text(self.contract_doc('supervisor' if name == 'supervisor' else 'worker', name))
             prompt += ('\nInterface contracts are ON for this task: read CONTRACTS.md in your current directory now '
                        'and follow it. Your first reply is phase "interfaces": a full plan (M0…Mn) and every '
                        'interface with its sample, and an empty dispatch. The P1 skeleton worker is '
@@ -3029,6 +3045,12 @@ def main(argv=None):
     c = sub.add_parser('chrome', help='run a vetted browser verb through the daemon (sandboxed agents)')
     c.add_argument('--config', default=str(LATEST))
     c.add_argument('argv', nargs=argparse.REMAINDER)
+    c = sub.add_parser('peer', help='send a peer notice to a worker through the daemon (contract tasks, §21)')
+    c.add_argument('--config', default=str(LATEST))
+    c.add_argument('--from', dest='sender', required=True)
+    c.add_argument('--to', required=True)
+    c.add_argument('--iface', required=True)
+    c.add_argument('--text-file', required=True)
     h = sub.add_parser('claude-stop', help='Claude Code Stop hook (internal; hook JSON on stdin)')
     for arg in ('cfg', 'agent', 'generation'):
         h.add_argument(arg)
@@ -3072,6 +3094,13 @@ def main(argv=None):
             ans = request(cfg, {'kind': 'chrome', 'argv': args.argv}, wait=150)
             print(ans.get('out') or ans.get('reason') or json.dumps(ans, ensure_ascii=False))
             sys.exit(ans.get('rc', 1) if ans.get('status') == 'ok' else 2)
+        elif args.cmd == 'peer':
+            ans = request(cfg, {'kind': 'peer', 'from': args.sender, 'to': args.to, 'iface': args.iface,
+                                'text_file': str(Path(args.text_file).resolve())})
+            ok = ans.get('status') == 'ok'
+            print('peer: delivered to ' + ', '.join(ans['delivered']) if ok else
+                  ans.get('reason') or json.dumps(ans, ensure_ascii=False))
+            sys.exit(0 if ok else 2)
         elif args.cmd == 'stop':
             print(json.dumps(request(cfg, {'kind': 'stop'}), ensure_ascii=False))
         elif args.cmd in ('pause', 'resume'):

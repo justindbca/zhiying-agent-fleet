@@ -241,6 +241,15 @@ Opt-in per task; without the key nothing changes. Rules: `docs/design.md` §18 (
 The program writes `<run>/contracts.json` (copied to `<workspace>/contracts.json`) and
 `<run>/contracts.log.jsonl`; agents only read them. Each agent directory gets `CONTRACTS.md`.
 
+**Peer notices** (contract tasks only; `docs/design.md` §21): a producer tells the consumers of an
+interface it changes (`UNAPPROVED`) and finishes (`READY`) directly. Two Claude Code workers use
+Claude Code's own `SendMessage` (session names `f<root token>-…-worker-<n>`, listed per consumer in
+`contracts.json` `consumers_runtime`); any pair with a Pi / Codex end uses the broker
+`fleet.py peer --from <me> --to <worker|consumers:IF-x> --iface IF-x --text-file <own file>`, which
+validates the fixed first line, 600 chars, READY-by-producer and 20/hour, puts `[peer] …` in the
+target's inbox and copies the supervisor (`[peer CC]`, appended to its next business message). A Claude
+turn woken by a peer message answers no delivery: logged as `unsolicited`, never a report.
+
 ## Sub-fleets (a worker becomes a sub-fleet supervisor; development)
 
 A busy worker can be turned into the supervisor of its own fleet for one numbered piece of work
