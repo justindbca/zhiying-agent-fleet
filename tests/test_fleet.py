@@ -701,6 +701,9 @@ def test_claude_worker_gets_claude_md_kit_and_trust(cfx, tmp_path):
 def test_claude_argv_pins_stop_hook_generation(cfx):
     argv = fleet.claude_argv(cfx.path, cfx.cfg, 'worker-1', 4, 'hi')
     assert argv[0] == '/bin/claude' and '--dangerously-skip-permissions' in argv and argv[-2:] == ['--', 'hi']
+    # acceptance 10/13 P1-5: an unattended pane must never open a choice dialog
+    assert argv[argv.index('--disallowedTools') + 1] == 'AskUserQuestion'
+    assert argv.index('--disallowedTools') < argv.index('--settings')  # variadic: an option must follow
     settings = json.loads(Path(argv[argv.index('--settings') + 1]).read_text())
     cmd = settings['hooks']['Stop'][0]['hooks'][0]['command']
     assert cmd.endswith('claude-stop ' + str(cfx.path) + ' worker-1 4')

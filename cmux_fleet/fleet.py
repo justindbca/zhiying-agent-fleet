@@ -766,6 +766,8 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
     timeout = 30 if cfg.get('transport_version') != 2 else int(float(cfg.get('profile_ready_timeout') or 180)) + 30
     settings.write_text(json.dumps({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': hook, 'timeout': timeout}]}]}}))
     argv = [cfg.get('claude') or 'claude', '--dangerously-skip-permissions', '--model', cfg.get('worker_model') or 'sonnet',
+            # Unattended panes: a choice dialog would wait for a human forever (acceptance 10/13 P1-5).
+            '--disallowedTools', 'AskUserQuestion',
             '--settings', str(settings), '--add-dir', str(Path(cfg['run']) / 'workspace')]
     if name != 'supervisor':  # stable per slot across generations (peer messages address it)
         argv += ['--name', claude_session_name(cfg, name)]
