@@ -1,4 +1,4 @@
-"""Bounded v2 transport API for one private Redis run (not wired into fleet).
+"""Bounded v2 transport API for one private Redis run.
 
 Message IDs, delivery IDs and Stream IDs are distinct. Inbox entries remain in
 PEL until a validated terminal commit or an explicit confirmed-stop resolution.
@@ -478,7 +478,8 @@ class MessageBus:
                                     max_connections=1, **options)
         return redis.Redis(connection_pool=pool)
 
-    def receive(self, slot, consumer, block_ms=DEFAULT_BLOCK_MS, *, generation, session_id):
+    def receive(self, slot, consumer, block_ms=DEFAULT_BLOCK_MS, *, generation, session_id,
+                reader=None):
         _short(consumer, "consumer"); _integer(generation, "generation")
         _short(session_id, "session_id"); _integer(block_ms, "block_ms", 1)
         current = self.r.hgetall(self.lease_key(slot))
@@ -490,7 +491,8 @@ class MessageBus:
             raise BusError("slot held: " + current["status"])
         if current.get("consumer") not in ("", consumer):
             raise BusError("protected_consumer")
-        reader = self.blocking_client(block_ms)
+        owned_reader = reader is None
+        reader = reader if reader is not None else self.blocking_client(block_ms)
         recovered = False
         try:
             # First inspect this consumer's PEL; never XCLAIM another consumer.
@@ -503,8 +505,9 @@ class MessageBus:
         except redis.RedisError as exc:
             raise BusError("receive failed: " + str(exc)) from exc
         finally:
-            reader.close()
-            reader.connection_pool.disconnect()
+            if owned_reader:
+                reader.close()
+                reader.connection_pool.disconnect()
         if not rows or not rows[0][1]:
             return None
         sid, fields = rows[0][1][0]

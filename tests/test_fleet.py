@@ -1002,6 +1002,8 @@ def test_kill_pane_retries_with_force_when_cmux_asks(monkeypatch, tmp_path):
     def fake_run(*args):
         calls.append(args)
         refused = args[0] == 'close-surface' and '--force' not in args
+        if args[0] == 'close-surface' and '--force' in args:
+            live.clear()
         return SimpleNamespace(returncode=1 if refused else 0, stdout='',
                                stderr='Error: confirmation_required: Surface has a running process' if refused else '')
     monkeypatch.setattr(cm, '_run', fake_run)
@@ -1009,7 +1011,7 @@ def test_kill_pane_retries_with_force_when_cmux_asks(monkeypatch, tmp_path):
     state = {'workspace': 'ws', 'control_workspace': None, 'surfaces': {'s1': {}}}
     live = {'s1': {'pane_id': 'p1', 'tty': None}}
     monkeypatch.setattr(mgr, '_meta', lambda: json.loads(json.dumps(state)), raising=False)
-    monkeypatch.setattr(mgr, '_save_meta', lambda m: (state.update(m), live.clear()), raising=False)
+    monkeypatch.setattr(mgr, '_save_meta', lambda m: state.update(m), raising=False)
     monkeypatch.setattr(mgr, '_where', lambda sid: 'ws', raising=False)
     monkeypatch.setattr(mgr, '_surfaces', lambda ws: dict(live), raising=False)
     assert mgr.kill_pane('s1')
@@ -1041,6 +1043,10 @@ def test_workers_become_tabs_of_one_pane_and_successor_takes_its_place(monkeypat
     orig_run = fake_run
 
     def tracking_run(*args):  # a move-surface lands the surface in the target pane
+        if args[:4] == ('--id-format', 'uuids', 'new-surface', '--type'):
+            panes['hist-1'] = args[args.index('--pane') + 1]
+        if args[0] == 'split-off':
+            panes[args[args.index('--surface') + 1]] = 'pane-h'
         if args[0] == 'move-surface':
             panes[args[args.index('--surface') + 1]] = args[args.index('--pane') + 1]
         return orig_run(*args)

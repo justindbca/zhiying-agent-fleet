@@ -306,7 +306,8 @@ def test_invalid_pi_callback_is_rejected(pfx, change):
 def mock_start(tmp_path, monkeypatch):
     from cmux_fleet import cmux_manager
     monkeypatch.setattr(cmux_manager, 'cmux_available', lambda: True)
-    mgr = SimpleNamespace(session_exists=lambda: False,
+    mgr = SimpleNamespace(meta_path=tmp_path / 'isolated-state' / 'cmux-fleet.json',
+                          session_exists=lambda: False,
                           spawn_window=lambda *a, **kw: SimpleNamespace(success=True))
     monkeypatch.setattr(cmux_manager, 'CmuxSessionManager', lambda name: mgr)
     monkeypatch.setattr(fleet, 'LATEST', tmp_path / 'latest.json')
@@ -317,8 +318,10 @@ def mock_start(tmp_path, monkeypatch):
         return SimpleNamespace(stdout='1.1.0\n', returncode=0)
     monkeypatch.setattr(fleet.subprocess, 'run', run)
     monkeypatch.setattr(fleet, 'connect', lambda cfg: FakeRedis())
+    # Provisioning is fake here: do not create persistent Redis directories in the checkout.
+    monkeypatch.setattr(fleet.redis_runtime, 'prepare', fleet.redis_runtime.paths)
     args = ['start', '--supervisor-cli', 'pi', '--worker-cli', 'pi', '--pi-model', 'local/test',
-            '--allow-unsandboxed-pi', '--runs-dir', str(tmp_path / 'runs'),
+            '--allow-unsandboxed-pi', '--allow-development-v2', '--runs-dir', str(tmp_path / 'runs'),
             '--pi-agent-dir', str(tmp_path / 'user-pi'), '--codex-home', str(tmp_path / 'codex-home')]
     return args, ran
 
@@ -327,11 +330,18 @@ def test_all_pi_start_needs_no_codex_binary_profile_or_login(tmp_path, monkeypat
     args, ran = mock_start(tmp_path, monkeypatch)
     fleet.main(args)
     cfg = fleet.load(tmp_path / 'latest.json')
+    assert cfg['cmux_state_dir'] == str(tmp_path / 'isolated-state')
     assert cfg['supervisor_cli'] == cfg['worker_cli'] == 'pi'
     assert cfg['codex'] is None and not (tmp_path / 'codex-home').exists()
     assert Path(cfg['pi_home']).is_dir()
     assert ran[0] == ['/bin/pi', '--version']
     assert '--unixsocket' in ran[1] and '6379' not in ran[1]
+    runtime = Path(cfg['redis_runtime_dir'])
+    assert runtime.parent == fleet.redis_runtime.DEFAULT_ROOT
+    assert cfg['redis_socket'] == str(runtime / 'redis.sock')
+    assert ran[1][ran[1].index('--dir') + 1] == str(runtime)
+    assert ran[1][ran[1].index('--pidfile') + 1] == str(runtime / 'redis.pid')
+    assert ran[1][ran[1].index('--logfile') + 1] == str(runtime / 'redis.log')
 
 
 def test_pi_start_requires_permission_before_launching_redis(tmp_path, monkeypatch):

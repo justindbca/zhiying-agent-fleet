@@ -67,6 +67,17 @@ def _run(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run([CMUX, *args], capture_output=True, text=True, env=env)
 
 
+def _wait_until(check, timeout: float = 3.0) -> bool:
+    """cmux acknowledges mutations before tree reflects them; wait, never repeat the mutation."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if check():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(.05)
+
+
 def cmux_available() -> bool:
     try:
         return _run('ping').stdout.strip() == 'PONG'
@@ -119,11 +130,11 @@ class CmuxSessionManager:
     """Agents in one workspace; dock the daemon into an inactive history-pane tab."""
 
     def __init__(self, session_name: str = 'cmux-fleet', agents_title: str = 'Fleet agents',
-                 control_title: str = 'Fleet control'):
+                 control_title: str = 'Fleet control', state_dir: Optional[Path] = None):
         self.session_name = session_name
         self.agents_title = agents_title
         self.control_title = control_title
-        self.meta_path = STATE_DIR / (session_name + '.json')
+        self.meta_path = (Path(state_dir) if state_dir is not None else STATE_DIR).expanduser().resolve() / (session_name + '.json')
 
     # -- ownership registry -------------------------------------------------
     def _meta(self) -> Dict:
@@ -210,15 +221,15 @@ class CmuxSessionManager:
         if before:  # --focus false still switches the view; give the user their workspace back
             _run('select-workspace', '--workspace', before)
         if p.returncode:
-            return None
+            return None, False
         ref = p.stdout.split()[-1]  # prints a ref (workspace:N); pin the UUID right away
         t = _run('--json', '--id-format', 'uuids', 'tree', '--workspace', ref)
         if t.returncode:
-            return None
+            return None, False
         ids = [ws['id'] for w in json.loads(t.stdout).get('windows', []) for ws in w.get('workspaces', [])
                if ws.get('title') == name]
         if len(ids) != 1:
-            return None
+            return None, False
         ws = ids[0]
         meta[key] = ws
         self._save_meta(meta)
@@ -227,7 +238,7 @@ class CmuxSessionManager:
 
     def _launcher(self, name: str, script: str, folder: Optional[Path] = None) -> str:
         """Write ``script`` to a launcher file and return the short command that runs it."""
-        folder = folder or (STATE_DIR / 'launch')
+        folder = folder or (self.meta_path.parent / 'launch')
         folder.mkdir(parents=True, exist_ok=True)
         safe = ''.join(c if c.isalnum() or c in '-_.' else '_' for c in name)
         path = folder / (safe + '-' + uuid.uuid4().hex[:6] + '.sh')
@@ -267,6 +278,8 @@ class CmuxSessionManager:
         if not sid:
             return SpawnResult(success=False, error='cmux surface creation failed (run inside cmux)')
         self._tag(sid, type=(metadata or {}).get('type', ''), label=window_name)
+        if not _wait_until(lambda: self._where(sid)):
+            return SpawnResult(success=False, pane_id=sid, error='cmux surface did not become visible')
         if not ran and not self._type_command(sid, full):
             return SpawnResult(success=False, error='cmux command delivery failed')
         self.rename(sid, window_name)
@@ -289,6 +302,8 @@ class CmuxSessionManager:
         if not sid:
             return SpawnResult(success=False, error='cmux surface creation failed (run inside cmux)')
         self._tag(sid, type=(metadata or {}).get('type', ''), label=window_name, output_file=output_file or '')
+        if not _wait_until(lambda: self._where(sid)):
+            return SpawnResult(success=False, pane_id=sid, error='cmux surface did not become visible')
         if not ran and not self._type_command(sid, full):
             return SpawnResult(success=False, pane_id=sid, error='cmux command delivery failed')
         self.rename(sid, window_name)
@@ -369,10 +384,12 @@ class CmuxSessionManager:
             # cmux >= 0.65 refuses to close a surface that still shows a running process; this
             # surface is ours and its process tree was just killed above.
             _run('close-surface', '--workspace', ws, '--surface', pane_id, '--force')
+        if not _wait_until(lambda: pane_id not in self._surfaces(ws)):
+            return False  # keep ownership so a failed/late close can be retried safely
         meta = self._meta()
         meta['surfaces'].pop(pane_id, None)
         self._save_meta(meta)
-        return pane_id not in self._surfaces(ws)
+        return True
 
     def place_right_of(self, pane_id: str, peer: str) -> bool:
         """Put an agent in its own split to the right of its peer's pane."""
@@ -382,7 +399,12 @@ class CmuxSessionManager:
         live = self._surfaces(ws)
         if live[pane_id]['pane_id'] != live[peer]['pane_id']:
             return True  # already side by side
-        return _run('split-off', '--workspace', ws, '--surface', pane_id, 'right', '--focus', 'false').returncode == 0
+        return self._split_surface(ws, pane_id, live[peer]['pane_id'], 'right')
+
+    def _split_surface(self, ws: str, sid: str, source_pane: str, direction: str) -> bool:
+        if _run('split-off', '--workspace', ws, '--surface', sid, direction, '--focus', 'false').returncode:
+            return False
+        return _wait_until(lambda: self._surfaces(ws).get(sid, {}).get('pane_id') not in (None, source_pane))
 
     def capture_to(self, pane_id: str, path: str) -> None:
         """Save a retiring agent's whole screen (with scrollback) for the history page."""
@@ -405,7 +427,7 @@ class CmuxSessionManager:
         for sid in controls:
             p = _run('move-surface', '--surface', sid, '--workspace', ws, '--pane', pane,
                      '--after', history_surface, '--focus', 'false')
-            if p.returncode:
+            if p.returncode or not _wait_until(lambda: self._surfaces(ws).get(sid, {}).get('pane_id') == pane):
                 return False  # leave the existing control workspace alive on failure
         meta = self._meta()
         meta['control_workspace'] = ws
@@ -425,24 +447,39 @@ class CmuxSessionManager:
         ws = self._where(supervisor)
         if not ws:
             return None
+        # Re-entry must not create another browser/split. A different run's history
+        # is not ours to reuse or remove; refuse rather than nesting into its layout.
+        live = self._surfaces(ws)
+        histories = [(sid, info) for sid, info in self._meta()['surfaces'].items()
+                     if info.get('type') == 'history' and sid in live]
+        if len(histories) > 1 or any(info.get('url') != history_url for _, info in histories):
+            return None
+        if any(self._where(w) != ws for w in workers):
+            return None
         first = None
         for w in workers:
-            if self._where(w) != ws:
-                continue
             if first is None:
-                self.place_right_of(w, supervisor)
+                if not self.place_right_of(w, supervisor):
+                    return None
                 first = w
-            else:
-                self.tab_into(w, first, before=False)
+            elif not self.tab_into(w, first, before=False):
+                return None
         pane = self._surfaces(ws)[supervisor]['pane_id']
-        p = _run('--id-format', 'uuids', 'new-surface', '--type', 'browser', '--workspace', ws, '--pane', pane,
-                 '--url', history_url, '--focus', 'false')
-        parts = p.stdout.split()
-        if p.returncode or len(parts) < 2:
+        if histories:
+            sid = histories[0][0]
+        else:
+            p = _run('--id-format', 'uuids', 'new-surface', '--type', 'browser', '--workspace', ws, '--pane', pane,
+                     '--url', history_url, '--focus', 'false')
+            parts = p.stdout.split()
+            if p.returncode or len(parts) < 2:
+                return None
+            sid = parts[1]
+            self._tag(sid, type='history', label='history', url=history_url)
+        if not _wait_until(lambda: sid in self._surfaces(ws)):
             return None
-        sid = parts[1]
-        self._tag(sid, type='history', label='history')
-        _run('split-off', '--workspace', ws, '--surface', sid, 'down', '--focus', 'false')
+        if self._surfaces(ws)[sid]['pane_id'] == pane:
+            if not self._split_surface(ws, sid, pane, 'down'):
+                return None
         self.rename(sid, 'history')
         self.dock_control(sid)
         _run('focus-panel', '--workspace', ws, '--panel', supervisor)
@@ -459,6 +496,8 @@ class CmuxSessionManager:
             return False
         target = self._surfaces(ws)[peer]['pane_id']
         place = ['--before', peer] if before else []
-        return _run('move-surface', '--workspace', ws, '--surface', pane_id, '--pane', target, *place,
-                    '--focus', 'false').returncode == 0
+        if _run('move-surface', '--workspace', ws, '--surface', pane_id, '--pane', target, *place,
+                '--focus', 'false').returncode:
+            return False
+        return _wait_until(lambda: self._surfaces(ws).get(pane_id, {}).get('pane_id') == target)
 

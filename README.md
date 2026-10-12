@@ -1,6 +1,6 @@
 # cmux-fleet
 
-One **supervisor** and N **worker** sessions (Codex by default; optional Pi and Claude Code), each in its
+One **supervisor** and N **worker** sessions (new Redis-v2 runs: Pi; legacy v1: Codex/Pi/Claude Code), each in its
 own [cmux](https://cmux.dev) tab, coordinated by a small daemon. The supervisor only judges and
 dispatches; workers only execute. Sessions whose context fills up are rotated automatically with a
 written handoff note, so a task can run for hours across many model sessions.
@@ -57,8 +57,9 @@ What the daemon enforces, independently of what the models claim:
 - For Codex agents: [Codex CLI](https://github.com/openai/codex) ≥ 0.156 (per-file profiles, `check_for_update_on_startup`). The daemon parses Codex's rollout `.jsonl` files (`token_count`,
   `task_complete`, subagent metadata); if a Codex release changes that format, pin the version that
   works for you.
-- `redis-server` on PATH (`brew install redis`). Each run starts its own instance on a Unix socket under
-  `/tmp`; it never touches `localhost:6379`.
+- `redis-server` on PATH (`brew install redis`). Each run starts its own private instance under the
+  checkout's `.runtime/redis/<token>/` (socket, PID, log and data); TCP is disabled and it never
+  touches `localhost:6379`. The binary is still an external dependency, not bundled.
 - Python ≥ 3.9 and the `redis` package.
 - Any model Codex can talk to: OpenAI API, ChatGPT login, or a local OpenAI-compatible server. The
   daemon reads the context window from the rollout, so no window size has to be configured.
@@ -87,28 +88,42 @@ Nothing else: the fleet creates its own Codex home for the agents and answers Co
 
 ## Use
 
-Open a cmux terminal, then:
+Open a cmux terminal, configure your Pi provider/model and replace `local/my-model` below.
+New starts require Redis v2 and an explicit development opt-in; native Codex/Claude v2 is not yet supported.
+The Codex-specific setup and launch examples below are retained only as legacy v1 reference.
 
 ```bash
-cmux-fleet start --workers 2                   # private redis + control tab; the daemon spawns 3 codex tabs
+cmux-fleet start --workers 2 --supervisor-cli pi --worker-cli pi \
+  --pi-model local/my-model --allow-unsandboxed-pi --allow-development-v2
 echo '{"goal": "Survey the three most-cited papers on X and write a comparison",
        "hours": 4,
        "artifacts": [{"path": "worker-1/report.md", "min_chars": 800, "contains": ["Conclusion"]}]}' \
   | cmux-fleet task -                           # hand the goal to the supervisor
 cmux-fleet status                               # task + per-agent state, context usage, inbox depth
-cmux-fleet stop                                 # cancel, shut the daemon and its redis down; tabs stay, close with ✕
+cmux-fleet stop                                 # cancel; confirm runtime retirement before Redis shutdown
 ```
 
 `start` options: `--profile` (Codex profile, default `fleet`), `--codex` / `--redis-server` (binaries,
-default: first on PATH), `--runs-dir` (default `~/.cmux-fleet/runs`), `--codex-home` (the agents'
+default: first on PATH), `--redis-runtime-dir` (default: checkout `.runtime/redis`),
+`--runs-dir` (default `~/.cmux-fleet/runs`), `--codex-home` (the agents'
 isolated Codex home, default `~/.cmux-fleet/codex-home`), `--handoff-ratio`,
 `--handoff-timeout`, `--stall-timeout`, `--window` (fallback context size until the rollout reports one),
 `--compact-limit` (Codex auto-compaction token limit; by default Codex decides), `--chrome-script`
 (see below).
 
 Each run writes to `~/.cmux-fleet/runs/fleet-<time>-<token>/`: `config.json`, `workspace/<worker>/`
-(worker cwd, all deliverables land here), `agents/supervisor/`, `handoffs/`, `prompts/`, the private
-Redis dump and log. `~/.cmux-fleet/latest.json` points at the newest run.
+(worker cwd, all deliverables land here), `agents/supervisor/`, `handoffs/`, and `prompts/`.
+`~/.cmux-fleet/latest.json` points at the newest run and pins `redis_runtime_root`,
+`redis_runtime_dir`, `redis_instance_id` and `redis_socket` for callbacks and control.
+
+Private Redis files live separately in `.runtime/redis/<token>/`: `redis.sock`, `redis.pid`,
+`redis.log`, `fleet.rdb`, and v2's `appendonlydir/`. The short token avoids Unix socket path-length
+limits; directories are owner-only (700). Overlong paths fail before Redis starts, with no `/tmp`
+or TCP fallback. Use an explicit short, writable `--redis-runtime-dir` for a read-only/non-editable
+installation. Legacy `/tmp/cmux-fleet-*.sock` configs remain supported; existing fleets are not
+migrated or restarted. Stop removes the socket through Redis shutdown, but retains logs/data.
+Keep `.runtime/` out of Git (a local `.git/info/exclude` entry is sufficient); these are runtime
+files, not source. See [the design baseline](docs/design.md#13-redis-项目内运行目录用户新要求).
 
 ## Layout and the history page
 
@@ -131,7 +146,8 @@ the daemon, not by a model.
 
 ```bash
 cmux-fleet start --mode service --worker-names exit,reentry,rung --roles ~/my-roles \
-    --supervisor-profile flashnext --worker-profile fleet --max-busy 2 --request-timeout 600
+    --supervisor-cli pi --worker-cli pi --pi-model local/my-model \
+    --allow-unsandboxed-pi --allow-development-v2 --max-busy 2 --request-timeout 600
 echo '{"id": "cu-1:r7", "to": "exit", "payload": {...},
        "reply": {"required": ["verdict", "param", "evidence"], "allowed": ["verdict", "param", "evidence", "note"]}}' \
   | cmux-fleet request -
@@ -173,7 +189,7 @@ cmux-fleet start --workers 2 --worker-cli claude --worker-model sonnet --worker-
 - The "trust this folder?" prompt is pre-answered in `~/.claude.json`; the scope file is also written as `CLAUDE.md`.
 - `--worker-kit DIR` is copied into every worker cwd: `DIR/.claude/{agents,skills}` and `DIR/mcp.json`.
 
-## Pi agents (optional, Pi >= 1.1.0)
+## Pi agents (v1 compatibility by default, Pi >= 1.1.0)
 
 Pi can run the supervisor, workers, or both. Claude workers still run the **official `claude` CLI
 as a separate process started by fleet**. Pi does not proxy Claude requests or consume Claude Code's
@@ -229,6 +245,50 @@ python tests/pi_smoke.py --model local/my-model
 ```
 
 This tests READY, JSON request/result and handoff to a new generation. It is not a real cmux TUI test.
+
+## Redis v2 development runtime
+
+V2 now connects the existing Fleet dispatcher to persistent Pi bridges. Select it explicitly
+on a fresh isolated development run with `--transport-version 2 --allow-development-v2`
+and `--supervisor-cli pi --worker-cli pi`, plus the existing explicit model/permission options.
+Claude/Codex v2 combinations are rejected before provisioning or profile retirement.
+New `start` commands now require Redis v2 (the default); `--transport-version 1` is rejected. Existing v1 configs remain readable for draining/status/stop only: do not edit their transport version in place. The file-delivery and native-Codex/Claude startup descriptions above are legacy behavior, not a supported new v2 launch path. Unsupported CLI combinations fail rather than silently falling back to files. The development opt-in is still required.
+
+V2 deliveries use run-scoped Redis Streams and full business context rather than message files
+or cmux paste. Structured `fleet_decision` / `fleet_result` tools collect candidates; settled plus
+daemon validation commits them. UI cards are non-context session entries. Simple replies and
+mechanical failures cause no supervisor reporting turn. Task reports still require supervisor
+judgment and independent artifact acceptance. External request/result JSON remains compatible.
+
+Timeout, interruption or disconnection holds the slot/PEL until reliable retirement confirms stop.
+A same-run daemon restart retains sessions and pauses uncertain work; it never starts a second set
+of agents or shuts Redis down as crash cleanup. Explicit v2 fleet stop retires runtimes before
+shutting down Redis. New v2 Redis uses AOF everysec, with about a one-second host-crash loss window.
+
+`cmux-fleet logs --config <isolated-config> --request <id> --slot worker-1 --generation 0
+--event result --level error --json --follow` reads audit detail through the independent control
+reader; it never ACKs work. Control failure does not determine scheduler commit.
+
+**This is a development integration, not production acceptance.** The local merge candidate passed
+the full regression suite, independent real-Redis race probes and installed Pi SDK/TUI contracts.
+An earlier frozen candidate passed a real Redis + Fleet + Pi/FlashNext TUI smoke on owned PTYs
+(cmux layout simulated); the final error-audit rerun was refused by the model server's memory guard. See the
+[Redis mailbox integration report](reports/redis-mailbox-merge-20261012/validation.md).
+Prepared effect intents can replay; ambiguous Redis script failures hold the run for inspection.
+Full crash/slow-UI coverage, 1000-message end-to-end accounting, performance, capacity/AOF and
+mixed-CLI validation remain gates. V2 browser-broker execution currently rejects explicitly.
+See [the design baseline](docs/design.md#11-redis-通信与分层显示-v22026-10-11-新要求开发接线待验收).
+
+Run the isolated acceptance suite on a parent that permits temporary Redis sockets:
+
+```bash
+python3 -m pytest -q tests/test_runtime_v2.py tests/test_message_bus_v2.py
+python3 -m pytest -q tests/test_pi_v2_contract.py tests/test_runtime_v2_planning.py
+python3 -m pytest -q tests
+```
+
+These tests use freshly created `/tmp/cmux-fleet-<token>.sock` instances with `port=0`, fake cmux
+and no model/GUI/production registry. The installed Pi packages are required by the TS harness.
 
 ## How a task flows
 
@@ -323,8 +383,9 @@ pip install -e '.[dev]'
 pytest
 ```
 
-The tests use an in-memory Redis, a fake cmux manager and synthetic rollout files; they never start a
-model, cmux or redis-server.
+Most tests use in-memory Redis, fake cmux and synthetic transcripts. Redis v2 integration tests
+start only owned temporary Redis processes; the TS contract harness starts a JSONL fixture child.
+They do not start a model or a real cmux fleet.
 
 ## License
 

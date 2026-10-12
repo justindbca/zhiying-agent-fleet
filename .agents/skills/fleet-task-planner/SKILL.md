@@ -157,24 +157,20 @@ $FLEET_BIN status
 
 ### 4.2 启动 task 模式 fleet（必要时）
 
-默认本机开发 / Pi supervisor 组合：
+新启动仅支持显式授权的 all-Pi Redis v2 开发 run。若用户指定 Claude/Codex，不擅自换成 Pi，应报告该 v2 CLI 组合尚不支持；已有 v1 实例不热改。以下示例沿用本机已配置的 FlashNext：
 
 ```bash
 $FLEET_BIN start --mode task --workers 2 \
   --supervisor-cli pi \
   --pi-model flashnext/Qwen3.8-Flash-Next-Uncensored-oQ4e-100K-MTP \
   --pi-thinking off \
-  --worker-cli claude --worker-model sonnet \
+  --worker-cli pi \
   --roles "$PLAN_DIR/roles" \
-  --allow-unsandboxed-pi \
+  --allow-unsandboxed-pi --allow-development-v2 \
   --max-busy 2
 ```
 
-如果该命令因本机版本不支持 `--supervisor-cli pi` 失败，退回已安装 fleet 的默认 profile，但必须在报告中写明退回原因：
-
-```bash
-$FLEET_BIN start --mode task --workers 2 --roles "$PLAN_DIR/roles" --max-busy 2
-```
+命令失败则报告具体错误；不得回退 v1 文件信箱、默认 Codex profile 或其他模型，也不能把 development gate 去掉来启动。用户未授权 Pi 无沙盒/开发模式时先请求确认。
 
 ### 4.3 构造 task JSON
 

@@ -3,7 +3,7 @@
 > 用户确认日期：2026-10-10。本文固定设计约束，不是某次演示的临时配置。
 > 历史实现基础：`0c43b9c`；Pi/profile 增量来自 `feat/pi-agents`，Redis v2 基础模块已单独进入本地 `main@5f973d5`。
 > **开发验证通过不等于已复核、已合并或已生产部署。** 旧实现验证状态见 §10；当前本地集成范围与复核见 [2026-10-12 报告](../reports/full-local-merge-20261012.md)。
-> **2026-10-11 新要求：Redis 阻塞通信 + control 详情显示。** 目标设计见 §11 与[完整 v2 方案](../../us-stock-option/reports/cmux-fleet-redis-control-design-v2-20261011.md)。§11 明确覆盖下文旧文件投递/机械结果转述要求；**v2 基础模块已有实现，但 daemon/bridge/control 运行链尚未接入或验收**，不能把模块合并说成运行代码已升级。
+> **2026-10-11 新要求：Redis 阻塞通信 + control 详情显示。** 目标设计见 §11 与[完整 v2 方案](../../us-stock-option/reports/cmux-fleet-redis-control-design-v2-20261011.md)。§11 明确覆盖下文旧文件投递/机械结果转述要求；**v2 基础模块与 all-Pi daemon/bridge/control 已有集成候选，真实 Redis/SDK/TUI 的局部闭环已验证；完整验收仍未完成，见 §14**，不能把模块合并说成运行代码已升级。
 
 ## 1. 延续原设计，不另造框架
 
@@ -149,7 +149,7 @@ Fleet agents（一个工作区）
 - service：暂停停止投递/换代，但请求继续排队且仍有超时；BLOCKED/故障交人处理。
 - task：按原 completed/blocked/budget_exhausted/cancelled 生命周期结束。
 - 保留超时、invalid、skipped、stalled 等结果，不把错误伪装成模型成功。
-- 私有 Redis 仅使用 `/tmp/cmux-fleet-<token>.sock`；不能回退 localhost:6379 或写生产 Redis。
+- 私有 Redis 新 run 使用项目 `.runtime/redis/<token>/redis.sock`（用户新要求见 §13）；旧 `/tmp/cmux-fleet-<token>.sock` 配置仅作兼容。不能回退 localhost:6379 或写生产 Redis。
 - `max-busy` 原语义只统计 worker，supervisor 不算，也不控制启动瞬间；不能把它宣传成完整的模型并发闸。
 
 ## 8. 配置与运行边界
@@ -207,7 +207,7 @@ Fleet agents（一个工作区）
 
 以后修改先对照本文；用户新要求须明确记录替代了哪条约束，再修改实现与回归。不能只改演示、只改截图，或把旧报告的临时状态当作新设计。
 
-## 11. Redis 通信与分层显示 v2（2026-10-11 新要求，待实施）
+## 11. Redis 通信与分层显示 v2（2026-10-11 新要求，开发接线待验收）
 
 完整实施方案：[Redis 阻塞通信与分层显示](../../us-stock-option/reports/cmux-fleet-redis-control-design-v2-20261011.md)。本节为目标约束，不是上线声明。
 
@@ -230,14 +230,25 @@ Fleet agents（一个工作区）
 
 ### 实现与交付边界
 
-- Redis Streams 阻塞消费、确认与恢复，沿用唯一 daemon；私有 socket 不变，不能静默回退文件信箱/生产 Redis。
+- Redis Streams 阻塞消费、确认与恢复，沿用唯一 daemon；私有 Unix socket 传输不变，路径按 §13 改为项目内运行目录，不能静默回退文件信箱/生产 Redis。
 - pi 原生扩展路径优先；Claude/Codex 官方 CLI 的输入与显示能力单独验证。未经验证不宣称混合链已支持，不擅换 CLI/认证路径。
 - v1/v2 按 run 显式区分，不热改在途实例。旧 §10 的 91 测试/演示不能证明 v2 通过。
 - v2 必测：无消息文件/模型 read；ACK/心跳/超时卡零模型调用；control 详情可追溯；旧代/重复/崩溃恢复；慢 UI 不阻塞调度；人工输入、命名、布局、交接与旧接口回归。
 
+### 2026-10-12 开发接线原始交付记录（后续集成验证见 §14）
+
+- 2026-10-12 用户进一步要求“所有实例通讯全部改成 Redis”：新 `start` 默认且只允许 `transport_version=2`，仍须 `--allow-development-v2`；拒绝新建 v1，不能再默认生成消息文件。旧/无版本配置仍按 v1 解释，仅供现存 run 正常收束、status/stop/callback，不热改在途实例。当前 v2 只支持 **Pi supervisor + Pi workers**，在 provisioning 和 profile retirement 前拒绝 Claude/Codex v2；不回退文件信箱、代理 Claude 或改用 headless CLI。
+- `Fleet` 保留唯一的 `submit/request/assign/on_supervisor/on_service_supervisor` 判断和产物验收、worker FIFO、pause/max-busy、label/代数及交接骨架。`runtime_v2.py` 只接 transport 与事件效果；`agent_bridge.py` 常驻 JSONL 子进程独立阻塞读取 inbox/UI/reply，并用生产连接登记/续租。v2 正文来自 Redis，投递不用 `.inbox` 文件或 cmux paste。
+- `pi_extension_v2.ts` 在 session_start 启桥、session_shutdown 幂等停桥；使用已安装 Pi 1.1.0 API。自定义 sendMessage 启动回合从 agent_start 关联（实际 SDK 不触发 before_agent_start）；人工回合隔离。fleet_decision/fleet_result 仅收候选，最后 settled 通知后由 daemon 验证。terminate 只按 Pi 的整批工具语义跳过冗余续问。UI Stream → appendEntry/registerEntryRenderer，transport IDs 只存非模型元数据。
+- 简单 service 结果、invalid/skipped/timeout/stalled 用 presentation 卡；不自动增加 supervisor 机械转述。task worker 报告仍形成另一个绑定的 supervisor 业务 delivery，COMPLETED 仍需字面产物验收。
+- 事件 XREADGROUP 与 legacy `fx:events` → processing List → 确定性登记 → 确认；保留旧 `fx:reply:* / fx:result:* / fx:results`。效果先在无副作用 overlay 上准备，再持久化 intent，preflight Lua 一起应用公开结果/UI、delivery 完成和事件 XACK。正常 Lua 执行隔离不等于异常回滚；prepared intent 可重放，applied 不重做效果，任何留下 applying 的不明写入失败暂停待查，不能盲重 RPUSH 或重跑工具。
+- timeout/cancel/disconnect/aborted/unfinished 保留 active lease/PEL，状态为 held，不把 Escape 当停机证据。交接继任进程 launch gate 等待旧 tab/process-tree 退役确认；关闭失败禁止继任执行。daemon 同 run 重启不 start_all，未证明安全时 held/paused；异常或 daemon 信号退出保留 Redis。只有显式 fleet stop 且各 runtime 退役确认后关闭 Redis。
+- v2 私有 Redis 使用 AOF `everysec`：主机/Redis 崩溃仍有约 **1 秒**未 fsync 窗口。未终态消息与去重证据不 TTL/裁剪；当前尚无容量归档清理的完整验收。browser broker 的 v2 可重放副作用事务尚未实现，命令明确拒绝。
+- 新 TS 扩展合同测试和效果规划单测通过，类型检查通过；这些不是模型或真实 TUI 测试。沙箱内实际 Redis 因 `Failed opening Unix socket: bind: Operation not permitted` 未能启动，真实 bridge/daemon 集成套件未通过。**development gate 不可移除**，直到独立复核、真实 Redis 全套、实际 SDK/监督者 TUI 输入、所有崩溃边界/慢 UI、1000 条对账、AOF 窗口/日志容量与性能分位测量完成。完整命令和进展保存在外部项目 `reports/cmux-fleet-runtime-v2/core-*.md`，不把旧 v1 演示当作 v2 验收。
+
 ## 12. 动态 agent profile 路由（2026-10-11，Phase 5 显式 live opt-in）
 
-本节根据用户本轮授权替代 Phase 4 的“任何 live=true 都 unsupported”约束。Phase 1 registry/router/planner、Phase 2 task 接入、Phase 3 稳定 slot assignment、Phase 4 授权与元数据应用继续保留；Phase 5 在唯一 daemon 的原投递边界增加受控 respawn。默认仍是 **advisory + metadata**，不是第二套 dispatcher。本轮只授权本仓 dev 验证，不涉及交易生产系统，不重启已有 fleet。§11 Redis v2 运行链仍未接入，本轮继续使用现有队列/投递协议。
+本节根据用户本轮授权替代 Phase 4 的“任何 live=true 都 unsupported”约束。Phase 1 registry/router/planner、Phase 2 task 接入、Phase 3 稳定 slot assignment、Phase 4 授权与元数据应用继续保留；Phase 5 在唯一 daemon 的原投递边界增加受控 respawn。默认仍是 **advisory + metadata**，不是第二套 dispatcher。本轮只授权本仓 dev 验证，不涉及交易生产系统，不重启已有 fleet。Phase 5 当时使用 v1 队列/投递协议；§11 新增的 v2 开发接线单独 opt-in，不表示 Phase 5 真实混合 CLI 已验收。
 
 ### 身份、规划与授权
 
@@ -290,3 +301,33 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - 两 worker 隔离 dev start 已尝试：当前沙箱不能连接 cmux socket，`Operation not permitted (errno 1)`，start 在 provisioning 前退出。
 - 进一步运行 `tests/pi_smoke.py`：临时私有 Redis 因 `Failed opening Unix socket: bind: Operation not permitted` 退出；未到 Pi/model 或 live switch。测试子进程/临时目录已清理，没有替换已有 fleet。
 - 完整命令、结果与待验收边界见 [dynamic-agent-routing.md](dynamic-agent-routing.md#dev-validation-2026-10-11)。**上述为 Phase 5 当时的历史状态：代码/模拟回归已完成；真实 dev 部署与 supervisor TUI smoke 受环境限制未通过；当时未独立复核、未合并、未生产部署。** 后续本地集成复核见 [2026-10-12 报告](../reports/full-local-merge-20261012.md)，不替代真实 TUI/生产验收。
+
+## 13. Redis 项目内运行目录（用户新要求）
+
+用户明确要求把 Redis 运行文件从 `/tmp` 改放本项目内。本节替代 §7/§11 的旧路径约束，不改变私有实例、唯一 daemon、task/service、v1/v2 协议或生产授权边界。
+
+- 新 `start` 默认在源码项目 `.runtime/redis/<8位token>/` 保管 `redis.sock`、`redis.pid`、`redis.log`、`fleet.rdb`；v2 的 AOF 子目录也在此。Redis binary 仍来自 `--redis-server`/PATH，本轮不是打包 binary。
+- Redis 专属目录与 `--runs-dir` 分开：保留原 workspace/history/agent home 路径和 latest 入口，避免带时间戳的长 run 路径超过 Unix socket 限制。默认 root 从代码位置确定，不随当前工作目录变化。
+- `--redis-runtime-dir` 可显式选择其他短且可写的 root，用于只读安装或独立开发验证。配置固定 `redis_runtime_root/redis_runtime_dir/redis_instance_id/redis_socket`，新进程按配置连接，不依赖调用 shell 的环境或当前目录。
+- `redis_runtime.py` 统一 startup、CLI/hooks/bridge 和 control 的 endpoint 校验。新配置的 socket 必须恰为 root/token/redis.sock，拒绝跨实例路径、相对路径、父目录穿越、符号链接逃逸或不完整元数据；不能把非法新配置降级成旧 `/tmp` 路径。
+- root 和新实例目录为当前用户所有、owner-only（700）；已有共享权限 root 明确拒绝，不替用户 chmod 任意目录。已有实例目录不复用、不删除。此权限不是同账号进程之间的安全隔离，也不解除 OS sandbox。
+- socket 按编码字节数检查：macOS 最长 103 字节（保留 NUL），Linux 107 字节。超长在创建/启动前失败，提示缩短路径；不建立 `/tmp` 软链、不自动退回 `/tmp` 或 TCP。仍 `--port 0` / `--unixsocketperm 700`。
+- 旧无 managed 元数据的 `/tmp/cmux-fleet-<token>.sock` config 继续严格兼容，供在途实例正常 status/stop/callback；不迁移、重启旧 fleet。它不是新 start 的 fallback。
+- stop 沿用唯一 daemon 的 Redis shutdown；socket/PID 由 Redis 清理，日志/RDB/AOF 保留供排错和恢复。不引入共享系统 Redis，不杀其他 Redis。
+- `.runtime/` 不进入版本控制。本工作区用 Git 本地 `info/exclude` 排除，没有修改 `.gitignore`；其他 checkout 需同样排除。
+
+## 14. Redis 信箱本地集成验证（2026-10-12）
+
+用户要求合并 Redis 信箱功能。本轮冻结框架候选后重跑完整回归、真实 Redis 竞态探针、已安装 Pi SDK/TUI 合同，以及真实 Redis + Fleet + Pi/FlashNext 的 supervisor TUI 输入闭环；详情与文件哈希见[集成报告](../reports/redis-mailbox-merge-20261012/validation.md)。
+
+这更新 §11 原始交付记录中的环境受限状态，不改变运行协议或撤销门槛。新启动默认且仅允许 Redis v2，仍需 `--allow-development-v2` 显式许可和 all-Pi；旧 v1 配置仅保留读取、收束与 stop 兼容，不热改。这落实用户将通信改入 Redis 的要求，不把新启动默认为文件信箱。真实模型验证使用独立 PTY，cmux 布局仍为模拟；单独的真实 cmux 布局测试不等于 v2 全链已获生产验收。完整崩溃/慢 UI/1000 条整链、性能/AOF/容量和混合 CLI 仍待验收。
+
+合并不热切当前 v1 run，不停止其在途任务，也不代表其他机器或生产实例已迁移。
+
+## 15. 全实例通信盘点与迁移（2026-10-12 用户新要求）
+
+- 盘点配置、进程、registry 与运输方式，区分运行实例、旧历史和仅登记的残留窗口；不能把历史 `.inbox` 文件数量当作正在执行的证明。
+- 用户当前本机 Pi 开发实例可在在途任务、队列收束后受控替换为新的 v2 run。保留旧 run/结果/交接记录，不篡改旧代数，也不删除历史文件伪装成无文件通信。
+- 新 run 的 supervisor 和每个 worker 都必须实际验证 Redis 收件；验收包含无新消息 Markdown、无模型读取消息文件、无机械 supervisor 转述，而不只是检查 config=2。
+- 对原生 Codex/Claude 和受保护的在役/生产实例明确列阻塞项；通信改造不授权替换 CLI、转移订阅凭证、停止交易服务或写生产 Redis。未验证的组合不宣称已迁移。
+- 只读盘点工具 `python3 -m cmux_fleet.transport_inventory` 报告已扫描机器/目录、配置版本、关联进程和消息文件数量；不连接 Redis、不读取消息正文、不修改任何实例。

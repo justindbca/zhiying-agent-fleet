@@ -38,15 +38,22 @@ def argv(cfg, name, generation, prompt, cwd, *, label):
     # Use fleet's existing label verbatim; do not invent a second naming scheme in Pi.
     return [cfg.get('pi') or 'pi', '--model', cfg['pi_model'], '--name', label,
             '--thinking', cfg.get('pi_thinking') or 'off', '--tui-mode', 'regular',
-            '--no-extensions', '--extension', str(Path(__file__).with_name('pi_extension.ts')),
+            '--no-extensions', '--extension', str(Path(__file__).with_name(
+                'pi_extension_v2.ts' if cfg.get('transport_version') == 2 else 'pi_extension.ts')),
             '--no-mcp', '--no-skills', '--no-prompt-templates', '--no-themes',
             '--no-context-files', '--no-approve', '--offline',
             '--append-system-prompt', str(Path(cwd) / 'AGENTS.md'),
-            '--tools', 'read,bash,edit,write',
+            '--tools', 'read,bash,edit,write' + (',fleet_decision' if name == 'supervisor' else ',fleet_result')
+                if cfg.get('transport_version') == 2 else 'read,bash,edit,write',
             '--session-dir', str(session_dir(cfg, name, generation)), '--', prompt]
 
 
 def environment(cfg_path, cfg, name, generation):
+    if cfg.get('transport_version') == 2:
+        return {'PI_CODING_AGENT_DIR': str(cfg['pi_home']), 'PI_SKIP_VERSION_CHECK': '1',
+                'CMUX_FLEET_PI_BRIDGE': json.dumps([cfg['python'],
+                    str(Path(__file__).with_name('agent_bridge.py')), str(cfg_path), name, str(generation)]),
+                'CMUX_FLEET_PI_SLOT': name, 'CMUX_FLEET_PI_MODE': cfg.get('mode', 'task')}
     return {'PI_CODING_AGENT_DIR': str(cfg['pi_home']),
             'CMUX_FLEET_PI_CALLBACK': json.dumps([
                 cfg['python'], str(Path(__file__).with_name('fleet.py')),

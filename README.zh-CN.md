@@ -1,6 +1,6 @@
 # cmux-fleet
 
-一个**监工**（supervisor）加 N 个**执行**（worker），默认使用 Codex，也支持 pi 和官方 Claude Code CLI
+一个**监工**（supervisor）加 N 个**执行**（worker），新 Redis-v2 run 使用 Pi；旧 v1 支持 Codex、Pi 和官方 Claude Code CLI
 交互会话，各占一个 [cmux](https://cmux.dev) 标签，由一个小 daemon 协调。监工只判断、只派活；worker 只执行。
 上下文快满的会话会自动写交接单并换新会话接力，一个任务可以跨很多个模型会话跑几个小时。
 
@@ -27,7 +27,7 @@ daemon 独立于模型的自述做这几件事：
 - macOS + [cmux](https://cmux.dev) ≥ 0.64.25（用到 `new-surface --command`）。`start` 要**在 cmux 终端里跑**，或把 cmux 设置里 automation → socket control mode 从 `cmuxOnly` 改掉；默认 cmux 只接受它自己窗口里起的进程。
 - [Codex CLI](https://github.com/openai/codex) ≥ 0.156（独立文件的配置档、`check_for_update_on_startup`）。
   daemon 解析 Codex 的 rollout `.jsonl`（`token_count`、`task_complete`、子 agent 元数据），Codex 若改格式，请钉住能用的版本。
-- PATH 里有 `redis-server`（`brew install redis`）。每次运行自起一个实例，只监听 `/tmp` 下的 Unix 套接字，绝不碰 `localhost:6379`。
+- PATH 里有 `redis-server`（`brew install redis`）。每次运行自起私有实例，socket、PID、日志和数据集中在项目 `.runtime/redis/<token>/`，关闭 TCP，绝不碰 `localhost:6379`。Redis 二进制仍是依赖，不代表已打包进软件。
 - Python ≥ 3.9 和 `redis` 包。
 - 任何 Codex 能连的模型：OpenAI API、ChatGPT 登录、本地 OpenAI 兼容服务。上下文窗口从 rollout 读，不用配。
 - agent 跑在**隔离的 Codex home**（`--codex-home`，默认 `~/.cmux-fleet/codex-home`）：`auth.json` 和配置档文件从你的 `~/.codex` 软链过来，登录共享，但你的钩子、MCP、插件不会在 agent 里跑；每个 agent 目录的信任条目自动写入。
@@ -50,22 +50,25 @@ model = "gpt-5.5"
 
 ## 用法
 
-在 cmux 终端里：
+在 cmux 终端里先配置好 Pi provider/model，并替换下面的 `local/my-model`。新启动只允许 Redis v2，需要显式开发许可；Codex/Claude 的配置和启动示例仅供旧 v1 参考，不代表新 v2 支持这些 CLI。
 
 ```bash
-cmux-fleet start --workers 2        # 起私有 redis + 控制台标签；daemon 再拉起 3 个 codex 标签
+cmux-fleet start --workers 2 --supervisor-cli pi --worker-cli pi \
+  --pi-model local/my-model --allow-unsandboxed-pi --allow-development-v2
 echo '{"goal": "……", "hours": 4, "artifacts": [{"path": "worker-1/report.md", "min_chars": 800, "contains": ["结论"]}]}' \
   | cmux-fleet task -               # 把目标交给监工
 cmux-fleet status                   # 任务 + 各 agent 状态 / 上下文占用 / 待投递数
-cmux-fleet stop                     # 取消任务，关 daemon 和它的 redis；标签保留，✕ 关
+cmux-fleet stop                     # 取消任务，确认 runtime 退役后才关闭 Redis
 ```
 
 `start` 参数：`--profile`（Codex 配置档，默认 `fleet`）、`--codex` / `--redis-server`（二进制路径，默认 PATH 里第一个）、
-`--runs-dir`（默认 `~/.cmux-fleet/runs`）、`--codex-home`（agent 的隔离 Codex home，默认 `~/.cmux-fleet/codex-home`）、`--handoff-ratio`、`--handoff-timeout`、`--stall-timeout`、
+`--redis-runtime-dir`（默认项目 `.runtime/redis`）、`--runs-dir`（默认 `~/.cmux-fleet/runs`）、`--codex-home`（agent 的隔离 Codex home，默认 `~/.cmux-fleet/codex-home`）、`--handoff-ratio`、`--handoff-timeout`、`--stall-timeout`、
 `--window`（rollout 还没报窗口时的兜底值）、`--compact-limit`（Codex 自动压缩阈值，默认交给 Codex 决定）、`--chrome-script`（见下）。
 
 每次运行写在 `~/.cmux-fleet/runs/fleet-<时间>-<token>/`：`config.json`、`workspace/<worker>/`（worker 的 cwd，产物都在这）、
-`agents/supervisor/`、`handoffs/`、`prompts/`、私有 Redis 的 dump 和日志。`~/.cmux-fleet/latest.json` 指向最近一次。
+`agents/supervisor/`、`handoffs/`、`prompts/`。`~/.cmux-fleet/latest.json` 指向最近一次，并固定该次 Redis 的目录、实例 ID 和 socket 路径，回调与 control 共用。
+
+私有 Redis 文件独立集中在项目 `.runtime/redis/<token>/`：`redis.sock`、`redis.pid`、`redis.log`、`fleet.rdb`，v2 的 AOF 在 `appendonlydir/`。目录权限 700；短 token 避免 Unix socket 路径过长，超长在启动 Redis 前明确失败，不回退 `/tmp` 或 TCP。非 editable/只读安装可显式传短且可写的 `--redis-runtime-dir`。旧 `/tmp/cmux-fleet-*.sock` 配置继续兼容，不迁移或重启在途实例；stop 后保留日志和数据。`.runtime/` 不纳入 Git，可用本地 `.git/info/exclude` 排除；详见[设计基线 §13](docs/design.md#13-redis-项目内运行目录用户新要求)。
 
 ## 一页布局与历史页
 
@@ -82,7 +85,7 @@ supervisor 和 worker 一样按「槽位.代数」命名：supervisor-1 → supe
 两边可用不同模型（如本地模型）；`--max-busy N` 限同时干活的 worker 数；`pause` / `resume` 由外部（交易日历等）控制，
 暂停时不投递、不换代，请求照常排队并会超时。命令与字段见英文 README「Service mode」。
 
-## pi 监工 + 官方 Claude Code worker
+## pi 监工 + 官方 Claude Code worker（旧 v1 参考，新启动不支持）
 
 pi 可运行 supervisor 或 worker；Claude 侧始终由 fleet **直接启动官方 `claude` CLI**，不是 pi 接 Claude 订阅接口，
 也不读取/复制 Claude 的登录凭证给 pi。仍需遵守服务条款，不能据此保证不会限流或封号。
@@ -108,6 +111,21 @@ cmux-fleet start --mode service --workers 2 \
 
 可选真实 pi 冒烟：`python tests/pi_smoke.py --model local/my-model`。仅启动临时私有 Redis，用假 cmux 验证 READY、
 请求/JSON 结果、换代/接力；不调用 Claude，不代表真实 cmux 窗口验收通过。
+
+## Redis v2 开发接线
+
+新 `start` 默认且只允许 Redis v2，须带 `--allow-development-v2`；`--transport-version 1` 明确拒绝。旧配置仍可 status/收束/stop，但不可原地修改版本冒充迁移。上文 Codex/Claude 启动示例属于旧版；未支持的 v2 CLI 组合直接失败，不回退文件信箱或暗换 CLI。
+v2 已接到原 Fleet 的队列/分派/验收链，常驻 Python bridge 阻塞读 Redis，把业务正文直接送给 Pi；不写消息 Markdown、不粘贴收件。
+结果工具只暂存候选，settled 后由 daemon 验证；简单 reply/失败/超时为 appendEntry UI-only 卡，不增加监工机械转述回合。
+task 报告仍另送监工判断，产物仍独立验收。Claude/Codex v2 在 provisioning/退役前拒绝；官方 Claude v1 保留。
+
+timeout/中止/通信失联保留槽位和 PEL，未确认停止不重新派活。daemon 同 run 重启先 held/paused，不重起 agents、不因异常关闭 Redis。
+显式 v2 stop 确认各 runtime 退役后才关 Redis。AOF everysec 仍有约 1 秒主机崩溃丢失窗口。`logs --config ... --request ... --json --follow` 为只读详情导出。
+
+**这不是生产验收。** 本地集成候选已通过完整回归、真实 Redis 竞态探针与已安装 Pi 的 SDK/TUI 合同。
+早一版冻结候选已通过真实 Redis + Fleet + Pi/FlashNext TUI 输入闭环（独立 PTY，cmux 布局模拟）；追加错误审计后的复测被模型后端内存保护拒绝启动。见[Redis 信箱集成记录](reports/redis-mailbox-merge-20261012/validation.md)。
+完整 crash/慢 UI/1000 条整链对账、性能、AOF/容量和混合 CLI 仍待验收，development gate 保留。
+可运行的隔离测试命令见英文 README 的 Redis v2 章节；v2 browser broker 尚未接入并明确拒绝。
 
 ## 任务怎么流转
 
@@ -160,7 +178,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-测试用内存版 Redis、假 cmux 管理器和合成的 rollout 文件，不起模型、不起 cmux、不起 redis-server。
+多数测试用内存 Redis、假 cmux 与合成 transcript；v2 集成只起自己创建的临时 Redis，TS 合同测试只起 JSONL fixture 子进程，不起模型或真实 cmux fleet。
 
 ## 许可
 

@@ -4,7 +4,7 @@
 Agents use Codex by default, with optional Pi supervisors/workers and official Claude
 Code workers. The daemon never reads screens: each CLI's hook/extension calls back at
 the end of a turn. Replies route through a private Redis instance listening only on a
-Unix socket under /tmp (never localhost:6379).
+project-local Unix socket under .runtime/redis (never localhost:6379).
 
 Subcommands
   start     provision the private Redis + the control surface (must run inside cmux)
@@ -42,14 +42,13 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import handoff, history, pi_adapter, profile_runtime, profile_launch  # noqa: E402
+from cmux_fleet import handoff, history, pi_adapter, profile_runtime, profile_launch, runtime_v2, redis_runtime  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
 from cmux_fleet.planner import build_dispatch_plan  # noqa: E402
 from cmux_fleet.router import route_task  # noqa: E402
 
-SOCK_PREFIX = '/tmp/cmux-fleet-'
 SESSION = 'cmux-fleet'  # cmux registry name
 HOME = Path(os.environ.get('CMUX_FLEET_HOME') or (Path.home() / '.cmux-fleet'))
 LATEST = HOME / 'latest.json'
@@ -72,7 +71,8 @@ THREAD_RE = r'[0-9a-f-]{36}'
 DEFAULTS = {'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 100000, 'stall_timeout': 1800,
             'chrome_min_interval': 20, 'profile': 'fleet', 'worker_cli': 'codex', 'worker_model': 'sonnet',
             'claude_window': 200000, 'mode': 'task', 'max_busy': 0, 'request_timeout': 900,
-            'apply_profiles_live': False, 'allow_profile_live_switch': False, 'profile_ready_timeout': 180}
+            'apply_profiles_live': False, 'allow_profile_live_switch': False, 'profile_ready_timeout': 180,
+            'transport_version': 1, 'allow_development_v2': False}
 CLAUDE_JSON = Path.home() / '.claude.json'
 
 
@@ -89,9 +89,7 @@ def save(path, data):
 
 def connect(cfg):
     import redis
-    sock = Path(cfg['redis_socket'])
-    if not sock.is_absolute() or not str(sock).startswith(SOCK_PREFIX):
-        raise ValueError('private cmux-fleet Unix socket required')
+    sock = redis_runtime.validate_socket(cfg)
     client = redis.Redis(unix_socket_path=str(sock), db=0, decode_responses=True,
                          socket_connect_timeout=3, socket_timeout=5)
     client.ping()  # Fail closed: never fall back to localhost:6379.
@@ -561,6 +559,8 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
 def pi_event(cfg_path, name, generation, raw):
     """Pi's bundled extension sends session metadata and final settlement over stdin."""
     cfg = load(cfg_path)
+    if cfg.get('transport_version') == 2:
+        raise ValueError('v2 Pi sessions must use the persistent bound bridge')
     if name not in ['supervisor'] + cfg['workers'] or not is_pi(cfg, name):
         raise ValueError('pi callback must name a pi agent in this fleet')
     if len(raw) > 1000000:
@@ -575,6 +575,7 @@ def pi_event(cfg_path, name, generation, raw):
 
 def actor(cfg_path, name, prompt, generation=None):
     cfg = load(cfg_path)
+    runtime_v2.validate_config(cfg)
     r = connect(cfg)
     info = r.hgetall(key('agent', name))
     # Every daemon launch pins this value in argv, never adopts a newer generation.
@@ -606,6 +607,7 @@ class Fleet:
     def __init__(self, cfg_path, r, mgr, sessions=None):
         self.path = Path(cfg_path).resolve()
         self.cfg = dict(DEFAULTS, **load(self.path))
+        self.transport_version = runtime_v2.validate_config(self.cfg)
         profile_runtime.validate_live_setting(self.cfg['apply_profiles_live'],
                                               allowed=self.cfg['allow_profile_live_switch'])
         timeout = self.cfg['profile_ready_timeout']
@@ -620,6 +622,8 @@ class Fleet:
         self.stopping = False
         self.next_liveness = 0
         self.last_chrome = 0
+        self.explicit_stop = False
+        self.v2 = runtime_v2.RuntimeV2(self) if self.transport_version == 2 else None
 
     # -- small helpers
     def agent(self, name):
@@ -661,12 +665,20 @@ class Fleet:
         self.log('service.resumed')
 
     def log(self, kind, **data):
+        if self.v2:
+            self.v2.log(kind, data)
+            return
         self.r.rpush(LOG, json.dumps(dict(time=time.time(), kind=kind, **data), ensure_ascii=False))
         self.r.ltrim(LOG, -2000, -1)
         print(time.strftime('%H:%M:%S'), kind, json.dumps(data, ensure_ascii=False)[:180], flush=True)
 
     def queue(self, name, text):
+        if self.v2:
+            return self.v2.queue(name, text)
         self.r.rpush(key('inbox', name), text)
+
+    def inbox_depth(self, name):
+        return self.v2.depth(name) if self.v2 else self.r.llen(key('inbox', name))
 
     def prepare_worker_profile(self, slot, instruction):
         """Authorize intent without spawning; recheck immediately before delivery."""
@@ -696,6 +708,7 @@ class Fleet:
     def preflight_profile(self, launch):
         """Check dependencies before retiring anything. Never select a fallback CLI."""
         cfg = dict(self.cfg, **launch['overrides'])
+        runtime_v2.validate_config(cfg)  # reject unsupported v2 CLI before retirement
         cli = cfg['worker_cli']
         binary = cfg.get(cli) or cli
         if not shutil.which(binary):
@@ -794,7 +807,8 @@ class Fleet:
         cwd = agent_cwd(self.cfg, name)
         cwd.mkdir(parents=True, exist_ok=True)
         role = 'supervisor' if name == 'supervisor' else 'worker'
-        scope = (HERE / 'agents' / (('service_' if self.service else '') + role + '.md')).read_text()
+        scope = (HERE / 'agents' / (('service_' if self.service else '') + role
+                                  + ('_v2' if self.v2 else '') + '.md')).read_text()
         if launch.get('role_text') and launch['role_text'].strip() != scope.strip():
             scope += '\n## Assigned profile role\n\n' + launch['role_text']
         extra = Path(self.cfg['roles']).expanduser() / (name + '.md') if self.cfg.get('roles') else None
@@ -819,6 +833,8 @@ class Fleet:
                   transcript='', ctx_used=0, ctx_window=0, msg_id='', msg_done='',
                   busy_since=time.time(), delivered=0, retry_at=0, last_msg='', empty_tries=0,
                   launch_ready=int(not launch_held), runtime_ready=0, current_profile='', idle_confirmed=0)
+        if self.v2:
+            self.setf(name, bridge_available=0, startup_deadline=time.time() + float(self.cfg['profile_ready_timeout']))
         if launch:
             self.setf(name, profile_state='switching', runtime_profile=launch['profile_id'],
                       profile_ready_deadline=time.time() + float(self.cfg['profile_ready_timeout']))
@@ -855,7 +871,7 @@ class Fleet:
             self.spawn(name, 'You are fleet agent ' + name + '. Read AGENTS.md in the current directory first. '
                              'There is no task yet: your final reply must be exactly READY.')
         history.write_page(self.run_dir, self.history_slots())
-        # One page: supervisor on the left above the history browser, workers stacked on the right.
+        # One page: supervisor above history/control on the left, worker tabs on the right.
         self.history_pane = self.mgr.arrange(self.agent('supervisor')['pane'],
                                              [self.agent(w)['pane'] for w in self.workers],
                                              history.page_url(self.run_dir))
@@ -865,7 +881,9 @@ class Fleet:
         return [(n, self.label(n), SUPERVISOR_LABEL if n == 'supervisor' else n) for n in self.names]
 
     # -- events
-    def handle(self, ev):
+    def handle(self, ev, *, _v2_internal=False):
+        if self.v2 and not _v2_internal:
+            return runtime_v2.post_event(self.v2.bus, ev)
         kind = ev.get('kind')
         if kind == 'task':
             try:
@@ -962,6 +980,8 @@ class Fleet:
             self.setf(name, **fields)
 
     def on_turn(self, ev):
+        if self.v2:
+            raise ValueError('v2 accepts bound structured settlement events only')
         name, info = ev.get('agent'), self.agent(ev.get('agent', ''))
         if not info or ev.get('generation') != int(info.get('generation', 0)):
             self.log('turn.stale', agent=name, generation=ev.get('generation'))
@@ -1042,7 +1062,7 @@ class Fleet:
         self.queue('supervisor', tag + '\n' + text + '\n\nReply with the JSON format from AGENTS.md.')
 
     def others_active(self):
-        return any(self.agent(w).get('state') != 'idle' or self.r.llen(key('inbox', w)) for w in self.workers)
+        return any(self.agent(w).get('state') != 'idle' or self.inbox_depth(w) for w in self.workers)
 
     def on_supervisor(self, text):
         t = self.task()
@@ -1088,7 +1108,7 @@ class Fleet:
         for slot, instruction, application in prepared:
             # Metadata describes the next instruction, not the last appended one.
             # A busy worker records intent only; delivery re-evaluates at idle.
-            if not self.r.llen(key('inbox', slot)):
+            if not self.inbox_depth(slot):
                 self.record_worker_profile(slot, application)
             advisory = profile_runtime.profile_advisory(slot, application)
             self.queue(slot, advisory + '[Supervisor instruction ' + t.get('id', '') + '] ' + instruction
@@ -1163,6 +1183,8 @@ class Fleet:
         return task_id
 
     def finish(self, status, reason):
+        if self.v2:
+            return self.v2.finish(status, reason)
         if self.service:  # a resident fleet never ends: hold everything for a human instead
             self.pause(status + ': ' + reason)
             return
@@ -1182,7 +1204,8 @@ class Fleet:
             raise ValueError('requests need a fleet started with --mode service')
         validate_request(spec, self.labels() + list(self.r.hgetall(NAMES)))
         rid = spec['id']
-        if self.r.hgetall(REQ + rid) or self.r.get(RESULT + rid):
+        if (self.r.hgetall(REQ + rid) or self.r.get(RESULT + rid)
+                or (self.v2 and self.r.get(self.v2.prefix + ':public:' + runtime_v2.digest(rid)))):
             raise ValueError('duplicate request id: ' + rid)
         self.r.hset(REQ + rid, mapping={'spec': json.dumps(spec, ensure_ascii=False), 'status': 'routing',
                                         'created': time.time(), 'attempts': 0, 'worker': ''})
@@ -1208,12 +1231,18 @@ class Fleet:
         keys = ', '.join(reply['required'])
         if reply.get('allowed') is not None:
             keys += ' (allowed keys: ' + ', '.join(reply['allowed']) + ')'
+        if self.v2:
+            return ('[Request ' + rid + '] ' + prefix + (instruction or 'Handle this request as your role describes.').strip()
+                    + '\nPayload (JSON):\n' + json.dumps(spec['payload'], ensure_ascii=False, indent=1)
+                    + '\nUse fleet_result with a business JSON object with keys: ' + keys + '.')
         return ('[Request ' + rid + '] ' + prefix + (instruction or 'Handle this request as your role describes.').strip()
                 + '\nPayload (JSON):\n' + json.dumps(spec['payload'], ensure_ascii=False, indent=1)
                 + '\nYour final reply must be exactly one JSON object with the keys: ' + keys
                 + '. No text outside the JSON object.')
 
     def publish(self, rid, status, **fields):
+        if self.v2:
+            return self.v2.publish(rid, status, **fields)
         req = self.r.hgetall(REQ + rid)
         now = time.time()
         rec = dict(id=rid, status=status, at=now, elapsed_s=round(now - float(req.get('created') or now), 1), **fields)
@@ -1290,15 +1319,15 @@ class Fleet:
 
     # -- delivery + rotation
     def pump(self):
-        if self.service and self.paused():
+        if (self.service or self.v2) and self.paused():
             return  # nothing is delivered and nothing rotates; requests keep queuing (and may time out)
         cap = int(self.cfg.get('max_busy') or 0)
-        busy = sum(self.agent(w).get('state') in ('busy', 'handoff') for w in self.workers)
+        busy = sum(self.agent(w).get('state') in ('busy', 'handoff', 'held') for w in self.workers)
         for name in self.names:
             info = self.agent(name)
             if name != 'supervisor' and cap and busy >= cap:
                 continue  # e.g. a local model server that rejects concurrent large requests
-            if (info.get('state') == 'idle' and self.r.llen(key('inbox', name))
+            if (info.get('state') == 'idle' and self.inbox_depth(name)
                     and time.time() >= float(info.get('retry_at') or 0)):
                 self.deliver(name)
                 if name != 'supervisor' and self.agent(name).get('state') in ('busy', 'handoff'):
@@ -1327,12 +1356,24 @@ class Fleet:
         info = self.agent(name)
         if info.get('state') != 'idle':
             return
-        pending = self.r.lrange(key('inbox', name), 0, 0)
+        if self.v2 and info.get('bridge_available') != '1':
+            return
+        pending = self.v2.pending_text(name) if self.v2 else self.r.lrange(key('inbox', name), 0, 0)
         if not pending:
             return
         text = pending[0]
         if name != 'supervisor' and not self.service:
             head = SUPERVISOR_INSTRUCTION_HEAD.search(text)
+            if self.v2:
+                mid = self.v2.bus.pending(name, 1)[0]
+                msg = self.v2.bus.message(mid)
+                # v2 stores the task binding as metadata; original profile validator
+                # still receives the business instruction at the idle boundary.
+                if msg['request_id'] != self.task().get('id'):
+                    self.finish('blocked', 'stale task instruction for ' + name)
+                    return
+                head = SUPERVISOR_INSTRUCTION_HEAD.search('[Supervisor instruction ' + msg['request_id'] + '] ' + text)
+                text = '[Supervisor instruction ' + msg['request_id'] + '] ' + text
             if head:
                 if head.group(1) != self.task().get('id'):
                     self.finish('blocked', 'stale task instruction for ' + name)
@@ -1377,6 +1418,8 @@ class Fleet:
             else:
                 self.start_rotation(name, used, window)
                 return
+        if self.v2:
+            return self.v2.deliver(name)
         self.r.lpop(key('inbox', name))
         if self.service:
             head = REQ_HEAD.match(text)
@@ -1395,6 +1438,8 @@ class Fleet:
 
     def send(self, name, pane, text):
         """Codex accepts verbatim paste; Claude and Pi use a file pointer with a delivery id."""
+        if self.v2:
+            raise ValueError('v2 deliveries use Redis authorization; file/paste fallback forbidden')
         if not (is_claude(self.runtime_cfg(name), name) or is_pi(self.runtime_cfg(name), name)):
             return self.mgr.send_prompt_to_idle(pane, text)
         # Claude's Stop hook reads the pointer from its transcript; Pi's extension captures it
@@ -1421,13 +1466,16 @@ class Fleet:
         self.log('rotate.start', agent=name, used=used, window=window, generation=info.get('generation'))
         prompt = (handoff.DUMP_PROMPT.format(path=draft, used=used, window=window)
                   + ' This is a same-task handoff: do not open windows, do not continue the task itself.')
+        if self.v2:
+            self.v2.offer_handoff(name, prompt)
+            return
         if not self.send(name, info['pane'], prompt):
             self.finish_rotation(name, timed_out=True)
 
     def skeleton(self, name, info):
         t = self.task()
         replies = self.r.lrange(key('replies', name), 0, -1)
-        pending = self.r.lrange(key('inbox', name), 0, 0)
+        pending = self.v2.pending_text(name) if self.v2 else self.r.lrange(key('inbox', name), 0, 0)
         return handoff.build_skeleton(
             info['handoff_id'], SESSION, t.get('goal') or (
                 ('resident service: route each request to a worker' if name == 'supervisor'
@@ -1443,6 +1491,11 @@ class Fleet:
                    'anything the model claims as done must be checked against the artifacts'])
 
     def finish_rotation(self, name, timed_out=False):
+        if self.v2 and timed_out:
+            # An unfinished handoff can still run tools. Retire it reliably before
+            # using a skeleton or advancing generation; Escape alone proves nothing.
+            self.v2.transaction('handoff-timeout-' + uuid.uuid4().hex,
+                                lambda: self.v2.hold(name, 'handoff deadline expired'))
         info = self.agent(name)
         generation = int(info['generation'])
         base = self.skeleton(name, info)
@@ -1471,11 +1524,17 @@ class Fleet:
                        snapshot=str(snapshot), source=source, timed_out=timed_out)
         new = self.spawn(name, '[Same-task takeover] You are ' + label + ' (taking over from ' + prev
                          + '). Read the handoff note ' + str(out) + ' and continue from it. In this turn only read '
-                         'the note, do no task work, and make your final reply exactly READY.')
-        self.mgr.tab_into(new, old)  # the successor takes the retiring session's place on the page
-        if not self.mgr.kill_pane(old):
+                         'the note, do no task work, and make your final reply exactly READY.',
+                         launch_held=bool(self.v2))
+        placed = self.mgr.tab_into(new, old)  # the successor takes the retiring session's place on the page
+        if (self.v2 and not placed) or not self.mgr.kill_pane(old) or (self.v2 and self.mgr.get_pane_status(old) is not None):
+            if self.v2:
+                self.setf(name, state='dead', launch_ready=0, retired_pane=old)
             self.finish('blocked', 'could not close the old session ' + prev + '; two sessions hold slot ' + name)
             return
+        if self.v2:
+            self.v2.confirm_retired(name)
+            self.setf(name, launch_ready=1, retired_pane='')
         self.refresh_history()
         self.log('rotate.done', agent=name, label=label, prev=prev, generation=generation + 1,
                  handoff=str(out), source=source, timed_out=timed_out)
@@ -1518,6 +1577,9 @@ class Fleet:
             self.on_stall(name, info, int(now - last))
 
     def on_stall(self, name, info, idle_s):
+        if self.v2:
+            return self.v2.transaction('stall-' + uuid.uuid4().hex,
+                lambda: self.v2.hold(name, 'no activity for ' + str(idle_s) + ' s; stop unconfirmed', public_status='stalled'))
         stalls = int(info.get('stalls', 0)) + 1
         self.log('agent.stalled', agent=name, state=info.get('state'), idle_s=idle_s, stalls=stalls)
         self.mgr.send_key(info['pane'], 'Escape')  # abort the turn; an aborted turn fires no notify
@@ -1548,6 +1610,8 @@ class Fleet:
                         'idle again. Dispatch a smaller, concrete instruction, or reply BLOCKED if a human is needed.')
 
     def tick(self):
+        if self.v2:
+            return self.v2.tick()
         now = time.time()
         for name in self.names:
             info = self.agent(name)
@@ -1575,6 +1639,8 @@ class Fleet:
 
     def run(self):
         self.mgr.get_or_create_session()
+        if self.v2:
+            return self.v2.run()
         self.start_all()
         while not self.stopping:
             self.r.set('fx:daemon:beat', str(time.time()))  # liveness for operators: a hung loop stops beating
@@ -1594,7 +1660,9 @@ def daemon(cfg_path):
     cfg = load(cfg_path)
     with (Path(cfg['run']) / 'daemon.lock').open('a+') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fleet = Fleet(cfg_path, connect(cfg), CmuxSessionManager(SESSION))
+        # cmux creates a fresh login shell: it does not inherit the start command's
+        # CMUX_FLEET_STATE. Pin the registry in config, never fall back for new runs.
+        fleet = Fleet(cfg_path, connect(cfg), CmuxSessionManager(SESSION, state_dir=cfg.get('cmux_state_dir')))
 
         def stop(signum, frame):
             fleet.stopping = True
@@ -1603,14 +1671,21 @@ def daemon(cfg_path):
         try:
             fleet.run()
         finally:
-            try:
-                fleet.r.shutdown()
-            except Exception:
-                pass  # redis closes the socket while acknowledging shutdown
+            if not fleet.v2 or fleet.explicit_stop:
+                try:
+                    fleet.r.shutdown()
+                except Exception:
+                    pass  # redis closes the socket while acknowledging shutdown
 
 
 def start(args):
     from cmux_fleet.cmux_manager import CmuxSessionManager, cmux_available
+    if args.transport_version != 2:
+        raise SystemExit('new fleet instances require Redis transport v2; v1 is only readable for existing runs')
+    try:
+        runtime_v2.validate_config(vars(args))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if not cmux_available():
         raise SystemExit('run this inside a cmux terminal: cmux only accepts processes started in its windows')
     clis = {args.supervisor_cli, args.worker_cli}
@@ -1648,9 +1723,15 @@ def start(args):
     if profiles:
         prepare_codex_home(home, profiles)
     token = uuid.uuid4().hex[:8]
+    try:
+        redis_cfg = redis_runtime.prepare(args.redis_runtime_dir, token)
+    except (OSError, ValueError) as exc:
+        raise SystemExit('cannot prepare private Redis runtime: ' + str(exc)) from exc
+    redis_dir = Path(redis_cfg['redis_runtime_dir'])
     run = Path(args.runs_dir).expanduser() / ('fleet-' + time.strftime('%Y%m%d-%H%M%S-') + token)
     (run / 'workspace').mkdir(parents=True)
-    cfg = {'run': str(run), 'redis_socket': SOCK_PREFIX + token + '.sock', 'python': sys.executable,
+    cfg = {'run': str(run), 'python': sys.executable, **redis_cfg,
+           'cmux_state_dir': str(mgr.meta_path.parent),
            'workers': workers, 'mode': args.mode, 'roles': args.roles, 'max_busy': args.max_busy,
            'request_timeout': args.request_timeout, 'supervisor_profile': args.supervisor_profile,
            'worker_profile': args.worker_profile, 'profile': args.profile, 'codex': codex, 'redis_server': redis_server, 'codex_home': str(home),
@@ -1662,14 +1743,16 @@ def start(args):
            'claude': args.claude or shutil.which('claude'), 'claude_window': args.claude_window,
            'supervisor_cli': args.supervisor_cli, 'pi': pi, 'pi_model': args.pi_model,
            'pi_thinking': args.pi_thinking, 'allow_unsandboxed_pi': args.allow_unsandboxed_pi,
-           'pi_agent_dir': args.pi_agent_dir, 'allow_profile_live_switch': args.allow_profile_live_switch}
+           'pi_agent_dir': args.pi_agent_dir, 'allow_profile_live_switch': args.allow_profile_live_switch,
+           'transport_version': args.transport_version, 'allow_development_v2': args.allow_development_v2}
     if 'pi' in clis:
         cfg['pi_home'] = str(pi_adapter.prepare_home(run / 'pi-home', args.pi_agent_dir))
     save(run / 'config.json', cfg)
     subprocess.run([redis_server, '--port', '0', '--unixsocket', cfg['redis_socket'],
-                    '--unixsocketperm', '700', '--dir', str(run), '--dbfilename', 'fleet.rdb',
-                    '--appendonly', 'no', '--save', '60 1', '--daemonize', 'yes',
-                    '--pidfile', str(run / 'redis.pid'), '--logfile', str(run / 'redis.log')], check=True)
+                    '--unixsocketperm', '700', '--dir', str(redis_dir), '--dbfilename', 'fleet.rdb',
+                    '--appendonly', 'yes' if args.transport_version == 2 else 'no',
+                    '--appendfsync', 'everysec', '--save', '60 1', '--daemonize', 'yes',
+                    '--pidfile', str(redis_dir / 'redis.pid'), '--logfile', str(redis_dir / 'redis.log')], check=True)
     for _ in range(30):
         try:
             connect(cfg)
@@ -1695,6 +1778,13 @@ def request(cfg, event, wait=30):
     import redis as redis_lib
     r = connect(cfg)
     event['request_id'] = uuid.uuid4().hex
+    if cfg.get('transport_version', 1) == 2:
+        bus = runtime_v2.bus_for(cfg, r)
+        try:
+            runtime_v2.post_event(bus, event, event['request_id'])
+            return runtime_v2.wait_reply(bus, event['request_id'], timeout=wait)
+        finally:
+            r.close(); r.connection_pool.disconnect()
     r.rpush(EVENTS, json.dumps(event, ensure_ascii=False))
     for _ in range(wait * 10):
         try:
@@ -1710,6 +1800,10 @@ def request(cfg, event, wait=30):
 
 
 def status(cfg):
+    if cfg.get('transport_version', 1) == 2:
+        from cmux_fleet.control_view import snapshot
+        print(json.dumps(snapshot(cfg), ensure_ascii=False, indent=2))
+        return
     r = connect(cfg)
     print(json.dumps({'mode': cfg.get('mode', 'task'), 'task': r.hgetall(TASK), 'service': r.hgetall(SERVICE),
                       'pending_requests': r.llen(REQQ), 'daemon_beat': float(r.get('fx:daemon:beat') or 0),
@@ -1738,9 +1832,15 @@ def main(argv=None):
     sub = p.add_subparsers(dest='cmd', required=True)
     s = sub.add_parser('start', help='provision the private redis + cmux control surface (inside cmux)')
     s.add_argument('--workers', type=int, default=1)
+    s.add_argument('--transport-version', type=int, choices=(2,), default=2,
+                   help='new runs require Redis v2; existing v1 runs must be drained and replaced, not hot-flipped')
+    s.add_argument('--allow-development-v2', action='store_true',
+                   help='opt into incomplete v2 acceptance; no production-readiness claim')
     s.add_argument('--profile', default=DEFAULTS['profile'], help='codex config profile for every agent (default: fleet)')
     s.add_argument('--codex', help='codex binary (default: first on PATH)')
     s.add_argument('--redis-server', help='redis-server binary (default: first on PATH)')
+    s.add_argument('--redis-runtime-dir', default=str(redis_runtime.DEFAULT_ROOT),
+                   help='private Redis runtime root (default: project .runtime/redis; no /tmp fallback)')
     s.add_argument('--runs-dir', default=str(HOME / 'runs'), help='where run directories are created')
     s.add_argument('--codex-home', default=str(HOME / 'codex-home'),
                    help='isolated CODEX_HOME for the agents (login + profile symlinked from yours; no hooks/MCP)')
@@ -1802,6 +1902,15 @@ def main(argv=None):
     t.add_argument('spec')
     for name in ('status', 'stop', 'resume'):
         sub.add_parser(name).add_argument('--config', default=str(LATEST))
+    ls = sub.add_parser('logs', help='read-only v2 audit timeline/details')
+    ls.add_argument('--config', default=str(LATEST))
+    for field in ('request', 'slot', 'event', 'level'):
+        ls.add_argument('--' + field)
+    ls.add_argument('--generation', type=int)
+    ls.add_argument('--after', default='0-0', help='resume after this Redis audit Stream ID')
+    ls.add_argument('--limit', type=int, default=100, help='maximum records per read/export page')
+    ls.add_argument('--json', action='store_true')
+    ls.add_argument('--follow', action='store_true')
     q = sub.add_parser('request', help='service mode: submit a request (JSON file or - for stdin)')
     q.add_argument('spec')
     q.add_argument('--config', default=str(LATEST))
@@ -1845,7 +1954,15 @@ def main(argv=None):
         print_inspection(args)
     else:
         cfg = load(args.config)
-        if args.cmd == 'status':
+        if args.cmd == 'logs':
+            from cmux_fleet.control_view import iter_events
+            for record in iter_events(cfg, after=args.after, limit=args.limit,
+                                      request_id=args.request, slot=args.slot,
+                                      generation=args.generation, event=args.event, level=args.level,
+                                      follow=args.follow):
+                print(json.dumps(record, ensure_ascii=False) if args.json else
+                      runtime_v2.sanitize_text(json.dumps(record, ensure_ascii=False)), flush=True)
+        elif args.cmd == 'status':
             status(cfg)
         elif args.cmd == 'chrome':
             ans = request(cfg, {'kind': 'chrome', 'argv': args.argv}, wait=150)
