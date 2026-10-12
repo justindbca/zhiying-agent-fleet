@@ -201,6 +201,10 @@ def test_codex_supervisor_dispatches_six_claude_workers_through_v2_bus(mixed):
         assert f.agent(slot)['state'] == 'busy'
         assert f.v2.bus.slot_state(slot)['status'] == 'received'
     assert sum(f.agent(w)['state'] == 'busy' for w in WORKERS) == 6
+    # Claude needs a bracketed paste for multi-line text; Codex must not get one.
+    modes = dict(f.mgr.bracketed)
+    assert modes[f.agent('supervisor')['pane']] is False
+    assert all(modes[f.agent(w)['pane']] is True for w in WORKERS)
     assert no_message_files(f)
 
 

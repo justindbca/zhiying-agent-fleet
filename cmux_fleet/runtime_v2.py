@@ -919,7 +919,8 @@ class RuntimeV2:
                 raise BusError('offered delivery was not received by this generation')
             self.renewed[slot] = time.monotonic()
             pane = self.f.agent(slot).get('pane')
-            if pane and self.f.mgr.send_prompt_to_idle(pane, got['body']['text']):
+            claude = self.f.cfg.get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') == 'claude'
+            if pane and self.f.mgr.send_prompt_to_idle(pane, got['body']['text'], bracketed=claude):
                 self.audit('tui.typed', slot=slot, message_id=env['message_id'], delivery_id=env['delivery_id'])
                 return True
         except (BusError, ValueError, KeyError, OSError) as exc:

@@ -14,6 +14,10 @@ Hard-won cmux facts (all measured, not documented):
   The Codex TUI treats the ESC as a bare Escape key and shows ``[200~`` literally in the
   composer (verified on codex-cli 0.156.1). Codex's own paste-burst detection already
   keeps a multi-line paste in the composer until the explicit Enter.
+* Claude Code is the opposite (measured on 2.1.280): an unbracketed multi-line paste was
+  once left unsubmitted and once split into two prompts at the newline. A bracketed paste
+  arrives as one prompt and the following Enter submits it, so Claude panes use
+  ``paste-buffer --bracketed``.
 * ``new-workspace --focus false`` still switches the user's view; select the previous
   workspace back afterwards.
 * ``pipe-pane`` is a one-shot snapshot, not a stream. The final screen is saved when a
@@ -260,12 +264,13 @@ class CmuxSessionManager:
             return False  # never type ahead of the prompt: the text gets truncated
         return self._paste(ws, sid, command)
 
-    def _paste(self, ws: str, sid: str, text: str) -> bool:
-        # Verbatim delivery; no bracketed-paste markers (see module docstring).
+    def _paste(self, ws: str, sid: str, text: str, bracketed: bool = False) -> bool:
+        # Verbatim delivery; no bracketed-paste markers by default (see module docstring).
         name = 'fleet-' + uuid.uuid4().hex
         if _run('set-buffer', '--name', name, text).returncode:
             return False
-        if _run('paste-buffer', '--name', name, '--workspace', ws, '--surface', sid).returncode:
+        if _run('paste-buffer', '--name', name, *(['--bracketed'] if bracketed else []),
+                '--workspace', ws, '--surface', sid).returncode:
             return False
         time.sleep(1)  # Codex paste-burst detection otherwise swallows the Enter.
         return _run('send-key', '--workspace', ws, '--surface', sid, 'Enter').returncode == 0
@@ -335,9 +340,9 @@ class CmuxSessionManager:
         p = _run('read-screen', '--workspace', ws, '--surface', pane_id, '--scrollback', '--lines', str(lines))
         return p.stdout if p.returncode == 0 else ''
 
-    def send_prompt_to_idle(self, pane_id: str, text: str) -> bool:
+    def send_prompt_to_idle(self, pane_id: str, text: str, bracketed: bool = False) -> bool:
         ws = self._where(pane_id)
-        return bool(ws) and self._paste(ws, pane_id, text)
+        return bool(ws) and self._paste(ws, pane_id, text, bracketed)
 
     def send_key(self, pane_id: str, key: str) -> bool:
         ws = self._where(pane_id)

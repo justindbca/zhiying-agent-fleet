@@ -89,8 +89,9 @@ class FakeMgr:
         self.alive.add(pane)
         return SimpleNamespace(success=True, pane_id=pane, error=None)
 
-    def send_prompt_to_idle(self, pane, text):
+    def send_prompt_to_idle(self, pane, text, bracketed=False):
         self.sent.append((pane, text))
+        self.bracketed = getattr(self, 'bracketed', []) + [(pane, bracketed)]
         return pane in self.alive
 
     def send_key(self, pane, k):
