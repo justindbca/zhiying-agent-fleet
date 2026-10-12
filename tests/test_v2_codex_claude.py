@@ -316,6 +316,8 @@ def test_startup_must_be_ready(private_redis_v2, tmp_path):  # noqa: F811
         f.test_sessions, f.test_claude = tmp_path / 'ch' / 'sessions', tmp_path / 'cp'
         f.test_threads = {'supervisor': str(uuid.uuid4()), 'worker-1': str(uuid.uuid4())}
         assert answer_turn(f, 'worker-1', 'Hello, how can I help?', startup=True)['status'] == 'rejected'
+        assert f.agent('worker-1')['state'] == 'starting'  # one correction first (acceptance 10/13 P1-3)
+        assert answer_turn(f, 'worker-1', 'Hello again', startup=True)['status'] == 'rejected'
         assert f.agent('worker-1')['state'] == 'dead'
     finally:
         fleet_mod.trust_claude_dir = real
