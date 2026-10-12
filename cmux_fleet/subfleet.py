@@ -25,6 +25,7 @@ Internal API
   delegated_route(cfg, name, generation) -> (cfg, name, generation)  hook re-targeting
   tree(cfg) -> nested status for ``status``
   page_links(cfg) -> {'parent', 'children'} for the history/control page (both directions)
+  follow_jump(fleet)             daemon tick: a clicked page link switches to that fleet's cmux workspace
 """
 import json
 import re
@@ -34,12 +35,16 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlsplit
 
 LIMITS = {'max_depth': 2, 'max_children': 3, 'max_agents_total': 12, 'child_workers_max': 3}
 ACTIVE = ('starting', 'running', 'stopping')
 TITLE_MAX = 60
 SEP = ' › '
 STOP_WAIT = 180  # seconds a tree stop waits for one child daemon to exit
+JUMP_PARAM = 'fleet-jump'  # query marker a page link click adds (history.py); a plain reload has none
+JUMP_POLL = 1.0  # seconds between two reads of the history pane URL
+JUMP_MAX_AGE = 120  # an older click (daemon was down) only puts the page back, it never moves the view
 
 
 class Refused(ValueError):
@@ -143,6 +148,106 @@ def page_links(cfg):
                          'outcome': rec.get('outcome'), 'slot': rec.get('slot'), 'attempt': rec.get('attempt'),
                          'title': rec.get('title') or '', 'url': history.page_url(d)})
     return {'parent': parent, 'children': children}
+
+
+def _page(url):
+    return unquote(urlsplit(url).path)
+
+
+def _jump_target(f, url, rel):
+    """(verdict, workspace, page to leave in this pane, reason) for a clicked link to ``url``.
+
+    Only this fleet's registered parent (config ``parent_config``) and its own children
+    (``sub/*/subfleet.json``) are targets, and only with the matching ``rel``. A closed or
+    unregistered target is shown in place (its history page stays readable); anything else
+    puts this fleet's own page back."""
+    from cmux_fleet import history
+    fleet = _fleet()
+    path = _page(url)
+    if path == _page(history.page_url(f.run_dir)):
+        return 'self', None, None, 'link to this fleet'
+    clean = urlsplit(url)._replace(query='', fragment='').geturl()
+    target = None
+    if rel == 'parent' and f.cfg.get('parent_config'):
+        try:
+            pcfg = fleet.load(f.cfg['parent_config'])
+        except (OSError, ValueError):
+            return 'unregistered', None, clean, 'parent config unreadable'
+        if path == _page(history.page_url(pcfg['run'])):
+            target = pcfg
+    elif rel == 'child':
+        for d in children_dirs(f.run_dir):
+            if path != _page(history.page_url(d)):
+                continue
+            if record(d).get('state') not in ACTIVE:
+                return 'closed', None, clean, 'sub-fleet ' + d.name + ' is ' + str(record(d).get('state'))
+            try:
+                target = fleet.load(d / 'config.json')
+            except (OSError, ValueError):
+                return 'unregistered', None, clean, 'sub-fleet config unreadable'
+    if target is None:
+        return 'unrelated', None, None, 'not a registered ' + (rel or 'parent/child') + ' of this fleet'
+    ws = fleet.manager_for(target).workspace_id()
+    if not ws or ws == f.mgr.workspace_id():
+        return 'unregistered', None, clean, 'no cmux workspace registered'
+    return 'jump', ws, None, ''
+
+
+def follow_jump(f, now=None):
+    """Daemon tick: an explicit link click on this fleet's history pane becomes a workspace switch.
+
+    The page's parent/child links navigate to ``<other page>?fleet-jump=<ms36>-<rand>&rel=parent|child``
+    (history.py). A URL without that marker is never acted on (reload, hash changes). Each marker is
+    handled once and recorded in Redis before acting, so repeated ticks and daemon restarts never
+    switch twice; they only finish restoring the pane. The source pane goes back to this fleet's own
+    page (last seen hash); the target fleet's pane is left alone. Returns the verdict or None."""
+    from cmux_fleet import history
+    fleet = _fleet()
+    now = time.time() if now is None else now
+    if not (f.cfg.get('parent_config') or children_dirs(f.run_dir)):
+        return None  # no links on the page: no cmux call per tick
+    if now < getattr(f, 'jump_next', 0) or not hasattr(f.mgr, 'browser_url'):
+        return None
+    f.jump_next = now + JUMP_POLL
+    pane = f.r.hget(fleet.SERVICE, 'history_pane')
+    url = pane and f.mgr.browser_url(pane)
+    if not url:
+        return None
+    parts = urlsplit(url)
+    query = parse_qs(parts.query)
+    own = history.page_url(f.run_dir)
+    if JUMP_PARAM not in query:
+        if parts.fragment and _page(url) == _page(own):
+            f.r.hset(fleet.SERVICE, 'history_hash', parts.fragment)
+        return None
+    nonce = query[JUMP_PARAM][0]
+    hash_ = f.r.hget(fleet.SERVICE, 'history_hash')
+    home = own + ('#' + hash_ if hash_ else '')
+    try:
+        done = json.loads(f.r.hget(fleet.SERVICE, 'history_jump') or '{}')
+    except ValueError:
+        done = {}
+    if done.get('nonce') == nonce:  # already handled (repeated tick, restart): never switch again
+        f.mgr.browser_goto(pane, done.get('page') or home)
+        return 'repeat'
+    try:
+        age = now - int(nonce.split('-', 1)[0], 36) / 1000
+    except ValueError:
+        age = None
+    rel = (query.get('rel') or [''])[0]
+    if age is None or not -60 <= age <= JUMP_MAX_AGE:
+        verdict, ws, page, why = 'stale', None, None, 'request too old or malformed'
+    else:
+        verdict, ws, page, why = _jump_target(f, url, rel)
+    page = page or home
+    f.r.hset(fleet.SERVICE, 'history_jump', json.dumps({'nonce': nonce, 'verdict': verdict, 'page': page}))
+    if verdict == 'jump' and not f.mgr.select_workspace(ws):
+        verdict, why = 'failed', 'select-workspace ' + ws + ' failed'
+        page = urlsplit(url)._replace(query='', fragment='').geturl()  # the user still sees what they clicked
+        f.r.hset(fleet.SERVICE, 'history_jump', json.dumps({'nonce': nonce, 'verdict': verdict, 'page': page}))
+    f.mgr.browser_goto(pane, page)
+    f.log('history.jump', verdict=verdict, rel=rel, target=_page(url), workspace=ws or '', reason=why)
+    return verdict
 
 
 def root_config(cfg):

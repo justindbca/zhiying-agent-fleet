@@ -2226,6 +2226,10 @@ class Fleet:
         self.write_result()
         self.sync_contract_files()
         subfleet.tick(self)  # sub-fleet spawns/returns: side effects, outside any v2 transaction
+        try:  # a parent/child page link was clicked: switch to that fleet's workspace (never fatal)
+            subfleet.follow_jump(self)
+        except Exception as exc:
+            self.log('history.jump_error', error=str(exc))
         if self.v2:
             return self.v2.tick()
         now = time.time()

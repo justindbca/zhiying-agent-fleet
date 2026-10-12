@@ -5,8 +5,9 @@ screen snapshot and handoff note are). ``write_page`` renders ``<run>/history.ht
 (supervisor-1 / worker-1 / ...), pick a generation (supervisor-1, supervisor-1.1, ...), read its screen or
 its handoff note, or search all of them at once. The page is self-contained (data embedded), so the
 cmux browser pane only needs a reload after each rotation; the selection lives in the URL hash.
-Sub-fleets (design.md §19): ``links`` adds the sub-fleet list (state + jump to each child's page) and,
-on a child's page, 'back to the parent fleet'.
+Sub-fleets (design.md §19): ``links`` adds the sub-fleet list (state + jump) and, on a child's page,
+'back to the parent fleet'. A click navigates with an explicit ``?fleet-jump=`` marker that the daemon
+turns into a cmux workspace switch (``subfleet.follow_jump``); a plain reload carries no marker.
 """
 import json
 import os
@@ -126,15 +127,17 @@ function rows(){
   if(q){const out=[];for(const s of DATA.slots)for(const g of s.gens){const n=count(g.screen,q)+count(g.note,q);if(n)out.push([s,g,n])}return out}
   const s=slot();return s?s.gens.slice().reverse().map(g=>[s,g,0]):[];
 }
-function fleets(){  // links move this pane to the other fleet's page; the sidebar title finds its workspace
+function fleets(){  // a click asks this fleet's daemon to switch to the other fleet's workspace (subfleet.follow_jump)
   const q=s=>esc(String(s)).replace(/"/g,'&quot;');
-  const a=(href,text,tip)=>`<a href="${q(href)}" title="${q(tip||'')}">${q(text)}</a>`;
+  const a=(href,rel,text,tip)=>`<a href="${q(href)}" data-rel="${rel}" title="${q(tip||'')}">${q(text)}</a>`;
   const p=DATA.parent,kids=DATA.children||[];
-  $('fleets').innerHTML=(p?a(p.url,'← 回到父 fleet'+(p.task_id?' '+p.task_id:''),'侧栏：'+p.title)
+  const going=new URLSearchParams(location.search).has('fleet-jump');
+  $('fleets').innerHTML=(going?'<span class="muted">正在切到对应工作区…</span>':'')+
+    (p?a(p.url,'parent','← 回到父 fleet'+(p.task_id?' '+p.task_id:''),'切到侧栏：'+p.title)
       +`<span class="muted">${q(p.title)}</span>`:'')+
-    (kids.length?`<span class="muted">子 fleet ${kids.length}：</span>`+kids.map(c=>a(c.url,c.task_id+
-      (c.attempt>1?' #'+c.attempt:'')+' · '+(c.state||'?')+(c.outcome?' ('+c.outcome+')':'')+' · '+(c.slot||''),
-      '侧栏：'+c.title)).join(''):'');
+    (kids.length?`<span class="muted">子 fleet ${kids.length}：</span>`+kids.map(c=>a(c.url,'child',c.task_id+
+      (c.attempt>1?' #'+c.attempt:'')+' · '+(c.state||'?')+(c.outcome&&c.outcome!==c.state?' ('+c.outcome+')':'')+' · '+(c.slot||''),
+      '切到侧栏：'+c.title)).join(''):'');
 }
 function render(){
   $('agents').innerHTML=DATA.slots.map(s=>`<button data-a="${s.slot}" class="${s.slot===st.agent&&!st.q?'on':''}">${s.title||s.slot}
@@ -163,6 +166,8 @@ function render(){
 }
 function step(d){if(!marks.length)return;if(cur>=0)marks[cur].classList.remove('cur');
   cur=(cur+d+marks.length)%marks.length;marks[cur].classList.add('cur');marks[cur].scrollIntoView({block:'center'})}
+document.addEventListener('click',e=>{const l=e.target.closest('#fleets a[data-rel]');if(!l)return;e.preventDefault();
+  location.href=l.getAttribute('href')+'?fleet-jump='+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8)+'&rel='+l.dataset.rel});
 document.addEventListener('click',e=>{const a=e.target.closest('[data-a]'),v=e.target.closest('[data-v]');
   if(a&&a.dataset.g){st.agent=a.dataset.a;st.gen=a.dataset.g;render()}
   else if(a){st.agent=a.dataset.a;st.gen='';st.q='';$('q').value='';render()}

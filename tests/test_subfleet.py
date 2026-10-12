@@ -29,6 +29,7 @@ class World:
         self.n, self.alive, self.owner, self.ws_of = 0, set(), {}, {}
         self.sent, self.keys, self.mgrs, self.order, self.closed = [], [], {}, [], []
         self.state_dir = Path(state_dir)
+        self.urls, self.selected, self.select_ok, self.url_reads = {}, [], True, 0
 
     def manager(self, cfg):
         name = cfg.get('session') or fleet.SESSION
@@ -97,6 +98,20 @@ class WorldMgr:
     def reload_browser(self, pane):
         self.__dict__.setdefault('reloaded', []).append(pane)
         return True
+
+    def browser_url(self, pane):
+        self.w.url_reads += 1
+        return self.w.urls.get(pane) if self.owns(pane) else None
+
+    def browser_goto(self, pane, url):
+        if not self.owns(pane):
+            return False
+        self.w.urls[pane] = url
+        return True
+
+    def select_workspace(self, ws):
+        self.w.selected.append(ws)
+        return self.w.select_ok
 
     def tab_into(self, pane, peer, before=True):
         self.tabbed = getattr(self, 'tabbed', []) + [(pane, peer)]
@@ -452,6 +467,182 @@ def test_history_page_link_text_is_escaped(tmp_path):
     page = history.write_page(tmp_path, [], links).read_text()
     assert page.count('</script>') == 1
     assert page_data(tmp_path)['parent']['title'] == '"><img src=x onerror=alert(1)>'
+
+
+def base36(n):
+    digits = ''
+    while True:
+        n, r = divmod(n, 36)
+        digits = '0123456789abcdefghijklmnopqrstuvwxyz'[r] + digits
+        if not n:
+            return digits
+
+
+def click(url, rel, at=None):
+    """The URL a page link click navigates to (history.py): explicit marker, never a plain reload."""
+    ms = int((time.time() if at is None else at) * 1000)
+    return url + '?' + subfleet.JUMP_PARAM + '=' + base36(ms) + '-' + uuid.uuid4().hex[:6] + '&rel=' + rel
+
+
+def history_pane(f):
+    return f.r.hget(fleet.SERVICE, 'history_pane')
+
+
+def jump(f, url, now=None):
+    t = time.time() if now is None else now
+    f.jump_next = 0  # tests drive the poll interval explicitly
+    f.world_url(url)
+    return subfleet.follow_jump(f, t)
+
+
+@pytest.fixture
+def linked(tree):
+    """Parent with running sub-fleet M0 and its in-process child daemon; both history panes live."""
+    from cmux_fleet import history
+    t, f = tree, tree.f
+    rec, out = spawn_m0(t)
+    cf = child_daemon(t, rec)
+    for x in (f, cf):
+        x.world_url = lambda url, x=x: t.world.urls.__setitem__(history_pane(x), url)
+        t.world.urls[history_pane(x)] = history.page_url(x.run_dir)
+    t.cf, t.rec, t.out = cf, rec, out
+    t.ws_parent, t.ws_child = f.mgr.workspace_id(), cf.mgr.workspace_id()
+    assert t.ws_parent and t.ws_child and t.ws_parent != t.ws_child
+    return t
+
+
+def test_clicked_page_links_switch_workspaces_both_ways_and_restore_the_source_page(linked):
+    """Option (a): a link click (explicit marker) -> select-workspace of the matching fleet; the
+    clicking pane goes back to its own page (last seen state), the target pane is not touched."""
+    from cmux_fleet import history
+    t, f, cf = linked, linked.f, linked.cf
+    own, kid = history.page_url(f.run_dir), history.page_url(t.rec['run'])
+    assert jump(f, own + '#agent=worker-2&gen=&view=note&q=') is None  # ordinary state: remembered only
+    assert t.world.selected == []
+    assert jump(f, click(kid, 'child')) == 'jump'
+    assert t.world.selected == [t.ws_child]
+    assert t.world.urls[history_pane(f)] == own + '#agent=worker-2&gen=&view=note&q='
+    assert t.world.urls[history_pane(cf)] == history.page_url(cf.run_dir)  # the child's pane: untouched
+    assert jump(cf, click(own, 'parent')) == 'jump'
+    assert t.world.selected == [t.ws_child, t.ws_parent]
+    assert t.world.urls[history_pane(cf)] == history.page_url(cf.run_dir)
+
+
+def test_reload_repeated_tick_and_daemon_restart_never_switch_twice(linked):
+    from cmux_fleet import history
+    t, f = linked, linked.f
+    own, kid = history.page_url(f.run_dir), history.page_url(t.rec['run'])
+    url = click(kid, 'child')
+    assert jump(f, url) == 'jump'
+    # the goto back did not land (or the page reloaded the marker URL): the same click is not a new one
+    assert jump(f, url) == 'repeat' and t.world.urls[history_pane(f)] == own
+    restarted = fleet.Fleet(f.path, f.r, f.mgr, sessions=t.sessions)  # a new daemon on the same Redis
+    restarted.world_url = f.world_url
+    assert jump(restarted, url) == 'repeat'
+    assert t.world.selected == [t.ws_child]
+    # a plain reload of the marker-free page is never a click
+    t.world.urls[history_pane(f)] = kid
+    assert jump(f, kid) is None and t.world.selected == [t.ws_child]
+    # a click left over from before a long daemon outage only puts the page back
+    assert jump(f, click(kid, 'child', at=time.time() - 600)) == 'stale'
+    assert t.world.selected == [t.ws_child] and t.world.urls[history_pane(f)] == own
+    # the poll interval: one URL read per JUMP_POLL, not one per loop pass
+    reads = t.world.url_reads
+    f.jump_next = 0
+    now = time.time()
+    subfleet.follow_jump(f, now); subfleet.follow_jump(f, now + .1); subfleet.follow_jump(f, now + .2)
+    assert t.world.url_reads == reads + 1
+
+
+def test_only_registered_matching_relations_jump(linked, tmp_path):
+    from cmux_fleet import history
+    t, f, cf = linked, linked.f, linked.cf
+    own, kid = history.page_url(f.run_dir), history.page_url(t.rec['run'])
+    assert jump(f, click(kid, 'parent')) == 'unrelated'  # right page, wrong relation
+    assert jump(cf, click(own, 'child')) == 'unrelated'  # the parent is not a child of the child
+    other = tmp_path / 'other-fleet'
+    other.mkdir()
+    assert jump(f, click(history.page_url(other), 'child')) == 'unrelated'  # not ours
+    assert jump(f, click(own, 'parent')) == 'self'  # a page link to this fleet itself
+    assert t.world.selected == []
+    assert t.world.urls[history_pane(f)] == own
+
+
+def test_failed_switch_and_missing_registration_show_the_target_page_in_place(linked):
+    from cmux_fleet import history
+    t, f = linked, linked.f
+    kid = history.page_url(t.rec['run'])
+    t.world.select_ok = False
+    assert jump(f, click(kid, 'child')) == 'failed'
+    assert t.world.urls[history_pane(f)] == kid  # what was clicked, without the marker
+    assert t.world.selected == [t.ws_child]
+    t.world.select_ok = True
+    assert jump(f, t.world.urls[history_pane(f)]) is None  # no marker any more: no retry storm
+    t.cf.mgr.ws = None  # the child's cmux registry lost its workspace
+    assert jump(f, click(kid, 'child')) == 'unregistered'
+    assert t.world.selected == [t.ws_child] and t.world.urls[history_pane(f)] == kid
+
+
+def test_returned_subfleet_keeps_a_readable_page_and_never_moves_the_view(linked):
+    from cmux_fleet import history
+    t, f, cf = linked, linked.f, linked.cf
+    kid = history.page_url(t.rec['run'])
+    t.out.write_text('done')
+    cf.v2.finish('completed', 'ok')
+    cf.write_result()
+    subfleet.tick(f)
+    stop_child_like_daemon(cf)
+    subfleet.tick(f)
+    assert subfleet.record(t.rec['run'])['state'] == 'returned'
+    assert jump(f, click(kid, 'child')) == 'closed'
+    assert t.world.selected == [] and t.world.urls[history_pane(f)] == kid
+    assert history.page_path(t.rec['run']).is_file()
+    # from the closed child's page (shown in the parent's pane) 'back to the parent' is this fleet
+    assert jump(f, click(history.page_url(f.run_dir), 'parent')) == 'self'
+    assert t.world.selected == [] and t.world.urls[history_pane(f)].startswith(history.page_url(f.run_dir))
+
+
+def test_the_daemon_tick_follows_a_click(linked):
+    from cmux_fleet import history
+    t, f = linked, linked.f
+    f.jump_next = 0
+    f.world_url(click(history.page_url(t.rec['run']), 'child'))
+    f.tick()
+    assert t.world.selected == [t.ws_child] and t.world.urls[history_pane(f)] == history.page_url(f.run_dir)
+
+
+def test_manager_browser_url_goto_and_select_workspace(tmp_path, monkeypatch):
+    calls = []
+
+    def run(*args):
+        calls.append(args)
+        return SimpleNamespace(returncode=0, stdout='file:///r/history.html?fleet-jump=x\n', stderr='')
+    monkeypatch.setattr(cmux_manager, '_run', run)
+    m = cmux_manager.CmuxSessionManager('cmux-fleet', state_dir=tmp_path)
+    monkeypatch.setattr(m, '_surfaces', lambda w: {'h1': {'pane_id': 'p1'}} if w == 'ws' else {})
+    m._save_meta({'workspace': 'ws', 'control_workspace': None, 'surfaces': {'h1': {'type': 'history'}}})
+    assert m.browser_url('h1') == 'file:///r/history.html?fleet-jump=x'
+    assert m.browser_url('other') is None  # never reads a surface it does not own
+    assert m.browser_goto('h1', 'file:///r/history.html') and m.select_workspace('ws-2')
+    assert calls == [('browser', '--surface', 'h1', 'url'), ('browser', '--surface', 'h1', 'goto', 'file:///r/history.html'),
+                     ('select-workspace', '--workspace', 'ws-2')]
+    assert not m.select_workspace('')
+
+
+def test_fleets_without_links_never_read_the_pane(tree):
+    f = tree.f
+    f.jump_next = 0
+    assert subfleet.follow_jump(f) is None and tree.world.url_reads == 0
+
+
+def test_page_links_carry_the_explicit_jump_marker(tmp_path):
+    from cmux_fleet import history
+    links = {'parent': {'task_id': '', 'url': 'file:///p/history.html', 'title': 'P'},
+             'children': [{'task_id': 'M0', 'url': 'file:///c/history.html', 'title': 'C', 'state': 'failed',
+                           'outcome': 'failed'}]}
+    page = history.write_page(tmp_path, [], links).read_text()
+    assert "'?fleet-jump='" in page and 'data-rel' in page and subfleet.JUMP_PARAM == 'fleet-jump'
+    assert "c.outcome!==c.state" in page  # 'failed (failed)' is shown once
 
 
 def test_root_stop_stops_children_first_without_orphans(tree):
