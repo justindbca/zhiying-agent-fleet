@@ -314,3 +314,16 @@ def test_v2_claude_stop_hook_outlives_ready_wait(tmp_path):
     argv = fleet.claude_argv('cfg.json', cfg, 'worker-1', 1, 'hi')
     settings = json.loads(Path(argv[argv.index('--settings') + 1]).read_text())
     assert settings['hooks']['Stop'][0]['hooks'][0]['timeout'] == 30  # v1 unchanged
+
+
+def test_codex_turn_matches_rollout_cwd_through_symlinked_run_dir(tmp_path):
+    real = tmp_path / 'real'
+    (real / 'agents' / 'supervisor').mkdir(parents=True)
+    link = tmp_path / 'link'
+    link.symlink_to(real)
+    thread = str(uuid.uuid4())
+    sessions = tmp_path / 'sessions'
+    write_rollout(sessions, thread, real / 'agents' / 'supervisor', rows=[
+        {'type': 'event_msg', 'payload': {'type': 'task_complete', 'turn_id': 'u1', 'last_agent_message': 'READY'}}])
+    data = {'thread-id': thread, 'turn-id': 'u1', 'last-assistant-message': 'READY'}
+    assert fleet.completed_turn(fleet.agent_cwd({'run': str(link)}, 'supervisor'), data, sessions)

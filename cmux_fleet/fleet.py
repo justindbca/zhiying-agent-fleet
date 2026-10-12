@@ -434,7 +434,8 @@ def completed_turn(cwd, data, sessions):
     for path in rollouts(thread, sessions):  # newest chunk of a resumed thread wins
         try:
             meta = _meta(path)
-            if _is_subagent(meta) or meta.get('cwd') != str(cwd):
+            # Codex records the real path (/tmp is /private/tmp on macOS); compare resolved paths.
+            if _is_subagent(meta) or os.path.realpath(meta.get('cwd') or '') != os.path.realpath(cwd):
                 continue
             for line in reversed(_tail(path, 262144)):
                 try:
