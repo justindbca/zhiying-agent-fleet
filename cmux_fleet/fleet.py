@@ -2381,6 +2381,14 @@ class Fleet:
         return self.brake_trip('wall', self.label(name) + ' hit a ' + wall['scope'] + ' wall ("' + wall['line'][:120]
                                + '"); ' + what, agent=name, source=source, wall=wall, decision=action)
 
+    def stalled_screens(self, now):
+        """Screens of busy agents past stall_timeout (only while a task / service is running)."""
+        limit = float(self.cfg['stall_timeout'])
+        if limit <= 0 or not self.running() or self.paused():
+            return {}
+        return {name: self.capture_screen(name, info) for name, info in ((n, self.agent(n)) for n in self.names)
+                if info.get('state') == 'busy' and now - self.last_activity(info) >= limit}
+
     def capture_screen(self, name, info):
         """The tail of an agent's screen for wall detection ('' if it cannot be read)."""
         pane = info.get('pane')
@@ -2417,8 +2425,15 @@ class Fleet:
         self.write_result()
         self.sync_contract_files()
         subfleet.tick(self)  # sub-fleet spawns/returns: side effects, outside any v2 transaction
-        record = (self.v2.transaction('brake-' + uuid.uuid4().hex, lambda: self.brake_tick(time.time()))
-                  if self.v2 else self.brake_tick(time.time()))
+        if self.v2:
+            # v2 holds a stalled slot inside RuntimeV2.tick (Fleet.on_stall is v1 only): read the
+            # screens of slots about to be held first, so a wall pauses the fleet instead.
+            screens = self.stalled_screens(time.time())
+            record = self.v2.transaction('brake-' + uuid.uuid4().hex, lambda: next(
+                (r for r in [self.on_wall(n, text, 'screen') for n, text in screens.items()] if r), None)
+                or self.brake_tick(time.time()))
+        else:
+            record = self.brake_tick(time.time())
         if record:
             self.brake_notify(record)
         if self.v2:

@@ -435,5 +435,5 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - 池读数来自额度调度员的 `~/.cmux-fleet/quota.json`（config `quota_file` 可改）：`{"pools": {"pool-a": {"cash_used_usd", "at"}, "pool-b": {"week_used_pct", "at"}}}`。缺失 / 读不出 / 超过 1 小时 = unknown：显示在 `brake.json`，**不触发**。
 - 到线：pause（不投递、不轮换，全部可续）+ 审计 `brake.tripped` + `<run>/brake.json` + 可选 `brake_notify` argv（`start --brake-notify`，无 shell）。v2 下判定在一个事务里做，通知在事务外。
 - 续跑：`cmux-fleet resume` 在预算线仍越线时被拒，须 `resume --raise LIMIT=VALUE`（不能改池）；墙引起的暂停可直接 resume。新任务开新卡时清掉上一张卡的刹车暂停（操作员手动 pause 不清）。
-- 墙表一张：账号级墙（usage / weekly / session limit、429）→ 换边或停，fleet 内即停（pause）；分池墙（"You've reached your Fable limit"、`/usage-credits`）→ 同 CLI 降一档（`same_cli_downgrade`，吸收自 us-stock-option `config/cli_tier_map.yaml`），没有下一档也停。来源：短回合文本（≤400 字，长报告不判墙）与卡住时的屏幕尾部。当前只**判定 + 记录（agent `wall` 字段、`brake.json`）+ 暂停**；自动按降档换下一代未接线（依赖 B 的名单 `profile` 列 / A 的组合表）。
+- 墙表一张：账号级墙（usage / weekly / session limit、429）→ 换边或停，fleet 内即停（pause）；分池墙（"You've reached your Fable limit"、`/usage-credits`）→ 同 CLI 降一档（`same_cli_downgrade`，吸收自 us-stock-option `config/cli_tier_map.yaml`），没有下一档也停。来源：卡住（超 `stall_timeout`）时的屏幕尾部（v1 在 `on_stall`，v2 在 `Fleet.tick` 的刹车事务里、早于 v2 hold）；v1 另看短回合文本（≤400 字，长报告不判墙）。启动时撞墙（非 READY）仍走原 blocked 终态。当前只**判定 + 记录（agent `wall` 字段、`brake.json`）+ 暂停**；自动按降档换下一代未接线（依赖 B 的名单 `profile` 列 / A 的组合表）。
 - v1 task 的 `pause` 现在也会停投递（原来只对 service / v2 生效）。

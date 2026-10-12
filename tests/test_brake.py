@@ -412,3 +412,21 @@ def test_service_budget_card_comes_from_config(tmp_path):
     f.pump()
     f.tick()
     assert f.paused() and 'max_calls 1/1' in f.r.hget('fx:service', 'reason')
+
+
+def test_v2_stalled_screen_wall_pauses_before_the_slot_is_held(fx):
+    """v2 never calls Fleet.on_stall: the wall scan runs in the brake transaction of Fleet.tick."""
+    f = fx
+    f.service = False; f.cfg['mode'] = 'task'; f.cfg['stall_timeout'] = 60
+    event(f, dict(kind='task', request_id='new-task', spec={'goal': 'write an evidence report'}))
+    f.pump(); receive(f, 'supervisor')
+    f.mgr.capture_to = lambda pane, path: Path(path).write_text('thinking...\n' + REAL_CODEX_WALL + '\n')
+    stale = time.time() - 3600
+    f.setf('supervisor', busy_since=stale)
+    transcript = Path(f.agent('supervisor')['transcript'])
+    os.utime(transcript, (stale, stale))
+    f.tick()
+    assert f.paused() and f.task()['status'] == 'running'
+    assert json.loads(f.agent('supervisor')['wall'])['scope'] == 'account'
+    audit = [x for _, x in f.r.xrange(f.v2.bus.audit_key) if x['event'] == 'brake.tripped']
+    assert audit and json.loads((f.run_dir / 'brake.json').read_text())['source'] == 'screen'
