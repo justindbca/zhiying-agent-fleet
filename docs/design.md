@@ -468,4 +468,7 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - **显示**：每次解析写入 `fx:agent:<slot>` 的 `handoff_window`（或 `measured`）/ `handoff_ratio` / `handoff_source`（如 `window: built-in opus; ratio: --handoff-ratio`）；名单变更后立即刷新全体。`status` 的 `context` 带这三项，control 行显示 `handoff=<ratio>@<window>`。
 - **已知边界**：内置表按子串判断，`opus` 一律当 1M 依据用户陈述（未在 API 层核实具体模型的真实窗口，若某个 opus 变体实为 200k 用 `claude:<model>` 覆盖）；模型串精确匹配，别名（`opus`）与全名（`claude-opus-…`）是不同键；adopt 的子 fleet 监工仍不换代（§19）。
 
-**验证**：`python3 -m pytest -q tests` 全套通过（新增 `tests/test_handoff_limits.py`：内置表与旗标、五层顺序、opus 300k 不换代 / sonnet 120k 换代、profile 运行模型、worker 覆盖 + 不重启热载改变阈值、坏值整份拒收保留原阈值、config 表校验、Codex 实测窗口不动除非显式覆盖、状态字段；`tests/test_roster.py` 新增坏值参数与 v2 热载进 `status`）。独立复核、合并、部署均未做。
+**验证**：`python3 -m pytest -q tests` 全套通过（新增 `tests/test_handoff_limits.py`：内置表与旗标、五层顺序、opus 300k 不换代 / haiku 120k 换代、profile 运行模型、worker 覆盖 + 不重启热载改变阈值、坏值整份拒收保留原阈值、config 表校验、Codex 实测窗口不动除非显式覆盖、状态字段；`tests/test_roster.py` 新增坏值参数与 v2 热载进 `status`）。独立复核、合并、部署均未做。
+
+**Claude 窗口与自压缩（2026-10-13 补，Fable r2）**：官方文档 `code.claude.com/docs/en/model-config.md`：裸 `opus`（Opus 5.5）、裸 `sonnet` 都是原生 1M，内置表因此把 `sonnet` 也算 1M（haiku 仍走 `--claude-window`）。Claude Code 自压缩约在 967K（CHANGELOG 2.1.247）；`autoCompactWindow` 只能压低、不能抬高压缩点，所以 fleet **不**设它——0.6 × 1M = 600K 的换代总先于自压缩。roster 把 window 调到接近 1M 时要自己留出余量（ratio × window 低于约 967K）。
+

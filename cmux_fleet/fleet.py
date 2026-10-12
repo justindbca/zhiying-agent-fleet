@@ -234,7 +234,7 @@ def claude_transcript_usage(path, window):
     return 0, window
 
 
-CLAUDE_1M = ('[1m]', 'opus', 'fable')  # built-in: Claude models with a 1,000,000-token window
+CLAUDE_1M = ('[1m]', 'opus', 'fable', 'sonnet')  # built-in: Claude models with a native 1,000,000-token window (code.claude.com/docs/en/model-config)
 
 
 def handoff_limits(cli, model, cfg, table=None, worker=None):

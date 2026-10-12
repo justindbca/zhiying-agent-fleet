@@ -37,7 +37,8 @@ def test_builtin_table_and_flags():
     assert lim('claude', 'claude-opus-4-1', CFG)[0] == 1000000
     assert lim('claude', 'fable', CFG)[0] == 1000000
     assert lim('claude', 'sonnet[1m]', CFG)[0] == 1000000
-    assert lim('claude', 'sonnet', CFG) == (200000, .6, 'window: --claude-window; ratio: --handoff-ratio')
+    assert lim('claude', 'sonnet', CFG)[0] == 1000000  # native 1M (code.claude.com/docs/en/model-config)
+    assert lim('claude', 'haiku', CFG) == (200000, .6, 'window: --claude-window; ratio: --handoff-ratio')
     assert lim('claude', 'haiku', dict(CFG, claude_window=150000, handoff_ratio=.5))[:2] == (150000, .5)
     assert lim('codex', 'gpt-6', CFG)[:2] == (None, .6)  # measured from the rollout
     assert lim('pi', 'local/flash', CFG)[0] is None
@@ -53,16 +54,16 @@ def test_resolution_order_worker_roster_config_builtin():
         1000000, .7, 'window: worker; ratio: roster claude:opus')
     assert lim('claude', 'opus', cfg, table, {'ratio': .8})[1] == .8
     assert lim('codex', 'gpt-6', cfg)[0] == 50000  # explicit window overrides the measured one
-    assert lim('claude', 'sonnet', CFG, {'claude:opus': {'window': 1}})[0] == 200000  # exact model key only
+    assert lim('claude', 'haiku', CFG, {'claude:opus': {'window': 1}})[0] == 200000  # exact model key only
 
 
-def test_opus_1m_does_not_rotate_at_300k_but_sonnet_rotates_at_120k(cfx):
+def test_opus_1m_does_not_rotate_at_300k_but_haiku_rotates_at_120k(cfx):
     cfx.cfg['worker_model'] = 'opus'
     transcript(cfx, 'worker-1', 300000)
     assert deliver(cfx, 'worker-1') == 'busy'
     assert cfx.agent('worker-1')['ctx_window'] == '1000000'
     cfx.setf('worker-1', state='idle')  # turn finished
-    cfx.cfg['worker_model'] = 'sonnet'
+    cfx.cfg['worker_model'] = 'haiku'
     transcript(cfx, 'worker-1', 120000)
     assert deliver(cfx, 'worker-1') == 'handoff'
 

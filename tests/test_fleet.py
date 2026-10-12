@@ -813,7 +813,7 @@ def test_claude_usage_and_activity_come_from_transcript(cfx, tmp_path):
             {'type': 'assistant', 'isSidechain': True, 'message': {'usage': {'input_tokens': 999999}}}]
     tr.write_text('\n'.join(json.dumps(x) for x in rows) + '\n')
     cfx.setf('worker-1', transcript=str(tr))
-    assert cfx.usage('worker-1') == (120020, 200000)
+    assert cfx.usage('worker-1') == (120020, 1000000)  # sonnet: native 1M (§22)
     sub = tr.with_suffix('') / 'subagents' / 'agent-1.jsonl'
     sub.parent.mkdir(parents=True)
     sub.write_text('{}\n')
