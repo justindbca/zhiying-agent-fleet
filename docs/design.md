@@ -417,3 +417,21 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 **验证**：`python3 -m pytest -q tests` 全套通过（新增 `tests/test_subfleet.py`：两套真私有 Redis + 两个进程内 daemon + 每套登记分开记归属的假 cmux + 真 `claude_stop`/`notify` 入口：移交→子 fleet READY 走父钩子→子监工决策派给子 worker→交卷→release→父收回同会话 READY→父监工收到结果；委派中不投递不判死；产出缺失判 failed 与重试编号；起子 Redis 失败回滚；收回前 Escape；会话丢失原位起下一代；主 resume 保留 delegated slot 并拉起子 fleet；上限四项与编号范围；Pi/忙槽拒绝；请求文件经 tick 执行；status 树；迟到代数不改投；树停无孤儿 Redis；主 resume 拉起子 fleet；子 resume 接回 adopt 窗格；父任务终态停子 fleet；v2 主循环跑 Fleet.tick 回归；cmux_manager 的 release/adopt/place_after/close_all 用假 `_run`）。
 
 **未验收 / 已知缺口**：真实 cmux 上的跨工作区 `move-surface` 移交、`reorder-workspace`、标签标题与 `--name` 的先后，均未实测；一个正在跑的 Claude 会话在中途换掉 CLAUDE.md 后是否真按监工格式只回决策 JSON（提示词层面），未实测——这是本块最大的剩余风险；主 fleet 控制页「子 fleet 一览/跳转」与子 fleet「回到父 fleet」链接未做；委派中的 slot 仍可被父监工派活，消息排队到收回后再投；申请拆解→审批→`spawn_child` 的接线留给 contracts 合并后的下一块；子 fleet 任务的产出只做「文件存在非空」检查，正式验收交 contracts 块；独立复核、合并、部署均未做。
+
+## 20. 看门五态（transport v2，2026-10-13 批次 F）
+
+只在 v2 运输层；v1 `check_stalls` / `on_stall` 不变。代码 `cmux_fleet/watchdog.py`，由 `RuntimeV2.tick` 在 Redis 意图之外调用（抓屏 / 按键 / 杀 / 起新代都是副作用）；结算（hold / 入队 / 公布结果）仍走 `transaction`。每个非空闲槽位每 `watch_interval`（缺省 5 s）判一次，状态变化写审计 `agent.state`（from / to / 证据）。
+
+| 状态 | 判据 | 动作 |
+|---|---|---|
+| `idle` | 无在途投递且不在 starting | 什么都不做，再久也不判死（E1） |
+| `working` | 在途，转录 / rollout（含 Claude 子 agent 转录）`stall_timeout` 内有更新 | 无 |
+| `prompting` | 屏幕最后 `tail_lines` 行命中弹框表白名单（starting 时也查，信任框在 READY 前） | 存屏到 `<run>/watchdog/`，发表里的预定键；同一投递同一弹框答满 `max_hits`（3）次仍在 → 按 `stalled` |
+| `prompting`（未知） | 命中 `unknown_markers` 但不在白名单 | 只存屏 + hold（暂停派工），一个键都不按 |
+| `stalled` | 在途，`stall_timeout` 无活动 | Escape，最多 `stall_escapes`（3）次，均匀分布在 `stall_grace`（300 s）里；不 hold。期间转录再动 → `working` |
+| `frozen` | stalled 满 `stall_grace`；或 3 次 Escape 后屏幕摘要不变；或 `ps` 连续两次看到该 tty 进程 `U`（Linux `D`） | 存屏 → skeleton 交接单 → 新一代 `tab_into` 原位 → `kill_pane`（只认本 fleet 注册表里的 surface，杀其 tty 进程树）→ `confirm_retired`（投递 cancelled、`stop_confirmed`）→ worker：给监工发 `FROZEN` 报告，原指令**不重跑**；监工：原消息加注重新入队；service：请求公布 `stalled`。run 暂停中 / 子 fleet 收养的窗格 → 只 hold 不杀；杀不掉 → 任务 blocked |
+
+- 弹框表 `cmux_fleet/config/watchdog_prompts.yaml`（`--prompt-table` 可换），按 mtime 热载；坏改动审计 `watch.table_rejected` 并沿用旧表。缺省白名单只有三条：`dangerous_rm`、`read_outside`、`trust_folder`，键都是 `Enter`。
+- 自检：连续 `capture_fail_alarm`（3）次抓屏失败写一条 `watch.capture_fail`（error，每段连续失败只报一次）。
+- **hold 出口**：槽位 held（uncertain / expired）时，若同一会话、同一代、由该投递打字开启的回合结束（Claude Stop / Codex notify 经 `tui_turn`），钩子发 `turn_ended`；daemon 校验身份后 `resolve_uncertain(cancelled, execution_stopped=True)`，槽位回 idle，结果**不采用**，暂停状态不动（审计 `hold.released`）。手打回合 / 旧代 / 未 held 的伪造事件一律拒绝。
+- 参数：`--stall-timeout`（原有，缺省 1800）、`--stall-grace`、`--stall-escapes`、`--prompt-table`；配置非法在 `validate_config` 拒绝。`walled`（墙文案）不在本项，归刹车（E）。

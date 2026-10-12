@@ -44,7 +44,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import contracts, handoff, history, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
+from cmux_fleet import contracts, handoff, history, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, watchdog  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -659,6 +659,14 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
             bus.register_slot(name, generation, thread)
             return call('startup', text=text, failed=False, aborted=False)
         lease = r.hgetall(bus.lease_key(name))
+        if lease.get('status') in ('uncertain', 'expired') and lease.get('message_id') and info.get('state') == 'held':
+            # Hold exit (docs/design.md §20): the held turn has now ended in this very session, which
+            # proves its execution stopped. The daemon releases the slot; the result is not applied.
+            msg = bus.message(lease['message_id'])
+            if (msg.get('generation') != generation or msg.get('session_id') != thread
+                    or not runtime_v2.turn_answers(msg['body']['text'], inputs)):
+                return skipped('ignored', 'held delivery was not answered by this session')
+            return call('turn_ended', delivery={k: msg[k] for k in runtime_v2.IDENTITY})
         if lease.get('status') != 'received' or not lease.get('message_id'):
             return skipped('ignored', 'no received delivery (manual or duplicate turn)')
         msg = bus.message(lease['message_id'])
@@ -2490,6 +2498,8 @@ def start(args):
            'worker_profile': args.worker_profile, 'profile': args.profile, 'codex': codex, 'redis_server': redis_server, 'codex_home': str(home),
            'handoff_ratio': args.handoff_ratio, 'handoff_timeout': args.handoff_timeout,
            'window': args.window, 'stall_timeout': args.stall_timeout,
+           'stall_grace': args.stall_grace, 'stall_escapes': args.stall_escapes,
+           **({'prompt_table': str(Path(args.prompt_table).expanduser().resolve())} if args.prompt_table else {}),
            'compact_limit': args.compact_limit, 'chrome_script': args.chrome_script,
            'chrome_min_interval': args.chrome_min_interval, 'worker_cli': args.worker_cli,
            'worker_model': args.worker_model, 'worker_kit': args.worker_kit,
@@ -2602,6 +2612,14 @@ def main(argv=None):
                    help='context window fallback when the rollout has not reported one yet')
     s.add_argument('--stall-timeout', type=float, default=DEFAULTS['stall_timeout'],
                    help='seconds without rollout activity before a busy agent is treated as stalled (0 = off)')
+    s.add_argument('--stall-grace', type=float, default=watchdog.DEFAULTS['stall_grace'],
+                   help='transport v2: seconds a stalled agent gets after its first Escape before it is treated '
+                        'as frozen (killed and restarted in place)')
+    s.add_argument('--stall-escapes', type=int, default=watchdog.DEFAULTS['stall_escapes'],
+                   help='transport v2: Escape presses for a stalled agent; all of them leaving the screen '
+                        'unchanged means frozen')
+    s.add_argument('--prompt-table', help='transport v2: watchdog dialog whitelist YAML (hot-reloaded; default '
+                                          'cmux_fleet/config/watchdog_prompts.yaml)')
     s.add_argument('--compact-limit', type=int, help='codex model_auto_compact_token_limit (default: codex decides)')
     s.add_argument('--chrome-script', help='optional browser broker script run by the daemon for sandboxed agents')
     s.add_argument('--chrome-min-interval', type=float, default=DEFAULTS['chrome_min_interval'])

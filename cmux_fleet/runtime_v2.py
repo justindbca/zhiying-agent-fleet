@@ -20,6 +20,7 @@ from cmux_fleet import contracts
 from cmux_fleet.message_bus import BusError, MessageBus, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
 from cmux_fleet import subfleet
+from cmux_fleet import watchdog
 
 
 # Supported v2 CLI combinations. Everything else is refused with its reason, never
@@ -60,6 +61,13 @@ def validate_config(cfg):
             raise ValueError(problem)
         if cfg.get('allow_development_v2') is not True:
             raise ValueError('transport v2 requires --allow-development-v2; real SDK/TUI acceptance is pending')
+        for name in watchdog.DEFAULTS:
+            watchdog.setting(cfg, name)
+        if cfg.get('prompt_table'):
+            try:
+                watchdog.parse_table(Path(cfg['prompt_table']).read_text(encoding='utf-8'))
+            except OSError as exc:
+                raise ValueError('cannot read --prompt-table: ' + str(exc))
     return version
 
 
@@ -339,6 +347,7 @@ class RuntimeV2:
         self.pending_cursor = '0-0'
         self.held_events = set()
         self.renewed = {}
+        self.watchdog = watchdog.Watchdog(self)
         try:
             fleet.r.xgroup_create(self.events, self.group, '0-0', mkstream=True)
         except redis.ResponseError as exc:
@@ -544,7 +553,8 @@ class RuntimeV2:
                    correlation_id=ev.get('request_id', ''), message_id=delivery.get('message_id', ''),
                    delivery_id=delivery.get('delivery_id', ''), generation=ev.get('generation'),
                    level='error' if error_record else 'info', detail=ev)
-        if kind in ('bridge_session', 'startup', 'availability', 'candidate', 'started', 'settled', 'bridge_fault'):
+        if kind in ('bridge_session', 'startup', 'availability', 'candidate', 'started', 'settled', 'bridge_fault',
+                    'turn_ended'):
             info = self.f.agent(slot) if slot in self.f.names else {}
             if (not info or ev.get('run_id') != self.bus.run_id
                     or ev.get('generation') != int(info.get('generation', -1))):
@@ -583,6 +593,8 @@ class RuntimeV2:
                 self.f.setf(slot, bridge_available=int(ev.get('idle') is True))
             elif kind == 'bridge_fault':
                 self.hold(slot, ev.get('reason', 'bridge disconnected'))
+            elif kind == 'turn_ended':
+                self.release_held(slot, ev)
             elif kind == 'started':
                 try:
                     env = ev['delivery']
@@ -684,6 +696,38 @@ class RuntimeV2:
         self.f.setf(env['slot'], state='idle', idle_confirmed=1, request='', bridge_available=0)
         self.audit('committed', slot=env['slot'], message_id=env['message_id'],
                    delivery_id=env['delivery_id'], request_id=env['request_id'], detail=result)
+
+    def release_held(self, slot, ev):
+        """Hold exit: the held delivery's own turn ended in its own session, so its execution has
+        stopped. Release the slot (delivery cancelled, result NOT applied); the pause stays as is."""
+        env = ev.get('delivery')
+        lease = self.bus.r.hgetall(self.bus.lease_key(slot))
+        problem = None
+        if not isinstance(env, dict) or env.get('slot') != slot:
+            problem = 'invalid delivery identity'
+        elif self.f.agent(slot).get('state') != 'held' or lease.get('status') not in ('uncertain', 'expired'):
+            problem = 'slot is not held'
+        elif lease.get('current_delivery') != env.get('delivery_id') or lease.get('message_id') != env.get('message_id'):
+            problem = 'not the held delivery'
+        else:
+            msg = self.bus.message(env['message_id'])
+            if any(str(msg.get(k)) != str(env.get(k)) for k in IDENTITY if k != 'request_id'):
+                problem = 'delivery identity mismatch'
+        if problem is None:
+            try:
+                self.bus.resolve_uncertain(slot, env, 'cancelled', execution_stopped=True)  # idempotent on replay
+            except (BusError, ValueError, KeyError, redis.ResponseError) as exc:
+                problem = 'release failed: ' + str(exc)[:300]
+        if problem:
+            self.audit('hold.release_rejected', slot=slot, level='warn', error=problem)
+            self.reply(ev, {'status': 'rejected', 'reason': problem})
+            return
+        self.f.setf(slot, state='idle', idle_confirmed=1, bridge_available=0, request='', watch_state='idle',
+                    stall_escapes=0, watch_since=0)
+        self.audit('hold.released', slot=slot, level='warn', message_id=env['message_id'],
+                   delivery_id=env['delivery_id'], detail={'reason': 'held turn ended in its own session; '
+                   'execution stopped, result not applied', 'paused': self.f.paused()})
+        self.reply(ev, {'status': 'released', 'execution_stopped': True})
 
     def remember(self, slot, business_value):
         # Preserve the original recent-reply input to the handoff skeleton. Store
@@ -1309,10 +1353,10 @@ class RuntimeV2:
                     deadline = int(self.f.r.hget(self.bus.msg_key(mid), 'deadline_at'))
                     if int(now*1000) >= min(deadline, int(state['lease_until'])):
                         self.hold(slot, 'lease/delivery deadline expired; execution stop unconfirmed', public_status='timeout')
-                    elif float(self.f.cfg['stall_timeout']) > 0 and now-self.f.last_activity(info) >= float(self.f.cfg['stall_timeout']):
-                        self.hold(slot, 'agent stalled; execution stop unconfirmed', public_status='stalled')
+                    # Stalls are the watchdog's (docs/design.md §20): Escape ladder, then kill + next generation.
         self.transaction('tick-' + uuid.uuid4().hex, expire)
         self.renew_tui()
+        self.watchdog.tick(now)  # screen / keys / kill / spawn: side effects, outside any Redis intent
         for slot in self.f.names:
             info = self.f.agent(slot)
             if info.get('handoff_id') and info.get('state') in ('handoff', 'held') and now >= float(info.get('handoff_deadline') or 0):

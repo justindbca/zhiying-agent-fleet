@@ -1,0 +1,33 @@
+# Watchdog prompt table (docs/design.md §20). Hot-reloaded: the daemon re-reads this file when it
+# changes; an invalid edit is refused (audited) and the previous table stays in force.
+#
+# prompts: whitelist of KNOWN, harmless confirmation dialogs. When every string in `match` (case-
+#   insensitive, literal) is on the last `tail_lines` lines of the agent's screen, the watchdog
+#   saves the screen and sends `keys` (cmux send-key names). The same dialog answered `max_hits`
+#   times within one delivery stops being answered: the slot is treated as stalled.
+#   `any` (optional) additionally needs at least one of its strings.
+# unknown_markers: a screen that shows one of these but matches no whitelist entry is an UNKNOWN
+#   dialog: the screen is saved, the slot is held, and nothing is pressed (an Enter could approve
+#   something the task never authorised).
+tail_lines: 25
+max_hits: 3
+prompts:
+  - name: dangerous_rm
+    # Claude Code still asks for `rm` on a possibly-empty variable under
+    # --dangerously-skip-permissions (10/12 E16); Enter = the default "Yes" was verified safe there.
+    match: ["dangerous rm"]
+    keys: [Enter]
+  - name: read_outside
+    # "Read outside the working directories?" (E2: hub stuck 26 days on it).
+    match: ["outside the working director"]
+    keys: [Enter]
+  - name: trust_folder
+    # Codex "Trust this folder?" / Claude "Do you trust the files in this folder?".
+    match: ["trust"]
+    any: ["trust this folder", "trust the files in this folder"]
+    keys: [Enter]
+unknown_markers:
+  - "Do you want to proceed?"
+  - "Do you want to make this edit"
+  - "Do you want to create"
+  - "❯ 1. Yes"
