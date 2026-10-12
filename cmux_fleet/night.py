@@ -10,6 +10,7 @@ still missing, queued work kept on its slot). The supervisor itself is never swi
 
 The brake only receives a placeholder: fx:night {on, brake_card} for the budget code to read.
 """
+import importlib
 import json
 import os
 import time
@@ -57,11 +58,43 @@ def same_slots(day, night):
                          '(day: ' + ', '.join(day) + '; night: ' + ', '.join(night) + ')')
 
 
+def pair_module():
+    """Feature A's combination table (cmux_fleet.cli_pairs), or None before A is merged."""
+    try:
+        return importlib.import_module('cmux_fleet.cli_pairs')
+    except ModuleNotFoundError as exc:
+        if exc.name != 'cmux_fleet.cli_pairs':
+            raise
+        return None
+
+
+def pair_refusal(cfg, table=None):
+    """Why a slot's merged config may not run its (supervisor_cli, worker_cli, mode) pair, or None.
+
+    Uses A's interface (A-interface.md v1.2): pair_problem decides (adopt exception first, then
+    forbidden / unlisted, adapter_missing even under smoke, unverified only with lifecycle smoke);
+    PairTable.lookup only labels the refusal. Before A is merged: runtime_v2.v2_cli_problem."""
+    pairs = pair_module()
+    if pairs is None:
+        from cmux_fleet import runtime_v2
+        return runtime_v2.v2_cli_problem(cfg)
+    table = table or pairs.load_pairs()
+    problem = pairs.pair_problem(cfg, table)
+    if problem is None:
+        return None
+    sup, wrk = cfg.get('supervisor_cli') or 'codex', cfg.get('worker_cli') or 'codex'
+    mode = cfg.get('mode') or 'task'
+    row = table.lookup(sup, wrk, mode)
+    verdict = 'unlisted' if row is None else 'adapter_missing' if row['adapter_missing'] else row['status']
+    return sup + '+' + wrk + '/' + mode + ' [' + verdict + ']: ' + problem
+
+
 def resolve_launches(cfg, profiles):
     """{slot: launch} for each roster profile, or ValueError listing every problem.
 
-    The CLI pair is checked through runtime_v2.validate_config on the slot's merged config: that is
-    the combination-table entry point (docs: cli_pairs.yaml) and it never gets looser here."""
+    Before a swap each slot's merged config passes the CLI pair check (pair_refusal on one table
+    snapshot per roster, so every slot is judged alike), then runtime_v2.validate_config (which,
+    after A, re-reads the same table as a second gate). Nothing is loosened here."""
     from cmux_fleet import profile_launch, runtime_v2
     from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError
     if not profiles:
@@ -70,11 +103,22 @@ def resolve_launches(cfg, profiles):
         registry = AgentRegistry(cfg.get('agent_registry') or None)
     except AgentRegistryError as exc:
         raise ValueError('agent registry: ' + str(exc)) from exc
+    pairs, table = pair_module(), None
+    if pairs is not None:
+        try:
+            table = pairs.load_pairs()
+        except (OSError, ValueError) as exc:
+            raise ValueError('cli pair table: ' + str(exc)) from exc
     errors, launches = [], {}
     for slot, profile in profiles.items():
         try:
             launch = profile_launch.resolve_launch(registry.get(profile), registry, cfg)
-            runtime_v2.validate_config(dict(cfg, **launch['overrides']))
+            merged = dict(cfg, **launch['overrides'])
+            if merged.get('transport_version', 1) == 2:
+                problem = pair_refusal(merged, table)
+                if problem:
+                    raise ValueError(problem)
+            runtime_v2.validate_config(merged)
         except KeyError:
             errors.append(slot + ': unknown agent profile ' + profile)
             continue

@@ -8,6 +8,7 @@ import json
 import os
 
 import pytest
+import yaml
 
 from test_roster import REPORT, audits, hot, write_roster  # noqa: F401  (fixture)
 from test_v2_codex_claude import WORKERS, answer_turn, decision, mixed, no_provisioning, submit, typed  # noqa: F401
@@ -248,33 +249,114 @@ def test_failed_preflight_blocks_and_keeps_the_old_runtime(nightly, monkeypatch)
     assert pane in f.mgr.alive and f.agent('worker-1')['label'] == 'worker-1'
 
 
-# ------------------------------------------------------------------ codex + pi (feature A's table)
-def pair_table(rows):
-    """Stub of the combination-table check: (supervisor_cli, worker_cli, mode) -> status."""
-    real = runtime_v2.v2_cli_problem
+# ------------------------------------------------------------------ CLI pair check (feature A's table)
+@pytest.fixture
+def pairs(monkeypatch, tmp_path):
+    """A's cmux_fleet.cli_pairs if merged, else the v1.2 stub; returns write(rows) -> table path.
 
-    def problem(cfg):
-        key = (cfg.get('supervisor_cli') or 'codex', cfg.get('worker_cli') or 'codex', cfg.get('mode') or 'task')
-        status = rows.get(key)
-        if status == 'verified':
-            return None
-        return real(cfg) if status is None else 'combination ' + '+'.join(key) + ' is ' + status
-    return problem
+    Under the stub runtime_v2.v2_cli_problem is pointed at the stub too (A v1.2: its body is
+    `return cli_pairs.pair_problem(cfg)`), so validate_config judges the same table."""
+    import sys
+    import cmux_fleet
+    module = night.pair_module()
+    if module is None:
+        import cli_pairs_stub as module
+        monkeypatch.setitem(sys.modules, 'cmux_fleet.cli_pairs', module)
+        monkeypatch.setattr(cmux_fleet, 'cli_pairs', module, raising=False)
+        monkeypatch.setattr(runtime_v2, 'v2_cli_problem', lambda cfg: module.pair_problem(cfg))
+    path = tmp_path / 'cli_pairs.yaml'
+
+    def write(*rows):
+        pairs_ = [dict(supervisor_cli=sup, worker_cli=wrk, mode=mode, status=status, adapter_missing=list(missing),
+                       verified_by=None, **extra) for sup, wrk, mode, status, missing, extra in
+                  ((r + ((), {}))[:6] if len(r) == 4 else (r + ({},))[:6] if len(r) == 5 else r for r in rows)]
+        path.write_text(yaml.safe_dump({'version': 1, 'default': {}, 'pairs': pairs_}))
+        return path
+    monkeypatch.setattr(module, 'DEFAULT_PATH', path)
+    write.module = module
+    return write
 
 
-def test_flashnext_night_is_rejected_whole_until_the_pair_is_admitted(hot):
+def v2cfg(**extra):
+    return dict(fleet.DEFAULTS, **dict(dict(transport_version=2, supervisor_cli='codex', worker_cli='claude',
+                                            allow_development_v2=True, mode='task'), **extra))
+
+
+def refusal(cfg, card='flashnext-coder'):
+    with pytest.raises(ValueError) as exc:
+        night.resolve_launches(cfg, {'worker-1': card})
+    return str(exc.value)
+
+
+def test_pair_check_forbidden_and_unlisted_are_refused_even_under_smoke(pairs):
+    pairs(('codex', 'claude', 'task', 'verified'),
+          ('codex', 'pi', 'task', 'forbidden', (), {'reason': 'night pair forbidden by operator'}))
+    for cfg in (v2cfg(), v2cfg(lifecycle='smoke')):
+        err = refusal(cfg)
+        assert 'worker-1: profile flashnext-coder: codex+pi/task [forbidden]: night pair forbidden' in err
+    pairs(('codex', 'claude', 'task', 'verified'))  # codex+pi not listed: treated as forbidden
+    err = refusal(v2cfg(lifecycle='smoke'))
+    assert 'codex+pi/task [unlisted]' in err and 'mixed Pi/Codex' in err
+
+
+def test_pair_check_adapter_missing_is_refused_even_under_smoke(pairs):
+    pairs(('codex', 'claude', 'task', 'verified'),
+          ('codex', 'pi', 'task', 'unverified', ('pi_bridge_x', 'night_brief'), {'reason': 'needs adapters'}))
+    err = refusal(v2cfg(lifecycle='smoke'))
+    assert 'codex+pi/task [adapter_missing]: needs adapters [adapter missing: pi_bridge_x, night_brief]' in err
+
+
+def test_pair_check_unverified_needs_smoke(pairs):
+    pairs(('codex', 'claude', 'task', 'verified'),
+          ('codex', 'pi', 'task', 'unverified', (), {'reason': 'night pair unverified'}))
+    err = refusal(v2cfg())
+    assert '[unverified]: night pair unverified; an unverified pair may run only with --lifecycle smoke' in err
+    assert refusal(v2cfg(lifecycle='night')) == err  # only the smoke lifecycle admits it
+    launch = night.resolve_launches(v2cfg(lifecycle='smoke'), {'worker-1': 'flashnext-coder'})['worker-1']
+    assert launch['overrides']['worker_cli'] == 'pi'
+    pairs(('codex', 'claude', 'task', 'verified'), ('codex', 'pi', 'task', 'verified'))
+    assert night.resolve_launches(v2cfg(), {'worker-1': 'flashnext-coder'})['worker-1']['overrides']['worker_cli'] == 'pi'
+
+
+def test_pair_check_adopt_exception_is_claude_claude_task_only(pairs):
+    """Sub-fleet (design §19): an adopted Claude supervisor passes before the row is consulted."""
+    pairs(('claude', 'claude', 'task', 'unverified', ('claude_supervisor',)))
+    sub = v2cfg(supervisor_cli='claude', adopt=True)
+    assert night.resolve_launches(sub, {'worker-1': 'claude-coder'})['worker-1']['overrides']['worker_cli'] == 'claude'
+    assert '[adapter_missing]' in refusal(dict(sub, adopt=False), 'claude-coder')
+    assert '[unlisted]' in refusal(dict(sub, mode='service'), 'claude-coder')   # service: no exception
+    assert 'claude+pi/task [unlisted]' in refusal(sub)                          # other worker CLI: no exception
+
+
+def test_pair_check_judges_every_slot_on_one_table_and_reports_a_broken_table(pairs, monkeypatch):
+    path = pairs(('codex', 'claude', 'task', 'verified'), ('codex', 'pi', 'task', 'verified'))
+    tables = []
+    real = pairs.module.pair_problem
+    monkeypatch.setattr(pairs.module, 'pair_problem', lambda cfg, table=None: tables.append(table) or real(cfg, table))
+    night.resolve_launches(v2cfg(), {'worker-1': 'flashnext-coder', 'worker-2': 'flashnext-coder'})
+    snapshot = [t for t in tables if t is not None]  # validate_config's own re-read passes None
+    assert len(snapshot) == 2 and snapshot[0] is snapshot[1]
+    path.write_text('version: 2\npairs: []\n')
+    with pytest.raises(ValueError, match='cli pair table: .*version: 1'):
+        night.resolve_launches(v2cfg(), {'worker-1': 'flashnext-coder'})
+
+
+def test_flashnext_night_is_rejected_whole_until_the_pair_is_admitted(hot, pairs):
     f = hot
+    pairs(('codex', 'claude', 'task', 'verified'),
+          ('codex', 'pi', 'task', 'unverified', (), {'reason': 'mixed Pi/Codex fleets are unvalidated'}))
     path = write_profiles(f, 'roster.yaml', {'worker-2': 'flashnext-coder'})
     f.cfg['roster'] = str(path)
     f.tick()
     rejected, = audits(f, 'roster.rejected')
-    assert any('worker-2: profile flashnext-coder' in e and 'mixed Pi/' in e for e in json.loads(rejected['errors']))
+    assert any('worker-2: profile flashnext-coder: codex+pi/task [unverified]' in e and 'lifecycle smoke' in e
+               for e in json.loads(rejected['errors']))
     assert f.agent('worker-2')['label'] == 'worker-2' and not f.cfg.get('worker_profiles')
 
 
-def test_flashnext_night_swaps_to_pi_when_the_table_admits_codex_pi(hot, monkeypatch):
+def test_flashnext_night_swaps_to_pi_when_the_table_admits_codex_pi(hot, monkeypatch, pairs):
     f = hot
-    monkeypatch.setattr(runtime_v2, 'v2_cli_problem', pair_table({('codex', 'pi', 'task'): 'verified'}))
+    pairs(('codex', 'claude', 'task', 'verified'), ('codex', 'pi', 'task', 'verified'))
     monkeypatch.setattr(f, 'preflight_profile', lambda launch: None)
     f.cfg['pi_home'] = str(f.run_dir / 'pi-home')
     path = write_profiles(f, 'roster.yaml', {'worker-2': 'flashnext-coder'})
@@ -288,8 +370,9 @@ def test_flashnext_night_swaps_to_pi_when_the_table_admits_codex_pi(hot, monkeyp
     assert runtime_v2.tui_slot(f.v2.slot_cfg('worker-1'), 'worker-1')       # the day slots stay Claude TUIs
     switched, = audits(f, 'roster.profile_switched')
     assert switched['cli'] == 'pi'
-    # An 'unverified' row stays refused (smoke-only admission is feature A/D's).
-    monkeypatch.setattr(runtime_v2, 'v2_cli_problem', pair_table({('codex', 'pi', 'task'): 'unverified'}))
+    # The table is re-read: demoting the row to adapter_missing refuses the next roster even under smoke.
+    pairs(('codex', 'claude', 'task', 'verified'), ('codex', 'pi', 'task', 'unverified', ('night_brief',)))
+    f.cfg['lifecycle'] = 'smoke'
     write_profiles(f, 'roster.yaml', {'worker-3': 'flashnext-coder', 'worker-2': 'flashnext-coder'})
     f.tick()
-    assert 'is unverified' in audits(f, 'roster.rejected')[-1]['errors']
+    assert '[adapter_missing]' in audits(f, 'roster.rejected')[-1]['errors']
