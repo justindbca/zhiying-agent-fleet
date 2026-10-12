@@ -930,7 +930,9 @@ class RuntimeV2:
         for slot in reattach:
             self.f.setf(slot, state='idle', bridge_available=0, busy_since=time.time(), report_retries=0)
             self.audit('resume.reattached', slot=slot, generation=self.f.agent(slot).get('generation'))
-        self.respawn([s for s in self.f.names if s not in reattach], page)
+        # A delegated slot's pane is run by its sub-fleet (resumed below): never replace it here.
+        delegated = [s for s in self.f.workers if self.f.agent(s).get('state') == 'delegated']
+        self.respawn([s for s in self.f.names if s not in reattach and s not in delegated], page)
         self.f.resume()
         if self.f.service:
             self.transaction('resume-requests-' + uuid.uuid4().hex, self.requeue_requests)

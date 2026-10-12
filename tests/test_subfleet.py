@@ -72,6 +72,7 @@ class WorldMgr:
 
     def send_key(self, pane, k):
         self.w.keys.append((pane, k))
+        self.w.sent.append((pane, '<key ' + k + '>'))  # one ordered log of what reached each tab
         return self.owns(pane)
 
     def get_pane_status(self, pane):
@@ -657,3 +658,68 @@ def test_cli_spawn_targets_the_owning_fleet(tree):
     args.task_id = 'M3'
     out = subfleet.cli_spawn(f.cfg, args, wait=0)
     assert out['status'] == 'pending' and (f.run_dir / 'subfleet-requests' / (out['request'] + '.json')).exists()
+
+
+def test_parent_resume_keeps_a_delegated_slot_and_relaunches_the_child(tree):
+    t, f = tree, tree.f
+    rec, _ = spawn_m0(t)
+    f.v2.close()
+    again = fleet.Fleet(f.path, f.r, f.mgr, sessions=t.sessions)
+    t.fleets[0] = again
+    t.f = again
+    again.resume_requested = True
+    again.v2.resume_run()
+    info = again.agent('worker-1')
+    assert info['state'] == 'delegated' and info['generation'] == '0' and info['pane'] == rec['placeholder']
+    assert rec['placeholder'] in t.world.alive and t.world.owner[rec['pane']] == 'cmux-fleet:M0'
+    assert subfleet.delegated_route(again.cfg, 'worker-1', 0)[0]['task_id'] == 'M0'
+    child_mgr = t.world.mgrs['cmux-fleet:M0']
+    assert any('--resume' in cmd for _, cmd in getattr(child_mgr, 'windows', []))  # child daemon relaunched
+    assert again.agent('worker-2')['state'] != 'delegated'
+
+
+def test_failed_child_redis_start_rolls_back_without_killing_the_parent(tree, monkeypatch):
+    t, f = tree, tree.f
+    sid = f.agent('worker-1')['pane']
+
+    def boom(cfg, tries=30):
+        raise SystemExit('private Redis did not become ready')
+    monkeypatch.setattr(fleet, 'start_redis', boom)
+    with pytest.raises(subfleet.Refused, match='did not become ready'):
+        spawn_m0(t)
+    info = f.agent('worker-1')
+    assert info['state'] == 'idle' and info['pane'] == sid and t.world.owner[sid] == 'cmux-fleet'
+    assert not subfleet.active_children(f.run_dir)
+    assert subfleet.record(f.run_dir / 'sub' / 'M0')['state'] == 'failed'
+    assert len([p for p in t.world.alive if t.world.owner.get(p) == 'cmux-fleet']) == 4  # sup, 2 workers, history
+
+
+def test_return_aborts_a_running_turn_before_the_return_prompt(tree):
+    t, f = tree, tree.f
+    rec, _ = spawn_m0(t)
+    cf = child_daemon(t, rec)
+    f.v2.finish('blocked', 'main task blocked')
+    subfleet.tick(f)
+    stop_child_like_daemon(cf)
+    subfleet.tick(f)
+    log = [x for p, x in t.world.sent if p == rec['pane']]
+    assert log[-2] == '<key Escape>' and 'worker of the main fleet again' in log[-1]
+
+
+def test_lost_session_is_replaced_by_the_next_generation_in_place(tree):
+    t, f = tree, tree.f
+    rec, out = spawn_m0(t)
+    cf = child_daemon(t, rec)
+    out.write_text('done')
+    cf.v2.finish('completed', 'ok')
+    cf.write_result()
+    subfleet.tick(f)
+    stop_child_like_daemon(cf)
+    (Path(rec['run']) / 'handback.json').unlink()
+    t.world.alive.discard(rec['pane'])  # e.g. cmux restarted: the delegated session is gone
+    t.world.owner.pop(rec['pane'], None)
+    subfleet.tick(f)
+    info = f.agent('worker-1')
+    assert info['generation'] == '1' and info['label'] == 'worker-1.1' and info['state'] == 'starting'
+    assert rec['placeholder'] not in t.world.alive and info['pane'] not in (rec['pane'], rec['placeholder'])
+    assert subfleet.record(rec['run'])['state'] == 'returned'

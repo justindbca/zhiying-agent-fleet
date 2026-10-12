@@ -303,23 +303,23 @@ def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, lau
             f.mgr.kill_pane(ph.pane_id)
         raise Refused('could not open the placeholder tab for ' + slot)
     f.mgr.rename(ph.pane_id, placeholder_label(slot, task_id, ws_title))
-    # 2. child run directory, config, private Redis, task
-    (rec_dir / 'workspace').mkdir(parents=True)
-    backup = rec_dir / 'handover'
-    backup.mkdir()
-    cwd = fleet.agent_cwd(f.cfg, slot)
-    for fname in ('AGENTS.md', 'CLAUDE.md'):
-        if (cwd / fname).exists():
-            shutil.copy2(cwd / fname, backup / fname)
     rec = {'task_id': task_id, 'slot': slot, 'run': str(rec_dir), 'state': 'starting', 'attempt': attempt,
            'workers': workers, 'output': output, 'created': time.time(), 'title': ws_title,
            'placeholder': ph.pane_id, 'pane': sid, 'generation': int(info_now.get('generation') or 0)}
-    save_record(rec_dir, rec)
-    redis_cfg = redis_runtime.prepare(f.cfg.get('redis_runtime_root') or redis_runtime.DEFAULT_ROOT,
-                                      uuid.uuid4().hex[:8])
-    cfg = child_config(f, slot, task_id, workers, rec_dir, sid, None, redis_cfg, name)
-    released = None
-    try:
+    cfg = released = None
+    try:  # anything below fails -> rollback; SystemExit too (start_redis), never the parent daemon
+        # 2. child run directory, config, private Redis, task
+        (rec_dir / 'workspace').mkdir(parents=True)
+        backup = rec_dir / 'handover'
+        backup.mkdir()
+        cwd = fleet.agent_cwd(f.cfg, slot)
+        for fname in ('AGENTS.md', 'CLAUDE.md'):
+            if (cwd / fname).exists():
+                shutil.copy2(cwd / fname, backup / fname)
+        save_record(rec_dir, rec)
+        redis_cfg = redis_runtime.prepare(f.cfg.get('redis_runtime_root') or redis_runtime.DEFAULT_ROOT,
+                                          uuid.uuid4().hex[:8])
+        cfg = child_config(f, slot, task_id, workers, rec_dir, sid, None, redis_cfg, name)
         child_r = fleet.start_redis(cfg)
         hours = 16
         deadline = float(f.task().get('deadline') or 0)
@@ -340,7 +340,7 @@ def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, lau
         result = (launch or default_launch)(rec_dir / 'config.json', cfg, child_mgr)
         if not result.success:
             raise RuntimeError('child daemon did not start: ' + str(result.error))
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         rollback(f, rec_dir, rec, released, cfg)
         raise Refused('sub-fleet ' + task_id + ' could not start: ' + str(exc)) from exc
     rec['state'] = 'running'
@@ -352,9 +352,10 @@ def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, lau
 def rollback(f, rec_dir, rec, released, cfg):
     """Undo a half-started spawn: the worker gets its pane back, the child Redis goes down."""
     fleet = _fleet()
-    shutdown_redis(cfg)
-    child_mgr = fleet.manager_for(cfg)
-    child_mgr.release(rec['pane'])
+    if cfg and cfg.get('redis_socket'):
+        shutdown_redis(cfg)
+    fleet.manager_for({'session': session_name(rec['task_id']), 'cmux_state_dir': f.cfg.get('cmux_state_dir')}
+                      ).release(rec['pane'])
     if released is not None:
         f.mgr._tag(rec['pane'], **{k: v for k, v in released.items() if isinstance(v, str)})
     f.setf(rec['slot'], state='idle', pane=rec['pane'], delegated_pane='', delegated_task='', delegate_cfg='')
@@ -362,7 +363,8 @@ def rollback(f, rec_dir, rec, released, cfg):
     f.mgr.kill_pane(rec['placeholder'])
     rec['state'] = 'failed'
     rec['reason'] = 'start failed'
-    save_record(rec_dir, rec)
+    if Path(rec_dir).is_dir():
+        save_record(rec_dir, rec)
 
 
 def restore_role(f, rec):
@@ -565,6 +567,9 @@ def collect(f, child_run, notify=True):
     child_mgr.meta_path.unlink(missing_ok=True)
     f.setf(slot, delegated_pane='', delegated_task='', delegate_cfg='')
     if returned:
+        # The adopted session may still be mid-turn (parent task ended, stop): abort that turn so its
+        # late Stop cannot settle as the READY of the return. Second place Escape counts as accepted stop.
+        f.mgr.send_key(rec['pane'], 'Escape')
         f.mgr.kill_pane(ph)
         f.mgr.rename(rec['pane'], 'fx-' + f.cfg.get('tab_prefix', '') + f.label(slot))
         f.setf(slot, pane=rec['pane'], state='starting', launch_ready=1, runtime_ready=0, bridge_available=0,
