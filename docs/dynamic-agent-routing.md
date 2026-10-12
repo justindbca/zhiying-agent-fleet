@@ -10,6 +10,7 @@ Cards live in `cmux_fleet/agents/` alongside role prompts. JSON needs only the s
 |---|---|---|---|
 | `flashnext-coder` | Pi | `flashnext/Qwen3.8-Flash-Next-Uncensored-oQ4e-100K-MTP` | code-edit, test-fix, planning |
 | `claude-reviewer` | Official Claude Code CLI, directly | `opus` (role `reviewer.md`, independent read-only reviewer) | code-review, safety-audit, planning |
+| `claude-coder` | Official Claude Code CLI, directly | `opus` (role `worker.md`); preferred for implementation when fleet `worker_cli` is `claude` | code-edit, test-fix, planning |
 | `researcher` | Codex | Existing worker/shared Codex profile and its model | web-research, planning |
 
 Researcher stays on Codex to preserve the existing research runtime and configuration. Optional fields retain existing defaults when absent. A profile ID is never an agent identity: `worker-1` becomes `worker-1.1` on respawn, never `flashnext-coder`.

@@ -105,6 +105,9 @@ def test_pi_and_codex_fleets_keep_existing_plan(fx, worker_cli):  # noqa: F811
     fx.submit({"goal": GOAL, "auto_agents": True})
     assert plan_pairs(fx.task()) == [
         ("implementation", "flashnext-coder", []), ("review", "claude-reviewer", ["implementation"])]
+    fx.finish("cancelled", "next goal")
+    fx.submit({"goal": "plan the architecture", "auto_agents": True})
+    assert plan_pairs(fx.task()) == [("planning", "flashnext-coder", [])]
 
 
 def test_codex_supervisor_claude_workers_plan_passes_v2_preflight(mixed, monkeypatch):  # noqa: F811
