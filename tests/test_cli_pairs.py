@@ -28,9 +28,13 @@ def test_shipped_table_rows_and_default():
         assert table.lookup('pi', 'pi', mode)['status'] == 'verified'
         assert table.lookup('codex', 'pi', mode)['status'] == 'unverified'
         assert table.lookup('codex', 'pi', mode)['adapter_missing'] == []
-        assert table.lookup('claude', 'pi', mode)['adapter_missing'] == ['claude_supervisor']
+        # Claude supervisor adapter landed (A3): unverified, smoke-only, nothing missing.
+        assert table.lookup('claude', 'pi', mode)['adapter_missing'] == []
+        assert table.lookup('claude', 'pi', mode)['status'] == 'unverified'
     assert table.lookup('codex', 'claude', 'service')['adapter_missing'] == ['codex_service_renderer']
-    assert table.lookup('claude', 'claude', 'task')['adapter_missing'] == ['claude_supervisor']
+    assert table.lookup('claude', 'claude', 'task')['adapter_missing'] == []
+    assert table.lookup('claude', 'claude', 'task')['status'] == 'unverified'
+    assert table.lookup('claude', 'claude', 'service') is None and table.lookup('claude', 'codex', 'task') is None
     assert table.lookup('codex', 'codex', 'task')['status'] == 'unverified'
     assert table.lookup('pi', 'codex', 'task') is None
 
@@ -48,11 +52,13 @@ def test_unverified_runs_only_under_smoke_lifecycle():
     assert cli_pairs.pair_problem({'supervisor_cli': 'codex', 'worker_cli': 'codex', 'lifecycle': 'smoke'}) is None
 
 
-def test_adapter_missing_refused_even_for_smoke():
-    for cfg in ({'supervisor_cli': 'claude', 'worker_cli': 'pi', 'mode': 'task'},
-                {'supervisor_cli': 'codex', 'worker_cli': 'claude', 'mode': 'service'}):
-        reason = cli_pairs.pair_problem(dict(cfg, lifecycle='smoke'))
-        assert reason and 'adapter missing' in reason
+def test_adapter_missing_refused_even_for_smoke(tmp_path):
+    reason = cli_pairs.pair_problem({'supervisor_cli': 'codex', 'worker_cli': 'claude', 'mode': 'service',
+                                     'lifecycle': 'smoke'})
+    assert reason and 'adapter missing' in reason
+    table = cli_pairs.load_pairs(write(tmp_path, [row('claude', 'pi', 'task', 'unverified', ['claude_supervisor'])]))
+    reason = cli_pairs.pair_problem({'supervisor_cli': 'claude', 'worker_cli': 'pi', 'lifecycle': 'smoke'}, table)
+    assert reason and 'adapter missing: claude_supervisor' in reason
 
 
 def test_forbidden_and_unlisted_refused_even_for_smoke(tmp_path):
@@ -68,7 +74,8 @@ def test_forbidden_and_unlisted_refused_even_for_smoke(tmp_path):
 
 def test_adopted_claude_subfleet_exception_is_task_only():
     base = {'supervisor_cli': 'claude', 'worker_cli': 'claude', 'mode': 'task'}
-    assert 'no Claude supervisor adapter' in cli_pairs.pair_problem(base)
+    assert '--lifecycle smoke' in cli_pairs.pair_problem(base)
+    assert cli_pairs.pair_problem(dict(base, lifecycle='smoke')) is None
     assert cli_pairs.pair_problem(dict(base, adopt={'pane': 'x'})) is None
     assert cli_pairs.pair_problem(dict(base, adopt={'pane': 'x'}, mode='service'))
 

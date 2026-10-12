@@ -20,7 +20,8 @@ Subcommands
   agents    list or match offline agent profiles (does not contact a fleet)
   plan      build an offline dynamic dispatch plan (does not contact a fleet)
   notify    Codex notify hook (internal)
-  claude-stop  Claude Code Stop hook for claude workers (internal)
+  claude-stop  Claude Code Stop hook for claude agents (internal)
+  claude-prompt  Claude Code UserPromptSubmit hook of a v2 claude supervisor (internal)
   pi-event  Pi settled/session extension callback (internal)
   actor     exec the configured CLI for one agent (internal)
 """
@@ -74,6 +75,7 @@ CHROME_VERBS = {'check', 'tabs', 'newtab', 'go', 'url', 'js'}
 THREAD_RE = r'[0-9a-f-]{36}'
 DEFAULTS = {'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 100000, 'stall_timeout': 1800,
             'chrome_min_interval': 20, 'profile': 'fleet', 'worker_cli': 'codex', 'worker_model': 'sonnet',
+            'supervisor_model': 'opus',
             'claude_window': 200000, 'mode': 'task', 'max_busy': 0, 'request_timeout': 900,
             'apply_profiles_live': False, 'allow_profile_live_switch': False, 'profile_ready_timeout': 180,
             'transport_version': 1, 'allow_development_v2': False, 'max_attempts': 2}
@@ -618,6 +620,70 @@ def claude_user_prompts(path, count=3):
     return list(out)
 
 
+PROMPT_HOOK_TIMEOUT = 30  # seconds; Claude lets the prompt through when a hook times out
+PROMPT_WAIT = 20  # daemon acceptance wait, kept inside PROMPT_HOOK_TIMEOUT
+IMAGE_PLACEHOLDER = re.compile(r'\[Image #\d+\]')
+
+
+def prompt_hook_slot(cfg, name, generation=None):
+    """A fleet-launched v2 Claude supervisor (not a §19 adopted pane, whose hooks are the parent's)."""
+    return (name == 'supervisor' and cfg.get('transport_version') == 2 and is_claude(cfg, name)
+            and not subfleet.adopted(cfg, name, generation))
+
+
+def claude_prompt(cfg_path, name, generation, raw, wait=PROMPT_WAIT):
+    """UserPromptSubmit hook of a v2 Claude supervisor: the design.md §5 input boundary.
+
+    Returns None to let the prompt reach the model (the daemon-typed delivery, the spawn
+    prompt, slash commands), else the reason shown when the prompt is blocked. Operator
+    text is never answered off-protocol: it becomes an operator_input event (original
+    submit / queue / ui-<uuid> request semantics) and is typed back as a normal delivery.
+    """
+    data = json.loads(raw or '{}')
+    prompt = data.get('prompt') if isinstance(data.get('prompt'), str) else ''
+    cfg = load(cfg_path)
+    generation = int(generation)
+    if not prompt_hook_slot(cfg, name, generation) or not prompt.strip() or prompt.lstrip().startswith('/'):
+        return None
+    r = connect(cfg)
+    try:
+        bus = runtime_v2.bus_for(cfg, r)
+        info = r.hgetall(key('agent', name))
+        if int(info.get('generation', -1)) != generation or info.get('state') == 'dead':
+            return 'Fleet：这个终端属于已退役的监工代，输入未受理。'
+        if info.get('state') == 'starting':
+            try:
+                first = (Path(cfg['run']) / 'prompts' / (name + '-g' + str(generation) + '.md')).read_text()
+            except OSError:
+                first = ''
+            if runtime_v2.turn_answers(first, [prompt]):
+                return None
+            return 'Fleet 尚未 READY，输入未受理；请先检查启动状态。'
+        lease = r.hgetall(bus.lease_key(name))
+        if lease.get('status') == 'received' and lease.get('message_id'):
+            msg = bus.message(lease['message_id'])
+            if msg.get('generation') == generation and runtime_v2.turn_answers(msg['body']['text'], [prompt]):
+                return None
+        if IMAGE_PLACEHOLDER.search(prompt):
+            return 'Fleet 输入只支持文字，图片未转交；请改用图片文件路径后重发。'
+        correlation = 'ui-' + uuid.uuid4().hex
+        try:
+            runtime_v2.post_event(bus, dict(kind='operator_input', agent=name, generation=generation,
+                                            run_id=bus.run_id, thread=data.get('session_id'), text=prompt,
+                                            request_id=correlation), correlation)
+            answer = runtime_v2.wait_reply(bus, correlation, timeout=wait)
+        except (runtime_v2.redis.RedisError, runtime_v2.BusError, ValueError) as exc:
+            return 'Fleet 输入未确认（' + str(exc)[:200] + '）；请先查看 control 再决定是否重试。'
+        if answer.get('status') == 'accepted':
+            return ('Fleet：指令已排队（' + str(answer.get('id') or answer.get('task_id')) + '），'
+                    '监工会按派活流程处理；这段输入不会直接进入当前对话。')
+        if answer.get('status') == 'rejected':
+            return 'Fleet 输入被拒绝：' + str(answer.get('reason') or '原因未给出')
+        return 'Fleet 输入未确认（' + correlation + '）；请先查看 control 再决定是否重试。'
+    finally:
+        r.close(); r.connection_pool.disconnect()
+
+
 def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=None, settle_wait=30):
     """v2 turn end of an official interactive CLI (Codex notify / Claude Stop hook).
 
@@ -707,14 +773,25 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
     settings = cwd / ('.fleet-settings-g' + str(generation) + '.json')
     # v2: the READY hook waits for the daemon, which may still be spawning other tabs.
     timeout = 30 if cfg.get('transport_version') != 2 else int(float(cfg.get('profile_ready_timeout') or 180)) + 30
-    settings.write_text(json.dumps({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': hook, 'timeout': timeout}]}]}}))
-    argv = [cfg.get('claude') or 'claude', '--dangerously-skip-permissions', '--model', cfg.get('worker_model') or 'sonnet',
+    hooks = {'Stop': [{'hooks': [{'type': 'command', 'command': hook, 'timeout': timeout}]}]}
+    if prompt_hook_slot(cfg, name, generation):
+        # Operator input typed in the supervisor tab is queued as a daemon request (design.md §5).
+        hooks['UserPromptSubmit'] = [{'hooks': [{'type': 'command', 'timeout': PROMPT_HOOK_TIMEOUT, 'command': shlex.join(
+            [cfg['python'], str(Path(__file__).resolve()), 'claude-prompt', str(cfg_path), name, str(generation)])}]}]
+    settings.write_text(json.dumps({'hooks': hooks}))
+    argv = [cfg.get('claude') or 'claude', '--dangerously-skip-permissions', '--model', claude_model(cfg, name),
             '--settings', str(settings), '--add-dir', str(Path(cfg['run']) / 'workspace')]
     if name != 'supervisor':  # stable per slot across generations (peer messages address it)
         argv += ['--name', claude_session_name(cfg, name)]
     if (cwd / 'mcp.json').exists():
         argv += ['--mcp-config', str(cwd / 'mcp.json')]
     return argv + ['--', prompt]  # --add-dir / --mcp-config are variadic: end options first
+
+
+def claude_model(cfg, name):
+    if name == 'supervisor':
+        return cfg.get('supervisor_model') or DEFAULTS['supervisor_model']
+    return cfg.get('worker_model') or DEFAULTS['worker_model']
 
 
 def claude_session_name(cfg, name):
@@ -1041,7 +1118,7 @@ class Fleet:
             output_file=str(self.run_dir / 'prompts' / (name + '-g' + str(generation) + '.terminal.log')),
             auto_close=False, metadata={'type': role, 'cli_type': agent_cli(cfg, name),
                       'profile': (cfg.get('pi_model') if is_pi(cfg, name) else
-                                  cfg.get('worker_model') if is_claude(cfg, name) else agent_profile(cfg, name))},
+                                  claude_model(cfg, name) if is_claude(cfg, name) else agent_profile(cfg, name))},
             env_vars=dict({'PATH': os.environ.get('PATH', '')}, **(
                 pi_adapter.environment(cfg_path, cfg, name, generation) if is_pi(cfg, name)
                 else {'CODEX_HOME': str(codex_home(self.cfg))})))
@@ -1104,7 +1181,8 @@ class Fleet:
         elif kind == 'operator_input':
             try:
                 info = self.agent('supervisor')
-                if (ev.get('agent') != 'supervisor' or not is_pi(self.cfg, 'supervisor')
+                if (ev.get('agent') != 'supervisor'
+                        or not (is_pi(self.cfg, 'supervisor') or prompt_hook_slot(self.cfg, 'supervisor', ev.get('generation')))
                         or ev.get('generation') != int(info.get('generation', -1))
                         or ev.get('thread') != info.get('thread')
                         or info.get('state') not in ('idle', 'busy')):
@@ -2493,6 +2571,7 @@ def start(args):
            'compact_limit': args.compact_limit, 'chrome_script': args.chrome_script,
            'chrome_min_interval': args.chrome_min_interval, 'worker_cli': args.worker_cli,
            'worker_model': args.worker_model, 'worker_kit': args.worker_kit,
+           'supervisor_model': args.supervisor_model,
            'claude': args.claude or shutil.which('claude'), 'claude_window': args.claude_window,
            'supervisor_cli': args.supervisor_cli, 'pi': pi, 'pi_model': args.pi_model,
            'pi_thinking': args.pi_thinking, 'allow_unsandboxed_pi': args.allow_unsandboxed_pi,
@@ -2605,7 +2684,8 @@ def main(argv=None):
     s.add_argument('--compact-limit', type=int, help='codex model_auto_compact_token_limit (default: codex decides)')
     s.add_argument('--chrome-script', help='optional browser broker script run by the daemon for sandboxed agents')
     s.add_argument('--chrome-min-interval', type=float, default=DEFAULTS['chrome_min_interval'])
-    s.add_argument('--supervisor-cli', choices=('codex', 'pi'), default='codex', help='CLI for the supervisor')
+    s.add_argument('--supervisor-cli', choices=('codex', 'pi', 'claude'), default='codex', help='CLI for the supervisor')
+    s.add_argument('--supervisor-model', default=DEFAULTS['supervisor_model'], help='claude supervisor: --model value')
     s.add_argument('--worker-cli', choices=('codex', 'claude', 'pi'), default=DEFAULTS['worker_cli'],
                    help='CLI for workers')
     s.add_argument('--pi', help='pi binary (>= 1.1.0; default: first on PATH)')
@@ -2700,6 +2780,9 @@ def main(argv=None):
     h = sub.add_parser('claude-stop', help='Claude Code Stop hook (internal; hook JSON on stdin)')
     for arg in ('cfg', 'agent', 'generation'):
         h.add_argument(arg)
+    h = sub.add_parser('claude-prompt', help='Claude Code UserPromptSubmit hook (internal; hook JSON on stdin)')
+    for arg in ('cfg', 'agent', 'generation'):
+        h.add_argument(arg)
     h = sub.add_parser('pi-event', help='Pi extension callback (internal; event JSON on stdin)')
     for arg in ('cfg', 'agent', 'generation'):
         h.add_argument(arg)
@@ -2716,6 +2799,10 @@ def main(argv=None):
         notify(args.cfg, args.agent, args.generation, args.payload)
     elif args.cmd == 'claude-stop':
         claude_stop(args.cfg, args.agent, args.generation, sys.stdin.read())
+    elif args.cmd == 'claude-prompt':
+        reason = claude_prompt(args.cfg, args.agent, args.generation, sys.stdin.read())
+        if reason:  # nothing at all on pass: a UserPromptSubmit hook's stdout becomes model context
+            print(json.dumps({'decision': 'block', 'reason': reason}, ensure_ascii=False))
     elif args.cmd == 'pi-event':
         pi_event(args.cfg, args.agent, args.generation, sys.stdin.read(1000001))
     elif args.cmd == 'actor':
