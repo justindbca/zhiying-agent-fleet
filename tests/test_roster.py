@@ -226,3 +226,15 @@ def test_start_roster_validation_precedes_provisioning(monkeypatch, tmp_path):
     bad.write_text('workers:\n  - name: exit\n  - name: exit\n')
     with pytest.raises(SystemExit, match='duplicate worker name exit'):
         fleet.main(base + ['--roster', str(bad)])
+
+
+def test_added_rows_on_a_capped_default_model_are_rejected_whole(hot):
+    # Added rows run the fleet default: its model card (Fable: max_concurrent 1) caps them.
+    from cmux_fleet.agent_registry import AgentRegistry
+    f = hot
+    f.cfg['worker_model'] = AgentRegistry().model('fable').model
+    write_roster(f, WORKERS + ['fresh'])
+    f.tick()
+    rejected, = audits(f, 'roster.rejected')
+    assert any('exceed max_concurrent 1' in e for e in json.loads(rejected['errors']))
+    assert f.workers == WORKERS and 'fresh' not in disk_workers(f)

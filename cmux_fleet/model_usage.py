@@ -9,11 +9,19 @@ Counting rules (docs/design.md §12 模型特点卡; interface for the night swi
   switch decided earlier in the same tick is already counted); without one it runs the fleet
   default, mapped to a model card only by an exact (cli, model string) match. No match = unmapped,
   never guessed, never counted.
-- Dead slots hold nothing. Retiring slots still hold their model until they are gone.
+- An old generation holds its model until its tab is confirmed gone: during a profile switch the
+  slot holds the old model (``retired_pane`` + ``retired_launch``) and the new one, so a switch never
+  frees the old model's ticket early. A failed switch rolls ``runtime_launch`` back once the new tab
+  is gone, so the failed generation holds nothing.
+- Dead slots hold nothing, unless a tab of theirs is still alive (``alive`` callback). Retiring slots
+  still hold their model until they are gone.
+- The fleet default is capped like a card: ``default_problem`` refuses a start / roster / sub-fleet
+  that puts more slots on the default model than its card allows; ``Fleet.card_gate(slot, None)``
+  gates a switch back to the default.
 - The supervisor is not counted (its Codex profile name does not say which model card it is).
 """
 import json
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Callable, Dict, Mapping, Optional, Tuple
 
 from cmux_fleet.agent_registry import AgentCard, AgentRegistry
 
@@ -49,26 +57,47 @@ def slot_card(info: Mapping, cfg: Mapping, registry: AgentRegistry) -> Tuple[Opt
         return profile, None  # a card removed after spawn: unknown, not guessed
 
 
-class Usage:
-    """Snapshot {slot: (profile, model key)} of the live worker slots."""
+def retired_model(info: Mapping, cfg: Mapping, registry: AgentRegistry) -> Optional[str]:
+    """Model key the slot's not-yet-retired old generation runs (``retired_launch``; a handoff that
+    keeps the launch has none, so the current launch is used)."""
+    launch = info['retired_launch'] if 'retired_launch' in info else info.get('runtime_launch')
+    return slot_card({'runtime_launch': launch or ''}, cfg, registry)[1]
 
-    def __init__(self, slots: Mapping[str, Tuple[Optional[str], Optional[str]]]):
+
+class Usage:
+    """Snapshot {slot: (profile, model key)} of the live worker slots, plus {slot: model key} of old
+    generations not yet confirmed gone (``retiring``). A slot counts once per model it holds."""
+
+    def __init__(self, slots: Mapping[str, Tuple[Optional[str], Optional[str]]],
+                 retiring: Optional[Mapping[str, str]] = None):
         self.slots = dict(slots)
+        self.retiring = dict(retiring or {})
 
     @classmethod
-    def from_agents(cls, agents: Mapping[str, Mapping], cfg: Mapping, registry: AgentRegistry) -> 'Usage':
-        return cls({slot: slot_card(info, cfg, registry) for slot, info in agents.items()
-                    if info.get('state') != 'dead'})
+    def from_agents(cls, agents: Mapping[str, Mapping], cfg: Mapping, registry: AgentRegistry,
+                    alive: Optional[Callable[[str], bool]] = None) -> 'Usage':
+        """``alive(pane)`` (None = not checked): a dead slot whose tab is still alive keeps its model,
+        and an old generation's tab that is gone no longer holds one."""
+        slots, retiring = {}, {}
+        for slot, info in agents.items():
+            pane = info.get('pane')
+            if info.get('state') != 'dead' or (alive and pane and alive(pane)):
+                slots[slot] = slot_card(info, cfg, registry)
+            old = info.get('retired_pane')
+            if old and (alive is None or alive(old)):
+                key = retired_model(info, cfg, registry)
+                if key:
+                    retiring[slot] = key
+        return cls(slots, retiring)
 
     def holders(self, key: str, exclude: Optional[str] = None):
-        return sorted(slot for slot, (_, model) in self.slots.items() if model == key and slot != exclude)
+        held = {slot for slot, (_, model) in self.slots.items() if model == key}
+        held |= {slot for slot, model in self.retiring.items() if model == key}
+        return sorted(held - {exclude})
 
     def counts(self) -> Dict[str, int]:
-        out: Dict[str, int] = {}
-        for _, model in self.slots.values():
-            if model:
-                out[model] = out.get(model, 0) + 1
-        return out
+        keys = {model for _, model in self.slots.values() if model} | set(self.retiring.values())
+        return {key: len(self.holders(key)) for key in keys}
 
     def for_planning(self, reusable) -> Dict[str, int]:
         """Router occupancy for a plan that may reuse ``reusable`` slots: a model already running on
@@ -76,7 +105,8 @@ class Usage:
         reusable = set(reusable)
         out = self.counts()
         for key in list(out):
-            if any(self.slots[s][1] == key for s in reusable if s in self.slots):
+            if any(self.slots[s][1] == key and self.retiring.get(s, key) == key
+                   for s in reusable if s in self.slots):
                 out[key] -= 1
         return out
 
@@ -114,15 +144,47 @@ def host_problem(card: AgentCard, host: Optional[str]) -> Optional[str]:
     return 'profile %s runs only on %s, this fleet is on %s' % (card.id, ', '.join(card.hosts), host)
 
 
+def default_card(cfg: Mapping, registry: AgentRegistry):
+    """The model card of the fleet default worker runtime, or None (unmapped: not capped, not guessed)."""
+    key = default_model(cfg, registry)
+    return registry.model(key) if key else None
+
+
+def default_problem(cfg: Mapping, slots, registry: AgentRegistry) -> Optional[str]:
+    """None if ``slots`` (worker slot names) may all run the fleet default; else why not.
+
+    The default runtime is capped by its model card like any card: a fleet may not start, add roster
+    slots or delegate a sub-fleet onto more slots of one model than its max_concurrent (design v2 §3
+    并发 = 本 fleet 票数; §4.13 M ≤ 算力闸票数), and never on a host the card excludes."""
+    card = default_card(cfg, registry)
+    if card is None:
+        return None
+    problem = host_problem(card, cfg.get('host') or None)
+    if problem:
+        return 'fleet default worker model: ' + problem
+    slots = list(slots)
+    if card.max_concurrent is not None and len(slots) > card.max_concurrent:
+        return ('fleet default worker model %s: %d worker slots (%s) exceed max_concurrent %d'
+                % (card.id, len(slots), ', '.join(slots), card.max_concurrent))
+    return None
+
+
 def check_slots(cfg: Mapping, workers, profiles: Mapping[str, str], registry: AgentRegistry):
     """Errors for a whole roster: ``profiles`` {slot: card id}, other slots run the fleet default.
 
-    Each slot holds one model; per model, slots with a capped card must fit its max_concurrent.
-    Default (profile-less) slots are counted when their model maps, but only the card-carrying slots
-    are refused (the fleet default was accepted at start). Host limits apply to every card."""
+    Each slot holds one model; per model, the slots must fit the smallest max_concurrent of the cards
+    on them. Default (profile-less) slots count when their model maps, and the default model's own
+    card caps them too (no bypass through the default). Host limits apply to every card."""
     errors, slots, caps = [], {}, {}
     host = cfg.get('host') or None
     default = default_model(cfg, registry)
+    if default and any(not profiles.get(slot) for slot in workers):
+        card = registry.model(default)
+        problem = host_problem(card, host)
+        if problem:
+            errors.append('fleet default worker model: ' + problem)
+        if card.max_concurrent is not None:
+            caps.setdefault(default, []).append((None, card.max_concurrent))
     for slot in workers:
         profile = profiles.get(slot)
         if not profile:

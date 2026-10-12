@@ -196,3 +196,151 @@ def test_submit_plans_against_current_occupancy(fx):
     assert [s['agent_id'] for s in json.loads(task['dispatch_plan'])['subtasks']][0] == 'flashnext-coder'
     first = json.loads(task['profile_assignments'])['assignments'][0]
     assert (first['agent_id'], first['worker']) == ('flashnext-coder', 'worker-3')
+
+
+# -- capacity boundaries: failed successor, old generation still alive, fleet default
+
+def test_an_old_generation_holds_its_model_until_its_tab_is_gone():
+    # worker-1 switches flashnext -> claude-coder; its old FlashNext tab is not confirmed gone yet.
+    slots = agents(w1=('claude-coder', 'starting'), w2='flashnext-coder', w3='')
+    slots['w1'].update(retired_pane='old-1', retired_launch=launch('flashnext-coder'))
+    usage = model_usage.Usage.from_agents(slots, CLAUDE, REG)
+    assert usage.holders('flashnext') == ['w1', 'w2'] and usage.holders('opus') == ['w1', 'w3']
+    assert usage.counts() == {'flashnext': 2, 'opus': 2}
+    assert 'running on w1, w2' in usage.admit('w3', REG.get('flashnext-coder'))  # no early release
+    assert usage.for_planning(['w1']) == {'flashnext': 2, 'opus': 2}  # a slot mid-switch is not reusable
+    # Once cmux says the old tab is gone, the ticket is free.
+    usage = model_usage.Usage.from_agents(slots, CLAUDE, REG, alive=lambda pane: pane != 'old-1')
+    assert usage.holders('flashnext') == ['w2'] and usage.admit('w3', REG.get('flashnext-coder')) is None
+    # A plain handoff keeps the launch: the retiring tab holds the same model, counted once.
+    slots = agents(w1='flashnext-coder')
+    slots['w1'].update(retired_pane='old-1')
+    assert model_usage.Usage.from_agents(slots, PI, REG).counts() == {'flashnext': 1}
+
+
+def test_a_dead_slot_holds_its_model_only_while_a_tab_of_it_is_alive():
+    slots = agents(w1=('flashnext-coder', 'dead'), w2='flashnext-coder')
+    slots['w1']['pane'] = 'p-1'
+    assert model_usage.Usage.from_agents(slots, PI, REG).holders('flashnext') == ['w2']
+    assert model_usage.Usage.from_agents(slots, PI, REG, alive=lambda p: True).holders('flashnext') == ['w1', 'w2']
+    assert model_usage.Usage.from_agents(slots, PI, REG, alive=lambda p: False).holders('flashnext') == ['w2']
+
+
+def test_a_failed_switch_rolls_back_the_new_models_reservation(live, monkeypatch):
+    f = live
+    add_slots(f, worker_2='flashnext-coder')
+    old_launch = f.agent('worker-1').get('runtime_launch', '')
+    dispatch(f)
+    monkeypatch.setattr(f.mgr, 'tab_into', lambda *args: False)  # the successor cannot be placed
+    f.deliver('worker-1')
+    info = f.agent('worker-1')
+    assert info['state'] == 'dead' and f.task()['status'] == 'blocked'
+    assert info['runtime_launch'] == old_launch  # rolled back once the new tab was closed
+    usage = f.model_usage(REG)
+    assert usage.holders('flashnext') == ['worker-2']  # the failed generation holds no ticket
+    # The old tab was never closed: it stays recorded and holds what it ran before (the fixture's
+    # Codex default is unmapped, so nothing is counted for it, and certainly not FlashNext).
+    assert info['retired_pane'] and f.mgr.get_pane_status(info['retired_pane'])
+    assert 'worker-1' not in usage.retiring and 'worker-1' not in usage.slots
+    assert f.card_gate('worker-3', REG.get('flashnext-coder'), REG) is None
+
+
+def test_a_failed_switch_whose_new_tab_survives_keeps_holding(live, monkeypatch):
+    f = live
+    add_slots(f, worker_2='flashnext-coder')
+    dispatch(f)
+    monkeypatch.setattr(f.mgr, 'tab_into', lambda *args: False)
+    monkeypatch.setattr(f.mgr, 'kill_pane', lambda pane: False)  # nothing can be closed
+    f.deliver('worker-1')
+    info = f.agent('worker-1')
+    assert info['state'] == 'dead' and json.loads(info['runtime_launch'])['profile_id'] == 'flashnext-coder'
+    assert f.model_usage(REG).holders('flashnext') == ['worker-1', 'worker-2']  # its tab still runs FlashNext
+    assert 'running on worker-1, worker-2' in f.card_gate('worker-3', REG.get('flashnext-coder'), REG)[1]
+
+
+def test_switch_away_from_a_capped_model_keeps_its_ticket_until_the_old_tab_closes(live, monkeypatch):
+    f = live
+    f.cfg.update(worker_cli='claude', worker_model='opus')
+    add_slots(f, worker_2='flashnext-coder')
+    f.setf('worker-1', runtime_launch=launch('flashnext-coder'))
+    old = f.agent('worker-1')['pane']
+    seen = {}
+    real_kill = f.mgr.kill_pane
+
+    def kill(pane):  # observe the counts while the old FlashNext tab is still alive
+        if pane == old:
+            seen['during'] = f.model_usage(REG).holders('flashnext')
+        return real_kill(pane)
+    monkeypatch.setattr(f.mgr, 'kill_pane', kill)
+    f.switch_profile('worker-1', profile_launch.resolve_launch(REG.get('claude-coder'), REG, f.cfg))
+    assert seen['during'] == ['worker-1', 'worker-2']
+    info = f.agent('worker-1')
+    assert info['retired_pane'] == '' and info['retired_launch'] == ''
+    assert f.model_usage(REG).holders('flashnext') == ['worker-2']
+
+
+def test_the_fleet_default_is_capped_like_a_card():
+    assert model_usage.default_problem(PI, ['w1', 'w2'], REG) is None
+    assert model_usage.default_problem(PI, ['w1', 'w2', 'w3'], REG) == (
+        'fleet default worker model flashnext: 3 worker slots (w1, w2, w3) exceed max_concurrent 2')
+    assert 'runs only on studio, this fleet is on macmini' in model_usage.default_problem(
+        dict(PI, host='macmini'), ['w1'], REG)
+    assert model_usage.default_problem(CLAUDE, ['w%d' % i for i in range(9)], REG) is None  # opus: 按名额
+    assert model_usage.default_problem({'worker_cli': 'pi', 'pi_model': 'local/x'}, ['a', 'b', 'c'], REG) is None
+    fable = {'worker_cli': 'claude', 'worker_model': REG.model('fable').model}
+    assert 'max_concurrent 1' in model_usage.default_problem(fable, ['w1', 'w2'], REG)
+    # A roster of only default slots is capped by the default model's own card.
+    assert model_usage.check_slots(PI, ['a', 'b', 'c'], {}, REG) == [
+        'model flashnext: 3 slots (a, b, c) exceed max_concurrent 2']
+    assert model_usage.check_slots(PI, ['a', 'b'], {}, REG) == []
+
+
+def test_switching_back_to_the_default_is_gated(live):
+    f = live
+    f.cfg.update(worker_cli='pi', pi_model=REG.model('flashnext').model)
+    add_slots(f, worker_2='flashnext-coder', worker_3='')
+    f.setf('worker-1', runtime_launch=launch('claude-coder'))
+    assert f.card_gate('worker-1', None, REG) == (
+        'wait', 'max_concurrent 2 for model flashnext reached (running on worker-2, worker-3)')
+    f.setf('worker-3', state='dead')
+    assert f.card_gate('worker-1', None, REG) is None
+    f.cfg['pi_model'] = 'local/default'  # unmapped default: not capped, not guessed
+    f.setf('worker-3', state='idle')
+    assert f.card_gate('worker-1', None, REG) is None
+
+
+def test_start_without_profiles_refuses_more_default_slots_than_the_card_allows(monkeypatch):
+    from cmux_fleet import cmux_manager
+
+    def forbidden():
+        pytest.fail('the default-model cap must be checked before cmux/Redis provisioning')
+    monkeypatch.setattr(cmux_manager, 'cmux_available', forbidden)
+    with pytest.raises(SystemExit, match=r'3 worker slots \(worker-1, worker-2, worker-3\) exceed max_concurrent 2'):
+        fleet.main(['start', '--supervisor-cli', 'pi', '--worker-cli', 'pi', '--workers', '3',
+                    '--pi-model', REG.model('flashnext').model, '--allow-development-v2'])
+    with pytest.raises(SystemExit, match='exceed max_concurrent 1'):
+        fleet.main(['start', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--worker-names', 'a,b',
+                    '--worker-model', REG.model('fable').model, '--allow-development-v2'])
+
+
+def test_a_sub_fleet_on_a_capped_default_is_refused(fx):
+    from cmux_fleet import subfleet
+    f = fx
+    f.cfg.update(worker_cli='claude', worker_model=REG.model('fable').model)
+    reason = subfleet.check(f, 'worker-1', 'M0', 2)
+    assert reason and 'max_concurrent 1' in reason
+
+
+def test_a_failed_switch_away_keeps_the_old_models_ticket_while_the_old_tab_lives(live, monkeypatch):
+    f = live
+    f.cfg.update(worker_cli='claude', worker_model='opus')
+    add_slots(f, worker_2='flashnext-coder')
+    f.setf('worker-1', runtime_launch=launch('flashnext-coder'))
+    monkeypatch.setattr(f.mgr, 'tab_into', lambda *args: False)
+    f.switch_profile('worker-1', profile_launch.resolve_launch(REG.get('claude-coder'), REG, f.cfg))
+    info = f.agent('worker-1')
+    assert info['state'] == 'dead' and info['runtime_launch'] == launch('flashnext-coder')  # rolled back
+    usage = f.model_usage(REG)
+    assert usage.holders('flashnext') == ['worker-1', 'worker-2'] and usage.holders('opus') == []
+    f.mgr.kill_pane(info['retired_pane'])  # the old tab goes away later: its ticket is released
+    assert f.model_usage(REG).holders('flashnext') == ['worker-2']
