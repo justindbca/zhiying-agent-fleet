@@ -29,7 +29,8 @@ def test_shipped_table_rows_and_default():
         assert table.lookup('codex', 'pi', mode)['status'] == 'unverified'
         assert table.lookup('codex', 'pi', mode)['adapter_missing'] == []
         assert table.lookup('claude', 'pi', mode)['adapter_missing'] == ['claude_supervisor']
-    assert table.lookup('codex', 'claude', 'service')['adapter_missing'] == ['codex_service_renderer']
+    assert table.lookup('codex', 'claude', 'service')['adapter_missing'] == []   # A2: tui_cards renderer
+    assert table.lookup('codex', 'claude', 'service')['status'] == 'unverified'
     assert table.lookup('claude', 'claude', 'task')['adapter_missing'] == ['claude_supervisor']
     assert table.lookup('codex', 'codex', 'task')['status'] == 'unverified'
     assert table.lookup('pi', 'codex', 'task') is None
@@ -50,7 +51,7 @@ def test_unverified_runs_only_under_smoke_lifecycle():
 
 def test_adapter_missing_refused_even_for_smoke():
     for cfg in ({'supervisor_cli': 'claude', 'worker_cli': 'pi', 'mode': 'task'},
-                {'supervisor_cli': 'codex', 'worker_cli': 'claude', 'mode': 'service'}):
+                {'supervisor_cli': 'claude', 'worker_cli': 'claude', 'mode': 'task'}):
         reason = cli_pairs.pair_problem(dict(cfg, lifecycle='smoke'))
         assert reason and 'adapter missing' in reason
 
