@@ -52,9 +52,9 @@ You are the top supervisor of this fleet: your own interface declarations are th
    {"id": "M2", "to": "worker-3", "instruction": "Build the report from the samples of IF-M0-sources@1 and IF-M1-metrics@2; write worker-3/report.md", "consumes": ["IF-M0-sources@1", "IF-M1-metrics@2"], "edits": ["worker-3/report_tool.py"]},
    {"id": "M9", "to": "worker-4", "instruction": "Run every consumer against the real outputs and write worker-4/integration.md, one line per interface: id@version · consumer · PASS/FAIL · evidence", "depends_on": ["M0", "M1", "M2"], "serial_reason": "integration"}],
  "artifacts": [{"path": "worker-4/integration.md", "min_chars": 200, "contains": ["PASS"], "not_contains": ["FAIL"]},
-               {"path": "checks/pytest.txt", "cmd_exit": ["python3", "-m", "pytest", "-q", "worker-3/tests"], "contains": ["passed"], "not_contains": [" skipped", "failed"]}]}
+               {"path": "checks/pytest.txt", "contains": ["passed"], "not_contains": [" skipped", "failed"]}]}
 ```
 - `phase` / `plan`: only in P0 replies (see above).
 - `interfaces[]`: new or changed interfaces. `change` is `new` (default) / `compatible` / `breaking`. `decision` (`approve` / `reject`) answers a worker's pending proposal. Optional fields: `min_chars`, `contains`, `json_keys`, `writers`, `decisions`, `final`.
 - `dispatch[].id` / `provides` / `consumes` / `edits` / `depends_on` + `serial_reason` as above.
-- `artifacts[].not_contains`: literal strings the file must not contain. `artifacts[].cmd_exit`: an argv list (no shell) the daemon runs in the shared output directory (timeout `timeout_s`, default 120, max 600 seconds); it must exit 0, and its combined output is written to `path`, where the literal checks then apply.
+- `artifacts[].not_contains`: literal strings the file must not contain. `artifacts[].cmd_exit`: acceptance commands are declared **only by the caller** in the task spec (the daemon runs them in the shared output directory at COMPLETED; they must exit 0 and their output is written to `path`). A decision that adds or changes a `cmd_exit` is rejected as an invalid decision; to keep a caller's command artifact, repeat it unchanged or leave it out.

@@ -46,7 +46,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import cli_pairs, contracts, handoff, history, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
+from cmux_fleet import brake, cli_pairs, contracts, handoff, history, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -87,6 +87,7 @@ ESCALATIONS = 'fx:escalations'  # task mode: {task id: worker's split request / 
 ITEMS = 'fx:items'  # plain task mode: {dispatch id: {to, instruction}} for dispatch items that carry an id
 ESCALATION_DECISIONS = ('approve', 'revise', 'reject')
 CMD_TIMEOUT, CMD_TIMEOUT_MAX = 120, 600  # artifact cmd_exit (contract tasks): seconds the daemon may block
+BRAKE = 'fx:brake'  # budget card + counters + last trip of the current task / service (cmux_fleet/brake.py)
 
 
 def load(path):
@@ -331,10 +332,14 @@ def validate_artifacts(artifacts, extended=False):
         if not isinstance(contains, list) or not all(isinstance(x, str) for x in contains):
             raise ValueError('contains must be a list of literal strings')
         if not extended:
-            continue  # contract-only keys (not_contains / cmd_exit) stay ignored, as before
+            continue  # extended keys (not_contains / json_keys / cmd_exit) stay ignored, as before
         banned = item.get('not_contains', [])
         if not isinstance(banned, list) or not all(isinstance(x, str) and x for x in banned):
             raise ValueError('not_contains must be a list of literal strings')
+        keys = item.get('json_keys')
+        if keys is not None and (not isinstance(keys, list) or not keys
+                                 or not all(isinstance(x, str) and x for x in keys)):
+            raise ValueError('json_keys must be a non-empty list of key names')
         argv = item.get('cmd_exit')
         if argv is not None and (not isinstance(argv, list) or not argv
                                  or not all(isinstance(x, str) and x and '\x00' not in x for x in argv)):
@@ -362,10 +367,23 @@ def run_check_command(item, root, path):
     return None if done.returncode == 0 else 'command exited ' + str(done.returncode) + ': ' + item['path']
 
 
-def check_artifacts(artifacts, root, extended=False, run_commands=False):
+def json_key_failures(text, keys):
+    """json_keys: the file is one JSON object, or ends with one (a report closing with a verdict
+    line like {"verdict": "PASS", "p0": 0}); every key must be present."""
+    try:
+        obj = json.loads(text)
+    except ValueError:
+        obj = contracts.last_json_object(text)[0]
+    if not isinstance(obj, dict):
+        return ['no JSON object (whole file or final line)']
+    return ['missing JSON key ' + k for k in keys if k not in obj]
+
+
+def check_artifacts(artifacts, root, extended=False, run_commands=False, commands=None):
     """Literal file checks only (exists / size / contains); returns failures (empty = pass).
-    ``extended`` (contract tasks) adds not_contains and cmd_exit; commands run only when
-    ``run_commands`` (the COMPLETED gate), never from result.json / resume re-checks."""
+    ``extended`` (contract tasks and frozen artifacts) adds not_contains, json_keys and cmd_exit;
+    commands run only when ``run_commands`` (the COMPLETED gate), never from result.json / resume re-checks,
+    and only those whose command_key is in ``commands`` (the caller's declared set); any other is reported, not run."""
     root = Path(root).resolve()
     failures = []
     for item in artifacts:
@@ -374,6 +392,9 @@ def check_artifacts(artifacts, root, extended=False, run_commands=False):
             failures.append('outside workspace: ' + item['path'])
             continue
         if extended and run_commands and item.get('cmd_exit'):
+            if command_key(item) not in (commands or ()):
+                failures.append('cmd_exit not declared by the caller, not run: ' + item['path'])
+                continue
             problem = run_check_command(item, root, path)
             if problem:
                 failures.append(problem)
@@ -390,7 +411,46 @@ def check_artifacts(artifacts, root, extended=False, run_commands=False):
             elif banned:
                 failures.append('artifact contains forbidden text ' + json.dumps(banned, ensure_ascii=False)
                                 + ': ' + item['path'])
+            elif extended and item.get('json_keys'):
+                failures += [x + ': ' + item['path'] for x in json_key_failures(text, item['json_keys'])]
     return failures
+
+
+def extended_checks(task):
+    """Contract tasks and caller-frozen artifacts use the extended checks (not_contains / json_keys / cmd_exit)."""
+    return task.get('contracts') == '1' or task.get('artifacts_frozen') == '1'
+
+
+def command_key(item):
+    """Identity of an artifact's acceptance command: path + argv + timeout (all three are what runs)."""
+    return json.dumps([item.get('path'), item.get('cmd_exit'), item.get('timeout_s', CMD_TIMEOUT)])
+
+
+def caller_commands(task):
+    """The cmd_exit commands the CALLER declared in the task spec (stored apart from the merged artifacts
+    list at submit). A task stored without that field (older daemon) has none: nothing runs."""
+    return {command_key(a) for a in json.loads(task.get('caller_artifacts') or '[]')
+            if isinstance(a, dict) and a.get('cmd_exit')}
+
+
+def command_guard(task, decision):
+    """Supervisor decisions may not add or replace a cmd_exit: only an artifact identical to one the caller
+    declared may carry one. Raises ValueError (the normal correction / three-strike path)."""
+    allowed = caller_commands(task)
+    for item in decision.get('artifacts') or []:
+        if isinstance(item, dict) and 'cmd_exit' in item and command_key(item) not in allowed:
+            raise ValueError('cmd_exit on ' + str(item.get('path')) + ' was not declared by the caller: a '
+                             'supervisor decision may not add or replace acceptance commands (drop cmd_exit, or '
+                             'repeat the caller\'s artifact unchanged)')
+
+
+def validate_contract(raw):
+    """Task spec ``contract``: {"artifacts_frozen": bool}. Returns the frozen flag."""
+    raw = {} if raw is None else raw
+    if (not isinstance(raw, dict) or set(raw) - {'artifacts_frozen'}
+            or type(raw.get('artifacts_frozen', False)) is not bool):
+        raise ValueError('contract may only have artifacts_frozen (true or false)')
+    return raw.get('artifacts_frozen', False)
 
 
 def validate_agent_registry_path(value):
@@ -823,7 +883,8 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
         return call('settled', delivery={k: msg[k] for k in runtime_v2.IDENTITY},
                     candidates=runtime_v2.tui_candidates(name, msg['body'].get('purpose'), text or '',
                                                          msg['body'].get('mode') or cfg.get('mode') or 'task'),
-                    failed=False, aborted=False, unfinished=False)
+                    failed=False, aborted=False, unfinished=False,
+                    wall_text=(text or '') if len((text or '').strip()) <= brake.TURN_WALL_MAX else '')
     finally:
         r.close(); r.connection_pool.disconnect()
 
@@ -967,6 +1028,14 @@ class Fleet:
         self.lifecycle_close = None  # set by lifecycle_close.request_close: why/how this run is being closed
         self.close_workspace_pending = False
         self.notifier = None  # tests: replaces the TG / parent channels (lifecycle_close.notify)
+        if self.service:
+            brake.validate_budget(self.cfg.get('budget'))
+        elif self.cfg.get('budget') is not None:
+            raise ValueError('config budget is for service mode; a task carries its own budget')
+        argv = self.cfg.get('brake_notify')
+        if argv is not None and (not isinstance(argv, list) or not argv or not all(isinstance(x, str) and x for x in argv)):
+            raise ValueError('brake_notify must be an argv list of strings (no shell)')
+        self.pending_notify = []  # brake trips recorded inside a v2 event transaction (notified on tick)
         self.v2 = runtime_v2.RuntimeV2(self) if self.transport_version == 2 else None
 
     # -- small helpers
@@ -1316,11 +1385,16 @@ class Fleet:
                 answer = {'status': 'rejected', 'reason': str(exc)}
             self.r.set('fx:reply:' + ev['request_id'], json.dumps(answer, ensure_ascii=False), ex=86400)
         elif kind in ('pause', 'resume'):
+            answer = {'status': 'accepted'}
             if kind == 'pause':
                 self.pause(ev.get('reason') or 'paused by operator')
             else:
-                self.resume()
-            self.r.set('fx:reply:' + ev['request_id'], json.dumps({'status': 'accepted'}), ex=86400)
+                try:
+                    self.brake_resume(ev.get('raise'))
+                    self.resume()
+                except (ValueError, TypeError) as exc:
+                    answer = {'status': 'rejected', 'reason': str(exc)}
+            self.r.set('fx:reply:' + ev['request_id'], json.dumps(answer, ensure_ascii=False), ex=86400)
         elif kind == 'stop':
             if not self.service and self.running():
                 self.finish('cancelled', 'stopped by operator')
@@ -1880,6 +1954,10 @@ class Fleet:
                 self.log('turn.launch_held', agent=name, generation=ev.get('generation'))
                 return
             if ev.get('failed') or ev.get('aborted') or ev.get('text', '').strip() != 'READY':
+                record = self.startup_wall(name, ev.get('text', ''))
+                if record:
+                    self.brake_notify(record)
+                    return
                 self.block_profile(name, 'startup did not return READY; check its terminal', dead=True)
                 return
         if (is_claude(self.runtime_cfg(name), name) or is_pi(self.runtime_cfg(name), name)) and info.get('state') in ('busy', 'handoff', 'idle'):
@@ -1915,6 +1993,14 @@ class Fleet:
             self.log('ready', agent=name, generation=info.get('generation'))
             return
         text = ev.get('text', '')
+        if self.running() and len(text.strip()) <= brake.TURN_WALL_MAX:
+            record = self.on_wall(name, text, 'turn')
+            if record:  # a wall message is not a report: keep the message for after resume (once per message)
+                if info.get('last_msg') and info.get('wall_requeued') != (ev.get('msg_id') or info.get('msg_id') or '-'):
+                    self.r.lpush(key('inbox', name), info['last_msg'])
+                    self.setf(name, wall_requeued=ev.get('msg_id') or info.get('msg_id') or '-')
+                self.brake_notify(record)
+                return
         if not text.strip() and info.get('last_msg'):
             # Empty turn: the model backend dropped the request (seen with a local server
             # under memory pressure). Re-deliver the same message after a backoff instead of
@@ -1973,6 +2059,7 @@ class Fleet:
             if state is not None:
                 state, rows, held, changes, skeleton = self.contract_decision(state, decision)
                 rows = {r['id']: r for r in rows + held}
+            command_guard(t, decision)  # after the shape checks: a malformed cmd_exit keeps its own message
             # Validate the whole dispatch before queuing any part of it. Rejections
             # use the existing supervisor correction/three-strike blocked path.
             prepared = []
@@ -1993,7 +2080,13 @@ class Fleet:
                            + '). Resend one JSON object in the AGENTS.md format, nothing else.')
             return
         artifacts = json.loads(t.get('artifacts') or '[]')
-        artifacts += [a for a in decision.get('artifacts', []) if a not in artifacts]
+        added = [a for a in decision.get('artifacts', []) if a not in artifacts]
+        if t.get('artifacts_frozen') == '1':
+            if added:  # layer 1 of the contract belongs to the caller: never widened or narrowed here
+                self.log('contract.append_ignored', task=t.get('id', ''), dropped=added)
+        else:
+            artifacts += added
+        self.brake_count('rounds')
         self.r.hset(TASK, mapping={'bad_replies': 0, 'completion': decision['completion'],
                                    'reason': decision.get('reason', ''),
                                    'artifacts': json.dumps(artifacts, ensure_ascii=False)})
@@ -2001,7 +2094,8 @@ class Fleet:
             self.finish('blocked', decision.get('reason', 'needs a human'))
             return
         if decision['status'] == 'COMPLETED':
-            failures = (check_artifacts(artifacts, self.workspace(), state is not None, state is not None)
+            extended = state is not None or t.get('artifacts_frozen') == '1'
+            failures = (check_artifacts(artifacts, self.workspace(), extended, extended, caller_commands(t))
                         if artifacts else ['no artifacts were declared, nothing to verify'])
             failures += self.contract_gate(state) if state is not None else []
             if not failures:
@@ -2071,11 +2165,15 @@ class Fleet:
         skeleton_worker = spec.get('skeleton_worker', (self.active_workers() or [None])[0])
         if use_contracts and skeleton_worker not in self.active_workers():
             raise ValueError('skeleton_worker must be one of ' + ', '.join(self.active_workers()))
+        frozen = validate_contract(spec.get('contract'))
+        if frozen and not spec.get('artifacts'):
+            raise ValueError('contract.artifacts_frozen needs the caller\'s non-empty artifacts list')
         if 'artifacts' in spec:
             # Auto-planned task specs may explicitly say there are no pre-declared artifacts.
             # Keep the legacy non-auto validation unchanged.
             if not (auto_agents and spec['artifacts'] == []):
-                validate_artifacts(spec['artifacts'], extended=use_contracts)
+                validate_artifacts(spec['artifacts'], extended=use_contracts or frozen)
+        budget = brake.validate_budget(spec.get('budget'))
         hours = spec.get('hours', 16)
         if isinstance(hours, bool) or not isinstance(hours, (int, float)) or not 0 < hours < 1000:
             raise ValueError('hours must be a positive number')
@@ -2103,9 +2201,12 @@ class Fleet:
                   'lifecycle_spec': json.dumps(life_spec, ensure_ascii=False),
                   'reason': '', 'deadline': time.time() + hours * 3600, 'bad_replies': 0,
                   'bounces': 0, 'artifacts': json.dumps(spec.get('artifacts', []), ensure_ascii=False),
+                  'caller_artifacts': json.dumps(spec.get('artifacts', []), ensure_ascii=False),
                   'apply_profiles_live': json.dumps(spec.get('apply_profiles_live', False))}
         if use_contracts:
             fields['contracts'] = 1
+        if frozen:
+            fields['artifacts_frozen'] = 1
         if dispatch_plan is not None:
             fields.update(
                 auto_agents=1,
@@ -2115,12 +2216,18 @@ class Fleet:
                     profile_assignments, ensure_ascii=False, separators=(',', ':')),
             )
         self.r.hset(TASK, mapping=fields)
+        self.brake_start(budget)
         prompt = ('[New task ' + task_id + '] Goal: ' + spec['goal']
                   + '\nWorkers you can dispatch to: ' + ', '.join(self.labels())
                   + '\nShared output directory: ' + str(self.workspace())
                   + ' (artifact paths are relative to it, e.g. worker-1/report.md)'
                   + '\nArtifacts pre-declared by the operator: '
                   + json.dumps(spec.get('artifacts', []), ensure_ascii=False))
+        if frozen:
+            prompt += ('\nThese artifacts are frozen by the caller: they are the acceptance contract. Artifacts you '
+                       'add in a decision are ignored and audited; to change them, reply BLOCKED and say why.')
+        if budget:
+            prompt += '\nBudget card (the daemon pauses the fleet at any line): ' + json.dumps(budget, ensure_ascii=False)
         if dispatch_plan is not None:
             prompt += ('\nAuto-agent dispatch plan (profile ids are recommendations, not worker names): '
                        + fields['dispatch_plan']
@@ -2272,6 +2379,7 @@ class Fleet:
                            + '). Resend one JSON object in the AGENTS.md format, nothing else.')
             return
         self.r.hset(SERVICE, mapping={'bad_replies': 0, 'reason': decision.get('reason', '')})
+        self.brake_count('rounds')
         for item in decision['dispatch']:
             if self.r.hget(REQ + item['request_id'], 'status') != 'routing':
                 self.log('dispatch.unknown_request', id=item['request_id'])
@@ -2296,9 +2404,12 @@ class Fleet:
 
     # -- delivery + rotation
     def pump(self):
-        if (self.service or self.v2) and self.paused():
+        if self.paused():
             return  # nothing is delivered and nothing rotates; requests keep queuing (and may time out)
         cap = int(self.cfg.get('max_busy') or 0)
+        card = (self.brake_budget() or {}).get('max_busy')
+        if card:  # the budget card can only tighten --max-busy
+            cap = min(cap, card) if cap else card
         busy = sum(self.agent(w).get('state') in ('busy', 'handoff', 'held') for w in self.workers)
         for name in self.names:
             info = self.agent(name)
@@ -2420,6 +2531,7 @@ class Fleet:
             if name != 'supervisor':
                 self.setf(name, request=head.group(1) if head else '')
         self.setf(name, state='busy', busy_since=time.time(), delivered=int(info.get('delivered') or 0) + 1)
+        self.brake_count('calls')
         if not self.send(name, self.agent(name)['pane'], text):
             self.r.lpush(key('inbox', name), text)
             self.finish('blocked', 'delivery failed: ' + name)
@@ -2701,9 +2813,18 @@ class Fleet:
             self.on_stall(name, info, int(now - last))
 
     def on_stall(self, name, info, idle_s):
+        screen = self.capture_screen(name, info) if self.running() else ''
         if self.v2:
-            return self.v2.transaction('stall-' + uuid.uuid4().hex,
-                lambda: self.v2.hold(name, 'no activity for ' + str(idle_s) + ' s; stop unconfirmed', public_status='stalled'))
+            def stalled():
+                self.v2.hold(name, 'no activity for ' + str(idle_s) + ' s; stop unconfirmed', public_status='stalled')
+                return self.on_wall(name, screen, 'screen')
+            record = self.v2.transaction('stall-' + uuid.uuid4().hex, stalled)
+            if record:
+                self.brake_notify(record)
+            return None
+        record = self.on_wall(name, screen, 'screen')
+        if record:
+            self.brake_notify(record)
         stalls = int(info.get('stalls', 0)) + 1
         self.log('agent.stalled', agent=name, state=info.get('state'), idle_s=idle_s, stalls=stalls)
         self.mgr.send_key(info['pane'], 'Escape')  # abort the turn; an aborted turn fires no notify
@@ -2732,6 +2853,262 @@ class Fleet:
         else:
             self.report(name, 'STALLED: no activity for ' + minutes + ' min, its turn was aborted. The worker is '
                         'idle again. Dispatch a smaller, concrete instruction, or reply BLOCKED if a human is needed.')
+
+    # -- brake (cmux_fleet/brake.py): budget card per pool + wall table
+    def brake_budget(self):
+        return json.loads(self.r.hget(BRAKE, 'budget') or 'null')
+
+    def brake_start(self, budget):
+        """A new card: counters restart (task submit; service: first tick)."""
+        if self.paused() and (self.r.hget(SERVICE, 'reason') or '').startswith('brake: '):
+            self.resume()  # a brake pause belongs to the card it tripped, not to the next task
+        base = brake.pool_reading(brake.read_quota(self.cfg.get('quota_file')), (budget or {}).get('pool'))
+        self.r.delete(BRAKE)
+        self.r.hset(BRAKE, mapping={'budget': json.dumps(budget), 'calls': 0, 'rounds': 0, 'started': time.time(),
+                                    'usd_base': '' if base is None else base, 'tripped': ''})
+
+    def brake_count(self, counter):
+        self.r.hincrby(BRAKE, counter, 1)
+
+    def brake_tick(self, now):
+        """Pause at any budget line. Returns the trip record (notify after the transaction) or None."""
+        if self.service and self.cfg.get('budget') and not self.r.hget(BRAKE, 'budget'):
+            self.brake_start(brake.validate_budget(self.cfg['budget']))
+        state = self.r.hgetall(BRAKE)
+        budget = json.loads(state.get('budget') or 'null')
+        if not budget or not self.running() or self.paused():
+            return None
+        quota = brake.read_quota(self.cfg.get('quota_file'))
+        if budget.get('pool') == 'pool-a' and state.get('usd_base') in (None, ''):
+            base = brake.pool_reading(quota, 'pool-a', now)
+            if base is not None:  # the first known reading is the baseline: spend before it is not ours
+                self.r.hset(BRAKE, mapping={'usd_base': base})
+                state['usd_base'] = base
+        found = brake.trips(self.brake_card(budget), brake.counters(state, quota, now))
+        if found:
+            return self.brake_trip('budget', 'budget line reached: ' + brake.describe(found), lines=found)
+        return None
+
+    def brake_card(self, budget):
+        """The card as evaluated (default pool-a cash cap, day or night per B's fx:night)."""
+        return brake.effective(budget, self.r.hget('fx:night', 'brake_card') == 'night')
+
+    def brake_trip(self, kind, reason, **detail):
+        record = dict(kind=kind, reason=reason, at=time.time(), task=self.task().get('id', ''), **detail)
+        self.r.hset(BRAKE, mapping={'tripped': json.dumps(record, ensure_ascii=False)})
+        if not self.paused():
+            self.pause('brake: ' + reason)
+            # The pause this brake owns (the first trip's reason and agent): later trips overwrite `tripped`.
+            self.r.hset(BRAKE, mapping={'paused_by': json.dumps({'reason': 'brake: ' + reason, 'kind': kind,
+                                                                 'agent': detail.get('agent', '')})})
+        self.log('brake.tripped', **{('brake' if k == 'kind' else k): v for k, v in record.items() if k != 'at'})
+        return record
+
+    def brake_notify(self, record):
+        """Side effects of a trip, outside any v2 transaction: <run>/brake.json and the operator's notify argv."""
+        state = self.r.hgetall(BRAKE)
+        card = json.loads(state.get('budget') or 'null')
+        save(self.run_dir / 'brake.json', dict(record, budget=card, effective_budget=self.brake_card(card),
+             counters=brake.counters(state, brake.read_quota(self.cfg.get('quota_file')))))
+        argv = self.cfg.get('brake_notify')
+        if argv:
+            try:
+                subprocess.Popen(list(argv) + ['[cmux-fleet brake] ' + record['reason']], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            except OSError as exc:
+                self.log('brake.notify_failed', error=str(exc))
+
+    def brake_resume(self, raises):
+        """Operator resume: refused while a budget line is still reached (resume --raise LIMIT=VALUE)."""
+        if raises is not None and (not isinstance(raises, list) or not all(isinstance(x, str) for x in raises)):
+            raise ValueError('raise must be a list of LIMIT=VALUE strings')
+        state = self.r.hgetall(BRAKE)
+        budget = json.loads(state.get('budget') or 'null')
+        tripped = json.loads(state.get('tripped') or 'null')
+        if raises:
+            if not budget:
+                raise ValueError('--raise needs a budget card on the current task / service')
+            budget = brake.parse_raise(raises, budget)
+            if budget.get('pool') != json.loads(state['budget']).get('pool'):
+                raise ValueError('--raise cannot change the pool')
+        if budget:  # any resume, whatever paused the run (a later wall trip or a hold can overwrite the record)
+            found = brake.trips(self.brake_card(budget), brake.counters(state, brake.read_quota(self.cfg.get('quota_file'))))
+            if found:
+                raise ValueError('budget still over the line (' + brake.describe(found)
+                                 + '); resume with --raise LIMIT=<higher value>')
+        if raises:
+            self.r.hset(BRAKE, mapping={'budget': json.dumps(budget)})
+            self.log('brake.raised', budget=budget)
+        if tripped:
+            self.r.hset(BRAKE, mapping={'tripped': ''})
+        self.r.hset(BRAKE, mapping={'paused_by': ''})
+
+    def on_wall(self, name, text, source):
+        """A wall on a turn text or a stalled screen: decide (downgrade / stop), record, pause."""
+        wall = brake.classify_wall(text)
+        if not wall:
+            return None
+        cfg = self.runtime_cfg(name)
+        cli = agent_cli(cfg, name)
+        model = (cfg.get('pi_model') if cli == 'pi' else cfg.get('codex_model') if cli == 'codex'
+                 else cfg.get('supervisor_model') if name == 'supervisor' else cfg.get('worker_model')) or ''
+        action = brake.wall_action(wall, cli, model)
+        if action['action'] == 'downgrade' and name not in self.workers:
+            # Master design v2 binding table: a supervisor wall is not answered by swapping its model.
+            action = {'action': 'stop', 'cli': cli, 'from': model,
+                      'advice': 'supervisor slot: no automatic downgrade; resume after the reset or restart it'}
+        self.setf(name, wall=json.dumps(dict(wall, **action), ensure_ascii=False))
+        if action['action'] == 'stop' and name in self.workers:
+            self.setf(name, wall_downgrade='', wall_switch='')  # a stop wins over an earlier pending downgrade
+        if action['action'] == 'downgrade':
+            pending = json.loads(self.agent(name).get('wall_downgrade') or 'null')
+            if not pending or pending.get('to') != action['to']:
+                self.setf(name, wall_downgrade=json.dumps(dict(action, key=brake.MODEL_KEY[cli], source=source,
+                                                               at=uuid.uuid4().hex[:12]), ensure_ascii=False))
+        what = ('same CLI one tier down: ' + action['from'] + ' -> ' + action['to'] if action['action'] == 'downgrade'
+                else action['advice'])
+        return self.brake_trip('wall', self.label(name) + ' hit a ' + wall['scope'] + ' wall ("' + wall['line'][:120]
+                               + '"); ' + what, agent=name, source=source, wall=wall, decision=action)
+
+    def notify_later(self, record):
+        """A trip recorded inside a v2 event transaction: brake.json / notify argv run on the next tick."""
+        if record:
+            self.pending_notify.append(record)
+
+    def startup_wall(self, name, text):
+        """A new generation answered its startup prompt with a wall instead of READY: walled (not dead),
+        fleet paused resumable. A model-pool wall is downgraded by wall_tick; any other wall is retried
+        (same launch) once the operator resumes."""
+        if len((text or '').strip()) > brake.TURN_WALL_MAX:
+            return None
+        record = self.on_wall(name, text, 'startup')
+        if record:
+            self.setf(name, state='walled', runtime_ready=0, bridge_available=0)
+        return record
+
+    def wall_tick(self):
+        """Wall side effects (spawn / kill), outside any v2 transaction. At an idle boundary run the pending
+        same-CLI downgrade as the slot's next generation; once that generation is READY lift the wall's own
+        pause; retry a startup-walled slot after the operator resumed."""
+        for name in self.active_workers():
+            info = self.agent(name)
+            req = json.loads(info.get('wall_downgrade') or 'null')
+            if req and info.get('wall_switch') == req['at']:
+                if info.get('state') == 'idle' and info.get('runtime_ready') == '1':
+                    self.wall_switched(name, req)
+                continue
+            in_flight = self.v2 and self.r.hget(self.v2.bus.lease_key(name), 'current_delivery')
+            current = self.runtime_cfg(name)
+            if req and (agent_cli(current, name) != req['cli'] or (current.get(req['key']) or '') != (req['from'] or '')):
+                # The slot already runs something else (B's roster / night swap, a live profile): never undo it.
+                self.setf(name, wall_downgrade='', wall_switch='')
+                self.log('brake.downgrade_superseded', agent=name, wanted=req, cli=agent_cli(current, name),
+                         model=current.get(req['key'], ''))
+                req = None
+            if req and info.get('state') in ('idle', 'walled') and not in_flight:
+                launch = json.loads(info.get('runtime_launch') or '{}')
+                launch = {'profile_id': launch.get('profile_id') or 'wall-downgrade', 'role_text': launch.get('role_text', ''),
+                          'overrides': dict(launch.get('overrides', {}), worker_cli=req['cli'], **{req['key']: req['to']})}
+                self.setf(name, wall_switch=req['at'])
+                self.wall_rotate(name, launch, 'same-CLI downgrade after a model-pool wall: ' + str(req['from'])
+                                 + ' -> ' + req['to'])
+            elif info.get('state') == 'walled' and not self.paused():
+                self.wall_rotate(name, json.loads(info.get('runtime_launch') or 'null'), 'retry after the wall pause was resumed')
+
+    def wall_switched(self, name, req):
+        self.setf(name, wall_downgrade='', wall_switch='')
+        owner = json.loads(self.r.hget(BRAKE, 'paused_by') or 'null') or {}
+        ours = (owner.get('kind') == 'wall' and owner.get('agent') == name
+                and self.r.hget(SERVICE, 'reason') == owner.get('reason'))
+        budget = self.brake_budget()
+        over = budget and brake.trips(self.brake_card(budget), brake.counters(
+            self.r.hgetall(BRAKE), brake.read_quota(self.cfg.get('quota_file'))))
+        self.log('brake.downgraded', agent=name, label=self.label(name), cli=req['cli'], to=req['to'],
+                 resumed=bool(self.paused() and ours and not over))
+        if self.paused() and ours and not over:
+            # Only the wall's own pause: an operator pause, an F hold or a budget line keeps the fleet paused.
+            self.r.hset(BRAKE, mapping={'tripped': '', 'paused_by': ''})
+            self.resume()
+
+    def wall_rotate(self, name, launch, why):
+        """Same slot, next generation (optionally another launch), queue kept on the slot. Like B's
+        roster profile swap: skeleton handoff, saved screen, held launch, tab into place, old tab killed,
+        v2 delivery confirmed retired. Failure blocks the task like any profile switch failure."""
+        info = self.agent(name)
+        generation, old, prev = int(info['generation']), info.get('pane'), self.label(name)
+        if not old or self.mgr.get_pane_status(old) is None:
+            return self.block_profile(name, why + ': the old runtime tab is missing', dead=True) or False
+        handoff_id = uuid.uuid4().hex[:8]
+        note = self.run_dir / 'handoffs' / (name + '-g' + str(generation) + '-' + handoff_id + '-wall.md')
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text(self.skeleton(name, dict(info, handoff_id=handoff_id)))
+        snapshot = note.with_suffix('.terminal.txt')
+        self.mgr.capture_to(old, str(snapshot))
+        history.record(self.run_dir, slot=name, label=prev, generation=generation, handoff=str(note),
+                       snapshot=str(snapshot), source='wall', timed_out=False)
+        label = name + '.' + str(generation + 1)
+        self.setf(name, generation=generation + 1, label=label, prev_label=prev, handoff_id='',
+                  runtime_launch=profile_launch.encode_launch(launch) if launch else '', runtime_profile='',
+                  launch_ready=0, runtime_ready=0, retired_pane=old)
+        self.r.hset(NAMES, mapping={label: name})
+        try:
+            new = self.spawn(name, '[Same-task takeover] You are ' + label + ' (taking over from ' + prev + ': ' + why
+                             + '). Read the handoff note ' + str(note) + ' and continue from it. In this turn only '
+                             'read the note, do no task work, and make your final reply exactly READY.', launch_held=True)
+            if not self.mgr.tab_into(new, old):
+                raise RuntimeError('could not place the successor in the worker pane')
+            if not self.mgr.kill_pane(old) or self.mgr.get_pane_status(old) is not None:
+                raise RuntimeError('could not confirm retirement of the old runtime ' + prev)
+        except (Exception, SystemExit) as exc:
+            self.setf(name, launch_ready=0, state='dead')
+            return self.block_profile(name, why + ' failed: ' + str(exc), dead=True) or False
+        if self.v2:
+            self.v2.confirm_retired(name)
+        self.setf(name, launch_ready=1, retired_pane='')
+        self.refresh_history()
+        self.log('brake.wall_rotated', agent=name, label=label, prev=prev, generation=generation + 1, why=why,
+                 cli=agent_cli(self.runtime_cfg(name), name), handoff=str(note))
+        return True
+
+    def wall_gate(self, name, screen, source='watch'):
+        """E before F: the watchdog calls this on every screen it captures, BEFORE the prompt whitelist,
+        the unknown-dialog hold and the stall ladder. A wall on the bottom of the screen trips the brake
+        (pause, record, notify) and returns the trip record: the caller then presses no key, holds nothing
+        and leaves the slot alone this tick (a wall menu is never a dialog to answer). None: no wall."""
+        if not brake.screen_wall(screen):
+            return None
+        tripped = json.loads(self.r.hget(BRAKE, 'tripped') or 'null')
+        if self.paused() and tripped and tripped.get('kind') == 'wall' and tripped.get('agent') == name:
+            return tripped  # already braked on this agent's wall: hands off, no second notify
+        tail = '\n'.join((screen or '').rstrip().splitlines()[-brake.GATE_TAIL:])
+        if self.v2:
+            record = self.v2.transaction('brake-wall-' + uuid.uuid4().hex, lambda: self.on_wall(name, tail, source))
+        else:
+            record = self.on_wall(name, tail, source)
+        if record:
+            self.brake_notify(record)
+        return record
+
+    def stalled_screens(self, now):
+        """Screens of busy agents past stall_timeout (only while a task / service is running)."""
+        limit = float(self.cfg['stall_timeout'])
+        if limit <= 0 or not self.running() or self.paused():
+            return {}
+        return {name: self.capture_screen(name, info) for name, info in ((n, self.agent(n)) for n in self.names)
+                if info.get('state') == 'busy' and now - self.last_activity(info) >= limit}
+
+    def capture_screen(self, name, info):
+        """The tail of an agent's screen for wall detection ('' if it cannot be read)."""
+        pane = info.get('pane')
+        if not pane:
+            return ''
+        path = self.run_dir / 'brake' / (name + '-screen.txt')
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.mgr.capture_to(pane, str(path))
+            return '\n'.join(path.read_text(errors='replace').splitlines()[-60:])
+        except (OSError, AttributeError, RuntimeError, subprocess.SubprocessError):
+            return ''
 
     def write_result(self):
         """Task terminal: write <run>/result.json once per task (start --resume refuses a finished run)."""
@@ -2766,6 +3143,19 @@ class Fleet:
                 raise
             except Exception as exc:
                 self.log('tick.error', part=part, error=repr(exc))
+        if self.v2:
+            # v2 holds a stalled slot inside RuntimeV2.tick (Fleet.on_stall is v1 only): read the
+            # screens of slots about to be held first, so a wall pauses the fleet instead.
+            screens = self.stalled_screens(time.time())
+            record = self.v2.transaction('brake-' + uuid.uuid4().hex, lambda: next(
+                (r for r in [self.on_wall(n, text, 'screen') for n, text in screens.items()] if r), None)
+                or self.brake_tick(time.time()))
+        else:
+            record = self.brake_tick(time.time())
+        for done in [r for r in self.pending_notify + [record] if r]:
+            self.brake_notify(done)
+        self.pending_notify = []
+        self.wall_tick()  # spawn / kill: outside any v2 transaction
         if self.v2:
             return self.v2.tick()
         now = time.time()
@@ -2815,7 +3205,7 @@ def save_result(run, task, status=None, reason=None, contract_summary=None):
     """<run>/result.json (atomic): the run is finished. Artifacts are re-checked on disk here."""
     workspace = Path(run) / 'workspace'
     artifacts = json.loads(task.get('artifacts') or '[]')
-    extended = task.get('contracts') == '1'
+    extended = extended_checks(task)
     result = {
         'status': status or task.get('status', ''), 'reason': task.get('reason', '') if reason is None else reason,
         'task_id': task.get('id', ''), 'goal': task.get('goal', ''), 'at': time.time(),
@@ -3015,6 +3405,14 @@ def start(args):
             raise SystemExit(str(exc)) from exc
         lifecycle_problem = str(exc)  # missing --lifecycle: refused below, after the config checks
         args.lifecycle, args.mode = None, getattr(args, 'mode', None) or DEFAULTS['mode']
+    budget = None
+    if getattr(args, 'budget', None):
+        if args.mode != 'service':
+            raise SystemExit('--budget is the service budget card; a task carries its own "budget" in the task spec')
+        try:
+            budget = brake.validate_budget(json.loads(args.budget))
+        except ValueError as exc:
+            raise SystemExit('--budget rejected: ' + str(exc)) from exc
     try:
         runtime_v2.validate_config(vars(args))
     except ValueError as exc:
@@ -3087,6 +3485,8 @@ def start(args):
     cfg = {'run': str(run), 'python': sys.executable, **redis_cfg,
            'cmux_state_dir': str(mgr.meta_path.parent),
            'workers': workers, 'mode': args.mode, 'lifecycle': args.lifecycle, 'roles': args.roles, 'max_busy': args.max_busy,
+           **({'budget': budget} if budget else {}),
+           **({'brake_notify': shlex.split(args.brake_notify)} if getattr(args, 'brake_notify', None) else {}),
            'request_timeout': args.request_timeout, 'supervisor_profile': args.supervisor_profile,
            'worker_profile': args.worker_profile, 'profile': args.profile, 'codex': codex, 'redis_server': redis_server, 'codex_home': str(home),
            'handoff_ratio': args.handoff_ratio, 'handoff_timeout': args.handoff_timeout,
@@ -3244,6 +3644,10 @@ def main(argv=None):
     s.add_argument('--worker-profile', help='codex profile for codex workers (default: --profile)')
     s.add_argument('--max-busy', type=int, default=DEFAULTS['max_busy'],
                    help='at most this many workers working at once (0 = no limit)')
+    s.add_argument('--budget', help='service mode: budget card JSON, e.g. \'{"pool": "pool-a", "max_usd": 40, '
+                   '"max_calls": 200}\' (tasks put "budget" in the task spec); the daemon pauses at any line')
+    s.add_argument('--brake-notify', help='command run (no shell) with one message argument when the brake pauses '
+                   'the fleet, e.g. "/usr/local/bin/tg-send --chat ops"')
     s.add_argument('--request-timeout', type=float, default=DEFAULTS['request_timeout'],
                    help='service mode: seconds before an unanswered request is published as timeout')
     s.add_argument('--resume', metavar='RUN_DIR|auto',
@@ -3291,7 +3695,10 @@ def main(argv=None):
         '({"goal":..., "hours":..., "artifacts":[...], "auto_agents":true, "agent_registry":...})')
     t.add_argument('spec')
     for name in ('status', 'stop', 'resume'):
-        sub.add_parser(name).add_argument('--config', default=str(LATEST))
+        sp = sub.add_parser(name)
+        sp.add_argument('--config', default=str(LATEST))
+    sp.add_argument('--raise', dest='raise_', action='append', metavar='LIMIT=VALUE',
+                    help='after a budget pause: raise a budget line (e.g. max_calls=400); repeatable')
     ls = sub.add_parser('logs', help='read-only v2 audit timeline/details')
     ls.add_argument('--config', default=str(LATEST))
     for field in ('request', 'slot', 'event', 'level'):
@@ -3386,6 +3793,8 @@ def main(argv=None):
             print(json.dumps(request(cfg, {'kind': 'stop'}), ensure_ascii=False))
         elif args.cmd in ('pause', 'resume'):
             ev = {'kind': args.cmd, 'reason': getattr(args, 'reason', '')}
+            if getattr(args, 'raise_', None):
+                ev['raise'] = args.raise_
             print(json.dumps(request(cfg, ev), ensure_ascii=False))
         elif args.cmd == 'results':
             r = connect(cfg)

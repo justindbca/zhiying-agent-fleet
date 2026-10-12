@@ -1,0 +1,44 @@
+# Wall table (one table for the whole fleet; brake.py reads it, the watchdog only "sees").
+# Absorbs us-stock-option config/cli_tier_map.yaml (same_cli_downgrade / aliases / default) and
+# the wall regexes of OpenClaw multi_agent_daemon.py (_RATE_LIMIT_PATTERNS, _MODEL_POOL_WALL_PATTERNS).
+# MAD keeps its own copy: change both together.
+#
+# account   : the whole account / CLI is walled (weekly / session / usage limit, 429). Changing the
+#             model does not help -> switch side (other CLI) or stop. Inside one fleet the brake pauses
+#             (stop, keep resumable); switching side is the CLI pairs table's job (item A).
+# model_pool: only one model tier is walled ("You've reached your Fable limit"). Same CLI one tier
+#             down usually still has quota -> same_cli_downgrade.
+# Account patterns are checked first: a weekly-limit screen that also says /usage-credits is account-level.
+# Auth errors (401, Not logged in, expired OAuth) are not walls: the watchdog handles them.
+account:
+  - "You've (?:hit|reached) your (?:usage|weekly|session|daily|monthly|5-hour) limit"
+  - "\\b(?:weekly|session|daily|5-hour|usage) limit reached"
+  - "Claude (?:AI )?usage limit reached"
+  - "(?:error|ERR|⚠|❌|429).*rate limit"
+  - "rate limit(?:ed|s)\\b"
+  - "(?:429|HTTP\\s*429).*too many requests"
+  - "quota (?:exceeded|exhausted)"
+model_pool:
+  - "You've (?:hit|reached) your\\s+(?!(?:usage|weekly|session|daily|monthly|5-hour)\\b)[\\w.\\-]+.{0,20}?\\blimit\\b"
+  - "/usage-credits"
+  - "Set up usage credits"
+# Same CLI one tier down (2026-09-20). Codex gpt-5.6-* names are copied as-is: v1 design §91
+# flags them as stale; fix them here when the Codex catalogue is confirmed.
+same_cli_downgrade:
+  claude-fable-5: claude-sonnet-5
+  claude-opus-5: claude-sonnet-5
+  gpt-5.6-sol: gpt-5.6-luna
+  gpt-5.6-terra: gpt-5.6-luna
+aliases:
+  fable: claude-fable-5
+  opus: claude-opus-5
+  sonnet: claude-sonnet-5
+  haiku: claude-haiku-4-5
+  claude-haiku-4-5-20251001: claude-haiku-4-5
+  claude-opus-4-8: claude-opus-5
+  gpt-5.5: gpt-5.6-terra
+  gpt-reserve: gpt-5.6-luna
+# Model assumed when a slot names none.
+default:
+  codex: gpt-5.6-terra
+  claude: claude-fable-5

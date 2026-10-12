@@ -212,8 +212,8 @@ def write(f, rel, text):
     path.write_text(text)
 
 
-def to_parallel(f):
-    submit(f, contracts=True)
+def to_parallel(f, **spec):
+    submit(f, contracts=True, **spec)
     sup(f, p0_reply())
     write(f, 'worker-1/skeleton.md', 'IF-M0-src@1 · M0 → M2 · PASS · ok\nIF-M1-metrics@1 · M1 → M2 · PASS · ok\n')
     report(f, 'worker-1')
@@ -409,11 +409,11 @@ def test_breaking_change_proposal_approval_stale_and_clear(cf):
 
 
 def test_completed_gate_needs_ready_interfaces_and_contract_artifact_checks(cf):
-    to_parallel(cf)
     py = sys.executable
     artifacts = [{'path': 'worker-3/integration.md', 'contains': ['PASS'], 'not_contains': ['FAIL']},
                  {'path': 'checks/ok.txt', 'cmd_exit': [py, '-c', 'print("3 passed")'], 'contains': ['passed'],
                   'not_contains': [' skipped']}]
+    to_parallel(cf, artifacts=artifacts[1:])  # acceptance commands come from the caller only
     write(cf, 'worker-3/integration.md', 'IF-M0-src@1 · M2 · PASS\nIF-M1-metrics@1 · M2 · FAIL\n')
     sup(cf, {'status': 'COMPLETED', 'completion': 100, 'dispatch': [], 'artifacts': artifacts})
     msg = inbox(cf, 'supervisor')[-1]
@@ -427,12 +427,15 @@ def test_completed_gate_needs_ready_interfaces_and_contract_artifact_checks(cf):
         e['status'] = 'ready'
     cf.save_contract(state)
     bad = [{'path': 'checks/bad.txt', 'cmd_exit': [py, '-c', 'print("1 skipped"); raise SystemExit(3)']}]
-    assert fleet.check_artifacts(bad, cf.workspace(), True, True) == ['command exited 3: checks/bad.txt']
+    allow = {fleet.command_key(x) for x in bad}
+    assert fleet.check_artifacts(bad, cf.workspace(), True, True, allow) == ['command exited 3: checks/bad.txt']
     skipped = [{'path': 'checks/skip.txt', 'cmd_exit': [py, '-c', 'print("2 passed, 1 skipped")'],
                 'not_contains': [' skipped']}]
-    assert 'forbidden text [" skipped"]' in fleet.check_artifacts(skipped, cf.workspace(), True, True)[0]
+    assert 'forbidden text [" skipped"]' in fleet.check_artifacts(
+        skipped, cf.workspace(), True, True, {fleet.command_key(x) for x in skipped})[0]
     slow = [{'path': 'checks/slow.txt', 'cmd_exit': [py, '-c', 'import time; time.sleep(5)'], 'timeout_s': 1}]
-    assert fleet.check_artifacts(slow, cf.workspace(), True, True) == ['command timed out after 1 s: checks/slow.txt']
+    assert fleet.check_artifacts(slow, cf.workspace(), True, True, {fleet.command_key(x) for x in slow}) == [
+        'command timed out after 1 s: checks/slow.txt']
     with pytest.raises(ValueError, match='cmd_exit must be a non-empty argv list'):
         fleet.validate_artifacts([{'path': 'a/b', 'cmd_exit': 'rm -rf /'}], extended=True)
     sup(cf, {'status': 'COMPLETED', 'completion': 100, 'dispatch': [], 'artifacts': artifacts})
@@ -530,3 +533,76 @@ def test_resume_restores_contract_state_and_redoes_the_skeleton_run(task_run):  
     assert resume_answer(f, 'worker-2', 'Done:\n- skeleton\nEvidence:\n- worker-2/skeleton.md\nNot done: none\n'
                                         'Blocked: none')['status'] == 'committed'
     assert f.contract_state()['phase'] == 'parallel'
+
+
+# ---- acceptance commands belong to the caller (E: supervisor decisions never add / replace cmd_exit)
+def _cmd(marker, text='ok'):
+    return [sys.executable, '-c', 'open(%r, "a").write("x"); print(%r)' % (str(marker), text)]
+
+
+def test_supervisor_cannot_add_a_cmd_exit_in_a_contract_task(cf, tmp_path):
+    marker = tmp_path / 'ran'
+    to_parallel(cf, artifacts=[{'path': 'worker-3/integration.md', 'contains': ['PASS']}])
+    sup(cf, {'status': 'COMPLETED', 'completion': 100, 'dispatch': [],
+             'artifacts': [{'path': 'checks/own.txt', 'cmd_exit': _cmd(marker)}]})
+    assert 'was not declared by the caller' in inbox(cf, 'supervisor')[-1]
+    assert cf.task()['bad_replies'] == '1' and cf.task()['bounces'] == '0' and cf.task()['status'] == 'running'
+    assert not marker.exists() and len(json.loads(cf.task()['artifacts'])) == 1
+
+
+def test_supervisor_cannot_replace_the_callers_cmd_exit(cf, tmp_path):
+    caller, swapped = tmp_path / 'caller', tmp_path / 'swapped'
+    declared = {'path': 'checks/tests.txt', 'cmd_exit': _cmd(caller, '3 passed'), 'contains': ['passed']}
+    to_parallel(cf, artifacts=[declared])
+    for forged in (dict(declared, cmd_exit=_cmd(swapped, '3 passed')), dict(declared, timeout_s=600)):
+        sup(cf, {'status': 'COMPLETED', 'completion': 100, 'dispatch': [], 'artifacts': [forged]})
+        assert 'was not declared by the caller' in inbox(cf, 'supervisor')[-1]
+    assert not caller.exists() and not swapped.exists() and cf.task()['status'] == 'running'
+    state = cf.contract_state()
+    for e in state['interfaces'].values():
+        e['status'] = 'ready'
+    cf.save_contract(state)
+    sup(cf, {'status': 'COMPLETED', 'completion': 100, 'dispatch': [], 'artifacts': [declared]})  # unchanged: ok
+    assert cf.task()['status'] == 'completed' and caller.read_text() == 'x' and not swapped.exists()
+
+
+def test_forged_stored_artifact_command_is_reported_not_run(cf, tmp_path):
+    """Even if a cmd_exit reaches the stored artifacts list another way, only the caller's set runs."""
+    marker = tmp_path / 'ran'
+    to_parallel(cf, artifacts=[{'path': 'worker-3/integration.md', 'contains': ['PASS']}])
+    write(cf, 'worker-3/integration.md', 'PASS')
+    forged = json.loads(cf.task()['artifacts']) + [{'path': 'checks/x.txt', 'cmd_exit': _cmd(marker)}]
+    cf.r.hset(fleet.TASK, mapping={'artifacts': json.dumps(forged)})
+    state = cf.contract_state()
+    for e in state['interfaces'].values():
+        e['status'] = 'ready'
+    cf.save_contract(state)
+    sup(cf, {'status': 'COMPLETED', 'completion': 100, 'dispatch': []})
+    assert 'cmd_exit not declared by the caller, not run: checks/x.txt' in inbox(cf, 'supervisor')[-1]
+    assert not marker.exists() and cf.task()['status'] == 'running'
+    old_task = {k: v for k, v in cf.task().items() if k != 'caller_artifacts'}  # stored by an older daemon
+    assert fleet.caller_commands(old_task) == set()
+
+
+def test_result_recheck_never_runs_commands(cf, tmp_path):
+    marker = tmp_path / 'ran'
+    declared = {'path': 'checks/tests.txt', 'cmd_exit': _cmd(marker, '1 passed'), 'contains': ['passed']}
+    to_parallel(cf, artifacts=[declared])
+    state = cf.contract_state()
+    for e in state['interfaces'].values():
+        e['status'] = 'ready'
+    cf.save_contract(state)
+    sup(cf, {'status': 'COMPLETED', 'completion': 100, 'dispatch': []})
+    assert cf.task()['status'] == 'completed' and marker.read_text() == 'x'  # ran once, at the gate
+    cf.tick()  # result.json re-check
+    result = json.loads((cf.run_dir / 'result.json').read_text())
+    assert result['artifacts'][0]['problems'] == [] and marker.read_text() == 'x'
+
+
+def test_non_contract_decision_with_cmd_exit_is_rejected(cf, tmp_path):
+    marker = tmp_path / 'ran'
+    submit(cf)
+    sup(cf, {'status': 'RUNNING', 'completion': 1, 'dispatch': [
+        {'to': 'worker-1', 'instruction': 'Write worker-1/x.md with the findings'}],
+             'artifacts': [{'path': 'worker-1/x.md', 'cmd_exit': _cmd(marker)}]})
+    assert 'was not declared by the caller' in inbox(cf, 'supervisor')[-1] and not marker.exists()

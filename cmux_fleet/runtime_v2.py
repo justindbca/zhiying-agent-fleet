@@ -553,7 +553,15 @@ class RuntimeV2:
                     self.audit('startup.duplicate', slot=slot)
                     self.reply(ev, {'status': 'rejected', 'reason': 'startup belongs to an already settled or held runtime'})
                     return
-                if (info.get('launch_ready', '1') != '1'
+                walled = None
+                if (info.get('launch_ready', '1') == '1' and ev.get('text', '').strip() != 'READY'
+                        and slot in self.f.workers + ['supervisor']):
+                    # E: a wall instead of READY pauses resumable (Pi also reports the model error text).
+                    walled = self.f.startup_wall(slot, '\n'.join(str(ev.get(k) or '') for k in ('text', 'error')))
+                if walled:
+                    self.f.notify_later(walled)
+                    self.reply(ev, {'status': 'rejected', 'reason': 'usage wall at startup: slot walled, fleet paused'})
+                elif (info.get('launch_ready', '1') != '1'
                         or ev.get('failed') or ev.get('aborted') or ev.get('text', '').strip() != 'READY'):
                     self.f.setf(slot, state='dead', runtime_ready=0, bridge_available=0)
                     self.f.finish('blocked', slot + ': startup failed before READY')
@@ -575,6 +583,13 @@ class RuntimeV2:
                         'started_at': int(time.time()*1000), 'execution_phase': 'running'})
                 except (ValueError, KeyError, BusError) as exc:
                     self.audit('started.rejected', slot=slot, error=str(exc))
+            elif kind == 'candidate' and error_record and candidate.get('tool') == 'model':
+                # Pi model error (stopReason error): remember a wall for this delivery; its settled
+                # (failed) event then ends as a wall instead of an unconfirmed hold.
+                from cmux_fleet import brake
+                text = str(candidate.get('error') or '')[:brake.TURN_WALL_MAX]
+                if delivery.get('delivery_id') and brake.classify_wall(text):
+                    self.f.setf(slot, wall_error=dumps({'delivery_id': delivery['delivery_id'], 'text': text}))
             elif kind == 'settled':
                 self.settle(slot, ev)
                 env = ev.get('delivery') or {}
@@ -682,6 +697,37 @@ class RuntimeV2:
         self.audit('committed', slot=env['slot'], message_id=env['message_id'],
                    delivery_id=env['delivery_id'], request_id=env['request_id'], detail=result)
 
+    def wall_settle(self, slot, ev, env, msg):
+        """E: the turn ended on a usage wall (short official-CLI text, or a Pi model error for this delivery).
+        The turn is over, so execution has stopped: commit the delivery as `walled` (result not applied, never
+        a report), trip the brake, and queue the instruction again ONCE for after the pause / downgrade. A
+        replayed settled event finds the message committed (settle.late), so nothing is queued twice."""
+        from cmux_fleet import brake
+        text = ev.get('wall_text') if isinstance(ev.get('wall_text'), str) else ''
+        if not text:
+            pending = json.loads(self.f.agent(slot).get('wall_error') or 'null') or {}
+            text = pending.get('text', '') if pending.get('delivery_id') == env['delivery_id'] else ''
+        if not text or len(text.strip()) > brake.TURN_WALL_MAX or not brake.classify_wall(text):
+            return False
+        record = self.f.on_wall(slot, text, 'turn')
+        self.release(env, {'wall': record['wall']}, 'walled')
+        self.f.setf(slot, wall_error='')
+        body = msg['body'].get('text') or ''
+        if body:  # same request / kind / deadline / reply spec as the walled delivery: only the text gains a note
+            self.queue_index += 1
+            mid = 'm-' + digest(self.context['intent_id'] + ':' + str(self.queue_index))[:32]
+            again = dict(msg['body'], text=body if slot == 'supervisor' else brake.WALL_RESUME + body)
+            self.effects.hset(self.bus.msg_key(mid), dict(run_id=self.bus.run_id, slot=slot, message_id=mid,
+                body=_json(again), request_id=msg['request_id'], kind=msg.get('kind') or again.get('purpose') or '',
+                status='queued', deadline_at=msg['deadline_at'], created_at=int(time.time()*1000), attempt=0,
+                wall_of=env['message_id']))
+            self.effects.rpush(self.bus.pending_key(slot), mid)
+            self.audit('queued', slot=slot, message_id=mid, request_id=msg['request_id'], detail=again)
+        self.audit('brake.wall_requeued', slot=slot, message_id=env['message_id'], delivery_id=env['delivery_id'],
+                   level='warn', detail={'scope': record['wall']['scope'], 'requeued': bool(body)})
+        self.f.notify_later(record)
+        return True
+
     def remember(self, slot, business_value):
         # Preserve the original recent-reply input to the handoff skeleton. Store
         # candidate business data, before Python injects service correlation IDs.
@@ -717,6 +763,8 @@ class RuntimeV2:
         candidates = ev.get('candidates')
         purpose = msg['body'].get('purpose')
         error = None
+        if purpose != 'handoff' and self.wall_settle(slot, ev, env, msg):
+            return
         if ev.get('aborted') is not False or ev.get('failed') is not False or ev.get('unfinished'):
             self.hold(slot, 'aborted/error/unfinished settlement; execution stop unconfirmed', public_status='failed')
             return
@@ -1066,7 +1114,7 @@ class RuntimeV2:
 
     def brief(self, lost):
         """Re-queue lost dispatches (attempt-capped) and brief the new supervisor generation."""
-        from cmux_fleet.fleet import check_artifacts
+        from cmux_fleet.fleet import check_artifacts, extended_checks
         task = self.f.task()
         cap = int(self.f.cfg['max_attempts'])
         head = lambda text: ' '.join(text.split())[:200]
@@ -1090,7 +1138,7 @@ class RuntimeV2:
                 done.append((msg['committed_at'], '- ' + msg['slot'] + ': ' + head(msg['body']['text'])
                              + '\n  report: ' + dumps(msg.get('result') or {})[:600]))
         artifacts = json.loads(task.get('artifacts') or '[]')
-        checked = [(a['path'], check_artifacts([a], self.f.workspace(), task.get('contracts') == '1'))
+        checked = [(a['path'], check_artifacts([a], self.f.workspace(), extended_checks(task)))
                    for a in artifacts]
         state = self.f.contract_state()
         self.f.queue('supervisor', '[Resumed task ' + task['id'] + '] This run was interrupted and resumed with '
@@ -1153,6 +1201,7 @@ class RuntimeV2:
             self.f.setf(slot, state='busy', msg_id=env['message_id'], busy_since=time.time(),
                         request=env['request_id'], delivered=int(self.f.agent(slot).get('delivered') or 0)+1,
                         bridge_available=0)
+            self.f.brake_count('calls')
             self.audit('deliver', slot=slot, request_id=env['request_id'], message_id=env['message_id'],
                        delivery_id=env['delivery_id'], generation=env['generation'], detail=env['body'])
             if tui_slot(self.f.cfg, slot):
