@@ -11,5 +11,6 @@
   "cost_rank": 1,
   "latency_rank": 1,
   "risk_rank": 3,
-  "model": "flashnext/Qwen3.8-Flash-Next-Uncensored-oQ4e-100K-MTP"
+  "model": "flashnext/Qwen3.8-Flash-Next-Uncensored-oQ4e-100K-MTP",
+  "model_card": "flashnext"
 }

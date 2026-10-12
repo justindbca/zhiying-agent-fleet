@@ -2,7 +2,7 @@
 
 from dataclasses import asdict, dataclass
 import re
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from cmux_fleet.agent_registry import AgentCard, AgentRegistry
 
@@ -55,6 +55,32 @@ def _primary_capability(hints: Sequence[str]) -> str:
     return "planning"
 
 
+def host_matches(card: AgentCard, host: Optional[str]) -> bool:
+    """A card without ``hosts`` runs anywhere; otherwise case-insensitive match on the full
+    host name or its first label (``studio.local`` matches ``studio``)."""
+    if card.hosts is None or host is None:
+        return True
+    name = host.strip().lower()
+    allowed = {item.lower() for item in card.hosts}
+    return name in allowed or name.split(".", 1)[0] in allowed
+
+
+def _excluded(card: AgentCard, host: Optional[str], role: Optional[str],
+              occupancy: Optional[Mapping[str, int]]) -> Optional[str]:
+    """Why a card may not take this task (None: eligible). Cards without the fields are unrestricted."""
+    if not host_matches(card, host):
+        return "host %s not in %s" % (host, ",".join(card.hosts))
+    if role is not None:
+        if card.roles_denied and role in card.roles_denied:
+            return "role %s denied" % role
+        if card.roles_allowed is not None and role not in card.roles_allowed:
+            return "role %s not allowed" % role
+    if occupancy is not None and card.max_concurrent is not None:
+        if int(occupancy.get(card.id, 0)) >= card.max_concurrent:
+            return "max_concurrent %d reached" % card.max_concurrent
+    return None
+
+
 def _sort_key(card: AgentCard, overlap: int, primary: str,
               preferred_cli: Optional[str] = None) -> Tuple[Any, ...]:
     if primary in ("code-review", "safety-audit"):
@@ -69,12 +95,17 @@ def _sort_key(card: AgentCard, overlap: int, primary: str,
 
 def route_task(text: str, registry: Optional[AgentRegistry] = None, *,
                required_capability: Optional[str] = None,
-               preferred_cli: Optional[str] = None) -> RouteDecision:
+               preferred_cli: Optional[str] = None, host: Optional[str] = None,
+               role: Optional[str] = None,
+               occupancy: Optional[Mapping[str, int]] = None) -> RouteDecision:
     """Route by keywords, or exclusively by an explicitly required capability.
 
     A required capability must be supported by the selected card; unrelated task
     keywords do not affect eligibility or ranking. Omitting it preserves legacy routing.
     ``preferred_cli`` ranks cards on that CLI first among equally capable cards; None keeps legacy order.
+    Filters (each None = off, the legacy behaviour): ``host`` keeps cards whose ``hosts`` include it;
+    ``role`` drops cards that deny it or whose ``roles_allowed`` omit it; ``occupancy`` ({profile id:
+    slots now running it}) drops cards at their ``max_concurrent``. Filtering happens before ranking.
     """
     registry = registry or AgentRegistry()
     hints = classify_task(text)
@@ -86,12 +117,23 @@ def route_task(text: str, registry: Optional[AgentRegistry] = None, *,
     else:
         primary = _primary_capability(hints)
     effective_hints = hints or (primary,)
-    candidates = []
+    if role is not None and (not isinstance(role, str) or not role.strip()):
+        raise ValueError("role must be a non-empty string")
+    if host is not None and (not isinstance(host, str) or not host.strip()):
+        raise ValueError("host must be a non-empty string")
+    candidates, excluded = [], []
     for card in registry:
         overlap = len(set(effective_hints).intersection(card.capabilities))
         if overlap:
-            candidates.append((card, overlap))
+            why = _excluded(card, host, role and role.strip(), occupancy)
+            if why:
+                excluded.append("%s (%s)" % (card.id, why))
+            else:
+                candidates.append((card, overlap))
     if not candidates:
+        if excluded:
+            raise ValueError("no eligible agent for task capabilities %s; filtered out: %s"
+                             % (", ".join(effective_hints), "; ".join(excluded)))
         raise ValueError("no registered agent supports task capabilities: %s" % ", ".join(effective_hints))
     card, overlap = min(candidates, key=lambda item: _sort_key(item[0], item[1], primary, preferred_cli))
     confidence = .25 if not hints else round(overlap / len(effective_hints), 2)

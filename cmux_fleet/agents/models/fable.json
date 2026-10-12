@@ -1,0 +1,28 @@
+{
+  "id": "fable",
+  "display_name": "Claude Fable",
+  "cli": "claude",
+  "model": "fable",
+  "quota_pool": "claude",
+  "hosts": null,
+  "domains": null,
+  "context_window": 200000,
+  "handoff_ratio": null,
+  "max_concurrent": 1,
+  "roles_allowed": [
+    "orchestrator",
+    "falsifier",
+    "supervisor",
+    "consultant",
+    "final-writer"
+  ],
+  "roles_denied": [
+    "long-runner",
+    "implementer",
+    "line-checker"
+  ],
+  "judgement": "high",
+  "night_ok": true,
+  "measured": null,
+  "evidence": "design v2 §3（2026-10-13 初评）：R-WKF-033 约 28 个复核系列 1–2 轮 PASS，假 P0 1 例；能力上限 1M、预算 200K；fleet 监工零样本，Claude 监工适配层不存在（runtime_v2.py:40），夜间监工先补适配；CLI --model fable 未验（★2）。夜间只做监工或一次性会诊。不审自己写的方案。"
+}

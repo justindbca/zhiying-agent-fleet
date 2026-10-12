@@ -11,5 +11,6 @@
   "cost_rank": 3,
   "latency_rank": 2,
   "risk_rank": 2,
-  "model": "opus"
+  "model": "opus",
+  "model_card": "opus"
 }

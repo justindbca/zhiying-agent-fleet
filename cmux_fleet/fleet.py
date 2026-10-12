@@ -45,7 +45,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
 from cmux_fleet import contracts, handoff, history, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
-from cmux_fleet.agent_registry import AgentRegistry  # noqa: E402
+from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
 from cmux_fleet.planner import build_dispatch_plan  # noqa: E402
@@ -1591,8 +1591,10 @@ class Fleet:
             registry = AgentRegistry(registry_path)
             # Official Claude workers: prefer claude cards so a live switch never leaves the CLI
             # (v2 Codex supervisor + Claude workers rejects Pi/Codex workers). Pi/Codex fleets unchanged.
+            # Card hosts filter only when the operator named this machine (config 'host').
             plan = build_dispatch_plan(spec['goal'], registry,
-                                       'claude' if self.cfg.get('worker_cli') == 'claude' else None)
+                                       'claude' if self.cfg.get('worker_cli') == 'claude' else None,
+                                       host=self.cfg.get('host') or None)
             dispatch_plan = plan.to_dict()
             profile_assignments = assign_profiles(plan, self.active_workers(), registry)
         task_id = 'task-' + uuid.uuid4().hex[:10]
@@ -1821,6 +1823,18 @@ class Fleet:
         self.setf(name, ctx_used=used, ctx_window=window)
         return used, window
 
+    def handoff_ratio(self, name):
+        """The slot's profile card ratio (own or from its model card), else the fleet's --handoff-ratio."""
+        profile = self.agent(name).get('runtime_profile')
+        if profile:
+            try:
+                card = AgentRegistry(self.task().get('agent_registry') or None).get(profile)
+            except (AgentRegistryError, KeyError, OSError):
+                card = None
+            if card is not None and card.handoff_ratio is not None:
+                return card.handoff_ratio
+        return float(self.cfg['handoff_ratio'])
+
     def deliver(self, name):
         info = self.agent(name)
         if info.get('state') != 'idle':
@@ -1875,13 +1889,14 @@ class Fleet:
         used, window = self.usage(name)
         if subfleet.adopted(self.cfg, name, info.get('generation')):
             window = 0  # an adopted pane goes back to its parent fleet: never replace it with a successor
-        if window and used >= float(self.cfg['handoff_ratio']) * window:
+        ratio = self.handoff_ratio(name)
+        if window and used >= ratio * window:
             if int(info.get('delivered') or 0) == 0:
                 # A fresh session (only its READY turn so far) is already over the ratio: its
                 # baseline (system prompt + AGENTS.md) exceeds the budget, so rotating would spawn
                 # successors forever. Deliver anyway and say so once per generation.
                 self.log('rotate.impossible', agent=name, used=used, window=window,
-                         ratio=self.cfg['handoff_ratio'], reason='fresh session already over ratio; raise --handoff-ratio')
+                         ratio=ratio, reason='fresh session already over ratio; raise --handoff-ratio')
             elif agent_cli(self.runtime_cfg(name), name) == 'codex' and active_children(info.get('thread'), self.sessions):
                 # Hold the message: never feed a near-full session while its subagents run.
                 self.log('rotate.deferred', agent=name, reason='native subagents still running')
@@ -2494,6 +2509,7 @@ def start(args):
            'chrome_min_interval': args.chrome_min_interval, 'worker_cli': args.worker_cli,
            'worker_model': args.worker_model, 'worker_kit': args.worker_kit,
            'claude': args.claude or shutil.which('claude'), 'claude_window': args.claude_window,
+           'host': args.host.strip().lower() if args.host and args.host.strip() else None,
            'supervisor_cli': args.supervisor_cli, 'pi': pi, 'pi_model': args.pi_model,
            'pi_thinking': args.pi_thinking, 'allow_unsandboxed_pi': args.allow_unsandboxed_pi,
            'pi_agent_dir': args.pi_agent_dir, 'allow_profile_live_switch': args.allow_profile_live_switch,
@@ -2621,6 +2637,8 @@ def main(argv=None):
     s.add_argument('--worker-kit', help='claude workers: dir with .claude/{agents,skills} and mcp.json copied into each worker cwd')
     s.add_argument('--claude', help='claude binary (default: first on PATH)')
     s.add_argument('--claude-window', type=int, default=DEFAULTS['claude_window'], help='claude workers: context window')
+    s.add_argument('--host', default=None,
+                   help='this machine for agent-card hosts (e.g. studio); unset = cards are not filtered by host')
     s.add_argument('--mode', choices=('task', 'service'), default=DEFAULTS['mode'],
                    help='task: one goal until COMPLETED; service: resident, handles a stream of requests')
     s.add_argument('--worker-names', help='comma-separated worker names (default worker-1..N), e.g. exit,reentry,rung')

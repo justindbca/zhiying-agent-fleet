@@ -1,0 +1,27 @@
+{
+  "id": "haiku",
+  "display_name": "Claude Haiku",
+  "cli": "claude",
+  "model": "haiku",
+  "quota_pool": "claude",
+  "hosts": null,
+  "domains": null,
+  "context_window": 200000,
+  "handoff_ratio": null,
+  "max_concurrent": null,
+  "roles_allowed": [
+    "summarizer"
+  ],
+  "roles_denied": [
+    "reviewer",
+    "supervisor",
+    "implementer",
+    "plan-reviewer",
+    "falsifier",
+    "protocol-json"
+  ],
+  "judgement": "low",
+  "night_ok": true,
+  "measured": null,
+  "evidence": "design v2 §3（2026-10-13 初评）：fleet 零样本，暂定。说人话员摘要、格式类、日期正则兜底；不做任何判断与协议 JSON 产出（协议解析失败由 Python 宽容解析，不用它翻译）。"
+}

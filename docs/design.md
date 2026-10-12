@@ -290,6 +290,15 @@ Fleet agents（一个工作区）
 - `profile` 指 Codex 配置档名；Pi/Claude 上填写该字段明确报不支持，不猜测 CLI 参数。`role_file` 按 registry 解析且必须存在，拒绝路径/符号链接逃逸；角色作为附加指令保留基础 fleet 协议。缺省不附加。
 - 独立复核 worker（2026-10-13 用户要求“设置一个验收的 worker 单独去验收”）：`claude-reviewer` card 用 `role_file: reviewer.md`、`model: opus`。`reviewer.md` 是外部项目 `references/multi-round-review.md` 与 `.claude/rules-lib/R-WKF-033.md` 的 fleet 副本（最高原则、只读、只审给定范围、P0/P1/P2、报告模板、PASS=零 P0 零 P1），规范改了两处同步；它按上条附加在 worker 基础协议之后，回报仍是 Done/Evidence/Not done/Blocked，监工的产物验收不变。启用：`start --allow-profile-live-switch` + task `auto_agents: true` 与 `apply_profiles_live: true`，code-change plan 的 review 子任务即排到 `claude-reviewer`；不开 live 时只是 metadata 推荐，worker 仍跑原 CLI/角色。**v2 Codex 监工 + 官方 Claude worker 组合下的 profile 热切换尚未实测**（§11 对应小节“未验收”已列），只有 fake 回归；fleet `worker_cli=claude` 时 submit 以 `preferred_cli=claude` 规划（同能力卡里优先 claude 卡），code-change plan = `claude-coder`（claude/opus/worker.md）实现 + 依赖它的 `claude-reviewer` 复核，两张卡都过 v2 矩阵的 `preflight_profile`；pi/codex fleet 不传偏好，计划不变。research 仍只有 Codex 的 `researcher` 卡，该组合下 live 切过去仍会被拒。
 
+### 模型特点卡（2026-10-13，总设计 v2 §3；feat/model-cards）
+
+- **两层卡**：七张模型卡 `cmux_fleet/agents/models/{fable,opus,sonnet,haiku,sol,astra,flashnext}.json`（初评，取总设计 v2 §3），只是数据，**不参加路由**（`_load` 只扫 agents/ 下的文件，不扫子目录）；四张档案卡 id 不变（`claude-coder` / `claude-reviewer` / `flashnext-coder` / `researcher`），用 `model_card` 链到模型卡，自己没写的评估字段从模型卡继承（档案卡写了的以档案卡为准）。`claude-coder`、`claude-reviewer` → `opus`，`flashnext-coder` → `flashnext`，`researcher` 不链（Codex 缺省档未定是 Sol 还是 Astra）。档案卡与模型卡的 `cli` 必须一致。
+- **评估字段**（全可选；缺省 / null = 不限制或未知）：`quota_pool`（额度池名）、`hosts`（能跑的机器，字符串列表）、`domains`（允许的业务领域）、`context_window`（预算侧窗口，正整数；不是能力上限）、`handoff_ratio`（(0, 1]）、`max_concurrent`（本 fleet 票数，≥1）、`roles_allowed` / `roles_denied`（同一角色不能两边都列）、`judgement`（`high` / `mid` / `low-mid` / `low`）、`night_ok`（严格 bool）、`measured`（对象或 null，由记账员回填）、`evidence`（依据，字符串）。校验失败整份 registry 拒绝加载，与原字段一致。
+- **角色词表**（英文 slug ↔ 总设计角色）：`supervisor` 监工、`orchestrator` 编排者、`implementer` 实现者 / 机械实现、`fixer` 修复者、`reviewer` 复核 / 代码验收、`plan-reviewer` 方案审、`falsifier` 证伪者、`consultant` 会诊者、`researcher` 研究 worker / 网搜员、`reconciler` 对账员 / 断言抽取 / 取证员、`summarizer` 说人话员 / 格式类、`material` 材料加工 / 证据裁剪 / 事故夹具 / 生成端、`proposal-expert` proposal_only 专家、`final-writer` 写给用户的结论 / 对外定稿、`incident-analyst` 事故验尸假设员、`long-runner` 无硬超时长跑、`line-checker` 逐行核验、`protocol-json` 协议 JSON 产出。
+- **router**（`route_task(..., host=, role=, occupancy=)`，先过滤再排序；每个参数 None = 不过滤，与旧行为完全一致）：`host` 与卡的 `hosts` 比（不分大小写，全名或第一段，`studio.local` 配 `studio`）；`role` 被 `roles_denied` 列出或不在 `roles_allowed` 里就排除；`occupancy`（{档案 id: 正在跑它的槽数}）到 `max_concurrent` 就排除。全被过滤时报错写明每张卡被哪条过滤掉。`build_dispatch_plan` 透传 `host` / `occupancy`，不传 `role`。task 规划只在 fleet config 带 `host`（`start --host studio`）时按机器过滤；不给就不过滤（本机名不可靠，自动识别待拍板）。
+- **handoff_ratio 按档案**：投递前换代判断用本槽 `runtime_profile` 对应档案卡（含继承）的 `handoff_ratio`，没有档案或卡没写就用 fleet 的 `--handoff-ratio`。只改比例，窗口仍按 CLI 实测（`usage()` 不变）。当前 FlashNext 0.5、Opus 0.6（与缺省同），其余未写。
+- `judgement` / `night_ok` / `domains` / `quota_pool` / `measured` 在本项只是数据：夜间切换（B）、刹车（E）、记账员读取。
+
 ### 元数据的唯一含义
 
 | 字段 | 含义 |
