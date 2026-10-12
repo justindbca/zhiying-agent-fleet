@@ -4,18 +4,28 @@
       - name: exit            # required; same rules as --worker-names
         role: roles/exit.md   # optional; relative to this file's directory
       - name: reentry
+        profile: flashnext-coder  # optional agent card id: this slot's next generation runs that card
 
 The daemon re-reads the file while running (hot add / graceful remove). A file with any
 problem is rejected as a whole, with one reason per problem; the running roster stays.
+A changed `profile` swaps that slot to its next generation once it is idle (same slot name,
+docs/design.md §20 night switch); the card itself is resolved and checked by the daemon.
 """
 import re
 from pathlib import Path
 
 NAME_RE = r'[a-z][a-z0-9-]{0,30}'  # same as fleet.WORKER_NAME_RE: no dots (dots mark generations)
+PROFILE_RE = r'[a-z][a-z0-9-]{0,63}'  # same as agent_registry.AGENT_ID_RE
 
 
 def parse(raw, base):
     """Return (workers, roles): ordered names and {name: absolute role path}. ValueError lists every problem."""
+    workers, roles, _ = parse_entries(raw, base)
+    return workers, roles
+
+
+def parse_entries(raw, base):
+    """Return (workers, roles, profiles); profiles is {name: agent card id} for rows that set one."""
     try:
         import yaml
     except ImportError as exc:
@@ -30,11 +40,11 @@ def parse(raw, base):
     parse_limits(data.get('limits'))
     if not data['workers']:
         raise ValueError('the roster needs at least one worker')
-    errors, workers, roles = [], [], {}
+    errors, workers, roles, profiles = [], [], {}, {}
     for i, item in enumerate(data['workers']):
         where = 'workers[' + str(i) + ']'
-        if not isinstance(item, dict) or not set(item) <= {'name', 'role'} or 'name' not in item:
-            errors.append(where + ': must be a mapping with "name" and optional "role" only')
+        if not isinstance(item, dict) or not set(item) <= {'name', 'role', 'profile'} or 'name' not in item:
+            errors.append(where + ': must be a mapping with "name" and optional "role" / "profile" only')
             continue
         name = item['name']
         if not isinstance(name, str) or not re.fullmatch(NAME_RE, name) or name == 'supervisor':
@@ -44,6 +54,12 @@ def parse(raw, base):
             errors.append(where + ': duplicate worker name ' + name)
             continue
         workers.append(name)
+        if item.get('profile') is not None:
+            profile = item['profile']
+            if not isinstance(profile, str) or not re.fullmatch(PROFILE_RE, profile):
+                errors.append(where + ' (' + name + '): profile must be an agent card id matching ' + PROFILE_RE)
+                continue
+            profiles[name] = profile
         if item.get('role') is not None:
             role = item['role']
             path = (Path(base) / Path(role).expanduser()) if isinstance(role, str) and role.strip() else None
@@ -53,7 +69,7 @@ def parse(raw, base):
             roles[name] = str(path.resolve())
     if errors:
         raise ValueError('\n'.join(errors))
-    return workers, roles
+    return workers, roles, profiles
 
 
 LIMIT_KEYS = ('max_depth', 'max_children', 'max_agents_total', 'child_workers_max')
@@ -80,3 +96,8 @@ def load_limits(path):
 def load(path):
     path = Path(path).expanduser().resolve()
     return parse(path.read_bytes(), path.parent)
+
+
+def load_entries(path):
+    path = Path(path).expanduser().resolve()
+    return parse_entries(path.read_bytes(), path.parent)

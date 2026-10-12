@@ -158,7 +158,9 @@ def test_role_change_applies_at_next_generation_without_respawn(hot):
     ('workers:\n  - name: worker.2\n', 'no dots'),
     ('workers:\n  - name: supervisor\n', 'not be "supervisor"'),
     ('workers:\n  - {name: worker-1, role: nope.md}\n', 'role file not found: nope.md'),
-    ('workers:\n  - {name: worker-1, model: x}\n', 'optional "role" only'),
+    ('workers:\n  - {name: worker-1, model: x}\n', 'optional "role" / "profile" only'),
+    ('workers:\n  - {name: worker-1, profile: Bad_Id}\n', 'profile must be an agent card id'),
+    ('workers:\n  - {name: worker-1, profile: no-such-card}\n', 'worker-1: unknown agent profile no-such-card'),
     ('agents: []\n', 'only a "workers" list'),
 ])
 def test_invalid_roster_is_rejected_whole_and_roster_kept(hot, text, reason):

@@ -44,7 +44,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import contracts, handoff, history, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
+from cmux_fleet import contracts, handoff, history, night, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -788,6 +788,7 @@ class Fleet:
         # queued work, then retire; until then they still count as busy but take no new work.
         self.desired = list(self.workers)
         self.roster_stamp = self.roster_digest = None
+        self.roster_followed = None  # day or night roster file (night.json picks it)
         self.service = self.cfg.get('mode') == 'service'
         self.stopping = False
         self.next_liveness = 0
@@ -1069,6 +1070,7 @@ class Fleet:
         self.setf('supervisor', label=SUPERVISOR_LABEL)
         for name in self.workers:
             self.init_worker(name)
+            self.apply_roster_launch(name)
         for name in self.names:
             self.spawn_ready(name)
         history.write_page(self.run_dir, self.history_slots())
@@ -1825,7 +1827,9 @@ class Fleet:
         info = self.agent(name)
         if info.get('state') != 'idle':
             return
-        if self.v2 and not runtime_v2.tui_slot(self.cfg, name) and info.get('bridge_available') != '1':
+        if name != 'supervisor' and name in self.profile_swaps():
+            return  # the next generation (new profile) takes this queue once READY
+        if self.v2 and not runtime_v2.tui_slot(self.runtime_cfg(name), name) and info.get('bridge_available') != '1':
             return
         pending = self.v2.pending_text(name) if self.v2 else self.r.lrange(key('inbox', name), 0, 0)
         if not pending:
@@ -2018,9 +2022,13 @@ class Fleet:
 
     # -- hot roster (start --roster)
     def roster_tick(self):
-        path = self.cfg.get('roster')
+        path = night.roster_for(self.cfg)
         if not path:
             return
+        self.night_tick(path)
+        if path != self.roster_followed:  # night on/off: follow the other file from now on
+            self.roster_followed = path
+            self.roster_stamp = self.roster_digest = None
         try:
             st = os.stat(path)
             stamp = (st.st_mtime_ns, st.st_size)
@@ -2035,6 +2043,7 @@ class Fleet:
             if (info.get('state') in ('idle', 'dead') and not self.inbox_depth(name)
                     and not (self.v2 and self.r.hget(self.v2.bus.lease_key(name), 'current_delivery'))):
                 self.retire_worker(name)
+        self.profile_swap_tick()
 
     def reload_roster(self, path):
         try:
@@ -2050,13 +2059,14 @@ class Fleet:
         try:
             if problem:
                 raise ValueError(problem)
-            workers, roles = roster.parse(raw, Path(path).parent)
+            workers, roles, profiles = roster.parse_entries(raw, Path(path).parent)
             # A slot name used earlier in this run still has Redis state and a workspace.
             used = [n + ': name was already used in this run (agent state or workspace exists); pick a new name'
                     for n in workers if n not in self.workers
                     and (self.r.exists(key('agent', n)) or (self.workspace() / n).exists())]
             if used:
                 raise ValueError('\n'.join(used))
+            night.resolve_launches(self.cfg, profiles)  # unknown card or refused CLI pair: reject the whole file
         except ValueError as exc:
             self.log('roster.rejected', level='error', path=str(path), errors=str(exc).split('\n'),
                      kept=self.desired)
@@ -2067,6 +2077,10 @@ class Fleet:
         results.update({n: 'retiring when idle' for n in self.desired if n not in workers})
         results.update({n: 'role changed; applies at its next generation' for n in workers
                         if n in self.workers and roles.get(n) != old_roles.get(n)})
+        old_profiles = dict(self.cfg.get('worker_profiles') or {})
+        results.update({n: 'profile ' + (profiles.get(n) or 'run default') + '; next generation once idle'
+                        for n in workers if n in self.workers and profiles.get(n) != old_profiles.get(n)})
+        self.cfg['worker_profiles'] = profiles
         self.desired = workers
         # Retiring workers keep their role until gone (a handoff successor may still finish work).
         roles = dict({w: old_roles[w] for w in self.workers if w not in workers and w in old_roles}, **roles)
@@ -2074,7 +2088,7 @@ class Fleet:
         if adds:
             self.workers = self.workers + adds
             self.names = ['supervisor'] + self.workers
-        if adds or roles != old_roles:
+        if adds or roles != old_roles or profiles != old_profiles:
             # Hooks and bridges check membership in the config file: write it before spawning.
             self.persist_roster()
         for name in adds:
@@ -2086,7 +2100,8 @@ class Fleet:
 
     def persist_roster(self):
         self.cfg['workers'][:] = self.workers  # in place: the control view holds this list
-        fields = {'workers': list(self.workers), 'worker_roles': self.cfg.get('worker_roles') or {}}
+        fields = {'workers': list(self.workers), 'worker_roles': self.cfg.get('worker_roles') or {},
+                  'worker_profiles': self.cfg.get('worker_profiles') or {}}
         save(self.path, dict(load(self.path), **fields))
         try:
             latest = load(LATEST)
@@ -2098,6 +2113,7 @@ class Fleet:
     def add_worker(self, name):
         self.init_worker(name)
         try:
+            self.apply_roster_launch(name)
             pane = self.spawn_ready(name)
         except (Exception, SystemExit) as exc:
             self.setf(name, state='dead', launch_ready=0, runtime_ready=0)
@@ -2135,6 +2151,131 @@ class Fleet:
         self.persist_roster()  # its workspace stays: declared artifact paths must still verify
         self.refresh_history()
         self.log('roster.retired', agent=name, label=label, workers=self.workers)
+
+    # -- roster profiles / night switch (docs/design.md §20)
+    def apply_roster_launch(self, name):
+        """A slot that the roster gives a profile starts (or is added) running that card."""
+        profile = (self.cfg.get('worker_profiles') or {}).get(name)
+        if profile:
+            launch = night.resolve_launches(self.cfg, {name: profile})[name]
+            self.setf(name, runtime_launch=profile_launch.encode_launch(launch), roster_profile=profile)
+
+    def profile_swaps(self):
+        """Active slots whose roster profile differs from the one their generation runs."""
+        wanted = self.cfg.get('worker_profiles') or {}
+        return [n for n in self.active_workers() if (self.agent(n).get('roster_profile') or '') != (wanted.get(n) or '')]
+
+    def night_tick(self, path):
+        """Record a night on/off transition (audit + brake card placeholder for the budget code)."""
+        on = bool(self.cfg.get('roster_night')) and night.read_state(self.cfg['run'])['on']
+        prev = self.r.hget(night.NIGHT, 'on')
+        if prev == str(int(on)):
+            return
+        if prev is not None or on:
+            self.log('night.' + ('on' if on else 'off'), roster=str(path), brake_card='night' if on else 'day',
+                     supervisor='unchanged')
+        self.r.hset(night.NIGHT, mapping={'on': int(on), 'brake_card': 'night' if on else 'day', 'since': time.time()})
+
+    def profile_swap_tick(self):
+        pending = self.profile_swaps()
+        live = False
+        if pending and not self.service:
+            try:
+                live = profile_runtime.task_live_setting(self.task(), self.cfg['allow_profile_live_switch'])
+            except profile_runtime.ProfileRuntimeError:
+                live = True
+        for name in pending:
+            info = self.agent(name)
+            if live:  # a live task assignment owns this slot's runtime until the task ends
+                if info.get('roster_swap_deferred') != '1':
+                    self.setf(name, roster_swap_deferred=1)
+                    self.log('roster.profile_deferred', agent=name, reason='task apply_profiles_live owns the slot runtime')
+                continue
+            if (info.get('state') != 'idle' or info.get('idle_confirmed') == '0'
+                    or (self.v2 and self.r.hget(self.v2.bus.lease_key(name), 'current_delivery'))):
+                continue  # in-flight turns finish first
+            self.swap_profile(name)
+            if not self.running() and not self.service:
+                return
+        if self.r.hget(night.NIGHT, 'brief_due') == '1' and not self.profile_swaps() and not any(
+                self.agent(w).get('state') == 'starting' for w in self.active_workers()):
+            self.r.hset(night.NIGHT, mapping={'brief_due': 0})
+            self.breakpoint_brief()
+
+    def swap_profile(self, name):
+        """Same slot, next generation, the roster's profile; like a handoff, the queue stays on the slot."""
+        profile = (self.cfg.get('worker_profiles') or {}).get(name) or ''
+        info = self.agent(name)
+        try:
+            launch = night.resolve_launches(self.cfg, {name: profile})[name] if profile else None
+            if launch:
+                self.preflight_profile(launch)
+        except (OSError, ValueError, KeyError, SystemExit, subprocess.SubprocessError) as exc:
+            return self.block_profile(name, 'roster profile ' + (profile or 'run default') + ': ' + str(exc))
+        generation, old, prev = int(info['generation']), info.get('pane'), self.label(name)
+        if not old or self.mgr.get_pane_status(old) is None:
+            return self.block_profile(name, 'roster profile switch: the old runtime tab is missing', dead=True)
+        handoff_id = uuid.uuid4().hex[:8]
+        note = self.run_dir / 'handoffs' / (name + '-g' + str(generation) + '-' + handoff_id + '-profile.md')
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text(self.skeleton(name, dict(info, handoff_id=handoff_id)))
+        snapshot = note.with_suffix('.terminal.txt')
+        self.mgr.capture_to(old, str(snapshot))
+        history.record(self.run_dir, slot=name, label=prev, generation=generation, handoff=str(note),
+                       snapshot=str(snapshot), source='roster-profile', timed_out=False)
+        label = name + '.' + str(generation + 1)
+        # Fence old callbacks before the successor exists (same order as an idle profile switch).
+        self.setf(name, generation=generation + 1, label=label, prev_label=prev, handoff_id='',
+                  runtime_launch=profile_launch.encode_launch(launch) if launch else '', runtime_profile='',
+                  roster_profile=profile, roster_swap_deferred=0, launch_ready=0, retired_pane=old)
+        self.r.hset(NAMES, mapping={label: name})
+        self.r.hset(night.NIGHT, mapping={'brief_due': 1})
+        try:
+            new = self.spawn(name, '[Same-task takeover] You are ' + label + ' (taking over from ' + prev
+                             + ' on profile ' + (profile or 'run default') + '). Read the handoff note ' + str(note)
+                             + ' and continue from it. In this turn only read the note, do no task work, and make '
+                             'your final reply exactly READY.', launch_held=True)
+            if not self.mgr.tab_into(new, old):
+                raise RuntimeError('could not place the successor in the worker pane')
+            if not self.mgr.kill_pane(old) or self.mgr.get_pane_status(old) is not None:
+                raise RuntimeError('could not confirm retirement of the old runtime ' + prev)
+        except (Exception, SystemExit) as exc:
+            self.setf(name, launch_ready=0, state='dead')
+            return self.block_profile(name, 'roster profile switch failed: ' + str(exc), dead=True)
+        if self.v2:
+            self.v2.confirm_retired(name)
+        self.setf(name, launch_ready=1, retired_pane='')
+        self.refresh_history()
+        self.log('roster.profile_switched', agent=name, label=label, prev=prev, generation=generation + 1,
+                 profile=profile or 'run default', cli=agent_cli(self.runtime_cfg(name), name), handoff=str(note))
+
+    def breakpoint_brief(self):
+        """After a profile/night swap: tell the supervisor where the task stands (resume's summary)."""
+        t = self.task()
+        if self.service or t.get('status') != 'running':
+            return self.log('night.brief_skipped', reason='no running task')
+        wanted = self.cfg.get('worker_profiles') or {}
+        slots, kept = [], []
+        for w in self.active_workers():
+            slots.append('- ' + self.label(w) + ': ' + (wanted.get(w) or 'run default') + ' ('
+                         + agent_cli(self.runtime_cfg(w), w) + ')')
+            pending = self.v2.pending_text(w) if self.v2 else self.r.lrange(key('inbox', w), 0, 0)
+            if pending:
+                kept.append('- ' + self.label(w) + ' (' + str(self.inbox_depth(w)) + ' queued): '
+                            + ' '.join(pending[0].split())[:200])
+        night_on = self.r.hget(night.NIGHT, 'on') == '1'
+        self.queue('supervisor', '[' + ('Night' if night_on else 'Day') + ' switch ' + t['id'] + '] Workers moved to '
+                   'their ' + ('night' if night_on else 'day') + ' profiles at an idle boundary: same names, new '
+                   'generations that only read a handoff note. Work they finished stays finished.'
+                   + '\nGoal: ' + t.get('goal', '')
+                   + '\nWorkers now:\n' + '\n'.join(slots)
+                   + '\nWorkers you can dispatch to: ' + ', '.join(self.labels())
+                   + '\nShared output directory: ' + str(self.workspace())
+                   + (self.v2.progress(t) if self.v2 else '')
+                   + '\nQueued instructions kept on their slot (the new generation gets them; do NOT dispatch them again):\n'
+                   + ('\n'.join(kept) or '- none')
+                   + '\nDispatch only work that is still missing. Reply with the JSON format from AGENTS.md.')
+        self.log('night.brief', workers=self.labels(), kept=len(kept))
 
     # -- stall watchdog
     def last_activity(self, info):

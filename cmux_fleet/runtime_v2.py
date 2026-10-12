@@ -407,7 +407,7 @@ class RuntimeV2:
         kind = kind or ('supervisor' if slot == 'supervisor' else 'worker')
         # Prompt instructions remain business content. Transport labels are metadata.
         # Only Pi has the fleet_decision tool; official CLIs keep the AGENTS.md wording.
-        if not tui_slot(self.f.cfg, slot):
+        if not tui_slot(self.slot_cfg(slot), slot):
             text = text.replace('Reply with the service decision JSON from AGENTS.md.', 'Use fleet_decision to route this request.')
             text = text.replace('Reply with the JSON format from AGENTS.md.', 'Use fleet_decision when you have decided.')
             text = text.replace('Continue the current task using the AGENTS.md decision JSON.', 'Continue the current task using fleet_decision.')
@@ -554,7 +554,7 @@ class RuntimeV2:
                 # Fixed session binding: do not adopt a different same-generation Pi session.
                 if info.get('thread') and info['thread'] != ev.get('thread'):
                     raise ValueError('same-generation session replacement is unsupported')
-                if tui_slot(self.f.cfg, slot):
+                if tui_slot(self.slot_cfg(slot), slot):
                     self.tui_session(slot, ev)
                 else:
                     pi_adapter.event(self.f.cfg, slot, ev['generation'], dict(ev, kind='pi_session'))
@@ -646,7 +646,7 @@ class RuntimeV2:
         """Codex notify / Claude Stop binding: session id, and Claude's transcript only."""
         _short(ev.get('thread'), 'session_id')
         transcript = ev.get('transcript')
-        if (self.f.cfg.get('supervisor_cli' if slot == 'supervisor' else 'worker_cli')) == 'claude':
+        if (self.slot_cfg(slot).get('supervisor_cli' if slot == 'supervisor' else 'worker_cli')) == 'claude':
             if not isinstance(transcript, str) or not transcript.endswith('.jsonl') or not Path(transcript).is_absolute():
                 raise ValueError('Claude session binding requires its absolute transcript path')
         elif transcript != '':
@@ -809,7 +809,7 @@ class RuntimeV2:
                 error = 'task result requires done/evidence lists and not_done/blocked text'
             self.release(env, value, 'failed' if error else 'completed')
             retries = int(info.get('report_retries') or 0)
-            if error and tui_slot(self.f.cfg, slot) and retries < TUI_REPORT_RETRIES:
+            if error and tui_slot(self.slot_cfg(slot), slot) and retries < TUI_REPORT_RETRIES:
                 # Official CLIs report in free text (no fleet_result tool). Like the
                 # supervisor's correction path, ask this worker to resend through the
                 # normal FIFO delivery (new delivery/fence, same generation); never
@@ -973,7 +973,7 @@ class RuntimeV2:
         from cmux_fleet.fleet import RESUME_CLIS
         info = self.f.agent(slot)
         pane = info.get('pane')
-        return (tui_slot(self.f.cfg, slot) and info.get('runtime_ready') == '1' and not info.get('handoff_id')
+        return (tui_slot(self.slot_cfg(slot), slot) and info.get('runtime_ready') == '1' and not info.get('handoff_id')
                 and info.get('state') in ('idle', 'busy', 'held') and bool(pane)
                 and self.f.mgr.get_pane_status(pane) is not None and self.f.mgr.has_cli_process(pane, RESUME_CLIS))
 
@@ -1067,9 +1067,29 @@ class RuntimeV2:
         if history_pane:
             self.f.mgr.dock_control(history_pane)  # the new control tab joins history again
 
+    def progress(self, task):
+        """Where a task stands on disk and in Redis: verified / missing artifacts, accepted dispatches.
+        Shared by the resume brief and the night-switch brief (docs/design.md §17, §20)."""
+        from cmux_fleet.fleet import check_artifacts
+        head = lambda text: ' '.join(text.split())[:200]
+        done = []
+        for key in self.bus.r.scan_iter(match=self.prefix + ':message:*'):
+            msg = self.bus.message(key.rsplit(':', 1)[1])
+            if (msg.get('kind') == 'worker' and msg.get('request_id') == task['id']
+                    and msg.get('status') == 'committed' and msg.get('outcome') == 'completed'):
+                done.append((msg['committed_at'], '- ' + msg['slot'] + ': ' + head(msg['body']['text'])
+                             + '\n  report: ' + dumps(msg.get('result') or {})[:600]))
+        artifacts = json.loads(task.get('artifacts') or '[]')
+        checked = [(a['path'], check_artifacts([a], self.f.workspace(), task.get('contracts') == '1'))
+                   for a in artifacts]
+        return ('\nDeclared artifacts verified on disk: ' + json.dumps([p for p, bad in checked if not bad])
+                + '\nDeclared artifacts missing or failing: '
+                + json.dumps([p + ' (' + '; '.join(bad) + ')' for p, bad in checked if bad], ensure_ascii=False)
+                + '\nCompleted dispatches (their reports were accepted; do not redo them):\n'
+                + ('\n'.join(x for _, x in sorted(done)) or '- none'))
+
     def brief(self, lost):
         """Re-queue lost dispatches (attempt-capped) and brief the new supervisor generation."""
-        from cmux_fleet.fleet import check_artifacts
         task = self.f.task()
         cap = int(self.f.cfg['max_attempts'])
         head = lambda text: ' '.join(text.split())[:200]
@@ -1085,16 +1105,7 @@ class RuntimeV2:
             self.effects.hset(self.bus.msg_key(mid), {'replay': attempt})
             requeued.append('- ' + self.f.label(msg['slot']) + ' (attempt ' + str(attempt) + ' of ' + str(cap)
                             + '): ' + head(msg['body']['text']))
-        done = []
-        for key in self.bus.r.scan_iter(match=self.prefix + ':message:*'):
-            msg = self.bus.message(key.rsplit(':', 1)[1])
-            if (msg.get('kind') == 'worker' and msg.get('request_id') == task['id']
-                    and msg.get('status') == 'committed' and msg.get('outcome') == 'completed'):
-                done.append((msg['committed_at'], '- ' + msg['slot'] + ': ' + head(msg['body']['text'])
-                             + '\n  report: ' + dumps(msg.get('result') or {})[:600]))
-        artifacts = json.loads(task.get('artifacts') or '[]')
-        checked = [(a['path'], check_artifacts([a], self.f.workspace(), task.get('contracts') == '1'))
-                   for a in artifacts]
+        progress = self.progress(task)
         state = self.f.contract_state()
         self.f.queue('supervisor', '[Resumed task ' + task['id'] + '] This run was interrupted and resumed with '
                      'start --resume. You are a new supervisor generation: earlier decisions are not in your '
@@ -1102,11 +1113,7 @@ class RuntimeV2:
                      + '\nGoal: ' + task.get('goal', '')
                      + '\nWorkers you can dispatch to: ' + ', '.join(self.f.labels())
                      + '\nShared output directory: ' + str(self.f.workspace())
-                     + '\nDeclared artifacts verified on disk: ' + json.dumps([p for p, bad in checked if not bad])
-                     + '\nDeclared artifacts missing or failing: '
-                     + json.dumps([p + ' (' + '; '.join(bad) + ')' for p, bad in checked if bad], ensure_ascii=False)
-                     + '\nCompleted dispatches (their reports were accepted; do not redo them):\n'
-                     + ('\n'.join(x for _, x in sorted(done)) or '- none')
+                     + progress
                      + '\nLost dispatches the daemon already re-queued (do NOT dispatch them again):\n'
                      + ('\n'.join(requeued) or '- none')
                      + (('\nInterface contracts are on: read CONTRACTS.md in your directory and '
@@ -1158,7 +1165,7 @@ class RuntimeV2:
                         bridge_available=0)
             self.audit('deliver', slot=slot, request_id=env['request_id'], message_id=env['message_id'],
                        delivery_id=env['delivery_id'], generation=env['generation'], detail=env['body'])
-            if tui_slot(self.f.cfg, slot):
+            if tui_slot(self.slot_cfg(slot), slot):
                 self.type_into(slot, env)
 
     def type_into(self, slot, env):
@@ -1176,7 +1183,7 @@ class RuntimeV2:
                 raise BusError('offered delivery was not received by this generation')
             self.renewed[slot] = time.monotonic()
             pane = self.f.agent(slot).get('pane')
-            claude = self.f.cfg.get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') == 'claude'
+            claude = self.slot_cfg(slot).get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') == 'claude'
             if pane and self.f.mgr.send_prompt_to_idle(pane, got['body']['text'], bracketed=claude):
                 self.audit('tui.typed', slot=slot, message_id=env['message_id'], delivery_id=env['delivery_id'])
                 return True
@@ -1190,7 +1197,7 @@ class RuntimeV2:
         received leases while the runtime tab exists (stall/liveness checks still hold)."""
         period = min(10.0, self.bus.lease_ms / 3000.0)
         for slot in self.f.names:
-            if not tui_slot(self.f.cfg, slot) or time.monotonic() - self.renewed.get(slot, 0) < period:
+            if not tui_slot(self.slot_cfg(slot), slot) or time.monotonic() - self.renewed.get(slot, 0) < period:
                 continue
             state = self.bus.r.hgetall(self.bus.lease_key(slot))
             if state.get('status') != 'received' or not state.get('consumer', '').startswith('tui-'):
@@ -1247,8 +1254,12 @@ class RuntimeV2:
         env = self.bus.offer(slot, mid)
         if env:
             self.f.setf(slot, msg_id=mid, bridge_available=0)
-            if tui_slot(self.f.cfg, slot):
+            if tui_slot(self.slot_cfg(slot), slot):
                 self.type_into(slot, env)
+
+    def slot_cfg(self, slot):
+        """This slot's own CLI view: a roster/profile launch may run another worker CLI than the run default."""
+        return self.f.runtime_cfg(slot)
 
     def confirm_retired(self, slot):
         """Call only after cmux confirmed the old runtime process-tree/tab retirement."""
