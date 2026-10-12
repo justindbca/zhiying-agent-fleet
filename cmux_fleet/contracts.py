@@ -489,7 +489,7 @@ def dispatch(state, items, resolve):
 def releasable(state):
     """Held rows whose prerequisites are all done now."""
     tasks = state['tasks']
-    return [t for t in tasks.values() if t['status'] == 'pending'
+    return [t for t in tasks.values() if t['status'] == 'pending' and t.get('instruction')
             and all(tasks[d]['status'] == 'done' for d in t.get('depends_on') or [])]
 
 
