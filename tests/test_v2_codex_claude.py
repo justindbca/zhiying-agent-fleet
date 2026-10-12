@@ -73,7 +73,7 @@ def test_start_admits_codex_claude_task_to_provisioning(monkeypatch):
         raise Reached
     monkeypatch.setattr(cmux_manager, 'cmux_available', reached)
     with pytest.raises(Reached):
-        fleet.main(['start', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--workers', '6',
+        fleet.main(['start', '--lifecycle', 'dev_task', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--workers', '6',
                     '--allow-development-v2'])
 
 

@@ -44,7 +44,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import contracts, handoff, history, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
+from cmux_fleet import contracts, handoff, history, lifecycle, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -2279,6 +2279,11 @@ def save_result(run, task, status=None, reason=None, contract_summary=None):
         'artifacts': [dict(a, problems=check_artifacts([a], workspace, extended)) for a in artifacts]}
     if contract_summary:
         result['contracts'] = contract_summary
+    try:
+        cfg = load(Path(run) / 'config.json')
+    except (OSError, ValueError):
+        cfg = {}
+    result.update(mode=cfg.get('lifecycle'), base_mode=cfg.get('mode', 'task'))  # mode = lifecycle (None: legacy run)
     save(Path(run) / 'result.json', result)
 
 
@@ -2423,6 +2428,14 @@ def start(args):
             return
     if args.transport_version != 2:
         raise SystemExit('new fleet instances require Redis transport v2; v1 is only readable for existing runs')
+    lifecycle_problem = None
+    try:  # --lifecycle decides cfg['mode'] (its base) before the CLI-pair check reads both keys
+        args.lifecycle, args.mode = lifecycle.resolve_start(getattr(args, 'lifecycle', None), getattr(args, 'mode', None))
+    except ValueError as exc:
+        if getattr(args, 'lifecycle', None):
+            raise SystemExit(str(exc)) from exc
+        lifecycle_problem = str(exc)  # missing --lifecycle: refused below, after the config checks
+        args.lifecycle, args.mode = None, getattr(args, 'mode', None) or DEFAULTS['mode']
     try:
         runtime_v2.validate_config(vars(args))
     except ValueError as exc:
@@ -2436,6 +2449,11 @@ def start(args):
             workers, worker_roles = roster.load(roster_path)
         except (OSError, ValueError) as exc:
             raise SystemExit('--roster ' + str(roster_path) + ' rejected:\n' + str(exc)) from exc
+    if lifecycle_problem:
+        raise SystemExit(lifecycle_problem)
+    gate = lifecycle.clock_gate_problem(args.lifecycle)
+    if gate:
+        raise SystemExit(gate)
     if not cmux_available():
         raise SystemExit('run this inside a cmux terminal: cmux only accepts processes started in its windows')
     clis = {args.supervisor_cli, args.worker_cli}
@@ -2485,7 +2503,7 @@ def start(args):
     (run / 'workspace').mkdir(parents=True)
     cfg = {'run': str(run), 'python': sys.executable, **redis_cfg,
            'cmux_state_dir': str(mgr.meta_path.parent),
-           'workers': workers, 'mode': args.mode, 'roles': args.roles, 'max_busy': args.max_busy,
+           'workers': workers, 'mode': args.mode, 'lifecycle': args.lifecycle, 'roles': args.roles, 'max_busy': args.max_busy,
            'request_timeout': args.request_timeout, 'supervisor_profile': args.supervisor_profile,
            'worker_profile': args.worker_profile, 'profile': args.profile, 'codex': codex, 'redis_server': redis_server, 'codex_home': str(home),
            'handoff_ratio': args.handoff_ratio, 'handoff_timeout': args.handoff_timeout,
@@ -2516,7 +2534,7 @@ def start(args):
         connect(cfg).shutdown()
         raise SystemExit(result.error)
     save(LATEST, dict(cfg, config=str(run / 'config.json')))
-    print('fleet started (' + args.mode + ' mode): supervisor + ' + str(len(cfg['workers']))
+    print('fleet started (' + (args.lifecycle or '-') + ' lifecycle, ' + args.mode + ' mode): supervisor + ' + str(len(cfg['workers']))
           + ' worker(s) initialising. Run directory:', run)
 
 
@@ -2555,7 +2573,7 @@ def status(cfg):
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return
     r = connect(cfg)
-    print(json.dumps({'mode': cfg.get('mode', 'task'), 'task': r.hgetall(TASK), 'service': r.hgetall(SERVICE),
+    print(json.dumps({'mode': cfg.get('mode', 'task'), 'lifecycle': cfg.get('lifecycle'), 'task': r.hgetall(TASK), 'service': r.hgetall(SERVICE),
                       'pending_requests': r.llen(REQQ), 'daemon_beat': float(r.get('fx:daemon:beat') or 0),
                       'agents': {n: dict(r.hgetall(key('agent', n)), inbox=r.llen(key('inbox', n)))
                                  for n in ['supervisor'] + cfg['workers']}}, ensure_ascii=False, indent=2))
@@ -2621,8 +2639,11 @@ def main(argv=None):
     s.add_argument('--worker-kit', help='claude workers: dir with .claude/{agents,skills} and mcp.json copied into each worker cwd')
     s.add_argument('--claude', help='claude binary (default: first on PATH)')
     s.add_argument('--claude-window', type=int, default=DEFAULTS['claude_window'], help='claude workers: context window')
-    s.add_argument('--mode', choices=('task', 'service'), default=DEFAULTS['mode'],
-                   help='task: one goal until COMPLETED; service: resident, handles a stream of requests')
+    s.add_argument('--lifecycle', metavar='MODE',
+                   help='required: ' + ' | '.join(lifecycle.MODE_NAMES) + ' (config/fleet_modes.yaml); '
+                        'decides what done means, how the run is closed, and --mode')
+    s.add_argument('--mode', choices=('task', 'service'), default=None,
+                   help='transport mode, derived from --lifecycle (base); passing a different one is refused')
     s.add_argument('--worker-names', help='comma-separated worker names (default worker-1..N), e.g. exit,reentry,rung')
     s.add_argument('--roster', help='worker roster YAML (workers: [{name, role?}]); edits while running add or '
                                     'retire workers. Replaces --workers / --worker-names')
