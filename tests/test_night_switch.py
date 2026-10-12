@@ -6,6 +6,7 @@ the combination table (cli_pairs.yaml rows) that feature A will provide.
 """
 import json
 import os
+from pathlib import Path
 
 import pytest
 import yaml
@@ -65,21 +66,32 @@ def test_night_rosters_must_name_the_same_slots(tmp_path):
     assert night.check_rosters(cfg, day, other)['night'][2] == {'worker-1': 'claude-coder', 'worker-2': 'claude-coder'}
 
 
-def test_todays_matrix_refuses_a_flashnext_night_under_codex_claude(tmp_path):
-    """No loosening: codex supervisor + pi worker stays refused until the combination table admits it."""
+def test_todays_matrix_refuses_a_flashnext_night_under_codex_claude(tmp_path, pairs, monkeypatch):
+    """No loosening: codex supervisor + pi worker stays refused until the combination table admits it.
+    (Integration with A: the packaged table now lists codex+pi/task as verified after a real smoke, so
+    the refusal is checked on a table where the row is still unverified, and admission on A's own table.)"""
     cfg = dict(fleet.DEFAULTS, transport_version=2, supervisor_cli='codex', worker_cli='claude',
                allow_development_v2=True, mode='task')
     day, other = tmp_path / 'day.yaml', tmp_path / 'night.yaml'
     day.write_text('workers:\n  - name: worker-1\n')
     other.write_text('workers:\n  - {name: worker-1, profile: flashnext-coder}\n')
+    pairs(('codex', 'claude', 'task', 'verified'),
+          ('codex', 'pi', 'task', 'unverified', (), {'reason': 'transport v2 mixed Pi/Codex fleets are unvalidated'}))
     with pytest.raises(ValueError, match='mixed Pi/'):
         night.check_rosters(cfg, day, other)
+    from cmux_fleet import cli_pairs
+    monkeypatch.setattr(cli_pairs, 'DEFAULT_PATH', Path(cli_pairs.__file__).parent / 'config' / 'cli_pairs.yaml')
+    night.check_rosters(cfg, day, other)  # A's packaged table (codex+pi/task verified) admits the night pair
 
 
 # ------------------------------------------------------------------ start / CLI
-def test_start_checks_night_roster_before_provisioning(monkeypatch, tmp_path):
+def test_start_checks_night_roster_before_provisioning(monkeypatch, tmp_path, pairs):
     no_provisioning(monkeypatch)
-    base = ['start', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--allow-development-v2']
+    # D: start needs --lifecycle. A: codex+pi/task is verified in the packaged table, so the refusal
+    # below is checked on a table where that row is still unverified (same message as before A).
+    pairs(('codex', 'claude', 'task', 'verified'),
+          ('codex', 'pi', 'task', 'unverified', (), {'reason': 'transport v2 mixed Pi/Codex fleets are unvalidated'}))
+    base = ['start', '--lifecycle', 'dev_task', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--allow-development-v2']
     day = tmp_path / 'day.yaml'
     day.write_text('workers:\n  - name: exit\n')
     bad = tmp_path / 'bad.yaml'
@@ -489,3 +501,18 @@ def test_host_mismatch_at_swap_time_blocks_instead_of_swapping(hot, pairs, monke
     blocked, = audits(f, 'profile.blocked')
     assert blocked['agent'] == 'worker-2' and 'profile flashnext-coder runs only on' in blocked['reason']
     assert f.agent('worker-2')['label'] == 'worker-2' and not audits(f, 'roster.profile_switched')
+
+
+def test_night_swapped_slot_takes_its_card_handoff_ratio_through_the_one_resolver(hot, monkeypatch, pairs):
+    """Integration B x C x §22: a night swap only changes the slot's card; the handoff threshold then
+    comes from the single §22 resolver (card layer 3b), not from a second night-specific rule."""
+    f = hot
+    pairs(('codex', 'claude', 'task', 'verified'), ('codex', 'pi', 'task', 'verified'))
+    monkeypatch.setattr(f, 'preflight_profile', lambda launch: None)
+    f.cfg['pi_home'] = str(f.run_dir / 'pi-home')
+    f.cfg['roster'] = str(write_profiles(f, 'roster.yaml', {'worker-2': 'flashnext-coder'}))
+    f.tick()
+    assert f.agent('worker-2')['runtime_profile'] == 'flashnext-coder'
+    window, ratio, source = f.handoff_limits('worker-2')
+    assert ratio == .5 and source.endswith('ratio: card flashnext-coder')  # FlashNext card: 0.5
+    assert f.handoff_limits('worker-1')[1] == float(f.cfg['handoff_ratio'])  # day slot: fleet default
