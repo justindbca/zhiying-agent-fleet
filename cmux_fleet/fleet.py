@@ -241,16 +241,19 @@ def claude_transcript_usage(path, window):
 CLAUDE_1M = ('[1m]', 'opus', 'fable', 'sonnet')  # built-in: Claude models with a native 1,000,000-token window (code.claude.com/docs/en/model-config)
 
 
-def handoff_limits(cli, model, cfg, table=None, worker=None):
+def handoff_limits(cli, model, cfg, table=None, worker=None, card=None):
     """Effective (window, ratio, source) for one agent (docs/design.md §22).
 
     Window and ratio are resolved separately, first hit wins: the roster worker entry, the
     roster ``handoff`` table (``<cli>:<model>`` then ``<cli>``), the config ``handoff`` table
-    (same keys), then built-ins / start flags. ``window`` None means "measured" (Codex rollout,
-    Pi report). Only Claude needs a built-in: its transcript carries no window."""
+    (same keys), then the running profile's agent card (``card`` = (profile id, ratio): ratio only,
+    design.md §12 model cards), then built-ins / start flags. ``window`` None means "measured" (Codex
+    rollout, Pi report). Only Claude needs a built-in: its transcript carries no window."""
     layers = [('worker', worker or {})]
     for where, tab in (('roster', table or {}), ('config', cfg.get('handoff') or {})):
         layers += [(where + ' ' + k, tab[k]) for k in ((cli + ':' + model) if model else None, cli) if k and k in tab]
+    if card and card[1] is not None:
+        layers.append(('card ' + card[0], {'ratio': card[1]}))
     window = ratio = None
     for where, entry in layers:
         if window is None and 'window' in entry:
@@ -2462,7 +2465,8 @@ class Fleet:
         cfg = self.runtime_cfg(name)
         cli = agent_cli(cfg, name)
         model = cfg.get({'claude': 'worker_model', 'pi': 'pi_model'}.get(cli, 'codex_model')) or ''
-        limits = handoff_limits(cli, str(model), self.cfg, self.handoff_table, self.worker_handoff.get(name))
+        limits = handoff_limits(cli, str(model), self.cfg, self.handoff_table, self.worker_handoff.get(name),
+                                card=self.card_handoff_ratio(name))
         self.setf(name, handoff_window=limits[0] or 'measured', handoff_ratio=limits[1], handoff_source=limits[2])
         return limits
 
@@ -2514,17 +2518,23 @@ class Fleet:
         problem = self.model_usage(registry).admit(name, card)
         return ('wait', problem) if problem else None
 
-    def handoff_ratio(self, name):
-        """The slot's profile card ratio (own or from its model card), else the fleet's --handoff-ratio."""
+    def card_handoff_ratio(self, name):
+        """(profile id, ratio) from the slot's running profile card (own or from its model card), or
+        None. One layer of handoff_limits (design.md §22, below the roster / config tables)."""
         profile = self.agent(name).get('runtime_profile')
-        if profile:
-            try:
-                card = AgentRegistry(self.task().get('agent_registry') or None).get(profile)
-            except (AgentRegistryError, KeyError, OSError):
-                card = None
-            if card is not None and card.handoff_ratio is not None:
-                return card.handoff_ratio
-        return float(self.cfg['handoff_ratio'])
+        if not profile:
+            return None
+        try:
+            card = AgentRegistry(self.task().get('agent_registry') or None).get(profile)
+        except (AgentRegistryError, KeyError, OSError):
+            return None
+        return (profile, card.handoff_ratio) if card is not None and card.handoff_ratio is not None else None
+
+    def handoff_ratio(self, name):
+        """The slot's profile card ratio, else the fleet's --handoff-ratio (card layer only; the full
+        resolution incl. roster / config tables is handoff_limits)."""
+        card = Fleet.card_handoff_ratio(self, name)
+        return card[1] if card else float(self.cfg['handoff_ratio'])
 
     def deliver(self, name):
         info = self.agent(name)

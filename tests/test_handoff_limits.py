@@ -125,3 +125,16 @@ def test_control_view_shows_effective_handoff(cfx):
     assert agent['handoff_window'] == '1000000' and agent['handoff_ratio'] == '0.6'
     assert agent['handoff_source'] == 'window: built-in opus; ratio: --handoff-ratio'
     assert not control_view._secret_key('handoff_window') and not control_view._secret_key('handoff_source')
+
+
+def test_profile_card_ratio_is_one_layer_below_the_tables():
+    """Integration of §12 model cards into §22: the running profile card gives a ratio only, below
+    the roster / config tables and above --handoff-ratio; never a window."""
+    lim = fleet.handoff_limits
+    card = ('flashnext-coder', .5)
+    assert lim('pi', 'local/flash', CFG, card=card) == (None, .5, 'window: measured; ratio: card flashnext-coder')
+    assert lim('claude', 'haiku', CFG, card=card)[:2] == (200000, .5)  # window untouched by the card
+    assert lim('pi', 'local/flash', CFG, worker={'ratio': .8}, card=card)[1] == .8
+    assert lim('pi', 'local/flash', CFG, table={'pi': {'ratio': .7}}, card=card)[1] == .7
+    assert lim('pi', 'local/flash', dict(CFG, handoff={'pi': {'ratio': .65}}), card=card)[1] == .65
+    assert lim('pi', 'local/flash', CFG, card=('researcher', None))[1] == .6  # card without a ratio

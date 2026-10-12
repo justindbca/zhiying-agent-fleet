@@ -316,10 +316,10 @@ def test_start_without_profiles_refuses_more_default_slots_than_the_card_allows(
         pytest.fail('the default-model cap must be checked before cmux/Redis provisioning')
     monkeypatch.setattr(cmux_manager, 'cmux_available', forbidden)
     with pytest.raises(SystemExit, match=r'3 worker slots \(worker-1, worker-2, worker-3\) exceed max_concurrent 2'):
-        fleet.main(['start', '--supervisor-cli', 'pi', '--worker-cli', 'pi', '--workers', '3',
+        fleet.main(['start', '--lifecycle', 'dev_task', '--supervisor-cli', 'pi', '--worker-cli', 'pi', '--workers', '3',
                     '--pi-model', REG.model('flashnext').model, '--allow-development-v2'])
     with pytest.raises(SystemExit, match='exceed max_concurrent 1'):
-        fleet.main(['start', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--worker-names', 'a,b',
+        fleet.main(['start', '--lifecycle', 'dev_task', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--worker-names', 'a,b',
                     '--worker-model', REG.model('fable').model, '--allow-development-v2'])
 
 

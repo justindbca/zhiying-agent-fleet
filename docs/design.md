@@ -312,7 +312,7 @@ Fleet agents（一个工作区）
 - **并发（`cmux_fleet/model_usage.py`）**：计数单位是**模型**（档案卡按 `model_card`，未链的按自身 id；`claude-coder` + `claude-reviewer` 都记 `opus`）；**一个槽只记一次**，与代数无关（换代 / 同槽换卡不重复计）；槽跑的是本代 `runtime_launch` 冻结的卡（继任者 spawn 前就写入，所以同一拍里先决定的切换后面的判断已经看得到），没有就是 fleet 缺省，只按（cli, 模型串）精确匹配到模型卡，配不上就不计、不猜；**旧代占到 tab 真正关掉**：live 切换时槽同时占旧模型（`retired_pane` + `retired_launch`）和新模型，旧 tab 确认消失才放旧票，不提前释放；**新代起不来回滚预占**：切换失败、继任 tab 已关时 `runtime_launch` 写回旧值，失败的新代不占票；继任 tab 关不掉就继续占新模型；dead 槽不占，除非它的 tab 还活着（`Fleet.model_usage` 用 cmux 查 tab；查不到按活着算，不提前放票）；退役中的槽占到真正退掉；监工不计。真实派工路径：① submit 规划用 `Usage.for_planning(active)` 当 occupancy（某模型若已跑在可复用的在役槽上，该槽不再算占用），`assign_profiles(..., running=)` 让新档案优先落到已在跑同一模型的空槽；② 投递时的 live 切换先过 `Fleet.card_gate`：主机不符 → 阻塞 task（不暗换）；模型满 → 消息留在队列、`profile_state=pending`、审计 `profile.capacity_wait`（原因不变只记一次），每拍重试，有票即切；③ **缺省 runtime 同样受卡限**（`model_usage.default_problem`）：不带档案的 `start`（provisioning 之前，SystemExit）、名单热加新行（整份拒收，审计 `roster.rejected`）、子 fleet 委派（`subfleet.check` 拒绝）都按缺省模型的卡计票 + 主机；切回缺省用 `Fleet.card_gate(slot, None, registry)`；缺省配不上模型卡（含 Codex 档案名）= 不设限、不猜。续跑 / 旧 config 里已超票的只记 `capacity.over` 警告（已在跑的不杀）；④ 名单 / 夜间切换用 `model_usage.check_slots`（整份名单按模型计票 + 主机，缺省槽也按缺省模型自己的卡计），供 B 接（见 fleet 工作区 worker-3/C-interface.md）。`max_concurrent` 是本 fleet 票数，不跨 fleet。
 - **未核实字段**：卡上 `unverified` 列出缺外部事实的字段（Sol / Astra 的 `context_window` 留空；Fable 的 `model`；Haiku 的 `judgement`；FlashNext 的 `hosts`、`roles_allowed`），档案卡继承。
 - **`quota_pool`**：只写提供方额度族（`claude` / `codex` / `free-studio`）。Claude 的实际账号按机器（MBP + Studio = pool-a，macmini + 律师机 = pool-b，总设计 v2 §1.2，带时间戳的 `pools.json` 归额度调度员 / 刹车），不写进卡；Codex 账号未核实。
-- **handoff_ratio 按档案**：投递前换代判断用本槽 `runtime_profile` 对应档案卡（含继承）的 `handoff_ratio`，没有档案或卡没写就用 fleet 的 `--handoff-ratio`。只改比例，窗口仍按 CLI 实测（`usage()` 不变）。当前 FlashNext 0.5、Opus 0.6（与缺省同），其余未写。
+- **handoff_ratio 按档案**：本槽 `runtime_profile` 对应档案卡（含继承）的 `handoff_ratio` 是 §22 换代阈值解析的一层（排在名单 / config `handoff:` 表之后、`--handoff-ratio` 之前；集成分支 integration/batch-20261013 统一为一套解析，不另设第二套判定）。只给比例，窗口不从卡取（§22 内置表 / 实测不变）。当前 FlashNext 0.5、Opus 0.6（与缺省同），其余未写。
 - `judgement` / `night_ok` / `domains` / `quota_pool` / `measured` 在本项只是数据：夜间切换（B）、刹车（E）、记账员读取。
 
 ### 元数据的唯一含义
@@ -486,6 +486,7 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
   1. roster 该 worker 条目的 `window` / `handoff_ratio`；
   2. roster 顶层 `handoff:` 表，键先 `<cli>:<model>`（模型串精确匹配）再 `<cli>`，值 `{window?, ratio?}`；
   3. `config.json` 的同名 `handoff:` 表（静态，启动时校验，不热载）；
+  3b. 仅 ratio：本槽运行中档案卡（§12 模型特点卡，`runtime_profile` 含继承）的 `handoff_ratio`，来源显示 `card <档案 id>`（集成 C 时并入本层级，原 C 分支的单独 `handoff_ratio()` 判定不再直接用于换代）；
   4. 内置：Claude 模型名含 `[1m]` / `opus` / `fable` / `sonnet`（小写子串）→ 1,000,000，其余 Claude 模型 → `--claude-window`；Codex 取 rollout 自报 `model_context_window`、Pi 取自报 ctx_window（"measured"），只有显式 `window` 才覆盖；
   5. `--handoff-ratio`。两个旗标保留为最低层缺省，向后兼容。
 - **模型取当前运行值**：`runtime_cfg(name)`（含 profile 切换写入的 `runtime_launch.overrides`）里的 `worker_model`（Claude，监工同）/ `codex_model` / `pi_model`；监工走同一解析，只是没有 worker 条目。
