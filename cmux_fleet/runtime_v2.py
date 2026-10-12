@@ -66,6 +66,8 @@ def tui_slot(cfg, slot):
         cfg.get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') or 'codex') != 'pi'
 
 
+TUI_REPORT_RETRIES = 2  # corrections for an official-CLI task worker report before blocking
+
 IDENTITY = ('run_id', 'slot', 'generation', 'session_id', 'message_id', 'delivery_id',
             'stream_id', 'fence', 'consumer', 'request_id')
 
@@ -790,9 +792,23 @@ class RuntimeV2:
                     or not all(isinstance(value.get(k), str) for k in ('not_done', 'blocked'))):
                 error = 'task result requires done/evidence lists and not_done/blocked text'
             self.release(env, value, 'failed' if error else 'completed')
-            if error:
+            retries = int(info.get('report_retries') or 0)
+            if error and tui_slot(self.f.cfg, slot) and retries < TUI_REPORT_RETRIES:
+                # Official CLIs report in free text (no fleet_result tool). Like the
+                # supervisor's correction path, ask this worker to resend through the
+                # normal FIFO delivery (new delivery/fence, same generation); never
+                # invent done/evidence. Repeated failure still blocks the task.
+                self.f.setf(slot, report_retries=retries + 1)
+                self.audit('candidate.invalid', slot=slot, error=error, level='warn',
+                           detail={'retry': retries + 1, 'limit': TUI_REPORT_RETRIES})
+                self.f.queue(slot, 'Your last report is not in the AGENTS.md reply format (' + error
+                             + '). Do not redo the work. Resend only the report, one heading per line: '
+                             'Done: / Evidence: / Not done: / Blocked: (each heading followed by a colon).')
+            elif error:
                 self.f.finish('blocked', slot + ': ' + error)
             else:
+                if retries:
+                    self.f.setf(slot, report_retries=0)
                 self.ui(slot, result_card({'status': 'ok', 'worker': self.f.label(slot),
                     'message_id': env['message_id'], 'result': value}, execution_stopped=True))
                 self.remember(slot, value)

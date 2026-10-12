@@ -245,15 +245,41 @@ def test_duplicate_manual_and_old_generation_turns_are_rejected(mixed):
     assert f.r.llen(f.v2.bus.pending_key('supervisor')) == 1  # exactly one report follow-up
 
 
-def test_unparseable_worker_reply_is_not_success(mixed):
-    f = mixed
+def dispatch_one(f):
     submit(f)
     answer_turn(f, 'supervisor', decision(['worker-1']))
     f.pump()
-    env = f.v2.bus.slot_state('worker-1')
-    answer_turn(f, 'worker-1', 'I think it went fine.')
-    assert f.v2.bus.message(env['message_id'])['outcome'] == 'failed'
+
+
+def test_unparseable_worker_reply_gets_corrections_then_blocks(mixed):
+    f = mixed
+    dispatch_one(f)
+    for attempt in range(1, runtime_v2.TUI_REPORT_RETRIES + 1):
+        env = f.v2.bus.slot_state('worker-1')
+        answer_turn(f, 'worker-1', '## Done\nI wrote it. Anything else?')
+        assert f.v2.bus.message(env['message_id'])['outcome'] == 'failed'  # never a fake success
+        assert f.task()['status'] == 'running' and not f.paused()
+        assert f.agent('worker-2')['state'] == 'idle'
+        f.pump()  # correction goes through the normal delivery path: new delivery + fence
+        again = f.v2.bus.slot_state('worker-1')
+        assert again['status'] == 'received' and again['current_delivery'] != env['current_delivery']
+        assert int(again['fence']) > int(env['fence']) and again['generation'] == env['generation']
+        assert 'Done: / Evidence: / Not done: / Blocked:' in typed(f, 'worker-1')[-1]
+        assert f.r.llen(f.v2.bus.pending_key('supervisor')) == 0  # no bogus report
+    answer_turn(f, 'worker-1', 'Still prose.')
     assert f.task()['status'] == 'blocked'
+
+
+def test_corrected_worker_report_settles_and_resets_retries(mixed):
+    f = mixed
+    dispatch_one(f)
+    answer_turn(f, 'worker-1', 'I finished, it is in part.md.')
+    f.pump()
+    report = 'Done:\n- wrote part.md\nEvidence:\n- worker-1/part.md\nNot done: none\nBlocked: none'
+    assert answer_turn(f, 'worker-1', report)['status'] == 'committed'
+    assert f.task()['status'] == 'running' and f.agent('worker-1')['report_retries'] == '0'
+    f.pump()
+    assert typed(f, 'supervisor')[-1].startswith('[worker-1 report]')
 
 
 def test_max_busy_caps_only_when_set(mixed):
