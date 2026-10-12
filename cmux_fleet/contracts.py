@@ -548,14 +548,16 @@ def ready_claims(line):
 
 
 # ------------------------------------------------------------------ registry view
-def view(state, worker_cli):
-    """What agents read: registry + task table (+ program-filled consumers_runtime)."""
+def view(state, worker_cli, runtime=None):
+    """What agents read: registry + task table (+ program-filled consumers_runtime).
+    ``runtime``: worker slot -> (cli, Claude session name or None), refreshed by the daemon."""
     to = {m: t.get('to') for m, t in state['tasks'].items()}
+    runtime = runtime or {}
     interfaces = []
     for r in sorted(state['interfaces']):
         e = dict(state['interfaces'][r])
-        # TODO(next chunk: peer notices): session = fleet-prefixed Claude session name.
-        e['consumers_runtime'] = [{'m': m, 'worker': to.get(m), 'session': None, 'cli': worker_cli}
+        e['consumers_runtime'] = [{'m': m, 'worker': to.get(m), 'session': runtime.get(to.get(m), (None, None))[1],
+                                   'cli': runtime.get(to.get(m), (worker_cli, None))[0]}
                                   for m in e.get('consumers') or []]
         interfaces.append(e)
     return {'phase': state['phase'], 'interfaces': interfaces,
