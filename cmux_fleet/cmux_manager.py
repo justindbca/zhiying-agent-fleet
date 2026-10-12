@@ -322,8 +322,8 @@ class CmuxSessionManager:
         return PaneStatus(pane_id=pane_id, window_name=info.get('label', ''), alive=True,
                           metadata={k: v for k, v in info.items() if isinstance(v, str)})
 
-    def has_cli_process(self, pane_id: str) -> bool:
-        """A live surface may only contain a shell after its Codex process exits."""
+    def has_cli_process(self, pane_id: str, names: Tuple[str, ...] = ('codex',)) -> bool:
+        """A live surface may only contain a shell after its CLI process (default: Codex) exits."""
         ws = self._where(pane_id)
         if not ws:
             return False
@@ -331,7 +331,7 @@ class CmuxSessionManager:
         if not tty:
             return False
         result = subprocess.run(['ps', '-t', tty, '-o', 'comm='], capture_output=True, text=True)
-        return result.returncode == 0 and any(Path(line.strip()).name == 'codex' for line in result.stdout.splitlines())
+        return result.returncode == 0 and any(Path(line.strip()).name in names for line in result.stdout.splitlines())
 
     def capture_output(self, pane_id: str, lines: int = 2000) -> str:
         ws = self._where(pane_id)
