@@ -125,7 +125,7 @@ def test_effect_overlay_read_your_writes_and_source_immutability():
 def test_non_pi_profile_rejected_before_dependency_check_or_retirement(plan,monkeypatch):
     f,v,r,env=plan
     monkeypatch.setattr(fleet.shutil,'which',lambda name: (_ for _ in ()).throw(AssertionError('dependency check too late')))
-    with pytest.raises(ValueError,match='mixed Pi/Claude'):
+    with pytest.raises(ValueError,match='cannot change the worker CLI'):  # explicit since A x D (was: mixed Pi/Claude)
         f.preflight_profile({'overrides':{'worker_cli':'claude'}})
     assert not f.mgr.killed
 

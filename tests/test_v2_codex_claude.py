@@ -21,7 +21,12 @@ WORKERS = ['worker-' + str(i) for i in range(1, 7)]
 
 # ------------------------------------------------------------------ gate matrix
 CLIS = ('pi', 'codex', 'claude')
-ALLOWED = {('pi', 'pi', 'task'), ('pi', 'pi', 'service'), ('codex', 'claude', 'task')}
+# Real smokes (scripts/smoke_pair.sh, 2026-10-12) verified the codex+pi, codex+claude/service and
+# Claude-supervisor rows; codex+codex/task stays unverified (smoke-only).
+ALLOWED = {('pi', 'pi', 'task'), ('pi', 'pi', 'service'), ('codex', 'claude', 'task'),
+           ('codex', 'pi', 'task'), ('codex', 'pi', 'service'), ('codex', 'claude', 'service'),
+           ('claude', 'pi', 'task'), ('claude', 'pi', 'service'), ('claude', 'claude', 'task')}
+SMOKE_ONLY = {('codex', 'codex', 'task')}
 
 
 @pytest.mark.parametrize('mode', ['task', 'service'])
@@ -38,8 +43,9 @@ def test_v2_cli_matrix_allows_only_validated_pairs_with_reason(supervisor, worke
     with pytest.raises(ValueError) as exc:
         runtime_v2.validate_config(cfg)
     reason = str(exc.value)
-    if (supervisor, worker) == ('codex', 'claude'):
-        assert 'task mode only' in reason
+    if (supervisor, worker, mode) in SMOKE_ONLY:
+        assert 'Codex workers are unvalidated' in reason and '--lifecycle smoke' in reason
+        assert runtime_v2.validate_config(dict(cfg, lifecycle='smoke')) == 2
     elif supervisor == 'claude':
         assert 'no Claude supervisor adapter' in reason
     elif (supervisor, worker) == ('codex', 'codex'):
@@ -55,7 +61,7 @@ def no_provisioning(monkeypatch):
 
 
 @pytest.mark.parametrize('argv,match', [
-    (['--mode', 'service'], 'task mode only'),
+    (['--mode', 'service', '--lifecycle', 'dev_task'], 'runs on --mode task, not --mode service'),
     ([], 'allow-development-v2'),
 ])
 def test_start_rejects_codex_claude_before_provisioning(monkeypatch, argv, match):
@@ -73,14 +79,16 @@ def test_start_admits_codex_claude_task_to_provisioning(monkeypatch):
         raise Reached
     monkeypatch.setattr(cmux_manager, 'cmux_available', reached)
     with pytest.raises(Reached):
-        fleet.main(['start', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--workers', '6',
+        fleet.main(['start', '--lifecycle', 'dev_task', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--workers', '6',
                     '--allow-development-v2'])
 
 
 def test_inventory_reports_mixed_support_and_reason():
     ok = {'supervisor_cli': 'codex', 'worker_cli': 'claude', 'mode': 'task'}
     assert transport_inventory.v2_cli_problem(ok) is None
-    assert 'task mode only' in transport_inventory.v2_cli_problem(dict(ok, mode='service'))
+    assert transport_inventory.v2_cli_problem(dict(ok, mode='service')) is None   # verified by real smoke
+    assert 'Codex workers are unvalidated' in transport_inventory.v2_cli_problem(dict(ok, worker_cli='codex'))
+    assert transport_inventory.v2_cli_problem(dict(ok, worker_cli='codex', lifecycle='smoke')) is None
 
 
 # ------------------------------------------------------------------ live wiring

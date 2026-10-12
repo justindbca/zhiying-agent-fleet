@@ -541,8 +541,10 @@ def test_ids_levels_and_sessions():
 
 
 def test_v2_matrix_allows_claude_supervisor_only_for_adopted_subfleets():
+    # claude+claude/task is verified by a real smoke now; service (unlisted) still needs adopt-free refusal.
     base = dict(transport_version=2, allow_development_v2=True, supervisor_cli='claude', worker_cli='claude')
-    assert runtime_v2.v2_cli_problem(base)
+    assert runtime_v2.v2_cli_problem(base) is None
+    assert runtime_v2.v2_cli_problem(dict(base, mode='service'))
     assert runtime_v2.v2_cli_problem(dict(base, adopt={'pane': 'x'})) is None
     assert runtime_v2.v2_cli_problem(dict(base, adopt={'pane': 'x'}, mode='service'))
 

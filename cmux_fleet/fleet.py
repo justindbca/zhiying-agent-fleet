@@ -20,7 +20,8 @@ Subcommands
   agents    list or match offline agent profiles (does not contact a fleet)
   plan      build an offline dynamic dispatch plan (does not contact a fleet)
   notify    Codex notify hook (internal)
-  claude-stop  Claude Code Stop hook for claude workers (internal)
+  claude-stop  Claude Code Stop hook for claude agents (internal)
+  claude-prompt  Claude Code UserPromptSubmit hook of a v2 claude supervisor (internal)
   pi-event  Pi settled/session extension callback (internal)
   actor     exec the configured CLI for one agent (internal)
 """
@@ -38,13 +39,14 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import contracts, handoff, history, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
+from cmux_fleet import cli_pairs, contracts, handoff, history, lifecycle, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -75,6 +77,7 @@ CHROME_VERBS = {'check', 'tabs', 'newtab', 'go', 'url', 'js'}
 THREAD_RE = r'[0-9a-f-]{36}'
 DEFAULTS = {'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 100000, 'stall_timeout': 1800,
             'chrome_min_interval': 20, 'profile': 'fleet', 'worker_cli': 'codex', 'worker_model': 'sonnet',
+            'supervisor_model': 'opus',
             'claude_window': 200000, 'mode': 'task', 'max_busy': 0, 'request_timeout': 900,
             'apply_profiles_live': False, 'allow_profile_live_switch': False, 'profile_ready_timeout': 180,
             'transport_version': 1, 'allow_development_v2': False, 'max_attempts': 2}
@@ -669,6 +672,100 @@ def claude_user_prompts(path, count=3):
     return list(out)
 
 
+PROMPT_HOOK_TIMEOUT = 60  # seconds; Claude lets the prompt through when a hook times out or crashes
+PROMPT_DEADLINE = 40  # the hook's own hard stop: it blocks the prompt itself well before Claude's timeout
+PROMPT_WAIT = 20  # daemon acceptance wait, kept inside PROMPT_DEADLINE
+
+
+class PromptDeadline(Exception):
+    pass
+
+
+def claude_prompt_main(cfg_path, name, generation, raw, deadline=PROMPT_DEADLINE):
+    """Fail-closed wrapper of claude_prompt for the hook process: the decision JSON it returns
+    always blocks unless claude_prompt explicitly let the prompt through. A crash (non-zero exit)
+    or a hook timeout would make Claude Code pass the operator text to the model, bypassing the
+    design.md §5 queue, so every error and the PROMPT_DEADLINE alarm end in a block instead."""
+    def expire(signum, frame):
+        raise PromptDeadline
+    # The hook process runs this on its main thread; an embedding thread (tests) skips the alarm.
+    armed = threading.current_thread() is threading.main_thread()
+    if armed:
+        previous = signal.signal(signal.SIGALRM, expire)
+        signal.setitimer(signal.ITIMER_REAL, deadline)
+    try:
+        reason = claude_prompt(cfg_path, name, generation, raw, wait=min(PROMPT_WAIT, max(1.0, deadline - 10)))
+    except PromptDeadline:
+        reason = 'Fleet 输入未确认（超过 ' + str(deadline) + ' 秒）；请先查看 control 再决定是否重试。'
+    except Exception as exc:  # noqa: BLE001 - fail closed: never let operator text reach the model
+        reason = 'Fleet 输入未受理（' + type(exc).__name__ + ': ' + str(exc)[:200] + '）；请先查看 control。'
+    finally:
+        if armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+    return reason
+IMAGE_PLACEHOLDER = re.compile(r'\[Image #\d+\]')
+
+
+def prompt_hook_slot(cfg, name, generation=None):
+    """A fleet-launched v2 Claude supervisor (not a §19 adopted pane, whose hooks are the parent's)."""
+    return (name == 'supervisor' and cfg.get('transport_version') == 2 and is_claude(cfg, name)
+            and not subfleet.adopted(cfg, name, generation))
+
+
+def claude_prompt(cfg_path, name, generation, raw, wait=PROMPT_WAIT):
+    """UserPromptSubmit hook of a v2 Claude supervisor: the design.md §5 input boundary.
+
+    Returns None to let the prompt reach the model (the daemon-typed delivery, the spawn
+    prompt, slash commands), else the reason shown when the prompt is blocked. Operator
+    text is never answered off-protocol: it becomes an operator_input event (original
+    submit / queue / ui-<uuid> request semantics) and is typed back as a normal delivery.
+    """
+    data = json.loads(raw or '{}')
+    prompt = data.get('prompt') if isinstance(data.get('prompt'), str) else ''
+    cfg = load(cfg_path)
+    generation = int(generation)
+    if not prompt_hook_slot(cfg, name, generation) or not prompt.strip() or prompt.lstrip().startswith('/'):
+        return None
+    r = connect(cfg)
+    try:
+        bus = runtime_v2.bus_for(cfg, r)
+        info = r.hgetall(key('agent', name))
+        if int(info.get('generation', -1)) != generation or info.get('state') == 'dead':
+            return 'Fleet：这个终端属于已退役的监工代，输入未受理。'
+        if info.get('state') == 'starting':
+            try:
+                first = (Path(cfg['run']) / 'prompts' / (name + '-g' + str(generation) + '.md')).read_text()
+            except OSError:
+                first = ''
+            if runtime_v2.turn_answers(first, [prompt]):
+                return None
+            return 'Fleet 尚未 READY，输入未受理；请先检查启动状态。'
+        lease = r.hgetall(bus.lease_key(name))
+        if lease.get('status') == 'received' and lease.get('message_id'):
+            msg = bus.message(lease['message_id'])
+            if msg.get('generation') == generation and runtime_v2.turn_answers(msg['body']['text'], [prompt]):
+                return None
+        if IMAGE_PLACEHOLDER.search(prompt):
+            return 'Fleet 输入只支持文字，图片未转交；请改用图片文件路径后重发。'
+        correlation = 'ui-' + uuid.uuid4().hex
+        try:
+            runtime_v2.post_event(bus, dict(kind='operator_input', agent=name, generation=generation,
+                                            run_id=bus.run_id, thread=data.get('session_id'), text=prompt,
+                                            request_id=correlation), correlation)
+            answer = runtime_v2.wait_reply(bus, correlation, timeout=wait)
+        except (runtime_v2.redis.RedisError, runtime_v2.BusError, ValueError) as exc:
+            return 'Fleet 输入未确认（' + str(exc)[:200] + '）；请先查看 control 再决定是否重试。'
+        if answer.get('status') == 'accepted':
+            return ('Fleet：指令已排队（' + str(answer.get('id') or answer.get('task_id')) + '），'
+                    '监工会按派活流程处理；这段输入不会直接进入当前对话。')
+        if answer.get('status') == 'rejected':
+            return 'Fleet 输入被拒绝：' + str(answer.get('reason') or '原因未给出')
+        return 'Fleet 输入未确认（' + correlation + '）；请先查看 control 再决定是否重试。'
+    finally:
+        r.close(); r.connection_pool.disconnect()
+
+
 def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=None, settle_wait=30):
     """v2 turn end of an official interactive CLI (Codex notify / Claude Stop hook).
 
@@ -724,7 +821,8 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
         if not runtime_v2.turn_answers(msg['body']['text'], inputs):
             return ignored('turn was not started by the typed delivery')
         return call('settled', delivery={k: msg[k] for k in runtime_v2.IDENTITY},
-                    candidates=runtime_v2.tui_candidates(name, msg['body'].get('purpose'), text or ''),
+                    candidates=runtime_v2.tui_candidates(name, msg['body'].get('purpose'), text or '',
+                                                         msg['body'].get('mode') or cfg.get('mode') or 'task'),
                     failed=False, aborted=False, unfinished=False)
     finally:
         r.close(); r.connection_pool.disconnect()
@@ -764,14 +862,25 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
     settings = cwd / ('.fleet-settings-g' + str(generation) + '.json')
     # v2: the READY hook waits for the daemon, which may still be spawning other tabs.
     timeout = 30 if cfg.get('transport_version') != 2 else int(float(cfg.get('profile_ready_timeout') or 180)) + 30
-    settings.write_text(json.dumps({'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': hook, 'timeout': timeout}]}]}}))
-    argv = [cfg.get('claude') or 'claude', '--dangerously-skip-permissions', '--model', cfg.get('worker_model') or 'sonnet',
+    hooks = {'Stop': [{'hooks': [{'type': 'command', 'command': hook, 'timeout': timeout}]}]}
+    if prompt_hook_slot(cfg, name, generation):
+        # Operator input typed in the supervisor tab is queued as a daemon request (design.md §5).
+        hooks['UserPromptSubmit'] = [{'hooks': [{'type': 'command', 'timeout': PROMPT_HOOK_TIMEOUT, 'command': shlex.join(
+            [cfg['python'], str(Path(__file__).resolve()), 'claude-prompt', str(cfg_path), name, str(generation)])}]}]
+    settings.write_text(json.dumps({'hooks': hooks}))
+    argv = [cfg.get('claude') or 'claude', '--dangerously-skip-permissions', '--model', claude_model(cfg, name),
             '--settings', str(settings), '--add-dir', str(Path(cfg['run']) / 'workspace')]
     if name != 'supervisor':  # stable per slot across generations (peer messages address it)
         argv += ['--name', claude_session_name(cfg, name)]
     if (cwd / 'mcp.json').exists():
         argv += ['--mcp-config', str(cwd / 'mcp.json')]
     return argv + ['--', prompt]  # --add-dir / --mcp-config are variadic: end options first
+
+
+def claude_model(cfg, name):
+    if name == 'supervisor':
+        return cfg.get('supervisor_model') or DEFAULTS['supervisor_model']
+    return cfg.get('worker_model') or DEFAULTS['worker_model']
 
 
 def claude_session_name(cfg, name):
@@ -954,6 +1063,13 @@ class Fleet:
     def preflight_profile(self, launch):
         """Check dependencies before retiring anything. Never select a fallback CLI."""
         cfg = dict(self.cfg, **launch['overrides'])
+        if (self.v2 and cfg.get('worker_cli') != (self.cfg.get('worker_cli') or 'codex')):
+            # The pair table admits whole-run supervisor x worker CLI pairs; a v2 profile live switch
+            # that changes one slot's CLI (claude <-> pi bridge) mixes worker transports in one run,
+            # which no smoke covers. Kept refused explicitly now that mixed pairs can be verified.
+            raise ValueError('transport v2 profile live switch cannot change the worker CLI ('
+                             + str(self.cfg.get('worker_cli')) + ' -> ' + str(cfg.get('worker_cli'))
+                             + '); start a run with that worker CLI instead')
         runtime_v2.validate_config(cfg)  # reject unsupported v2 CLI before retirement
         cli = cfg['worker_cli']
         binary = cfg.get(cli) or cli
@@ -1043,8 +1159,11 @@ class Fleet:
     def role_scope(self, name, cfg, launch):
         """The AGENTS.md text of one agent (also written by a sub-fleet over its adopted pane)."""
         role = 'supervisor' if name == 'supervisor' else 'worker'
-        scope = (HERE / 'agents' / (('service_' if self.service else '') + role
-                                  + ('_v2' if self.v2 and is_pi(cfg, name) else '') + '.md')).read_text()
+        # v2 strips the [Request <id>] header (a transport id) before delivery and binds the id in
+        # code, so an official-CLI service supervisor gets the JSON-text role without request ids.
+        variant = ('_v2' if self.v2 and is_pi(cfg, name) else
+                   '_tui_v2' if self.v2 and self.service and role == 'supervisor' else '')
+        scope = (HERE / 'agents' / (('service_' if self.service else '') + role + variant + '.md')).read_text()
         if launch.get('role_text') and launch['role_text'].strip() != scope.strip():
             scope += '\n## Assigned profile role\n\n' + launch['role_text']
         roles = self.cfg.get('worker_roles') or {}
@@ -1104,7 +1223,7 @@ class Fleet:
             output_file=str(self.run_dir / 'prompts' / (name + '-g' + str(generation) + '.terminal.log')),
             auto_close=False, metadata={'type': role, 'cli_type': agent_cli(cfg, name),
                       'profile': (cfg.get('pi_model') if is_pi(cfg, name) else
-                                  cfg.get('worker_model') if is_claude(cfg, name) else agent_profile(cfg, name))},
+                                  claude_model(cfg, name) if is_claude(cfg, name) else agent_profile(cfg, name))},
             env_vars=dict({'PATH': os.environ.get('PATH', '')}, **(
                 pi_adapter.environment(cfg_path, cfg, name, generation) if is_pi(cfg, name)
                 else {'CODEX_HOME': str(codex_home(self.cfg))})))
@@ -1167,7 +1286,8 @@ class Fleet:
         elif kind == 'operator_input':
             try:
                 info = self.agent('supervisor')
-                if (ev.get('agent') != 'supervisor' or not is_pi(self.cfg, 'supervisor')
+                if (ev.get('agent') != 'supervisor'
+                        or not (is_pi(self.cfg, 'supervisor') or prompt_hook_slot(self.cfg, 'supervisor', ev.get('generation')))
                         or ev.get('generation') != int(info.get('generation', -1))
                         or ev.get('thread') != info.get('thread')
                         or info.get('state') not in ('idle', 'busy')):
@@ -2067,14 +2187,16 @@ class Fleet:
     def assign(self, rid, slot, instruction=None):
         spec = json.loads(self.r.hget(REQ + rid, 'spec'))
         self.r.hset(REQ + rid, mapping={'status': 'dispatched', 'worker': slot})
-        self.queue(slot, self.request_message(rid, spec, instruction))
+        self.queue(slot, self.request_message(rid, spec, instruction, slot=slot))
 
-    def request_message(self, rid, spec, instruction=None, prefix=''):
+    def request_message(self, rid, spec, instruction=None, prefix='', slot=None):
         reply = spec['reply']
         keys = ', '.join(reply['required'])
         if reply.get('allowed') is not None:
             keys += ' (allowed keys: ' + ', '.join(reply['allowed']) + ')'
-        if self.v2:
+        # Only Pi has the fleet_result tool; official CLIs (Codex/Claude TUIs) keep the
+        # service_worker.md wording and are mapped by runtime_v2.tui_candidates.
+        if self.v2 and not (slot and runtime_v2.tui_slot(self.cfg, slot)):
             return ('[Request ' + rid + '] ' + prefix + (instruction or 'Handle this request as your role describes.').strip()
                     + '\nPayload (JSON):\n' + json.dumps(spec['payload'], ensure_ascii=False, indent=1)
                     + '\nUse fleet_result with a business JSON object with keys: ' + keys + '.')
@@ -2687,6 +2809,11 @@ def save_result(run, task, status=None, reason=None, contract_summary=None):
         'artifacts': [dict(a, problems=check_artifacts([a], workspace, extended)) for a in artifacts]}
     if contract_summary:
         result['contracts'] = contract_summary
+    try:
+        cfg = load(Path(run) / 'config.json')
+    except (OSError, ValueError):
+        cfg = {}
+    result.update(mode=cfg.get('lifecycle'), base_mode=cfg.get('mode', 'task'))  # mode = lifecycle (None: legacy run)
     save(Path(run) / 'result.json', result)
 
 
@@ -2831,6 +2958,24 @@ def start(args):
             return
     if args.transport_version != 2:
         raise SystemExit('new fleet instances require Redis transport v2; v1 is only readable for existing runs')
+    # A new run without an explicit CLI takes the pair table's default combination (codex+claude,
+    # Codex supervisor on the table's profile, e.g. fleet-astra); the config written below always
+    # names both CLIs, so the codex fallback in pair_problem only serves old configs.
+    default = cli_pairs.load_pairs().default
+    args.supervisor_cli = getattr(args, 'supervisor_cli', None) or default.get('supervisor_cli') or 'codex'
+    args.worker_cli = getattr(args, 'worker_cli', None) or default.get('worker_cli') or 'codex'
+    if (args.supervisor_cli == 'codex' and default.get('supervisor_profile')
+            and not getattr(args, 'supervisor_profile', None) and not getattr(args, 'profile', None)):
+        args.supervisor_profile = default['supervisor_profile']
+    args.profile = getattr(args, 'profile', None) or DEFAULTS['profile']
+    lifecycle_problem = None
+    try:  # --lifecycle decides cfg['mode'] (its base) before the CLI-pair check reads both keys
+        args.lifecycle, args.mode = lifecycle.resolve_start(getattr(args, 'lifecycle', None), getattr(args, 'mode', None))
+    except ValueError as exc:
+        if getattr(args, 'lifecycle', None):
+            raise SystemExit(str(exc)) from exc
+        lifecycle_problem = str(exc)  # missing --lifecycle: refused below, after the config checks
+        args.lifecycle, args.mode = None, getattr(args, 'mode', None) or DEFAULTS['mode']
     try:
         runtime_v2.validate_config(vars(args))
     except ValueError as exc:
@@ -2844,6 +2989,11 @@ def start(args):
             workers, worker_roles = roster.load(roster_path)
         except (OSError, ValueError) as exc:
             raise SystemExit('--roster ' + str(roster_path) + ' rejected:\n' + str(exc)) from exc
+    if lifecycle_problem:
+        raise SystemExit(lifecycle_problem)
+    gate = lifecycle.clock_gate_problem(args.lifecycle)
+    if gate:
+        raise SystemExit(gate)
     if not cmux_available():
         raise SystemExit('run this inside a cmux terminal: cmux only accepts processes started in its windows')
     clis = {args.supervisor_cli, args.worker_cli}
@@ -2893,7 +3043,7 @@ def start(args):
     (run / 'workspace').mkdir(parents=True)
     cfg = {'run': str(run), 'python': sys.executable, **redis_cfg,
            'cmux_state_dir': str(mgr.meta_path.parent),
-           'workers': workers, 'mode': args.mode, 'roles': args.roles, 'max_busy': args.max_busy,
+           'workers': workers, 'mode': args.mode, 'lifecycle': args.lifecycle, 'roles': args.roles, 'max_busy': args.max_busy,
            'request_timeout': args.request_timeout, 'supervisor_profile': args.supervisor_profile,
            'worker_profile': args.worker_profile, 'profile': args.profile, 'codex': codex, 'redis_server': redis_server, 'codex_home': str(home),
            'handoff_ratio': args.handoff_ratio, 'handoff_timeout': args.handoff_timeout,
@@ -2901,6 +3051,7 @@ def start(args):
            'compact_limit': args.compact_limit, 'chrome_script': args.chrome_script,
            'chrome_min_interval': args.chrome_min_interval, 'worker_cli': args.worker_cli,
            'worker_model': args.worker_model, 'worker_kit': args.worker_kit,
+           'supervisor_model': args.supervisor_model,
            'claude': args.claude or shutil.which('claude'), 'claude_window': args.claude_window,
            'supervisor_cli': args.supervisor_cli, 'pi': pi, 'pi_model': args.pi_model,
            'pi_thinking': args.pi_thinking, 'allow_unsandboxed_pi': args.allow_unsandboxed_pi,
@@ -2924,7 +3075,7 @@ def start(args):
         connect(cfg).shutdown()
         raise SystemExit(result.error)
     save(LATEST, dict(cfg, config=str(run / 'config.json')))
-    print('fleet started (' + args.mode + ' mode): supervisor + ' + str(len(cfg['workers']))
+    print('fleet started (' + (args.lifecycle or '-') + ' lifecycle, ' + args.mode + ' mode): supervisor + ' + str(len(cfg['workers']))
           + ' worker(s) initialising. Run directory:', run)
 
 
@@ -2963,7 +3114,7 @@ def status(cfg):
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return
     r = connect(cfg)
-    print(json.dumps({'mode': cfg.get('mode', 'task'), 'task': r.hgetall(TASK), 'service': r.hgetall(SERVICE),
+    print(json.dumps({'mode': cfg.get('mode', 'task'), 'lifecycle': cfg.get('lifecycle'), 'task': r.hgetall(TASK), 'service': r.hgetall(SERVICE),
                       'pending_requests': r.llen(REQQ), 'daemon_beat': float(r.get('fx:daemon:beat') or 0),
                       'agents': {n: dict(r.hgetall(key('agent', n)), inbox=r.llen(key('inbox', n)))
                                  for n in ['supervisor'] + cfg['workers']}}, ensure_ascii=False, indent=2))
@@ -2994,7 +3145,9 @@ def main(argv=None):
                    help='new runs require Redis v2; existing v1 runs must be drained and replaced, not hot-flipped')
     s.add_argument('--allow-development-v2', action='store_true',
                    help='opt into incomplete v2 acceptance; no production-readiness claim')
-    s.add_argument('--profile', default=DEFAULTS['profile'], help='codex config profile for every agent (default: fleet)')
+    s.add_argument('--profile', default=None,
+                   help='codex config profile for every agent (default: fleet; the supervisor takes '
+                        'cli_pairs.yaml default.supervisor_profile unless --profile/--supervisor-profile is given)')
     s.add_argument('--codex', help='codex binary (default: first on PATH)')
     s.add_argument('--redis-server', help='redis-server binary (default: first on PATH)')
     s.add_argument('--redis-runtime-dir', default=str(redis_runtime.DEFAULT_ROOT),
@@ -3014,9 +3167,11 @@ def main(argv=None):
     s.add_argument('--compact-limit', type=int, help='codex model_auto_compact_token_limit (default: codex decides)')
     s.add_argument('--chrome-script', help='optional browser broker script run by the daemon for sandboxed agents')
     s.add_argument('--chrome-min-interval', type=float, default=DEFAULTS['chrome_min_interval'])
-    s.add_argument('--supervisor-cli', choices=('codex', 'pi'), default='codex', help='CLI for the supervisor')
-    s.add_argument('--worker-cli', choices=('codex', 'claude', 'pi'), default=DEFAULTS['worker_cli'],
-                   help='CLI for workers')
+    s.add_argument('--supervisor-cli', choices=('codex', 'pi', 'claude'), default=None,
+                   help='CLI for the supervisor (default: cli_pairs.yaml default)')
+    s.add_argument('--supervisor-model', default=DEFAULTS['supervisor_model'], help='claude supervisor: --model value')
+    s.add_argument('--worker-cli', choices=('codex', 'claude', 'pi'), default=None,
+                   help='CLI for workers (default: cli_pairs.yaml default)')
     s.add_argument('--pi', help='pi binary (>= 1.1.0; default: first on PATH)')
     s.add_argument('--pi-model', help='explicit provider/model for all pi agents; no implicit cloud fallback')
     s.add_argument('--pi-thinking', choices=('off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'), default='off')
@@ -3030,8 +3185,11 @@ def main(argv=None):
     s.add_argument('--worker-kit', help='claude workers: dir with .claude/{agents,skills} and mcp.json copied into each worker cwd')
     s.add_argument('--claude', help='claude binary (default: first on PATH)')
     s.add_argument('--claude-window', type=int, default=DEFAULTS['claude_window'], help='claude models not in the built-in 1M list ([1m]/opus/fable/sonnet): context window (§22)')
-    s.add_argument('--mode', choices=('task', 'service'), default=DEFAULTS['mode'],
-                   help='task: one goal until COMPLETED; service: resident, handles a stream of requests')
+    s.add_argument('--lifecycle', metavar='MODE',
+                   help='required: ' + ' | '.join(lifecycle.MODE_NAMES) + ' (config/fleet_modes.yaml); '
+                        'decides what done means, how the run is closed, and --mode')
+    s.add_argument('--mode', choices=('task', 'service'), default=None,
+                   help='transport mode, derived from --lifecycle (base); passing a different one is refused')
     s.add_argument('--worker-names', help='comma-separated worker names (default worker-1..N), e.g. exit,reentry,rung')
     s.add_argument('--roster', help='worker roster YAML (workers: [{name, role?}]); edits while running add or '
                                     'retire workers. Replaces --workers / --worker-names')
@@ -3115,6 +3273,9 @@ def main(argv=None):
     h = sub.add_parser('claude-stop', help='Claude Code Stop hook (internal; hook JSON on stdin)')
     for arg in ('cfg', 'agent', 'generation'):
         h.add_argument(arg)
+    h = sub.add_parser('claude-prompt', help='Claude Code UserPromptSubmit hook (internal; hook JSON on stdin)')
+    for arg in ('cfg', 'agent', 'generation'):
+        h.add_argument(arg)
     h = sub.add_parser('pi-event', help='Pi extension callback (internal; event JSON on stdin)')
     for arg in ('cfg', 'agent', 'generation'):
         h.add_argument(arg)
@@ -3131,6 +3292,10 @@ def main(argv=None):
         notify(args.cfg, args.agent, args.generation, args.payload)
     elif args.cmd == 'claude-stop':
         claude_stop(args.cfg, args.agent, args.generation, sys.stdin.read())
+    elif args.cmd == 'claude-prompt':
+        reason = claude_prompt_main(args.cfg, args.agent, args.generation, sys.stdin.read())
+        if reason:  # nothing at all on pass: a UserPromptSubmit hook's stdout becomes model context
+            print(json.dumps({'decision': 'block', 'reason': reason}, ensure_ascii=False))
     elif args.cmd == 'pi-event':
         pi_event(args.cfg, args.agent, args.generation, sys.stdin.read(1000001))
     elif args.cmd == 'actor':

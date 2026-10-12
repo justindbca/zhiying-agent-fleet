@@ -383,7 +383,7 @@ def test_auto_resume_of_finished_run_starts_a_new_run(tmp_path, monkeypatch):
     fleet.save(fleet.LATEST, {'run': str(run), 'config': str(run / 'config.json')})
     monkeypatch.setattr(cmux_manager, 'cmux_available', reached)
     with pytest.raises(Reached):  # the normal new-start path
-        fleet.main(['start', '--resume', 'auto', '--supervisor-cli', 'codex', '--worker-cli', 'claude',
+        fleet.main(['start', '--resume', 'auto', '--lifecycle', 'dev_task', '--supervisor-cli', 'codex', '--worker-cli', 'claude',
                     '--allow-development-v2'])
 
 

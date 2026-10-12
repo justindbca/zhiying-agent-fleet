@@ -1,0 +1,48 @@
+# Lifecycle modes (docs: us-stock-option tasks/plans/cmux-fleet-lifecycle-modes-20261013.md §4).
+# A lifecycle decides what "done" means and how a run is closed after done / blocked / timeout.
+# `start --lifecycle <mode>` is required; `base` maps it onto the transport mode (cfg['mode']:
+# task | service). The daemon re-reads this file when its mtime changes (no restart needed).
+version: 1
+require_mode_on_start: true          # start without --lifecycle -> refused
+common:
+  on_blocked: {hold_hours: 12, then: stop_keep_resumable, notify: [tg, parent]}
+  on_budget_exhausted: {hold_hours: 12, then: stop_keep_resumable, notify: [tg, parent]}
+  close_workspace_after_stop: true
+  notify_parent_session: true
+modes:
+  service:
+    base: service
+    on_complete: never
+    worker_idle_reclaim_min: 30
+    idle_stop_hours: null            # null = never stops by itself
+    stop: user_only
+    clock_gate: false
+  dev_task:
+    base: task
+    done_when: merged_to_deploy_branch_and_enqueued
+    require_integrator_worker: true
+    review_step: {reviewer: opus, must_pass: true}   # master design v2 §4.14 (draft said fable)
+    on_complete: stop_and_close
+    notify: [tg, parent]
+  program:
+    base: task                       # each phase runs as a child dev_task fleet
+    resident: false
+    child_mode: dev_task
+    ledger: program_ledger.json
+    done_when: last_phase_merged_and_review_pass
+  scheduled:
+    base: task
+    hard_timeout_min: 45
+    on_complete: stop_and_close
+    on_fail: stop_and_close
+    clock_gate: true                 # trading-day gate via global_clock; market closed -> not launched
+    clock_market: US
+  review_loop:
+    base: task
+    max_rounds: 3
+    on_pass: stop_and_close
+    on_cap: stop_and_report
+  smoke:
+    base: task
+    bases: [task, service]           # pair acceptance (A cli_pairs.yaml): `--mode service` smokes a service pair
+    on_any_end: stop_and_close
