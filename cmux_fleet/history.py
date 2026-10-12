@@ -59,7 +59,8 @@ def write_page(run_dir, slots):
                  'source': e.get('source'), 'timed_out': bool(e.get('timed_out')),
                  'screen': _read(e.get('snapshot'), SNAPSHOT_LIMIT), 'note': _read(e.get('handoff'))}
                 for e in rows if e.get('slot') == slot]
-        data.append({'slot': slot, 'title': title, 'live': live, 'gens': gens})
+        cards = _read(Path(run_dir) / 'cards' / (slot + '.log'), SNAPSHOT_LIMIT)  # tui_cards (official CLIs)
+        data.append({'slot': slot, 'title': title, 'live': live, 'gens': gens, 'cards': cards})
     blob = json.dumps({'run': str(run_dir), 'updated': time.time(), 'slots': data}, ensure_ascii=False)
     blob = blob.replace('<', '\\u003c')  # no </script>, <!-- or <script inside the script block
     path = page_path(run_dir)
@@ -97,7 +98,7 @@ mark{background:var(--mark);color:inherit}mark.cur{background:var(--cur)}
 <header><input id="q" placeholder="Search every generation of every agent (Enter = next match)">
 <span id="hits" class="muted"></span><button id="prev">&uarr;</button><button id="next">&darr;</button></header>
 <main><nav id="gens"></nav>
-<section><header id="views"><button data-v="screen">Screen</button><button data-v="note">Handoff note</button>
+<section><header id="views"><button data-v="screen">Screen</button><button data-v="note">Handoff note</button><button data-v="cards">Cards</button>
 <span id="title" class="muted"></span></header><pre id="text"></pre></section></main>
 <script>
 const DATA=/*DATA*/null;
@@ -126,10 +127,11 @@ function render(){
     :`<div class="empty muted">${st.q?'No match.':'No retired generation yet. The live session is '+(slot()?slot().live:'')+'.'}</div>`;
   const s=slot(),g=s&&s.gens.find(x=>x.label===st.gen);
   const ql=st.q.toLowerCase();  // show the half that holds the matches
-  if(g&&ql&&!count(st.view==='note'?g.note:g.screen,ql))st.view=st.view==='note'?'screen':'note';
+  if(g&&ql&&st.view!=='cards'&&!count(st.view==='note'?g.note:g.screen,ql))st.view=st.view==='note'?'screen':'note';
   for(const b of document.querySelectorAll('#views button'))b.className=b.dataset.v===st.view?'on':'';
-  $('title').textContent=g?`${g.label} retired ${when(g.at)}`:'';
-  const text=g?(st.view==='note'?g.note:g.screen)||'(empty)':'';
+  const cards=st.view==='cards';  // UI-only result cards of an official-CLI slot (live, not per generation)
+  $('title').textContent=cards?`${s?s.title||s.slot:''} result cards`:g?`${g.label} retired ${when(g.at)}`:'';
+  const text=cards?(s&&s.cards)||'(no cards)':g?(st.view==='note'?g.note:g.screen)||'(empty)':'';
   const q=st.q;
   if(q){const re=new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'gi');let out='',last=0,m;
     while((m=re.exec(text))){out+=esc(text.slice(last,m.index))+'<mark>'+esc(m[0])+'</mark>';last=m.index+m[0].length}
