@@ -434,6 +434,13 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - 计数：`calls` = 每次投递（v1 / v2 同一处计）；`rounds` = 被接受的监工决策；`hours` = 开卡起算（软线，task `hours` 仍是硬的 `budget_exhausted`）；`max_busy` 只能收紧 `--max-busy`。计数在 Redis `fx:brake`，新任务换新卡。
 - 池读数来自额度调度员的 `~/.cmux-fleet/quota.json`（config `quota_file` 可改）：`{"pools": {"pool-a": {"cash_used_usd", "at"}, "pool-b": {"week_used_pct", "at"}}}`。缺失 / 读不出 / 超过 1 小时 = unknown：显示在 `brake.json`，**不触发**。
 - 到线：pause（不投递、不轮换，全部可续）+ 审计 `brake.tripped` + `<run>/brake.json` + 可选 `brake_notify` argv（`start --brake-notify`，无 shell）。v2 下判定在一个事务里做，通知在事务外。
-- 续跑：`cmux-fleet resume` 在预算线仍越线时被拒，须 `resume --raise LIMIT=VALUE`（不能改池）；墙引起的暂停可直接 resume。新任务开新卡时清掉上一张卡的刹车暂停（操作员手动 pause 不清）。
+- 续跑：`cmux-fleet resume` 在预算线仍越线时被拒（不论暂停记录最后是谁写的：后来的墙、F 的 hold 改写暂停原因都不解锁），须 `resume --raise LIMIT=VALUE`（不能改池）；墙引起的暂停可直接 resume。新任务开新卡时清掉上一张卡的刹车暂停（操作员手动 pause 不清）。
 - 墙表一张：账号级墙（usage / weekly / session limit、429）→ 换边或停，fleet 内即停（pause）；分池墙（"You've reached your Fable limit"、`/usage-credits`）→ 同 CLI 降一档（`same_cli_downgrade`，吸收自 us-stock-option `config/cli_tier_map.yaml`），没有下一档也停。来源：卡住（超 `stall_timeout`）时的屏幕尾部（v1 在 `on_stall`，v2 在 `Fleet.tick` 的刹车事务里、早于 v2 hold）；v1 另看短回合文本（≤400 字，长报告不判墙）。启动时撞墙（非 READY）仍走原 blocked 终态。当前只**判定 + 记录（agent `wall` 字段、`brake.json`）+ 暂停**；自动按降档换下一代未接线（依赖 B 的名单 `profile` 列 / A 的组合表）。
 - v1 task 的 `pause` 现在也会停投递（原来只对 service / v2 生效）。
+
+### E 先于 F：看门的墙闸（`Fleet.wall_gate`）
+
+- 接口：`Fleet.wall_gate(slot, screen, source='watch') -> record | None`。看门（F，`watchdog.Watchdog.check`）每次抓屏后、在弹框白名单 / 未知弹框 hold / stalled 阶梯 / frozen 之前先调它。只看屏幕最后 `brake.GATE_TAIL`=25 行（`brake.screen_wall`）。
+- 返回 record：墙已触发刹车（pause、`agent.wall`、审计 `brake.tripped`、`brake.json` source=watch、可选通知；v2 下在一个事务里）。看门本 tick 对该槽**一个键都不按、不 hold、不杀不换代**——墙菜单（如 `❯ 1. Yes, switch…`）永远不当弹框答。同一 agent 的墙已经刹住时再调只返回原记录，不二次触发。返回 None：无墙，看门照自己的表走。
+- hold 出口（F 的 `turn_ended` → `release_held`）只把槽位放回 idle，**不解除暂停**；F 的 hold 会改写暂停原因，但刹车记录在 `fx:brake` 里独立保存，`resume` 每次都按预算卡复核，越线就拒。
+

@@ -2354,7 +2354,7 @@ class Fleet:
             budget = brake.parse_raise(raises, budget)
             if budget.get('pool') != json.loads(state['budget']).get('pool'):
                 raise ValueError('--raise cannot change the pool')
-        if budget and tripped and tripped.get('kind') == 'budget':
+        if budget:  # any resume, whatever paused the run (a later wall trip or a hold can overwrite the record)
             found = brake.trips(budget, brake.counters(state, brake.read_quota(self.cfg.get('quota_file'))))
             if found:
                 raise ValueError('budget still over the line (' + brake.describe(found)
@@ -2380,6 +2380,25 @@ class Fleet:
                 else action['advice'])
         return self.brake_trip('wall', self.label(name) + ' hit a ' + wall['scope'] + ' wall ("' + wall['line'][:120]
                                + '"); ' + what, agent=name, source=source, wall=wall, decision=action)
+
+    def wall_gate(self, name, screen, source='watch'):
+        """E before F: the watchdog calls this on every screen it captures, BEFORE the prompt whitelist,
+        the unknown-dialog hold and the stall ladder. A wall on the bottom of the screen trips the brake
+        (pause, record, notify) and returns the trip record: the caller then presses no key, holds nothing
+        and leaves the slot alone this tick (a wall menu is never a dialog to answer). None: no wall."""
+        if not brake.screen_wall(screen):
+            return None
+        tripped = json.loads(self.r.hget(BRAKE, 'tripped') or 'null')
+        if self.paused() and tripped and tripped.get('kind') == 'wall' and tripped.get('agent') == name:
+            return tripped  # already braked on this agent's wall: hands off, no second notify
+        tail = '\n'.join((screen or '').rstrip().splitlines()[-brake.GATE_TAIL:])
+        if self.v2:
+            record = self.v2.transaction('brake-wall-' + uuid.uuid4().hex, lambda: self.on_wall(name, tail, source))
+        else:
+            record = self.on_wall(name, tail, source)
+        if record:
+            self.brake_notify(record)
+        return record
 
     def stalled_screens(self, now):
         """Screens of busy agents past stall_timeout (only while a task / service is running)."""

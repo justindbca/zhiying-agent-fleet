@@ -34,6 +34,7 @@ NUM_LIMITS = ('max_usd', 'max_week_pct', 'max_hours')
 LINES = (('max_calls', 'calls'), ('max_rounds', 'rounds'), ('max_hours', 'hours'),
          ('max_usd', 'usd'), ('max_week_pct', 'week_pct'))
 TURN_WALL_MAX = 400  # a turn text longer than this is a report, not a wall message
+GATE_TAIL = 25  # screen lines the watchdog wall gate reads (same bottom-of-screen window as F's prompt table)
 
 
 def validate_budget(raw):
@@ -160,6 +161,12 @@ def classify_wall(text, table=None):
             if any(p.search(line) for p in table[scope]):
                 return {'scope': scope, 'line': line[:300]}
     return None
+
+
+def screen_wall(screen, lines=GATE_TAIL, table=None):
+    """Wall on the bottom of a live screen (watchdog gate, E before F), or None."""
+    rows = (screen or '').rstrip().splitlines()
+    return classify_wall('\n'.join(rows[-lines:]), table)
 
 
 def downgrade(cli, model, table=None):

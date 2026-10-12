@@ -430,3 +430,65 @@ def test_v2_stalled_screen_wall_pauses_before_the_slot_is_held(fx):
     assert json.loads(f.agent('supervisor')['wall'])['scope'] == 'account'
     audit = [x for _, x in f.r.xrange(f.v2.bus.audit_key) if x['event'] == 'brake.tripped']
     assert audit and json.loads((f.run_dir / 'brake.json').read_text())['source'] == 'screen'
+
+
+# ------------------------------------------------------------------ E before F (watchdog wall gate)
+TRUST_DIALOG = 'Do you trust the files in this folder?\n❯ 1. Yes, proceed\n  2. No, exit'
+
+
+def test_screen_wall_reads_the_bottom_of_the_screen_and_beats_a_dialog():
+    assert brake.screen_wall(REAL_FABLE_WALL + '\n' + TRUST_DIALOG)['scope'] == 'model_pool'
+    assert brake.screen_wall('❯ 1. Yes, switch to Sonnet\n' + REAL_CODEX_WALL)['scope'] == 'account'
+    assert brake.screen_wall(REAL_CODEX_WALL + '\n' + 'scrolled work line\n' * 30) is None  # old scrollback
+    assert brake.screen_wall(TRUST_DIALOG) is None  # no wall: the watchdog's own table decides
+
+
+def test_wall_gate_trips_before_the_watchdog_presses_anything(tmp_path):
+    f = make(tmp_path, {'goal': 'x'}, worker_cli='claude', worker_model='fable')
+    f.pump(); f.handle(turn('supervisor', decision())); f.pump()
+    assert f.wall_gate('worker-1', 'busy...\n' + TRUST_DIALOG) is None and not f.paused()
+    record = f.wall_gate('worker-1', 'busy...\n' + REAL_FABLE_WALL + '\n' + TRUST_DIALOG)
+    assert record['kind'] == 'wall' and record['source'] == 'watch' and record['decision']['to'] == 'claude-sonnet-5'
+    assert f.paused() and f.r.hget('fx:service', 'reason').startswith('brake: worker-1 hit a model_pool wall')
+    assert f.mgr.keys == [] and f.agent('worker-1')['state'] == 'busy'  # nothing pressed, slot not held
+    assert f.wall_gate('worker-1', REAL_FABLE_WALL)['at'] == record['at']  # idempotent: no second trip
+    assert sum(json.loads(x)['kind'] == 'brake.tripped' for x in f.r.lrange(fleet.LOG, 0, -1)) == 1
+    assert json.loads((f.run_dir / 'brake.json').read_text())['source'] == 'watch'
+
+
+def test_hold_release_never_resumes_a_brake_pause(tmp_path):
+    """F's unknown-dialog hold rewrites the pause reason and its turn_ended release only frees the slot:
+    the brake record survives both, dispatch stays paused, a plain resume stays refused."""
+    f = make(tmp_path, {'goal': 'x', 'budget': {'max_calls': 2}})
+    f.pump(); f.handle(turn('supervisor', decision())); f.pump()
+    f.tick()
+    assert f.paused() and json.loads(f.r.hget(fleet.BRAKE, 'tripped'))['kind'] == 'budget'
+    f.pause('worker-1: unknown confirmation dialog on screen (do you want to proceed?); nothing pressed')
+    f.setf('worker-1', state='idle', idle_confirmed=1)  # what RuntimeV2.release_held leaves behind
+    f.handle(turn('supervisor', decision()))
+    f.tick(); f.pump()
+    assert f.paused() and f.agent('worker-1')['state'] == 'idle' and f.agent('supervisor')['state'] == 'idle'
+    answer = control(f, 'resume', 'c1')
+    assert answer['status'] == 'rejected' and 'max_calls 2/2' in answer['reason'] and f.paused()
+
+
+def test_a_later_wall_trip_does_not_unlock_a_budget_pause(tmp_path):
+    f = make(tmp_path, {'goal': 'x', 'budget': {'max_calls': 2}}, worker_cli='claude', worker_model='fable')
+    f.pump(); f.handle(turn('supervisor', decision())); f.pump()
+    f.tick()
+    assert f.wall_gate('worker-1', REAL_FABLE_WALL)['kind'] == 'wall'  # overwrites the trip record
+    assert control(f, 'resume', 'c1')['status'] == 'rejected' and f.paused()
+    assert control(f, 'resume', 'c2', **{'raise': ['max_calls=9']})['status'] == 'accepted' and not f.paused()
+
+
+def test_v2_wall_gate_trips_in_a_transaction_without_holding_the_slot(fx):
+    f = fx
+    f.service = False; f.cfg['mode'] = 'task'
+    event(f, dict(kind='task', request_id='new-task', spec={'goal': 'write an evidence report'}))
+    f.pump(); receive(f, 'supervisor')
+    record = f.wall_gate('supervisor', 'thinking...\n' + REAL_CODEX_WALL + '\n❯ 1. Yes')
+    assert record['kind'] == 'wall' and record['wall']['scope'] == 'account'
+    assert f.paused() and f.task()['status'] == 'running' and f.agent('supervisor')['state'] != 'held'
+    assert f.r.hget(f.v2.bus.lease_key('supervisor'), 'status') == 'received' and f.mgr.keys == []
+    audit = [x for _, x in f.r.xrange(f.v2.bus.audit_key) if x['event'] == 'brake.tripped']
+    assert len(audit) == 1 and json.loads((f.run_dir / 'brake.json').read_text())['source'] == 'watch'
