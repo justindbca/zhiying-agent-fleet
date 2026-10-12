@@ -526,6 +526,10 @@ def test_clicked_page_links_switch_workspaces_both_ways_and_restore_the_source_p
     assert t.world.selected == [t.ws_child]
     assert t.world.urls[history_pane(f)] == own + '#agent=worker-2&gen=&view=note&q='
     assert t.world.urls[history_pane(cf)] == history.page_url(cf.run_dir)  # the child's pane: untouched
+    # clicked right after changing state on our own page: the marker URL's own hash wins over the last poll
+    assert jump(f, click(kid, 'child', shown=own + '#agent=supervisor&view=note')) == 'jump'
+    assert t.world.urls[history_pane(f)] == own + '#agent=supervisor&view=note'
+    t.world.selected.pop()
     assert jump(cf, click(own, 'parent')) == 'jump'
     assert t.world.selected == [t.ws_child, t.ws_parent]
     assert t.world.urls[history_pane(cf)] == history.page_url(cf.run_dir)

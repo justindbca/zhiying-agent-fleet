@@ -223,7 +223,8 @@ def follow_jump(f, now=None):
             f.r.hset(fleet.SERVICE, 'history_hash', parts.fragment)
         return None
     nonce = query[JUMP_PARAM][0]
-    hash_ = f.r.hget(fleet.SERVICE, 'history_hash')
+    own_shown = _page(url) == _page(own) and parts.fragment  # clicked on our page: its state is in the URL
+    hash_ = parts.fragment if own_shown else f.r.hget(fleet.SERVICE, 'history_hash')
     home = own + ('#' + hash_ if hash_ else '')
     try:
         done = json.loads(f.r.hget(fleet.SERVICE, 'history_jump') or '{}')
