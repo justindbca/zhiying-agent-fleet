@@ -447,7 +447,7 @@ def test_swap_waits_for_a_free_model_slot_holds_its_queue_and_retries(hot, pairs
     assert len(waits) == 1 and waits[0]['agent'] == 'worker-3'
     assert 'max_concurrent 2 for model flashnext reached (running on worker-1, worker-2)' in waits[0]['reason']
     assert 'worker-3' in f.profile_swaps() and f.agent('worker-3').get('roster_swap_deferred') != '1'  # queue held
-    assert not audits(f, 'profile.blocked') and f.task()['status'] != 'blocked'
+    assert not audits(f, 'profile.blocked') and f.task().get('status') != 'blocked'
     f.tick()
     assert len(audits(f, 'roster.capacity_wait')) == 1                 # audited once per reason
     f.setf('worker-1', state='idle')
@@ -479,11 +479,13 @@ def test_host_mismatch_at_swap_time_blocks_instead_of_swapping(hot, pairs, monke
     flash_ok(pairs)
     monkeypatch.setattr(f, 'preflight_profile', lambda launch: None)
     f.cfg['pi_home'] = str(f.run_dir / 'pi-home')
+    f.setf('worker-2', state='busy')   # roster accepted while the slot is mid-turn
     f.cfg['roster'] = str(write_profiles(f, 'roster.yaml', {'worker-2': FLASH}))
-    f.cfg['host'] = 'macmini'          # accepted roster, then the host no longer matches the card
-    f.cfg['worker_profiles'] = {'worker-2': FLASH}
-    f.roster_digest = None
-    f.cfg['roster'] = ''               # keep the in-memory roster; only the swap gate runs
     f.tick()
+    assert f.cfg['worker_profiles'] == {'worker-2': FLASH} and not audits(f, 'roster.rejected')
+    f.cfg['host'] = 'macmini'          # then the fleet's host no longer matches the card
+    f.setf('worker-2', state='idle')
+    f.tick()
+    blocked, = audits(f, 'profile.blocked')
+    assert blocked['agent'] == 'worker-2' and 'profile flashnext-coder runs only on' in blocked['reason']
     assert f.agent('worker-2')['label'] == 'worker-2' and not audits(f, 'roster.profile_switched')
-    assert 'runs only on' in f.task().get('reason', '') + json.dumps(audits(f, 'profile.blocked'))
