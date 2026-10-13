@@ -27,6 +27,9 @@ ALLOWED = {('pi', 'pi', 'task'), ('pi', 'pi', 'service'), ('codex', 'claude', 't
            ('codex', 'pi', 'task'), ('codex', 'pi', 'service'), ('codex', 'claude', 'service'),
            ('claude', 'pi', 'task'), ('claude', 'pi', 'service'), ('claude', 'claude', 'task')}
 SMOKE_ONLY = {('codex', 'codex', 'task')}
+# pi supervisor + official Claude workers (2026-10-13 default): smoke-only until its real smoke flips
+# the row to verified (scripts/smoke_pair.sh pi claude <mode>); the test follows the shipped status.
+PI_CLAUDE = {('pi', 'claude', 'task'), ('pi', 'claude', 'service')}
 
 
 @pytest.mark.parametrize('mode', ['task', 'service'])
@@ -35,6 +38,20 @@ SMOKE_ONLY = {('codex', 'codex', 'task')}
 def test_v2_cli_matrix_allows_only_validated_pairs_with_reason(supervisor, worker, mode):
     cfg = dict(transport_version=2, supervisor_cli=supervisor, worker_cli=worker, mode=mode,
                allow_development_v2=True)
+    if (supervisor, worker, mode) in PI_CLAUDE:
+        from cmux_fleet import cli_pairs
+        row = cli_pairs.load_pairs().lookup(supervisor, worker, mode)
+        assert row and row['status'] in ('verified', 'unverified') and not row['adapter_missing']
+        if row['status'] == 'unverified':
+            with pytest.raises(ValueError, match='--lifecycle smoke'):
+                runtime_v2.validate_config(cfg)
+            cfg = dict(cfg, lifecycle='smoke')
+        else:
+            assert 'smoke_pair.sh pi claude ' + mode in row['verified_by'] and 'PASS' in row['verified_by']
+        assert runtime_v2.validate_config(cfg) == 2
+        with pytest.raises(ValueError, match='allow-development-v2'):
+            runtime_v2.validate_config(dict(cfg, allow_development_v2=False))
+        return
     if (supervisor, worker, mode) in ALLOWED:
         assert runtime_v2.validate_config(cfg) == 2
         with pytest.raises(ValueError, match='allow-development-v2'):

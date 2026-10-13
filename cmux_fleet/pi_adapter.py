@@ -6,6 +6,23 @@ from pathlib import Path
 UNSANDBOXED_SCOPE = ('You run without an OS sandbox. The directory restrictions above are instructions, '
                      'not an isolation boundary. Do not drive the user\'s browser directly; use only '
                      'the broker command below if the operator enabled it.')
+THINKING = ('off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
+
+
+def for_agent(cfg, name, overrides=None):
+    """cfg as seen by one agent: its own pi model / thinking (config ``pi_models`` /
+    ``pi_thinkings``, from --supervisor-pi-model or a roster row) over the run-wide
+    ``pi_model`` / ``pi_thinking`` fallback; profile-launch ``overrides`` win over both.
+    Idempotent, so a saved per-generation snapshot resolves to the same values again."""
+    out, overrides = dict(cfg), overrides or {}
+    for key, table in (('pi_model', 'pi_models'), ('pi_thinking', 'pi_thinkings')):
+        own = (cfg.get(table) or {}).get(name)
+        if own:
+            out[key] = own
+        if key in overrides and own:  # a card's own value replaces this slot's entry for good
+            out[table] = {k: v for k, v in cfg[table].items() if k != name}
+    out.update(overrides)
+    return out
 
 
 def prepare_home(home, source):

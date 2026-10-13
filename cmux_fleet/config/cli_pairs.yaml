@@ -7,15 +7,38 @@
 #   reason: the refusal text shown to the user (unverified / forbidden / adapter_missing rows)
 #   verified_by: the real smoke (scripts/smoke_pair.sh, 1 supervisor + 2 workers, 4 v2 checks) that flipped it
 # Exception kept in code: claude+claude task with cfg adopt (docs/design.md §19 sub-fleet).
+# CLI boundary (docs/design.md §6, §11 2026-10-13 "Codex/FlashNext via pi"): Claude agents run only the
+# official `claude` CLI; pi never uses Claude subscription credentials. Codex models (openai-codex/*, ChatGPT
+# login) and FlashNext run through pi. The official Codex TUI supervisor stays optional:
+# `start --supervisor-cli codex [--supervisor-profile X]` (codex+* rows below).
+# default keys: supervisor_cli, worker_cli, mode, supervisor_profile (Codex supervisor only),
+#   supervisor_pi_model / supervisor_pi_thinking (a defaulted pi supervisor only; used only when neither
+#   --supervisor-pi-model/-thinking nor an explicit --pi-model/--pi-thinking is given -- a typed flag always wins).
+#   Any other default key is a load error.
+# Night pair (no extra schema): pi+pi rows with per-agent models, e.g.
+#   start --supervisor-cli pi --worker-cli pi --supervisor-pi-model openai-codex/gpt-6-astra
+#     --supervisor-pi-thinking high --pi-model flashnext/Qwen3.8-Flash-Next-Uncensored-oQ4e-100K-MTP --lifecycle <mode>
+#   (or roster rows `pi_model:` per worker). An explicit --supervisor-cli pi does not read default.supervisor_pi_*;
+#   --supervisor-pi-model is required there, else --pi-model would put the supervisor on FlashNext too.
 version: 1
-default: {supervisor_cli: codex, worker_cli: claude, mode: task, supervisor_profile: fleet-astra}  # start fills unset --supervisor-cli/--worker-cli (and the Codex supervisor profile) from here
+# start fills unset --supervisor-cli/--worker-cli (and, for a pi supervisor, its pi model/thinking) from here.
+# User decision 2026-10-13: pi supervisor on openai-codex/gpt-6-astra (thinking high) + official Claude Code workers.
+default: {supervisor_cli: pi, worker_cli: claude, mode: task,
+          supervisor_pi_model: openai-codex/gpt-6-astra, supervisor_pi_thinking: high}
 pairs:
   - {supervisor_cli: pi, worker_cli: pi, mode: task, status: verified, adapter_missing: [],
      verified_by: "design.md §11 §14", notes: "all-Pi bridge"}
   - {supervisor_cli: pi, worker_cli: pi, mode: service, status: verified, adapter_missing: [],
-     verified_by: "design.md §11 §14", notes: "all-Pi bridge"}
+     verified_by: "design.md §11 §14", notes: "all-Pi bridge; night pair = pi Astra supervisor + pi FlashNext workers via per-agent models"}
+  - {supervisor_cli: pi, worker_cli: claude, mode: task, status: verified, adapter_missing: [],
+     verified_by: "real smoke scripts/smoke_pair.sh pi claude task: fleet-20261013-115145-828661b9 2026-10-13 @3421f0d8+feat/codex-via-pi worktree, 4/4 checks PASS",
+     reason: "transport v2 pi supervisor + official Claude Code workers: verified by a real smoke (scripts/smoke_pair.sh pi claude task, see verified_by); shown only if this row is set back to unverified",
+     notes: "default (user decision 2026-10-13): pi Astra/high supervisor + official Claude Code workers"}
+  - {supervisor_cli: pi, worker_cli: claude, mode: service, status: verified, adapter_missing: [],
+     verified_by: "real smoke scripts/smoke_pair.sh pi claude service: fleet-20261013-115347-7e61f9af 2026-10-13 @3421f0d8+feat/codex-via-pi worktree, 4/4 checks PASS",
+     reason: "transport v2 pi supervisor + official Claude Code workers: verified by a real smoke (scripts/smoke_pair.sh pi claude service, see verified_by); shown only if this row is set back to unverified"}
   - {supervisor_cli: codex, worker_cli: claude, mode: task, status: verified, adapter_missing: [],
-     verified_by: "user decision 2026-10-12; design.md §18", notes: "default: Codex supervisor + official Claude Code workers"}
+     verified_by: "user decision 2026-10-12; design.md §18", notes: "optional official Codex TUI supervisor + official Claude Code workers (default until 2026-10-13)"}
   - {supervisor_cli: codex, worker_cli: claude, mode: service, status: verified,
      adapter_missing: [], verified_by: "real smoke scripts/smoke_pair.sh codex claude service: fleet-20261012-155328-b5e88a63 2026-10-12 @8a31c3c7, 4/4 checks PASS",
      reason: "transport v2 Codex supervisor + Claude workers supports task mode only until service mode passes a real smoke (scripts/smoke_pair.sh codex claude service); result cards render off-model via tui_cards",

@@ -180,6 +180,11 @@ def agent_cli(cfg, name):
     return cfg.get('supervisor_cli' if name == 'supervisor' else 'worker_cli') or 'codex'
 
 
+def agent_cfg(cfg, name):
+    """cfg with this agent's own pi model / thinking resolved (no profile launch)."""
+    return pi_adapter.for_agent(cfg, name)
+
+
 def is_claude(cfg, name):
     return agent_cli(cfg, name) == 'claude'
 
@@ -980,7 +985,7 @@ def pi_event(cfg_path, name, generation, raw):
 
 
 def actor(cfg_path, name, prompt, generation=None):
-    cfg = load(cfg_path)
+    cfg = agent_cfg(load(cfg_path), name)
     runtime_v2.validate_config(cfg)
     r = connect(cfg)
     info = r.hgetall(key('agent', name))
@@ -1000,8 +1005,16 @@ def actor(cfg_path, name, prompt, generation=None):
     if is_pi(cfg, name):
         os.environ.update(pi_adapter.environment(cfg_path, cfg, name, generation))
         argv = pi_adapter.argv(cfg, name, generation, prompt, agent_cwd(cfg, name), label=info['label'])
+        # pi rewrites its process title (ps shows only "pi"): keep the exact exec argv as launch evidence.
+        record = Path(cfg['run']) / 'prompts' / (name + '-g' + str(generation) + '.argv.json')
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps({'slot': name, 'label': info['label'], 'generation': generation,
+                                      'argv': argv, 'at': time.time()}, ensure_ascii=False) + '\n')
     elif is_claude(cfg, name):
         os.environ.pop('CLAUDECODE', None)
+        # Re-check trust at exec time: other Claude Code sessions rewrite ~/.claude.json and can drop
+        # the entry spawn() wrote moments ago (real smoke 2026-10-13: worker-1 stuck on the trust dialog).
+        trust_claude_dir(agent_cwd(cfg, name))
         argv = claude_argv(cfg_path, cfg, name, generation, prompt)
     else:
         argv = actor_argv(cfg_path, cfg, name, generation, prompt)
@@ -1058,7 +1071,7 @@ class Fleet:
 
     def runtime_cfg(self, name):
         launch = json.loads(self.agent(name).get('runtime_launch') or '{}')
-        return dict(self.cfg, **launch.get('overrides', {}))
+        return pi_adapter.for_agent(self.cfg, name, launch.get('overrides'))
 
     def setf(self, name, **fields):
         self.r.hset(key('agent', name), mapping={k: str(v) for k, v in fields.items()})
@@ -2826,12 +2839,20 @@ class Fleet:
                 raise ValueError('\n'.join(used))
             # Added rows without a profile run the fleet default: its model card caps them with the
             # live slots (C). Rows with a profile are counted by night.resolve_launches (B).
+            pi_models, pi_thinkings = roster.pi_settings(raw)
             adds = [n for n in workers if n not in self.workers and not profiles.get(n)]
             if adds:
-                problem = self.default_capacity_problem(adds)
+                problem = self.default_capacity_problem(adds, dict(self.cfg, pi_models=dict(
+                    {k: v for k, v in (self.cfg.get('pi_models') or {}).items() if k not in workers}, **pi_models)))
                 if problem:
                     raise ValueError(problem)
             night.resolve_launches(self.cfg, profiles, workers)  # unknown card, refused pair, card limits: reject all
+            problem = roster.pi_cli_problem(pi_models, pi_thinkings, self.cfg.get('worker_cli'))
+            unset = [n for n in adds if self.cfg.get('worker_cli') == 'pi' and not pi_models.get(n)
+                     and not self.cfg.get('pi_model')]
+            if problem or unset:
+                raise ValueError(problem or 'no pi model for ' + ', '.join(unset) + ': give the row a pi_model '
+                                 '(the run has no --pi-model fallback)')
         except ValueError as exc:
             self.log('roster.rejected', level='error', path=str(path), errors=str(exc).split('\n'),
                      kept=self.desired)
@@ -2855,6 +2876,16 @@ class Fleet:
         results.update({n: 'profile ' + (profiles.get(n) or 'run default') + '; next generation once idle'
                         for n in workers if n in self.workers and profiles.get(n) != old_profiles.get(n)})
         self.cfg['worker_profiles'] = profiles
+        # Own pi model / thinking per row (the supervisor's entry comes from start and stays).
+        old_pi = (dict(self.cfg.get('pi_models') or {}), dict(self.cfg.get('pi_thinkings') or {}))
+        keep = [w for w in self.workers if w not in workers] + ['supervisor']  # retiring slots keep theirs
+        self.cfg['pi_models'] = dict({k: v for k, v in old_pi[0].items() if k in keep}, **pi_models)
+        self.cfg['pi_thinkings'] = dict({k: v for k, v in old_pi[1].items() if k in keep}, **pi_thinkings)
+        results.update({n: 'pi_model ' + (self.cfg['pi_models'].get(n) or 'run default') + ' thinking '
+                        + (self.cfg['pi_thinkings'].get(n) or 'run default') + '; next generation once idle'
+                        for n in workers if n in self.workers and n not in results
+                        and (old_pi[0].get(n), old_pi[1].get(n)) != (pi_models.get(n), pi_thinkings.get(n))})
+        pi_changed = old_pi != (self.cfg['pi_models'], self.cfg['pi_thinkings'])
         self.desired = workers
         # Retiring workers keep their role until gone (a handoff successor may still finish work).
         roles = dict({w: old_roles[w] for w in self.workers if w not in workers and w in old_roles}, **roles)
@@ -2862,7 +2893,7 @@ class Fleet:
         if adds:
             self.workers = self.workers + adds
             self.names = ['supervisor'] + self.workers
-        if adds or roles != old_roles or profiles != old_profiles:
+        if adds or roles != old_roles or profiles != old_profiles or pi_changed:
             # Hooks and bridges check membership in the config file: write it before spawning.
             self.persist_roster()
         for name in adds:
@@ -2875,22 +2906,26 @@ class Fleet:
             if self.agent(name):
                 self.handoff_limits(name)
 
-    def default_capacity_problem(self, adds):
-        """None if new default slots ``adds`` fit the default model's card next to the live slots."""
+    def default_capacity_problem(self, adds, cfg=None):
+        """None if new default slots ``adds`` fit the default model's card next to the live slots
+        (``cfg``: the config with the new roster's per-slot pi models; default self.cfg)."""
+        cfg = cfg or self.cfg
         try:
             registry = AgentRegistry(self.task().get('agent_registry') or None)
         except (AgentRegistryError, OSError) as exc:
             return 'cannot read agent cards to check the default model: ' + str(exc)
-        key = model_usage.default_model(self.cfg, registry)
-        if key is None:
+        keys = {model_usage.default_model(pi_adapter.for_agent(cfg, n), registry) for n in adds} - {None}
+        if not keys:
             return None
         usage = self.model_usage(registry)
-        return model_usage.default_problem(self.cfg, sorted(set(usage.holders(key)) | set(adds)), registry)
+        held = {slot for key in keys for slot in usage.holders(key)}
+        return model_usage.default_problem(cfg, sorted(held | set(adds)), registry)
 
     def persist_roster(self):
         self.cfg['workers'][:] = self.workers  # in place: the control view holds this list
         fields = {'workers': list(self.workers), 'worker_roles': self.cfg.get('worker_roles') or {},
-                  'worker_profiles': self.cfg.get('worker_profiles') or {}}
+                  'worker_profiles': self.cfg.get('worker_profiles') or {},
+                  'pi_models': self.cfg.get('pi_models') or {}, 'pi_thinkings': self.cfg.get('pi_thinkings') or {}}
         save(self.path, dict(load(self.path), **fields))
         try:
             latest = load(LATEST)
@@ -2945,9 +2980,15 @@ class Fleet:
     def apply_roster_launch(self, name):
         """A slot that the roster gives a profile starts (or is added) running that card."""
         profile = (self.cfg.get('worker_profiles') or {}).get(name)
+        self.setf(name, roster_pi=self.roster_pi(name))
         if profile:
             launch = night.resolve_launches(self.cfg, {name: profile})[name]
             self.setf(name, runtime_launch=profile_launch.encode_launch(launch), roster_profile=profile)
+
+    def roster_pi(self, name):
+        """This slot's own pi model / thinking as the roster wants it (compared to roster_pi in Redis)."""
+        return json.dumps([(self.cfg.get('pi_models') or {}).get(name) or '',
+                           (self.cfg.get('pi_thinkings') or {}).get(name) or ''])
 
     def roster_card_gate(self, name, profile):
         """Feature C's per-slot card gate (Fleet.card_gate) before a roster swap onto ``profile``:
@@ -2960,7 +3001,9 @@ class Fleet:
     def profile_swaps(self):
         """Active slots whose roster profile differs from the one their generation runs."""
         wanted = self.cfg.get('worker_profiles') or {}
-        return [n for n in self.active_workers() if (self.agent(n).get('roster_profile') or '') != (wanted.get(n) or '')]
+        # roster_pi missing = a slot started before per-agent pi models: never swapped for that alone
+        return [n for n in self.active_workers() if (self.agent(n).get('roster_profile') or '') != (wanted.get(n) or '')
+                or self.agent(n).get('roster_pi') not in (None, self.roster_pi(n))]
 
     def night_tick(self, path):
         """Record a night on/off transition (audit + brake card placeholder for the budget code)."""
@@ -3036,7 +3079,7 @@ class Fleet:
         # Fence old callbacks before the successor exists (same order as an idle profile switch).
         self.setf(name, generation=generation + 1, label=label, prev_label=prev, handoff_id='',
                   runtime_launch=profile_launch.encode_launch(launch) if launch else '', runtime_profile='',
-                  roster_profile=profile, roster_swap_deferred=0, roster_capacity_wait='', launch_ready=0,
+                  roster_profile=profile, roster_pi=self.roster_pi(name), roster_swap_deferred=0, roster_capacity_wait='', launch_ready=0,
                   retired_pane=old)
         self.r.hset(NAMES, mapping={label: name})
         self.r.hset(night.NIGHT, mapping={'brief_due': 1})
@@ -3057,7 +3100,8 @@ class Fleet:
         self.setf(name, launch_ready=1, retired_pane='')
         self.refresh_history()
         self.log('roster.profile_switched', agent=name, label=label, prev=prev, generation=generation + 1,
-                 profile=profile or 'run default', cli=agent_cli(self.runtime_cfg(name), name), handoff=str(note))
+                 profile=profile or 'run default', cli=agent_cli(self.runtime_cfg(name), name), handoff=str(note),
+                 **({'pi_model': self.runtime_cfg(name).get('pi_model') or ''} if is_pi(self.runtime_cfg(name), name) else {}))
         return True
 
     def breakpoint_brief(self):
@@ -3688,6 +3732,55 @@ def daemon(cfg_path, resume=False):
         lifecycle_close.after_daemon(fleet)  # lock released, Redis down: close this run's workspace
 
 
+def resolve_supervisor(args, default):
+    """Fill the supervisor/worker CLIs and the supervisor's pi model/thinking from the pair table
+    default. Precedence for a pi supervisor (first hit wins):
+      model:    --supervisor-pi-model (or a mapped old --supervisor-profile) > explicit --pi-model
+                > default.supervisor_pi_model (only when the supervisor CLI came from the table default)
+      thinking: --supervisor-pi-thinking (or the mapped profile's) > explicit --pi-thinking
+                > default.supervisor_pi_thinking (same condition) > off
+    The table default never overrides a flag the operator typed. An old Codex profile flag on a
+    defaulted pi supervisor is mapped (cli_pairs.LEGACY_SUPERVISOR_PROFILES) or refused with the
+    new usage (ValueError) -- never a silent official Codex TUI."""
+    explicit = getattr(args, 'supervisor_cli', None)
+    args.supervisor_cli = explicit or default.get('supervisor_cli') or 'codex'
+    args.worker_cli = getattr(args, 'worker_cli', None) or default.get('worker_cli') or 'codex'
+    model, thinking = getattr(args, 'supervisor_pi_model', None), getattr(args, 'supervisor_pi_thinking', None)
+    if args.supervisor_cli != 'pi':
+        if model or thinking:
+            raise ValueError('--supervisor-pi-model / --supervisor-pi-thinking need a pi supervisor '
+                             '(--supervisor-cli pi, or the default)')
+        if (args.supervisor_cli == 'codex' and default.get('supervisor_profile')
+                and not getattr(args, 'supervisor_profile', None) and not getattr(args, 'profile', None)):
+            args.supervisor_profile = default['supervisor_profile']
+        args.pi_models, args.pi_thinkings = {}, {}
+        args.pi_thinking = getattr(args, 'pi_thinking', None) or 'off'
+        return
+    legacy = getattr(args, 'supervisor_profile', None) or (
+        getattr(args, 'profile', None) if args.worker_cli != 'codex' else None)
+    if legacy and not explicit:
+        mapped_model, mapped_thinking = cli_pairs.legacy_supervisor_profile(legacy)
+        if model and model != mapped_model:
+            raise ValueError('--supervisor-profile ' + legacy + ' maps to ' + mapped_model + ' but --supervisor-pi-model '
+                             'says ' + model + '; pass only --supervisor-pi-model')
+        model, thinking = mapped_model, thinking or mapped_thinking
+        print('--supervisor-profile/--profile ' + legacy + ' is the old Codex profile; now running the pi supervisor '
+              'on ' + model + ' (thinking ' + thinking + '). Use --supervisor-cli codex --supervisor-profile ' + legacy
+              + ' for the official Codex TUI.', file=sys.stderr)
+        args.supervisor_profile = None
+    elif getattr(args, 'supervisor_profile', None):
+        raise ValueError('--supervisor-profile is a Codex profile; a pi supervisor takes --supervisor-pi-model '
+                         'provider/model [--supervisor-pi-thinking LEVEL]')
+    run_model, run_thinking = getattr(args, 'pi_model', None), getattr(args, 'pi_thinking', None)
+    if not explicit:  # the table default only fills what neither a supervisor nor a run-wide flag set
+        model = model or (None if run_model else default.get('supervisor_pi_model'))
+        thinking = thinking or (None if run_thinking else default.get('supervisor_pi_thinking'))
+    args.pi_thinking = run_thinking or 'off'  # unset --pi-thinking is still "off" for the run
+    args.supervisor_pi_model, args.supervisor_pi_thinking = model, thinking
+    args.pi_models = {'supervisor': model} if model else {}
+    args.pi_thinkings = {'supervisor': thinking} if thinking else {}
+
+
 def start(args):
     from cmux_fleet.cmux_manager import CmuxSessionManager, cmux_available
     if getattr(args, 'max_attempts', None) is not None and args.max_attempts < 1:
@@ -3698,15 +3791,15 @@ def start(args):
             return
     if args.transport_version != 2:
         raise SystemExit('new fleet instances require Redis transport v2; v1 is only readable for existing runs')
-    # A new run without an explicit CLI takes the pair table's default combination (codex+claude,
-    # Codex supervisor on the table's profile, e.g. fleet-astra); the config written below always
-    # names both CLIs, so the codex fallback in pair_problem only serves old configs.
+    # A new run without an explicit CLI takes the pair table's default combination (pi supervisor on
+    # the table's model, e.g. openai-codex/gpt-6-astra thinking high, + official Claude workers); the
+    # config written below always names both CLIs, so the codex fallback in pair_problem only serves
+    # old configs. The official Codex supervisor stays available with --supervisor-cli codex.
     default = cli_pairs.load_pairs().default
-    args.supervisor_cli = getattr(args, 'supervisor_cli', None) or default.get('supervisor_cli') or 'codex'
-    args.worker_cli = getattr(args, 'worker_cli', None) or default.get('worker_cli') or 'codex'
-    if (args.supervisor_cli == 'codex' and default.get('supervisor_profile')
-            and not getattr(args, 'supervisor_profile', None) and not getattr(args, 'profile', None)):
-        args.supervisor_profile = default['supervisor_profile']
+    try:
+        resolve_supervisor(args, default)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     args.profile = getattr(args, 'profile', None) or DEFAULTS['profile']
     lifecycle_problem = None
     try:  # --lifecycle decides cfg['mode'] (its base) before the CLI-pair check reads both keys
@@ -3739,13 +3832,22 @@ def start(args):
         try:
             workers, worker_roles, worker_profiles = roster.load_entries(roster_path)
             launches = list(night.resolve_launches(probe, worker_profiles, workers).values())
+            roster_pi = roster.pi_settings(roster_path.read_bytes())
+            problem = roster.pi_cli_problem(*roster_pi, args.worker_cli)
+            if problem:
+                raise ValueError(problem)
         except (OSError, ValueError) as exc:
             raise SystemExit('--roster ' + str(roster_path) + ' rejected:\n' + str(exc)) from exc
+        args.pi_models = dict(roster_pi[0], **args.pi_models)
+        args.pi_thinkings = dict(roster_pi[1], **args.pi_thinkings)
         if getattr(args, 'night_roster', None):
             night_path = Path(args.night_roster).expanduser().resolve()
             try:
                 night.check_rosters(probe, roster_path, night_path)
                 launches += night.resolve_launches(probe, roster.load_entries(night_path)[2]).values()
+                problem = roster.pi_cli_problem(*roster.pi_settings(night_path.read_bytes()), args.worker_cli)
+                if problem:
+                    raise ValueError(problem)
             except (OSError, ValueError) as exc:
                 raise SystemExit('--night-roster: ' + str(exc)) from exc
         profile_clis = {launch['overrides']['worker_cli'] for launch in launches}
@@ -3762,7 +3864,7 @@ def start(args):
     try:
         problem = model_usage.default_problem(
             {'worker_cli': args.worker_cli, 'worker_model': args.worker_model, 'pi_model': args.pi_model,
-             'host': args.host.strip().lower() if args.host and args.host.strip() else None},
+             'pi_models': args.pi_models, 'host': args.host.strip().lower() if args.host and args.host.strip() else None},
             [w for w in workers if not worker_profiles.get(w)] if roster_path else (args.worker_names.split(',') if args.worker_names else
                                          ['worker-' + str(i + 1) for i in range(max(1, args.workers or 1))]),
             AgentRegistry())
@@ -3784,8 +3886,13 @@ def start(args):
     if 'pi' in clis:
         if not args.allow_unsandboxed_pi:
             raise SystemExit('pi has no sandbox: explicitly pass --allow-unsandboxed-pi after reviewing permissions')
-        if not args.pi_model:
-            raise SystemExit('--pi-model provider/model is required for pi agents')
+        unset = [n for n in (['supervisor'] if args.supervisor_cli == 'pi' else [])
+                 + (([w for w in workers if not worker_profiles.get(w)] if roster_path else ['workers'])
+                    if args.worker_cli == 'pi' else [])
+                 if not args.pi_models.get(n) and not args.pi_model]
+        if unset:
+            raise SystemExit('--pi-model provider/model is required for pi agents (or --supervisor-pi-model / '
+                             'roster pi_model); no model for: ' + ', '.join(unset))
         version = subprocess.run([pi, '--version'], text=True, capture_output=True, timeout=15, check=True).stdout.strip()
         match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', version)
         if not match or tuple(map(int, match.groups())) < (1, 1, 0):
@@ -3835,7 +3942,7 @@ def start(args):
            'claude': args.claude or shutil.which('claude'), 'claude_window': args.claude_window,
            'host': args.host.strip().lower() if args.host and args.host.strip() else None,
            'supervisor_cli': args.supervisor_cli, 'pi': pi, 'pi_model': args.pi_model,
-           'pi_thinking': args.pi_thinking, 'allow_unsandboxed_pi': args.allow_unsandboxed_pi,
+           'pi_thinking': args.pi_thinking, 'pi_models': args.pi_models, 'pi_thinkings': args.pi_thinkings, 'allow_unsandboxed_pi': args.allow_unsandboxed_pi,
            'pi_agent_dir': args.pi_agent_dir, 'allow_profile_live_switch': args.allow_profile_live_switch,
            'transport_version': args.transport_version, 'allow_development_v2': args.allow_development_v2,
            'max_attempts': args.max_attempts or DEFAULTS['max_attempts'], 'token': token,
@@ -3948,8 +4055,8 @@ def main(argv=None):
     s.add_argument('--allow-development-v2', action='store_true',
                    help='opt into incomplete v2 acceptance; no production-readiness claim')
     s.add_argument('--profile', default=None,
-                   help='codex config profile for every agent (default: fleet; the supervisor takes '
-                        'cli_pairs.yaml default.supervisor_profile unless --profile/--supervisor-profile is given)')
+                   help='codex config profile for every Codex agent (default: fleet). With the default pi '
+                        'supervisor an old supervisor profile (fleet-astra) maps to its pi model, others are refused')
     s.add_argument('--codex', help='codex binary (default: first on PATH)')
     s.add_argument('--redis-server', help='redis-server binary (default: first on PATH)')
     s.add_argument('--redis-runtime-dir', default=str(redis_runtime.DEFAULT_ROOT),
@@ -3983,8 +4090,17 @@ def main(argv=None):
     s.add_argument('--worker-cli', choices=('codex', 'claude', 'pi'), default=None,
                    help='CLI for workers (default: cli_pairs.yaml default)')
     s.add_argument('--pi', help='pi binary (>= 1.1.0; default: first on PATH)')
-    s.add_argument('--pi-model', help='explicit provider/model for all pi agents; no implicit cloud fallback')
-    s.add_argument('--pi-thinking', choices=('off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'), default='off')
+    s.add_argument('--pi-model', help='explicit provider/model for every pi agent without its own model '
+                   '(--supervisor-pi-model, roster pi_model); no implicit cloud fallback')
+    s.add_argument('--supervisor-pi-model', default=None,
+                   help='pi supervisor: provider/model (default: --pi-model if given, else cli_pairs.yaml '
+                        'default.supervisor_pi_model when the supervisor CLI comes from the default)')
+    s.add_argument('--supervisor-pi-thinking', choices=pi_adapter.THINKING, default=None,
+                   help='pi supervisor: thinking level (default: --pi-thinking if given, else cli_pairs.yaml '
+                        'default.supervisor_pi_thinking when the supervisor CLI comes from the default, else off)')
+    s.add_argument('--pi-thinking', choices=pi_adapter.THINKING, default=None,
+                   help='pi thinking level for every pi agent without its own (default: off; an explicit value '
+                        'also beats cli_pairs.yaml default.supervisor_pi_thinking)')
     s.add_argument('--pi-agent-dir', default=os.environ.get('PI_CODING_AGENT_DIR') or str(Path.home() / '.pi/agent'),
                    help='source of auth.json/models.json only, linked into a fresh per-run pi home')
     s.add_argument('--allow-unsandboxed-pi', action='store_true',
@@ -4008,7 +4124,8 @@ def main(argv=None):
     s.add_argument('--night-roster', help='night roster YAML: the same worker names as --roster, each with its night '
                                           'profile; `night on|off` switches between them (docs/design.md §25)')
     s.add_argument('--roles', help='dir of <agent-name>.md files appended to that agent\'s AGENTS.md (one prompt per worker)')
-    s.add_argument('--supervisor-profile', help='codex profile for the supervisor (default: --profile)')
+    s.add_argument('--supervisor-profile', help='codex profile for a Codex supervisor (default: --profile); without '
+                   '--supervisor-cli, fleet-astra maps to the pi supervisor on openai-codex/gpt-6-astra, others are refused')
     s.add_argument('--worker-profile', help='codex profile for codex workers (default: --profile)')
     s.add_argument('--max-busy', type=int, default=DEFAULTS['max_busy'],
                    help='at most this many workers working at once (0 = no limit)')

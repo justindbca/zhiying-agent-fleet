@@ -24,6 +24,7 @@ import json
 from typing import Callable, Dict, Mapping, Optional, Tuple
 
 from cmux_fleet.agent_registry import AgentCard, AgentRegistry
+from cmux_fleet.pi_adapter import for_agent
 
 
 def limit_key(card) -> str:
@@ -32,7 +33,8 @@ def limit_key(card) -> str:
 
 
 def default_model(cfg: Mapping, registry: AgentRegistry) -> Optional[str]:
-    """Model card id of the fleet's default worker runtime, or None (unknown: not counted)."""
+    """Model card id of the fleet's default worker runtime, or None (unknown: not counted).
+    Pass ``for_agent(cfg, slot)`` for one slot: a pi worker may have its own pi_model (roster)."""
     cli = cfg.get('worker_cli') or 'codex'
     model = {'pi': cfg.get('pi_model'), 'claude': cfg.get('worker_model'),
              'codex': cfg.get('codex_model')}.get(cli)
@@ -82,10 +84,10 @@ class Usage:
         for slot, info in agents.items():
             pane = info.get('pane')
             if info.get('state') != 'dead' or (alive and pane and alive(pane)):
-                slots[slot] = slot_card(info, cfg, registry)
+                slots[slot] = slot_card(info, for_agent(cfg, slot), registry)
             old = info.get('retired_pane')
             if old and (alive is None or alive(old)):
-                key = retired_model(info, cfg, registry)
+                key = retired_model(info, for_agent(cfg, slot), registry)
                 if key:
                     retiring[slot] = key
         return cls(slots, retiring)
@@ -156,16 +158,18 @@ def default_problem(cfg: Mapping, slots, registry: AgentRegistry) -> Optional[st
     The default runtime is capped by its model card like any card: a fleet may not start, add roster
     slots or delegate a sub-fleet onto more slots of one model than its max_concurrent (design v2 §3
     并发 = 本 fleet 票数; §4.13 M ≤ 算力闸票数), and never on a host the card excludes."""
-    card = default_card(cfg, registry)
-    if card is None:
-        return None
-    problem = host_problem(card, cfg.get('host') or None)
-    if problem:
-        return 'fleet default worker model: ' + problem
-    slots = list(slots)
-    if card.max_concurrent is not None and len(slots) > card.max_concurrent:
-        return ('fleet default worker model %s: %d worker slots (%s) exceed max_concurrent %d'
-                % (card.id, len(slots), ', '.join(slots), card.max_concurrent))
+    groups = {}  # card id -> (card, slots); a slot's own pi_model picks its card
+    for slot in slots:
+        card = default_card(for_agent(cfg, slot), registry)
+        if card is not None:
+            groups.setdefault(card.id, (card, []))[1].append(slot)
+    for card, group in groups.values():
+        problem = host_problem(card, cfg.get('host') or None)
+        if problem:
+            return 'fleet default worker model: ' + problem
+        if card.max_concurrent is not None and len(group) > card.max_concurrent:
+            return ('fleet default worker model %s: %d worker slots (%s) exceed max_concurrent %d'
+                    % (card.id, len(group), ', '.join(group), card.max_concurrent))
     return None
 
 
@@ -177,8 +181,8 @@ def check_slots(cfg: Mapping, workers, profiles: Mapping[str, str], registry: Ag
     card caps them too (no bypass through the default). Host limits apply to every card."""
     errors, slots, caps = [], {}, {}
     host = cfg.get('host') or None
-    default = default_model(cfg, registry)
-    if default and any(not profiles.get(slot) for slot in workers):
+    defaults = {slot: default_model(for_agent(cfg, slot), registry) for slot in workers if not profiles.get(slot)}
+    for default in dict.fromkeys(d for d in defaults.values() if d):
         card = registry.model(default)
         problem = host_problem(card, host)
         if problem:
@@ -188,7 +192,7 @@ def check_slots(cfg: Mapping, workers, profiles: Mapping[str, str], registry: Ag
     for slot in workers:
         profile = profiles.get(slot)
         if not profile:
-            slots[slot] = (None, default)
+            slots[slot] = (None, defaults[slot])
             continue
         try:
             card = registry.get(profile)

@@ -39,10 +39,10 @@ def test_new_all_pi_start_still_requires_development_opt_in(monkeypatch):
         fleet.main(['start', '--supervisor-cli', 'pi', '--worker-cli', 'pi'])
 
 
-# codex+pi and codex+claude/service left this list when their real smokes verified them (cli_pairs.yaml).
+# codex+pi and codex+claude/service left this list when their real smokes verified them (cli_pairs.yaml);
+# pi+claude left it when it became a listed pair (2026-10-13 default, tests/test_codex_via_pi.py).
 @pytest.mark.parametrize('supervisor,worker,mode,reason', [
     ('pi', 'codex', 'task', 'mixed Pi/Codex fleets are unvalidated'),
-    ('pi', 'claude', 'task', 'mixed Pi/Claude fleets are unvalidated'),
     ('codex', 'codex', 'task', 'Codex workers are unvalidated'),
     ('claude', 'codex', 'task', 'Claude supervisor'),
     ('claude', 'claude', 'service', 'Claude supervisor')])

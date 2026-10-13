@@ -39,12 +39,15 @@ def capture_start(monkeypatch):
 
 # ------------------------------------------------------------------ default combination
 def test_start_without_cli_flags_uses_pair_table_default(monkeypatch):
+    # 2026-10-13 default: pi supervisor (Astra, thinking high) + official Claude workers; the pair is
+    # smoke-only until its real smoke flips the row (tests/test_codex_via_pi.py covers the models).
+    table = cli_pairs.load_pairs()
+    assert (table.default['supervisor_cli'], table.default['worker_cli']) == ('pi', 'claude')
+    life = 'dev_task' if table.lookup('pi', 'claude', 'task')['status'] == 'verified' else 'smoke'
     seen = capture_start(monkeypatch)
     with pytest.raises(Reached):
-        fleet.main(['start', '--lifecycle', 'dev_task', '--allow-development-v2'])
-    default = cli_pairs.load_pairs().default
-    assert (default['supervisor_cli'], default['worker_cli']) == ('codex', 'claude')
-    assert seen == [{'supervisor_cli': 'codex', 'worker_cli': 'claude', 'mode': 'task', 'lifecycle': 'dev_task'}]
+        fleet.main(['start', '--lifecycle', life, '--allow-development-v2', '--allow-unsandboxed-pi'])
+    assert seen == [{'supervisor_cli': 'pi', 'worker_cli': 'claude', 'mode': 'task', 'lifecycle': life}]
 
 
 def test_start_default_follows_an_edited_table(tmp_path, monkeypatch):
@@ -75,14 +78,16 @@ def test_one_explicit_cli_fills_only_the_other_from_default(monkeypatch):
 
 
 @pytest.mark.parametrize('extra,expected', [
-    ([], ('fleet-astra', 'fleet')),                                   # table default: Astra supervisor
+    ([], (None, 'fleet')),                                            # table default names no Codex profile now
     (['--supervisor-profile', 'mine'], ('mine', 'fleet')),             # explicit supervisor profile wins
     (['--profile', 'shared'], (None, 'shared')),                       # explicit shared profile wins
 ])
-def test_codex_supervisor_profile_comes_from_table_default(monkeypatch, extra, expected):
+def test_explicit_codex_supervisor_keeps_its_profile_flags(monkeypatch, extra, expected):
+    # The official Codex TUI supervisor stays optional (brief item 5): only with --supervisor-cli codex.
     capture_start(monkeypatch)
     with pytest.raises(Reached):
-        fleet.main(['start', '--lifecycle', 'dev_task', '--allow-development-v2'] + extra)
+        fleet.main(['start', '--lifecycle', 'dev_task', '--allow-development-v2', '--supervisor-cli', 'codex',
+                    '--worker-cli', 'claude'] + extra)
     assert profiles == [expected]
 
 

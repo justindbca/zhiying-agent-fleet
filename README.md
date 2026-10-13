@@ -89,12 +89,16 @@ Nothing else: the fleet creates its own Codex home for the agents and answers Co
 ## Use
 
 Open a cmux terminal, configure your Pi provider/model and replace `local/my-model` below.
-New starts require Redis v2 and an explicit development opt-in. Supported v2 CLI pairs: all-Pi, or a Codex
-supervisor with official Claude Code workers in task mode (see "Redis v2 development runtime"); every other pair is refused.
+New starts require Redis v2 and an explicit development opt-in. Without `--supervisor-cli` / `--worker-cli`, `start`
+takes the default pair from `cmux_fleet/config/cli_pairs.yaml`: a **Pi supervisor on `openai-codex/gpt-6-astra` (thinking
+high) with official Claude Code workers** (user decision 2026-10-13). That table lists every supported pair and its status
+(see "Redis v2 development runtime"); a pair it does not list is refused. `start` also requires `--lifecycle <mode>`
+(`service`, `dev_task`, `program`, `scheduled`, `review_loop`, `smoke`; see `cmux_fleet/config/fleet_modes.yaml`); an
+`unverified` pair starts only with `--lifecycle smoke`.
 The Codex-specific setup and launch examples below are retained only as legacy v1 reference.
 
 ```bash
-cmux-fleet start --workers 2 --supervisor-cli pi --worker-cli pi \
+cmux-fleet start --workers 2 --supervisor-cli pi --worker-cli pi --lifecycle <mode> \
   --pi-model local/my-model --allow-unsandboxed-pi --allow-development-v2
 echo '{"goal": "Survey the three most-cited papers on X and write a comparison",
        "hours": 4,
@@ -146,7 +150,7 @@ requests. The supervisor only routes; each worker can have its own prompt; answe
 the daemon, not by a model.
 
 ```bash
-cmux-fleet start --mode service --worker-names exit,reentry,rung --roles ~/my-roles \
+cmux-fleet start --lifecycle service --worker-names exit,reentry,rung --roles ~/my-roles \
     --supervisor-cli pi --worker-cli pi --pi-model local/my-model \
     --allow-unsandboxed-pi --allow-development-v2 --max-busy 2 --request-timeout 600
 echo '{"id": "cu-1:r7", "to": "exit", "payload": {...},
@@ -303,11 +307,17 @@ A busy worker can be turned into the supervisor of its own fleet for one numbere
 
 ## Claude Code workers (optional)
 
-The supervisor defaults to Codex (or select Pi below). Workers can be official [Claude Code](https://claude.com/claude-code) CLI sessions instead:
+On Redis v2 the default supervisor is Pi on `openai-codex/gpt-6-astra` with official Claude Code workers (see "Redis v2
+development runtime"); the official Codex supervisor stays available with `--supervisor-cli codex`. This section describes the
+legacy v1 Claude worker path. Workers can be official [Claude Code](https://claude.com/claude-code) CLI sessions instead:
 
 ```bash
-cmux-fleet start --workers 2 --worker-cli claude --worker-model sonnet --worker-kit ~/my-kit
+cmux-fleet start --workers 2 --worker-cli claude --worker-model sonnet --worker-kit ~/my-kit \
+  --lifecycle <mode> --allow-unsandboxed-pi --allow-development-v2
 ```
+
+With no `--supervisor-cli` this now gets the default Pi supervisor (`openai-codex/gpt-6-astra`), hence
+`--allow-unsandboxed-pi`.
 
 - Each worker runs `claude --dangerously-skip-permissions --model <model> --settings <hook> --add-dir <workspace> [--mcp-config mcp.json] -- <prompt>`.
 - Turn ends come from a Claude Code **Stop hook** (`fleet.py claude-stop`) instead of Codex `notify`. A Stop that still lists
@@ -328,15 +338,38 @@ follow the providers' terms.
 Example: a local-model Pi supervisor with official Claude Code workers:
 
 ```bash
-cmux-fleet start --mode service --workers 2 \
+cmux-fleet start --lifecycle service --workers 2 \
   --supervisor-cli pi --pi-model local/my-model --pi-thinking off \
   --worker-cli claude --worker-model sonnet \
-  --allow-unsandboxed-pi
+  --allow-unsandboxed-pi --allow-development-v2
 ```
 
+The explicit `--supervisor-cli pi` takes its model from `--pi-model` (the table default is not read).
+
 Configure `local/my-model` in Pi's `models.json` first. `--pi-model` is required (no implicit
-fallback to a personal/cloud default). To use the same Pi model for workers instead, select
+fallback to a personal/cloud default) for every Pi agent that has no model of its own. To use the same Pi model for workers instead, select
 `--worker-cli pi`. An all-Pi fleet needs neither a Codex binary nor a Codex profile.
+
+- Per-agent Pi models. Model, highest first:
+  - supervisor: `--supervisor-pi-model` (or the model an old profile maps to, `--supervisor-profile fleet-astra` →
+    `openai-codex/gpt-6-astra`, only when `--supervisor-cli` is not given); then an explicit `--pi-model`; then, **only
+    when `--supervisor-cli` is not given** (pi taken from the `cli_pairs.yaml` default), `default.supervisor_pi_model`.
+    A flag you typed is never overridden by the table default. An explicit `--supervisor-cli pi` does **not** read the
+    table default: give `--supervisor-pi-model` or `--pi-model`. So `start --pi-model X` with no other CLI/model flag
+    runs the default Pi supervisor on X; to keep Astra while workers use X, also pass `--supervisor-pi-model`.
+  - worker: a live profile card's `model`; then its roster row `pi_model:` (Pi workers only, not together with
+    `profile:`); then `--pi-model`.
+  - Thinking is resolved separately in the same way: supervisor = `--supervisor-pi-thinking` (or the mapped profile's)
+    > explicit `--pi-thinking` > `default.supervisor_pi_thinking` (defaulted supervisor only) > `off`; worker = card >
+    roster `pi_thinking:` > `--pi-thinking` > `off`. E.g. `--pi-model X` alone gives the default supervisor X with
+    thinking `high`; adding `--pi-thinking low` gives X / low.
+  - A Pi agent left without a model refuses the start: `--pi-model provider/model is required for pi agents (or
+    --supervisor-pi-model / roster pi_model); no model for: ...`.
+  - `--supervisor-pi-model` / `--supervisor-pi-thinking` with a non-Pi supervisor (`--supervisor-cli codex|claude`) are
+    refused, not ignored. With an explicit `--supervisor-cli pi`, `--supervisor-profile X` is refused (use
+    `--supervisor-pi-model`); old-profile mapping applies only to a defaulted supervisor.
+  - Changing a row's `pi_model` / `pi_thinking` in the roster file moves that worker to its next generation on the new
+    model once idle (same slot name).
 
 - `--pi PATH`: Pi CLI binary, >= 1.1.0 (the `agent_settled` lifecycle is required).
 - `--pi-agent-dir DIR`: source Pi directory, default `$PI_CODING_AGENT_DIR` or `~/.pi/agent`.
@@ -381,26 +414,59 @@ V2 now connects the existing Fleet dispatcher to persistent Pi bridges. Select i
 on a fresh isolated development run with `--transport-version 2 --allow-development-v2`
 and `--supervisor-cli pi --worker-cli pi`, plus the existing explicit model/permission options.
 
-Codex supervisor + official Claude Code workers (task mode, user decision 2026-10-12) also run on v2.
+**Default pair (user decision 2026-10-13): Pi supervisor + official Claude Code workers.** Codex models and FlashNext
+run through Pi (ChatGPT login via Pi's `openai-codex` provider); Claude agents only ever run the official `claude` CLI, and
+Pi never uses Claude subscription credentials. With no `--supervisor-cli` the supervisor is Pi on
+`openai-codex/gpt-6-astra`, thinking high (`cli_pairs.yaml` `default.supervisor_pi_model` / `supervisor_pi_thinking`;
+`--supervisor-pi-model` / `--supervisor-pi-thinking`, or an explicit `--pi-model` / `--pi-thinking`, override them;
+an explicit `--supervisor-cli pi` skips the table default and needs `--supervisor-pi-model` or `--pi-model`; full order
+under "Pi agents"). No `--pi-model` is needed while
+the workers are Claude. `--allow-unsandboxed-pi` is still required:
+
+```bash
+cmux-fleet start --worker-model sonnet --workers 2 --lifecycle <mode> \
+  --allow-unsandboxed-pi --allow-development-v2
+```
+
+The `pi+claude` task/service rows are `verified` (real `scripts/smoke_pair.sh pi claude task|service`, 4/4 checks,
+runs `fleet-20261013-115145-828661b9` / `fleet-20261013-115347-7e61f9af`, 2026-10-13, uncommitted branch tree). Night pair: Pi Astra supervisor + Pi FlashNext workers
+(the verified `pi+pi` rows, per-agent models; `--supervisor-pi-model` is required here, otherwise `--pi-model` would put the
+supervisor on FlashNext too):
+
+```bash
+cmux-fleet start --supervisor-cli pi --worker-cli pi \
+  --supervisor-pi-model openai-codex/gpt-6-astra --supervisor-pi-thinking high \
+  --pi-model flashnext/Qwen3.8-Flash-Next-Uncensored-oQ4e-100K-MTP --workers 2 --lifecycle <mode> \
+  --allow-unsandboxed-pi --allow-development-v2
+```
+
+`--supervisor-profile fleet-astra` (or `--profile fleet-astra` while the workers are not Codex) without
+`--supervisor-cli` is the old Codex-profile spelling: it now starts the Pi supervisor on `openai-codex/gpt-6-astra`
+(thinking high) and prints a notice to stderr; combined with a different `--supervisor-pi-model` it is refused. Any other
+profile name there is refused with the two new usages (`--supervisor-cli codex --supervisor-profile X`, or
+`--supervisor-pi-model provider/model`). It never silently starts the official Codex TUI.
+
+Optional: official Codex supervisor + official Claude Code workers (task and service; the default from 2026-10-12 to 2026-10-13)
+also run on v2.
 The daemon receives each delivery from Redis and types only its business text into the official
 TUI (Claude panes get a bracketed paste); no `.inbox` file and no transport ID reach the model.
 The Codex `notify` / Claude `Stop` hooks bind the session on READY and then settle only the delivery
 this generation received, only when the typed text started that turn; the daemon validates it as for Pi.
-Agents keep the original AGENTS.md reply formats. Six parallel Claude workers with an Astra supervisor:
+Agents keep the original AGENTS.md reply formats. Six parallel Claude workers with an official Codex Astra supervisor:
 
 ```bash
 # once: a Codex profile file for the supervisor model (Codex >= 0.156 reads ~/.codex/<name>.config.toml)
 printf 'model = "gpt-6-astra"\nmodel_reasoning_effort = "high"\n' > ~/.codex/fleet-astra.config.toml
 cmux-fleet start --supervisor-cli codex --supervisor-profile fleet-astra \
   --worker-cli claude --worker-model sonnet --workers 6 --max-busy 0 \
-  --allow-development-v2
+  --lifecycle <mode> --allow-development-v2
 cmux-fleet task goal.json
 ```
 
 Validated locally with `--claude` pointing at the real Claude Code binary; the cmux `claude` shim found
-first on PATH inside cmux was not exercised. Service mode, Claude supervisors, Codex workers and
-Pi/official-CLI mixes stay refused with a reason
-before provisioning or profile retirement.
+first on PATH inside cmux was not exercised. Pairs and their status (verified / unverified = `--lifecycle smoke`
+only / refused) live in `cmux_fleet/config/cli_pairs.yaml`; Codex workers (`codex+codex`) are still unverified, and any
+pair the table does not list is refused with a reason before provisioning or profile retirement.
 New `start` commands now require Redis v2 (the default); `--transport-version 1` is rejected. Existing v1 configs remain readable for draining/status/stop only: do not edit their transport version in place. The file-delivery and native-Codex/Claude startup descriptions above are legacy behavior, not a supported new v2 launch path. Unsupported CLI combinations fail rather than silently falling back to files. The development opt-in is still required.
 
 V2 deliveries use run-scoped Redis Streams and full business context rather than message files
