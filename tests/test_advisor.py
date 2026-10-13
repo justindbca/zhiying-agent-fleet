@@ -42,6 +42,7 @@ def check(raw, cli='claude', whitelist=None, current=('sonnet', 'medium'), model
     ({'model': 'sonnet', 'domains': []}, 'reason must cite'),
     ({'model': 'sonnet', 'domains': [], 'reason': 'x', 'capability': 'research_web/coding'}, 'not a row'),
     ({'model': 'haiku', 'domains': [], 'reason': 'x', 'capability': 'research_web/web-research'}, 'untested cell'),
+    ({'model': 'opus', 'domains': [], 'reason': 'x', 'capability': 'research_web/web-research'}, 'verdict overkill'),
 ])
 def test_sheet_validation_failure_branches(raw, match):
     with pytest.raises(advisor.AdviceError, match=match):

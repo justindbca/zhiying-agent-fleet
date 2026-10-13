@@ -146,6 +146,8 @@ def validate(raw, *, cli, models, current, catalog, whitelist, matrix, cards):
         if not isinstance(row, dict):
             raise AdviceError('capability ' + str(capability) + ' is not a row of the capability matrix')
         verdict = (row.get(model) or {}).get('verdict', 'untested')
+        if verdict in ('reserve', 'overkill'):  # advisor.md forbids both; enforced here, not only in the prompt
+            raise AdviceError('verdict ' + verdict + ' for ' + capability + ' × ' + model)
         if verdict == 'untested':
             tested = [c.get('verdict') for m, c in row.items() if isinstance(c, dict) and c.get('verdict') != 'untested']
             if any(v != 'not_enough' for v in tested):
