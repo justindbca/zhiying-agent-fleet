@@ -815,7 +815,15 @@ def collect(f, child_run, notify=True):
     child_mgr.close_all()
     child_mgr.meta_path.unlink(missing_ok=True)
     f.setf(slot, delegated_pane='', delegated_task='', delegate_cfg='')
-    if returned:
+    # A Claude worker on the hook channel is never typed into after its launch prompt: instead of the
+    # role-change prompt, its next generation takes the returned session's place (CLI-argument prompt).
+    hooked = returned and f.v2 is not None and f.v2.hooked(slot)
+    if hooked:
+        f.mgr.kill_pane(ph)
+        f.setf(slot, pane=rec['pane'], state='idle')
+        f.v2.respawn([slot], True)
+        f.log('subfleet.slot_respawned', task=rec['task_id'], slot=slot, returned=True)
+    elif returned:
         # The adopted session may still be mid-turn (parent task ended, stop): abort that turn so its
         # late Stop cannot settle as the READY of the return. Second place Escape counts as accepted stop.
         f.mgr.send_key(rec['pane'], 'Escape')
@@ -862,7 +870,8 @@ def collect(f, child_run, notify=True):
         f.queue('supervisor', '[Sub-fleet ' + rec['task_id'] + ' ' + ('completed' if ok else 'failed') + '] '
                 + f.label(slot) + ' ran sub-fleet ' + rec['task_id'] + ' (attempt ' + str(rec.get('attempt', 1))
                 + '): ' + (rec.get('reason') or rec.get('outcome') or '') + '. ' + f.label(slot)
-                + ' is a worker again' + ('' if returned else ' (new generation: the delegated session was lost)')
+                + ' is a worker again' + ('' if returned and not hooked else ' (new generation: the delegated session was '
+                                          + ('retired' if hooked else 'lost') + ')')
                 + '.' + extra + '\nContinue the current task using the AGENTS.md decision JSON.')
     return rec
 

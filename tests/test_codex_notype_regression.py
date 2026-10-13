@@ -40,6 +40,7 @@ import pytest
 from test_fleet import FakeMgr, write_rollout, fx, turn as fleet_turn  # noqa: F401  (fx fixture)
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
 from test_resume import managed, task_run, crash_and_resume  # noqa: F401  (fixtures)
+import hook_sim
 import test_subfleet as ts
 from cmux_fleet import codex_queue, fleet, runtime_v2, subfleet
 
@@ -172,9 +173,12 @@ def drive(f, fn):
 
 
 def typed(f, slot, pane=None):
-    """Text that reached a (Claude worker) pane through the paste path."""
-    pane = pane or f.agent(slot)['pane']
-    return [text for p, text in f.mgr.sent if p == pane]
+    """Text that reached a (Claude worker) pane: pasted, or handed over by its Stop hook (hook channel,
+    conftest/hook_sim). An explicit ``pane`` reports that pane's pastes only."""
+    if pane:
+        return [text for p, text in f.mgr.sent if p == pane]
+    pane = f.agent(slot)['pane']
+    return [text for p, text in f.mgr.sent if p == pane] + hook_sim.handed_to(f, slot)
 
 
 def session(f, slot):
@@ -228,17 +232,17 @@ def startup_ready(f):
 
 
 def claude_turn(f, slot, text, prompt=None):
-    """A Claude worker's Stop hook (the worker side is unchanged by this work)."""
+    """A Claude worker's Stop hook (hook channel: hook_sim stands in for its blocking wait)."""
     gen = str(f.agent(slot)['generation'])  # read before the hook thread: the test client has one connection
     thread = session(f, slot)
     transcript = f.test_claude / slot / (thread + '.jsonl')
     transcript.parent.mkdir(parents=True, exist_ok=True)
     prompt = prompt if prompt is not None else typed(f, slot)[-1]
-    rows = [{'type': 'user', 'message': {'role': 'user', 'content': prompt}},
+    rows = [hook_sim.user_row(prompt, hook_sim.was_handed(slot, prompt)),
             {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': text}]}}]
     transcript.write_text('\n'.join(json.dumps(x) for x in rows) + '\n')
     raw = json.dumps({'session_id': thread, 'transcript_path': str(transcript), 'last_assistant_message': text})
-    return drive(f, lambda: fleet.claude_stop(f.path, slot, gen, raw))
+    return drive(f, lambda: hook_sim.claude_stop(f.path, slot, gen, raw))
 
 
 def lease(f, slot='supervisor'):

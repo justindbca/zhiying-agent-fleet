@@ -16,7 +16,7 @@ from pathlib import Path
 
 import redis
 
-from cmux_fleet import cli_pairs, contracts
+from cmux_fleet import claude_hook, cli_pairs, contracts
 from cmux_fleet.message_bus import BusError, MessageBus, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
 from cmux_fleet import codex_queue, lifecycle_close, subfleet, tui_cards
@@ -53,8 +53,9 @@ def validate_config(cfg):
 
 def tui_slot(cfg, slot):
     """Official interactive CLIs (Codex/Claude) have no in-process bridge: the daemon
-    receives their delivery and types the business text into the TUI; the CLI's own
-    turn-end hook (Codex notify / Claude Stop) settles it."""
+    receives their delivery and hands the business text to the TUI (typed for Codex and a
+    Claude supervisor; through the Stop-hook mailbox for Claude workers, see claude_hook);
+    the CLI's own turn-end hook (Codex notify / Claude Stop) settles it."""
     return cfg.get('transport_version') == 2 and (
         cfg.get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') or 'codex') != 'pi'
 
@@ -545,6 +546,10 @@ class RuntimeV2:
                     except codex_queue.QueueError as exc:
                         # No typing fallback: the startup deadline then blocks the slot as for no READY.
                         self.audit('startup.nudge_failed', slot=slot, level='error', error=str(exc)[:300])
+                elif self.hooked(slot):
+                    generation = int(self.f.agent(slot).get('generation') or 0)
+                    claude_hook.post(self.bus.r, self.hook_keys(slot, generation),
+                                     {'kind': 'nudge', 'generation': generation, 'text': STARTUP_NUDGE})
                 elif pane:
                     from cmux_fleet.fleet import is_claude
                     self.f.mgr.send_prompt_to_idle(pane, STARTUP_NUDGE, bracketed=is_claude(self.f.runtime_cfg(slot), slot))
@@ -1132,6 +1137,10 @@ class RuntimeV2:
         from cmux_fleet.fleet import RESUME_CLIS
         info = self.f.agent(slot)
         pane = info.get('pane')
+        if self.hooked(slot) and self.bus.r.hget(self.bus.lease_key(slot), 'current_delivery'):
+            # The Escape that aborts its in-flight turn would also kill the waiting Stop hook and
+            # leave the session with no delivery channel: start the next generation instead.
+            return False
         return (tui_slot(self.slot_cfg(slot), slot) and info.get('runtime_ready') == '1' and not info.get('handoff_id')
                 and info.get('state') in ('idle', 'busy', 'held') and bool(pane)
                 and self.f.mgr.get_pane_status(pane) is not None and self.f.mgr.has_cli_process(pane, RESUME_CLIS))
@@ -1349,11 +1358,22 @@ class RuntimeV2:
             if tui_slot(self.slot_cfg(slot), slot):
                 self.type_into(slot, env)
 
-    def type_into(self, slot, env):
-        """Receive an offered delivery for an official CLI and type only its business text.
+    def hooked(self, slot):
+        """A Claude worker: deliveries go through its Stop-hook mailbox, never its input box."""
+        return tui_slot(self.slot_cfg(slot), slot) and claude_hook.enabled(self.slot_cfg(slot), slot)
 
-        No message file and no transport IDs reach the model. The CLI's own turn-end hook
-        settles against this delivery in Redis. Any failure holds the slot (fail closed).
+    def hook_keys(self, slot, generation):
+        return claude_hook.keys(self.bus.prefix, slot, generation)
+
+    def type_into(self, slot, env):
+        """Receive an offered delivery for an official CLI and hand over only its business text.
+
+        No message file and no transport IDs reach the model (a Codex delivery carries only its
+        opaque delivery-token line). An official Codex agent gets the text through `codex queue`
+        (codex_queue); a Claude worker from its Stop hook (mailbox, claude_hook); any other official
+        CLI slot (a Claude supervisor) gets it typed into the TUI. The
+        CLI's own turn-end hook settles against this delivery in Redis. Any failure holds the slot
+        (fail closed).
         """
         consumer = 'tui-' + slot + '-g' + str(env['generation'])
         reason = 'TUI input not confirmed; prompt state unknown'
@@ -1370,6 +1390,17 @@ class RuntimeV2:
                            queued_id=got_q['queued_id'])
                 return True
             pane = self.f.agent(slot).get('pane')
+            if self.hooked(slot):
+                k = self.hook_keys(slot, env['generation'])
+                waiting = claude_hook.post(self.bus.r, k, {
+                    'kind': 'delivery', 'generation': env['generation'], 'message_id': env['message_id'],
+                    'delivery_id': env['delivery_id'], 'text': got['body']['text']})
+                # armed=False is normal right after a settle (the hook is still reporting the turn). If
+                # Escape / a hook timeout left the session idle, the next turn end of this session (any
+                # typed line) picks it up; otherwise the watchdog's stall path applies.
+                self.audit('tui.hooked', slot=slot, message_id=env['message_id'], delivery_id=env['delivery_id'],
+                           generation=env['generation'], armed=waiting)
+                return True
             claude = self.slot_cfg(slot).get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') == 'claude'
             if pane and self.f.mgr.send_prompt_to_idle(pane, got['body']['text'], bracketed=claude):
                 self.audit('tui.typed', slot=slot, message_id=env['message_id'], delivery_id=env['delivery_id'])

@@ -18,12 +18,13 @@ from pathlib import Path
 import pytest
 import yaml
 
+import hook_sim
 from test_fleet import FakeMgr
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
 from test_runtime_v2 import event, receive, session, settle
 from test_v2_codex_claude import answer_turn, no_message_files, typed
 from test_v2_codex_pi import pi_ready
-from cmux_fleet import cli_pairs, cmux_manager, fleet, pi_adapter, runtime_v2
+from cmux_fleet import claude_hook, cli_pairs, cmux_manager, codex_queue, fleet, pi_adapter, runtime_v2
 
 ASTRA = 'openai-codex/gpt-6-astra'
 FLASH = 'flashnext/Qwen3.8-Flash-Next-Uncensored-oQ4e-100K-MTP'
@@ -494,7 +495,9 @@ def test_pi_supervisor_task_dispatches_to_claude_and_completes(pi_claude):
     for w in WORKERS:
         text, = typed(f, w)
         assert 'Write ' + w + '/part.md' in text and 'fleet_result' not in text
-        assert dict(f.mgr.bracketed)[f.agent(w)['pane']] is True          # Claude bracketed paste
+        # Claude workers under a pi supervisor take the Stop-hook channel too: never pasted (no-typing batch)
+        assert f.agent(w)['pane'] not in dict(getattr(f.mgr, 'bracketed', []))
+        assert text in hook_sim.handed_to(f, w)
         out = f.workspace() / w / 'part.md'
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text('findings')
@@ -514,6 +517,25 @@ def test_pi_supervisor_task_dispatches_to_claude_and_completes(pi_claude):
     assert any('[worker-1 report]' in t or '[worker-2 report]' in t for t in reports)
     assert f.task()['status'] == 'completed'
     assert no_message_files(f)
+
+
+def test_pi_supervisor_and_hook_claude_workers_each_keep_their_own_channel(pi_claude):
+    """No-typing batch routing: a pi supervisor is never on the Codex queue or the Claude hook channel
+    (its extension takes deliveries); its Claude workers get theirs only from their Stop hook."""
+    f = pi_claude
+    assert not codex_queue.is_codex(f.cfg, 'supervisor') and not f.v2.hooked('supervisor')
+    assert all(f.v2.hooked(w) and not codex_queue.is_codex(f.cfg, w) for w in WORKERS)
+    runtime_v2.post_event(f.v2.bus, dict(kind='task', request_id='t1', spec={'goal': 'route check'}), 't1')
+    assert f.v2.step(10)
+    f.pump()
+    env = receive(f, 'supervisor')
+    assert env and not typed(f, 'supervisor') and not f.r.hget(fleet.key('agent', 'supervisor'), 'cq_token')
+    assert not f.r.exists(claude_hook.keys(f.v2.bus.prefix, 'supervisor', 0)['mailbox'])
+    settle(f, 'supervisor', env, {'status': 'RUNNING', 'completion': 10, 'reason': 'go',
+                                  'dispatch': [{'to': 'worker-1', 'instruction': 'Write worker-1/part.md now.'}]})
+    f.pump()
+    assert [t for t in hook_sim.handed_to(f, 'worker-1') if 'Write worker-1/part.md now.' in t]
+    assert not f.mgr.sent and not getattr(f.mgr, 'queued', [])   # nothing pasted, nothing codex-queued
 
 
 def test_pi_supervisor_service_request_reaches_claude_and_card_is_off_model(pi_claude_service):

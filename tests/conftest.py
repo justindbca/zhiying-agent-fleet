@@ -1,18 +1,24 @@
-"""Shared test setup: a fake `codex queue` for every test (Codex deliveries never type into a pane).
+"""Suite-wide test defaults: neither no-typing channel ever types into a pane.
 
+Codex: a fake `codex queue` for every test (Codex deliveries never type into a pane).
 The real CLI is never run by the unit tests. A queued delivery is recorded in its own log,
 `mgr.queued` (FakeMgr / test_subfleet's World), never in `mgr.sent`: `sent` stays the record of real
 `send_prompt_to_idle` pastes only, so "nothing was typed" assertions keep their meaning. Its turn is
 started in the rollout the way the real TUI does it (test_fleet.codex_rows). A test that installs its
 own `codex_queue.enqueue` stub keeps it: then only the real deliver runs.
-
 Guard (every test): a pane that received a queued Codex delivery must never also get a paste.
+
+Claude: Claude workers get their deliveries through the Stop-hook channel (cmux_fleet/claude_hook.py) in
+every test. A real hook blocks waiting for the next delivery, which an in-process test cannot do,
+so tests/hook_sim.py stands in for that wait only (see its docstring). A module that runs the real
+hook command in subprocesses sets ``HOOK_CHANNEL = True`` and gets no stand-in.
 """
 import uuid
 
 import pytest
 
 import test_fleet  # first: puts the checkout on sys.path
+import hook_sim  # noqa: E402
 from cmux_fleet import codex_queue, fleet  # noqa: E402
 
 
@@ -49,3 +55,13 @@ def fake_codex_queue(monkeypatch):
         codex_panes = {pane for pane, _ in queued if pane}
         typed = [(pane, text[:60]) for pane, text in sent if pane in codex_panes]
         assert not typed, 'a Codex pane got a paste: ' + repr(typed)
+
+
+@pytest.fixture(autouse=True)
+def _waiting_hook_stand_in(request, monkeypatch):
+    if getattr(request.module, 'HOOK_CHANNEL', False):
+        yield
+        return
+    hook_sim.install(monkeypatch)
+    yield
+    hook_sim.reset()

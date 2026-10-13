@@ -14,6 +14,7 @@ import test_fleet
 
 import pytest
 
+import hook_sim
 from test_fleet import FakeMgr, codex_rows, write_rollout
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
 from cmux_fleet import cmux_manager, codex_queue, fleet, runtime_v2, transport_inventory
@@ -165,8 +166,9 @@ def drive(f, fn):
 
 
 def typed(f, slot):
-    """What reached the slot: queued for a Codex pane, pasted for a Claude pane (test_fleet.received)."""
-    return test_fleet.received(f.mgr, f.agent(slot)['pane'])
+    """What the slot's current generation was given: queued for a Codex pane (codex queue), pasted for a
+    non-hook pane (test_fleet.received), or handed over by a Claude worker's Stop hook."""
+    return test_fleet.received(f.mgr, f.agent(slot)['pane']) + hook_sim.handed_to(f, slot)
 
 
 def answer_turn(f, slot, text, *, startup=False, prompt=None, generation=None):
@@ -182,11 +184,11 @@ def answer_turn(f, slot, text, *, startup=False, prompt=None, generation=None):
         return drive(f, lambda: fleet.notify(f.path, slot, str(gen), payload, f.test_sessions))
     transcript = f.test_claude / slot / (thread + '.jsonl')
     transcript.parent.mkdir(parents=True, exist_ok=True)
-    rows = [{'type': 'user', 'message': {'role': 'user', 'content': prompt}},
+    rows = [hook_sim.user_row(prompt, hook_sim.was_handed(slot, prompt)),
             {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': text}]}}]
     transcript.write_text('\n'.join(json.dumps(x) for x in rows) + '\n')
     raw = json.dumps({'session_id': thread, 'transcript_path': str(transcript), 'last_assistant_message': text})
-    return drive(f, lambda: fleet.claude_stop(f.path, slot, str(gen), raw))
+    return drive(f, lambda: hook_sim.claude_stop(f.path, slot, str(gen), raw))
 
 
 def decision(workers):
@@ -235,10 +237,11 @@ def test_codex_supervisor_dispatches_six_claude_workers_through_v2_bus(mixed):
         assert f.agent(slot)['state'] == 'busy'
         assert f.v2.bus.slot_state(slot)['status'] == 'received'
     assert sum(f.agent(w)['state'] == 'busy' for w in WORKERS) == 6
-    # Claude needs a bracketed paste for multi-line text; Codex is never pasted at all (codex queue).
-    modes = dict(f.mgr.bracketed)
+    # Nothing is pasted at all: Codex takes its deliveries from its own queue (codex queue) and the
+    # Claude workers from their Stop hook (hook channel).
+    modes = dict(getattr(f.mgr, 'bracketed', []))  # set by the first paste only
     assert f.agent('supervisor')['pane'] not in modes
-    assert all(modes[f.agent(w)['pane']] is True for w in WORKERS)
+    assert not any(f.agent(w)['pane'] in modes for w in WORKERS)
     assert no_message_files(f)
 
 
@@ -370,16 +373,20 @@ def test_renewal_extends_received_tui_lease(mixed):
 
 
 def test_v2_claude_stop_hook_outlives_ready_wait(tmp_path):
+    def timeout(cfg, generation):
+        argv = fleet.claude_argv('cfg.json', cfg, 'worker-1', generation, 'hi')
+        return json.loads(Path(argv[argv.index('--settings') + 1]).read_text())['hooks']['Stop'][0]['hooks'][0]['timeout']
     cfg = {'python': 'py', 'run': str(tmp_path), 'workers': ['worker-1'], 'transport_version': 2,
-           'profile_ready_timeout': 180}
+           'profile_ready_timeout': 180, 'worker_cli': 'claude'}
     fleet.agent_cwd(cfg, 'worker-1').mkdir(parents=True)
-    argv = fleet.claude_argv('cfg.json', cfg, 'worker-1', 0, 'hi')
-    settings = json.loads(Path(argv[argv.index('--settings') + 1]).read_text())
-    assert settings['hooks']['Stop'][0]['hooks'][0]['timeout'] == 210
-    del cfg['transport_version']
-    argv = fleet.claude_argv('cfg.json', cfg, 'worker-1', 1, 'hi')
-    settings = json.loads(Path(argv[argv.index('--settings') + 1]).read_text())
-    assert settings['hooks']['Stop'][0]['hooks'][0]['timeout'] == 30  # v1 unchanged
+    # Stop-hook channel: the hook waits there for the next delivery (claude_hook_timeout, default one day).
+    assert timeout(cfg, 0) == 86400
+    assert timeout(dict(cfg, claude_hook_timeout=900), 1) == 900
+    # Fallback (claude_hook_delivery: false): the READY wait budget as before, v1 unchanged.
+    typed_path = dict(cfg, claude_hook_delivery=False)
+    assert timeout(typed_path, 2) == 210
+    del typed_path['transport_version']
+    assert timeout(typed_path, 3) == 30
 
 
 def test_codex_turn_matches_rollout_cwd_through_symlinked_run_dir(tmp_path):
@@ -404,13 +411,13 @@ def test_claude_settlement_survives_megabytes_of_tool_output(mixed):
     thread = f.test_threads['worker-1']
     transcript = f.test_claude / 'worker-1' / (thread + '.jsonl')
     report = 'Done:\n- big\nEvidence:\n- worker-1/big.log\nNot done: none\nBlocked: none'
-    rows = [{'type': 'user', 'message': {'role': 'user', 'content': prompt}},
+    rows = [hook_sim.user_row(prompt, hook_sim.was_handed('worker-1', prompt)),
             {'type': 'user', 'message': {'role': 'user', 'content': [
                 {'type': 'tool_result', 'content': 'x' * 2_000_000}]}},
             {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': report}]}}]
     transcript.write_text('\n'.join(json.dumps(x) for x in rows) + '\n')
     raw = json.dumps({'session_id': thread, 'transcript_path': str(transcript), 'last_assistant_message': report})
-    assert drive(f, lambda: fleet.claude_stop(f.path, 'worker-1', '0', raw))['status'] == 'committed'
+    assert drive(f, lambda: hook_sim.claude_stop(f.path, 'worker-1', '0', raw))['status'] == 'committed'
 
 
 def test_ignored_turn_is_audited(mixed):

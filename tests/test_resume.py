@@ -8,6 +8,7 @@ Fake cmux, fake CLIs: this proves the reconcile wiring, not a real TUI.
 import fcntl
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
@@ -17,6 +18,7 @@ import uuid
 
 import pytest
 
+import hook_sim
 from test_fleet import FakeMgr
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
 from test_runtime_v2 import event, fx, receive, result, session  # noqa: F401  (fx fixture)
@@ -120,11 +122,11 @@ def answer_turn(f, slot, text, *, startup=False, prompt=None):
         return drive(f, lambda: fleet.notify(f.path, slot, str(gen), payload, f.test_sessions))
     transcript = f.test_claude / slot / (thread + '.jsonl')
     transcript.parent.mkdir(parents=True, exist_ok=True)
-    rows = [{'type': 'user', 'message': {'role': 'user', 'content': prompt}},
+    rows = [hook_sim.user_row(prompt, hook_sim.was_handed(slot, prompt)),
             {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': text}]}}]
     transcript.write_text('\n'.join(json.dumps(x) for x in rows) + '\n')
     raw = json.dumps({'session_id': thread, 'transcript_path': str(transcript), 'last_assistant_message': text})
-    return drive(f, lambda: fleet.claude_stop(f.path, slot, str(gen), raw))
+    return drive(f, lambda: hook_sim.claude_stop(f.path, slot, str(gen), raw))
 
 
 REPORT = 'Done:\n- wrote {0}\nEvidence:\n- {0}\nNot done: none\nBlocked: none'
@@ -205,19 +207,25 @@ def test_aof_restart_resumes_task_redoes_only_the_lost_dispatch_and_writes_resul
     assert [(a['path'], a['problems']) for a in out['artifacts']] == [('worker-1/a.md', []), ('worker-2/b.md', [])]
 
 
-def test_alive_worker_pane_is_reattached_not_respawned(task_run):
+def test_resume_reattaches_idle_hook_worker_and_replaces_in_flight_one(task_run):
     state = task_run
     half_done(state)
     mgr = state['mgr']
-    w2 = state['f'].agent('worker-2')['pane']
+    w1, w2 = state['f'].agent('worker-1')['pane'], state['f'].agent('worker-2')['pane']
     spawned = len(mgr.spawned)
     f = crash_and_resume(state)
-    assert f.agent('worker-2')['pane'] == w2 and f.agent('worker-2')['generation'] == '0'
-    assert w2 not in mgr.killed and (w2, 'Escape') in mgr.keys  # the old turn is aborted first
-    assert len(mgr.spawned) == spawned + 1  # only the supervisor's next generation
-    assert f.agent('worker-2')['state'] == 'idle'
-    f.pump()  # worker-2 is idle at once; the supervisor waits for READY
-    assert [t for t in typed(f, 'worker-2') if 'Write worker-2/b.md' in t].__len__() == 2
+    # Idle Claude worker: reattached as it is; its Stop hook keeps waiting (an Escape would kill it).
+    assert f.agent('worker-1')['pane'] == w1 and f.agent('worker-1')['generation'] == '0'
+    assert w1 not in mgr.killed and (w1, 'Escape') not in mgr.keys
+    # In-flight Claude worker: aborting its turn with Escape would also kill the waiting hook, so the
+    # hook channel replaces it with the next generation instead (RuntimeV2.reattachable).
+    assert w2 in mgr.killed and (w2, 'Escape') not in mgr.keys
+    assert f.agent('worker-2')['generation'] == '1' and f.agent('worker-2')['state'] == 'starting'
+    assert len(mgr.spawned) == spawned + 2  # the supervisor's and worker-2's next generations
+    assert answer_turn(f, 'worker-2', 'READY', startup=True)['status'] == 'ready'
+    f.pump()  # the lost dispatch is redone through worker-2.1's Stop hook, never typed
+    assert [t for t in typed(f, 'worker-2') if 'Write worker-2/b.md' in t].__len__() == 1
+    assert not [t for p, t in mgr.sent if p in (w2, f.agent('worker-2')['pane'])]
     assert answer_turn(f, 'worker-2', REPORT.format('worker-2/b.md'))['status'] == 'committed'
 
 
@@ -233,7 +241,9 @@ def test_attempt_cap_blocks_with_the_lost_dispatch_named(task_run):
     f = crash_and_resume(state)
     task = f.task()
     assert task['status'] == 'blocked'
-    assert 'worker-2.1' in task['reason'] and 'max-attempts 2' in task['reason'] and 'worker-2/b.md' in task['reason']
+    # The label carries the generation: each resume of an in-flight hook worker starts a new one.
+    assert re.search(r'worker-2\.\d+', task['reason']) and 'max-attempts 2' in task['reason'] \
+        and 'worker-2/b.md' in task['reason']
     f.tick()
     assert json.loads((f.run_dir / 'result.json').read_text())['status'] == 'blocked'
 
