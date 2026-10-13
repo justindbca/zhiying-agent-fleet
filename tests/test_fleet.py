@@ -1,8 +1,10 @@
 """Fleet daemon tests: in-memory Redis, fake cmux manager, fake Codex rollouts.
 No live model, no cmux, no redis-server."""
+import datetime
 import json
 import os
 import sys
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -141,6 +143,45 @@ def write_rollout(sessions, thread, cwd, used=1000, rows=(), window=95000):
     return path
 
 
+# ---- fake `codex queue` (installed for every test by tests/conftest.py)
+# Real Codex 0.162.1: a queued message starts its own turn whose rollout task_started has
+# turn_attribution.turn_trigger "queue" and whose one UserMessage carries the queued client_id.
+CODEX_QUEUE = {}  # thread -> {'turn', 'client_id', 'text'} of the queued delivery not answered yet
+
+
+def _stamp():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+
+
+def codex_rows(thread, prompt, text=None, *, pop=True):
+    """(turn_id, rollout rows) of a Codex turn whose input is `prompt`: the queued delivery's own
+    turn when `prompt` is what was queued, else a turn the user typed. text=None: still running."""
+    q = CODEX_QUEUE.get(thread)
+    if q and q['text'] == prompt:
+        if pop:
+            CODEX_QUEUE.pop(thread)
+        turn, trigger, client = q['turn'], 'queue', q['client_id']
+    else:
+        turn, trigger, client = 't-' + uuid.uuid4().hex, 'user', ''
+    rows = [{'timestamp': _stamp(), 'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_attribution': {
+                'turn_id': turn, 'turn_trigger': trigger, 'root_turn_id': turn}}},
+            {'timestamp': _stamp(), 'type': 'event_msg', 'payload': {'type': 'item_completed', 'turn_id': turn, 'item': {
+                'type': 'UserMessage', 'client_id': client, 'content': [{'type': 'text', 'text': prompt}]}}}]
+    if text is not None:
+        rows.append({'timestamp': _stamp(), 'type': 'event_msg', 'payload': {
+            'type': 'task_complete', 'turn_id': turn, 'last_agent_message': text}})
+    return turn, rows
+
+
+def append_rollout(sessions, thread, cwd, rows):
+    path = Path(sessions) / '2026/09/25' / ('rollout-' + thread + '.jsonl')
+    if not path.exists():
+        return write_rollout(Path(sessions), thread, cwd, rows=rows)
+    with path.open('a') as fh:
+        fh.write('\n'.join(json.dumps(x) for x in rows) + '\n')
+    return path
+
+
 @pytest.fixture
 def fx(tmp_path):
     run = tmp_path / 'run'
@@ -160,7 +201,9 @@ def fx(tmp_path):
 
 
 def turn(name, text, generation=0):
-    return {'kind': 'turn', 'agent': name, 'generation': generation, 'thread': THREADS.get(name), 'text': text}
+    q = CODEX_QUEUE.pop(THREADS.get(name), None)  # the queued delivery this turn answers (its rows are in the rollout)
+    return {'kind': 'turn', 'agent': name, 'generation': generation, 'thread': THREADS.get(name), 'text': text,
+            **({'turn': q['turn']} if q else {})}
 
 
 def decision(status='RUNNING', completion=30, dispatch=None, **extra):
@@ -486,7 +529,11 @@ def test_rotated_worker_gets_next_name_and_old_name_still_routes(fx):
     fx.pump()
     assert 'worker-1/map.md' in last_to(fx, 'worker-1')  # same slot dir, artifacts still valid
     write_rollout(fx.sessions, new_thread, fleet.agent_cwd(fx.cfg, 'worker-1'))
-    fx.handle({'kind': 'turn', 'agent': 'worker-1', 'generation': 1, 'thread': new_thread, 'text': 'Done: step two'})
+    append_rollout(fx.sessions, new_thread, fleet.agent_cwd(fx.cfg, 'worker-1'),  # rewritten: put its queued turn back
+                   codex_rows(new_thread, CODEX_QUEUE[new_thread]['text'], pop=False)[1])
+    q = CODEX_QUEUE.pop(new_thread, None)  # the queued delivery this turn answers
+    fx.handle({'kind': 'turn', 'agent': 'worker-1', 'generation': 1, 'thread': new_thread, 'text': 'Done: step two',
+               **({'turn': q['turn']} if q else {})})
     fx.pump()
     assert '[worker-1.1 report (took over from worker-1)]' in last_to(fx, 'supervisor')
     fx.handle(turn('supervisor', decision(dispatch=[
@@ -872,8 +919,9 @@ def submit(f, spec):
 
 
 def answer(f, name, text):
+    q = CODEX_QUEUE.pop(SVC_THREADS[name], None)  # the queued delivery this turn answers
     f.handle({'kind': 'turn', 'agent': name, 'generation': int(f.agent(name)['generation']),
-              'thread': SVC_THREADS[name], 'text': text})
+              'thread': SVC_THREADS[name], 'text': text, **({'turn': q['turn']} if q else {})})
 
 
 def results(f):

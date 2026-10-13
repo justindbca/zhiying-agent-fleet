@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from test_fleet import write_rollout
+from test_fleet import codex_rows, write_rollout
 from cmux_fleet import cmux_manager, fleet, redis_runtime, roster, runtime_v2, subfleet
 
 
@@ -250,9 +250,8 @@ def hook(t, f, slot, text, *, prompt=None, thread=None, generation=None):
     if prompt is None:
         prompt = [x for p, x in t.world.sent if p == f.agent(slot)['pane']][-1]
     if slot == 'supervisor' and fleet.agent_cli(f.cfg, slot) == 'codex':
-        turn_id = 't-' + uuid.uuid4().hex
-        write_rollout(t.sessions, thread, fleet.agent_cwd(f.cfg, slot), rows=[
-            {'type': 'event_msg', 'payload': {'type': 'task_complete', 'turn_id': turn_id, 'last_agent_message': text}}])
+        turn_id, rows = codex_rows(thread, prompt, text)  # the queued delivery's own turn, or a typed one
+        write_rollout(t.sessions, thread, fleet.agent_cwd(f.cfg, slot), rows=rows)
         payload = json.dumps({'type': 'agent-turn-complete', 'thread-id': thread, 'turn-id': turn_id,
                               'input-messages': [prompt], 'last-assistant-message': text})
         return drive(t, lambda: fleet.notify(f.path, slot, str(gen), payload, t.sessions))

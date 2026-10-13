@@ -46,7 +46,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import brake, cli_pairs, contracts, handoff, history, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, watchdog  # noqa: E402
+from cmux_fleet import brake, cli_pairs, codex_queue, contracts, handoff, history, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, watchdog  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -622,11 +622,19 @@ def completed_turn(cwd, data, sessions):
                 except ValueError:
                     continue
                 payload = row.get('payload', {})
+                if turn:
+                    # Known turn id: judge that turn's own end, even if a later (queued) turn has started since.
+                    if row.get('type') == 'event_msg' and payload.get('type') == 'task_complete' \
+                            and payload.get('turn_id') == turn:
+                        return (payload.get('last_agent_message') or '').strip() == text
+                    if row.get('type') == 'event_msg' and payload.get('type') == 'task_started' and (
+                            (payload.get('turn_attribution') or {}).get('turn_id') or payload.get('turn_id')) == turn:
+                        return False  # this turn has not finished (yet)
+                    continue
                 if row.get('type') == 'event_msg' and payload.get('type') == 'task_started':
                     return False
                 if row.get('type') == 'event_msg' and payload.get('type') == 'task_complete':
-                    return ((payload.get('last_agent_message') or '').strip() == text
-                            and (not turn or payload.get('turn_id') == turn))
+                    return (payload.get('last_agent_message') or '').strip() == text
             return False
         except (OSError, ValueError):
             continue
@@ -699,9 +707,11 @@ def notify(cfg_path, name, generation, payload, sessions=None):
         cfg, name, generation = subfleet.delegated_route(cfg, name, int(generation))
         return tui_turn(cfg, name, int(generation), thread=data.get('thread-id') or data.get('thread_id'),
                         transcript='', text=data.get('last-assistant-message') or data.get('last_assistant_message') or '',
-                        inputs=inputs if isinstance(inputs, list) else [])
+                        inputs=inputs if isinstance(inputs, list) else [],
+                        turn=data.get('turn-id') or data.get('turn_id') or '')
     r.rpush(EVENTS, json.dumps({'kind': 'turn', 'agent': name, 'generation': int(generation),
                                 'thread': data.get('thread-id') or data.get('thread_id'),
+                                'turn': data.get('turn-id') or data.get('turn_id') or '',
                                 'text': data.get('last-assistant-message') or data.get('last_assistant_message') or '',
                                 'at': time.time()}, ensure_ascii=False))
     return True
@@ -829,12 +839,13 @@ def claude_prompt(cfg_path, name, generation, raw, wait=PROMPT_WAIT):
         r.close(); r.connection_pool.disconnect()
 
 
-def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=None, settle_wait=30):
+def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=None, settle_wait=30, turn=''):
     """v2 turn end of an official interactive CLI (Codex notify / Claude Stop hook).
 
     First READY turn: bind the session, register the slot and report startup. Later turns:
-    settle only the delivery this generation received, only if the typed delivery text
-    started the turn. The daemon validates identity, lease, fence and schema as for Pi.
+    settle only the delivery this generation received, only if that delivery started the turn
+    (Claude: its typed text; Codex: the rollout proves the queued delivery started `turn`, see
+    codex_queue.bound). The daemon validates identity, lease, fence and schema as for Pi.
     """
     if name not in ['supervisor'] + cfg['workers'] or not runtime_v2.tui_slot(cfg, name):
         raise ValueError('turn hook must name an official-CLI v2 agent in this fleet')
@@ -860,9 +871,31 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
                                    'generation': str(generation), 'error': reason, 'level': 'warn',
                                    'at': str(int(time.time() * 1000))})
             return {'status': status, 'reason': reason}
+        codex = codex_queue.is_codex(cfg, name)
+        why = []
+
+        def answered(body_text, delivery):
+            """Did this delivery start the turn? Codex: exact rollout binding, never the cumulative inputs."""
+            if not codex:
+                return runtime_v2.turn_answers(body_text, inputs)
+            rec = codex_queue.wait_queued(r, name)  # fast callback: the CLI may not have returned yet
+            if rec['cq_delivery'] != delivery:
+                why.append('queued delivery is ' + (rec['cq_delivery'] or 'none') + ', not ' + delivery)
+                return False
+            ok, reason = codex_queue.bound(rec, thread, turn, sessions_dir(cfg))
+            if not ok:
+                why.append(reason)
+                return False
+            codex_queue.mark_bound(r, name, turn)
+            return True
         if int(info.get('generation', -1)) != generation or info.get('state') == 'dead':
             return skipped('stale', 'hook generation is not the current runtime')
         if info.get('state') == 'starting':
+            pending = codex_queue.record(info) if codex else {}
+            if pending.get('cq_delivery') and pending.get('cq_state') in ('queuing', 'queued'):
+                # A queued startup message (READY nudge / sub-fleet role change) must be the one this turn answers.
+                if not answered(pending.get('cq_text', ''), pending['cq_delivery']):
+                    return skipped('ignored', 'startup turn not bound to ' + pending['cq_delivery'] + ': ' + '; '.join(why))
             if info.get('thread') != thread:
                 answer = call('bridge_session')
                 if answer.get('status') != 'registered':
@@ -881,16 +914,16 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
             # proves its execution stopped. The daemon releases the slot; the result is not applied.
             msg = bus.message(lease['message_id'])
             if (msg.get('generation') != generation or msg.get('session_id') != thread
-                    or not runtime_v2.turn_answers(msg['body']['text'], inputs)):
-                return skipped('ignored', 'held delivery was not answered by this session')
+                    or not answered(msg['body']['text'], lease.get('current_delivery') or '')):
+                return skipped('ignored', 'held delivery was not answered by this session' + (': ' + '; '.join(why) if why else ''))
             return call('turn_ended', delivery={k: msg[k] for k in runtime_v2.IDENTITY})
         if lease.get('status') != 'received' or not lease.get('message_id'):
             return ignored('no received delivery (manual or duplicate turn)')
         msg = bus.message(lease['message_id'])
         if msg.get('generation') != generation or msg.get('session_id') != thread:
             return skipped('stale', 'delivery belongs to another generation/session')
-        if not runtime_v2.turn_answers(msg['body']['text'], inputs):
-            return ignored('turn was not started by the typed delivery')
+        if not answered(msg['body']['text'], lease.get('current_delivery') or ''):
+            return ignored('turn was not started by the delivery' + (': ' + '; '.join(why) if why else ''))
         return call('settled', delivery={k: msg[k] for k in runtime_v2.IDENTITY},
                     candidates=runtime_v2.tui_candidates(name, msg['body'].get('purpose'), text or '',
                                                          msg['body'].get('mode') or cfg.get('mode') or 'task'),
@@ -1310,7 +1343,8 @@ class Fleet:
         self.setf(name, role=role, generation=generation, state='starting', thread='', pane='',
                   transcript='', ctx_used=0, ctx_window=0, msg_id='', msg_done='',
                   busy_since=time.time(), delivered=0, retry_at=0, last_msg='', empty_tries=0,
-                  launch_ready=int(not launch_held), runtime_ready=0, current_profile='', idle_confirmed=0)
+                  launch_ready=int(not launch_held), runtime_ready=0, current_profile='', idle_confirmed=0,
+                  **{k: '' for k in codex_queue.FIELDS})  # a new session starts without a queued delivery
         if self.v2:
             self.setf(name, bridge_available=0, startup_deadline=time.time() + float(self.cfg['profile_ready_timeout']))
         if launch:
@@ -2032,6 +2066,17 @@ class Fleet:
                     peer.unsolicited(self, name, ev['text'][-8000:])  # e.g. woken by a peer SendMessage
                 return
             self.setf(name, msg_done=ev.get('msg_id'))
+        if codex_queue.is_codex(self.runtime_cfg(name), name) and info.get('state') in ('busy', 'handoff', 'starting'):
+            # A queued delivery settles only on the turn the rollout binds to it (a manual or repeated turn does not).
+            rec = codex_queue.record(info)
+            if rec['cq_delivery'] and rec['cq_state'] in ('queuing', 'queued', 'bound'):
+                rec = codex_queue.wait_queued(self.r, name)
+                ok, why = codex_queue.bound(rec, ev.get('thread') or '', ev.get('turn') or '', self.sessions)
+                if not ok or rec['cq_turn'] == (ev.get('turn') or ''):
+                    self.log('turn.unbound', agent=name, delivery=rec['cq_delivery'], turn=ev.get('turn'),
+                             reason=why or 'turn already settled')
+                    return
+                codex_queue.mark_bound(self.r, name, ev['turn'])
         if is_pi(self.runtime_cfg(name), name):
             self.pi_metadata(name, ev)
             failed = ev.get('failed') or ev.get('aborted')
@@ -2340,6 +2385,7 @@ class Fleet:
         self.log('task.' + status, reason=reason)
         for name in self.names:
             self.r.delete(key('inbox', name))
+            codex_queue.clear(self, name, 'task ' + status)
             pane = self.agent(name).get('pane')
             if pane and self.agent(name).get('state') == 'busy':
                 # An aborted turn fires no notify, so mark idle here; tabs stay open.
@@ -2671,8 +2717,13 @@ class Fleet:
         """Codex accepts verbatim paste; Claude and Pi use a file pointer with a delivery id."""
         if self.v2:
             raise ValueError('v2 deliveries use Redis authorization; file/paste fallback forbidden')
-        if not (is_claude(self.runtime_cfg(name), name) or is_pi(self.runtime_cfg(name), name)):
-            return self.mgr.send_prompt_to_idle(pane, text)
+        if codex_queue.is_codex(self.runtime_cfg(name), name):
+            # The TUI takes it from its own queue; on_turn settles only the turn the rollout binds to it.
+            try:
+                codex_queue.deliver(self, name, codex_queue.new_delivery_id('v1'), text)
+            except codex_queue.QueueError:
+                return False  # never falls back to typing
+            return True
         # Claude's Stop hook reads the pointer from its transcript; Pi's extension captures it
         # from before_agent_start. Both bind each turn end to exactly one daemon delivery.
         box = agent_cwd(self.cfg, name) / '.inbox'
@@ -2722,6 +2773,7 @@ class Fleet:
                    'anything the model claims as done must be checked against the artifacts'])
 
     def finish_rotation(self, name, timed_out=False):
+        codex_queue.clear(self, name, 'rotation')  # the retiring session must not start a queued item
         if self.v2 and timed_out:
             # An unfinished handoff can still run tools. Retire it reliably before
             # using a skeleton or advancing generation; Escape alone proves nothing.

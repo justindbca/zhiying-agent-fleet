@@ -19,7 +19,7 @@ import redis
 from cmux_fleet import cli_pairs, contracts
 from cmux_fleet.message_bus import BusError, MessageBus, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
-from cmux_fleet import lifecycle_close, subfleet, tui_cards
+from cmux_fleet import codex_queue, lifecycle_close, subfleet, tui_cards
 from cmux_fleet import watchdog
 
 
@@ -535,10 +535,17 @@ class RuntimeV2:
             for slot in list(self.rotation_pending):
                 self.rotation_pending.remove(slot)
                 self.f.finish_rotation(slot)
-            for slot in list(self.startup_nudges):  # pane typing is not a Redis effect either
+            for slot in list(self.startup_nudges):  # pane typing / queueing is not a Redis effect either
                 self.startup_nudges.remove(slot)
                 pane = self.f.agent(slot).get('pane')
-                if pane:
+                if codex_queue.is_codex(self.slot_cfg(slot), slot):
+                    try:
+                        codex_queue.deliver(self.f, slot, 'startup-nudge-g' + str(self.f.agent(slot).get('generation')),
+                                            STARTUP_NUDGE)
+                    except codex_queue.QueueError as exc:
+                        # No typing fallback: the startup deadline then blocks the slot as for no READY.
+                        self.audit('startup.nudge_failed', slot=slot, level='error', error=str(exc)[:300])
+                elif pane:
                     from cmux_fleet.fleet import is_claude
                     self.f.mgr.send_prompt_to_idle(pane, STARTUP_NUDGE, bracketed=is_claude(self.f.runtime_cfg(slot), slot))
             return True
@@ -1098,6 +1105,7 @@ class RuntimeV2:
         """Release the slot's lease and cancel its queue (re-queued afterwards). False: lease still held."""
         state = self.bus.r.hgetall(self.bus.lease_key(slot))
         released = True
+        codex_queue.clear(self.f, slot, 'start --resume')  # a not-yet-started queued item must never run
         if state.get('current_delivery'):
             pane = self.f.agent(slot).get('pane')
             if reattached and pane:
@@ -1301,12 +1309,18 @@ class RuntimeV2:
             if not got or got['delivery_id'] != env['delivery_id'] or not got['execution_allowed']:
                 raise BusError('offered delivery was not received by this generation')
             self.renewed[slot] = time.monotonic()
+            if codex_queue.is_codex(self.slot_cfg(slot), slot):
+                # Codex: the TUI takes the message from its own queue; nothing is typed (codex_queue).
+                got_q = codex_queue.deliver(self.f, slot, env['delivery_id'], got['body']['text'])
+                self.audit('tui.queued', slot=slot, message_id=env['message_id'], delivery_id=env['delivery_id'],
+                           queued_id=got_q['queued_id'])
+                return True
             pane = self.f.agent(slot).get('pane')
             claude = self.slot_cfg(slot).get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') == 'claude'
             if pane and self.f.mgr.send_prompt_to_idle(pane, got['body']['text'], bracketed=claude):
                 self.audit('tui.typed', slot=slot, message_id=env['message_id'], delivery_id=env['delivery_id'])
                 return True
-        except (BusError, ValueError, KeyError, OSError) as exc:
+        except (BusError, ValueError, KeyError, OSError, codex_queue.QueueError) as exc:
             reason += ': ' + str(exc)[:500]
         self.transaction('tui-input-' + env['delivery_id'], lambda: self.hold(slot, reason, public_status='failed'))
         return False
@@ -1350,6 +1364,7 @@ class RuntimeV2:
             return
         self.f.r.hset(TASK, mapping={'status': status, 'reason': reason})
         for slot in self.f.names:
+            codex_queue.clear(self.f, slot, 'task ' + status)  # a pending queued item must not run after the end
             for mid in self.f.r.lrange(self.bus.pending_key(slot), 0, -1):
                 msg = dict(message_id=mid)
                 self.cancel_queued(slot, msg, reason)
@@ -1391,6 +1406,7 @@ class RuntimeV2:
         self.audit('runtime.retired', slot=slot, execution_stopped=True)
 
     def retire(self, slot, reason):
+        codex_queue.clear(self.f, slot, 'retire: ' + reason)
         info = self.f.agent(slot)
         pane = info.get('pane')
         if info.get('state') == 'reclaimed' and not pane:  # already retired by the idle reclaim

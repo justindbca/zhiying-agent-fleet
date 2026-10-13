@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import test_fleet
 from test_fleet import FakeMgr, FakeRedis, write_rollout
 from cmux_fleet import contracts, fleet, runtime_v2
 
@@ -186,7 +187,9 @@ def cf(tmp_path):
 
 
 def turn(name, text):
-    return {'kind': 'turn', 'agent': name, 'generation': 0, 'thread': THREADS[name], 'text': text}
+    q = test_fleet.CODEX_QUEUE.pop(THREADS[name], None)  # the queued delivery this turn answers
+    return {'kind': 'turn', 'agent': name, 'generation': 0, 'thread': THREADS[name], 'text': text,
+            **({'turn': q['turn']} if q else {})}
 
 
 def submit(f, **spec):

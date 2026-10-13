@@ -20,7 +20,7 @@ import pytest
 from test_fleet import FakeMgr
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
 from test_runtime_v2 import event, fx, receive, result, session  # noqa: F401  (fx fixture)
-from test_fleet import write_rollout
+from test_fleet import codex_rows, write_rollout
 from test_v2_codex_claude import drive, typed
 from cmux_fleet import cmux_manager, fleet, redis_runtime, runtime_v2
 
@@ -113,9 +113,8 @@ def answer_turn(f, slot, text, *, startup=False, prompt=None):
     thread = f.test_threads.setdefault((slot, gen), str(uuid.uuid4())) if gen else f.test_threads[slot]
     prompt = prompt if prompt is not None else ('startup prompt' if startup else typed(f, slot)[-1])
     if slot == 'supervisor':
-        turn_id = 't-' + uuid.uuid4().hex
-        write_rollout(f.test_sessions, thread, fleet.agent_cwd(f.cfg, slot), rows=[
-            {'type': 'event_msg', 'payload': {'type': 'task_complete', 'turn_id': turn_id, 'last_agent_message': text}}])
+        turn_id, rows = codex_rows(thread, prompt, text)  # the queued delivery's own turn, or a typed one
+        write_rollout(f.test_sessions, thread, fleet.agent_cwd(f.cfg, slot), rows=rows)
         payload = json.dumps({'type': 'agent-turn-complete', 'thread-id': thread, 'turn-id': turn_id,
                               'input-messages': [prompt], 'last-assistant-message': text})
         return drive(f, lambda: fleet.notify(f.path, slot, str(gen), payload, f.test_sessions))

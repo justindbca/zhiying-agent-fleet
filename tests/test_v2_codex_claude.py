@@ -12,7 +12,7 @@ import uuid
 
 import pytest
 
-from test_fleet import FakeMgr, write_rollout
+from test_fleet import FakeMgr, codex_rows, write_rollout
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
 from cmux_fleet import cmux_manager, fleet, runtime_v2, transport_inventory
 
@@ -148,9 +148,8 @@ def answer_turn(f, slot, text, *, startup=False, prompt=None, generation=None):
     thread = f.test_threads[slot] if gen == 0 else f.test_threads[slot] + '-g' + str(gen)
     prompt = prompt if prompt is not None else (typed(f, slot)[-1] if typed(f, slot) and not startup else 'startup prompt')
     if slot == 'supervisor':
-        turn_id = 't-' + uuid.uuid4().hex
-        write_rollout(f.test_sessions, thread, fleet.agent_cwd(f.cfg, slot), rows=[
-            {'type': 'event_msg', 'payload': {'type': 'task_complete', 'turn_id': turn_id, 'last_agent_message': text}}])
+        turn_id, rows = codex_rows(thread, prompt, text)  # the queued delivery's own turn, or a typed one
+        write_rollout(f.test_sessions, thread, fleet.agent_cwd(f.cfg, slot), rows=rows)
         payload = json.dumps({'type': 'agent-turn-complete', 'thread-id': thread, 'turn-id': turn_id,
                               'input-messages': [prompt], 'last-assistant-message': text})
         return drive(f, lambda: fleet.notify(f.path, slot, str(gen), payload, f.test_sessions))
@@ -209,9 +208,9 @@ def test_codex_supervisor_dispatches_six_claude_workers_through_v2_bus(mixed):
         assert f.agent(slot)['state'] == 'busy'
         assert f.v2.bus.slot_state(slot)['status'] == 'received'
     assert sum(f.agent(w)['state'] == 'busy' for w in WORKERS) == 6
-    # Claude needs a bracketed paste for multi-line text; Codex must not get one.
+    # Claude needs a bracketed paste for multi-line text; Codex is never pasted at all (codex queue).
     modes = dict(f.mgr.bracketed)
-    assert modes[f.agent('supervisor')['pane']] is False
+    assert f.agent('supervisor')['pane'] not in modes
     assert all(modes[f.agent(w)['pane']] is True for w in WORKERS)
     assert no_message_files(f)
 
