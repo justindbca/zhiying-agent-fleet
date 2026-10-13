@@ -2068,6 +2068,10 @@ class Fleet:
         for stale in (ESCALATIONS, ITEMS):
             if self.r.get(stale) is not None:
                 self.r.delete(stale)
+        if self.cfg.get('advisor') is True:  # an earlier task's unadvised dispatches never match this one
+            for w in self.workers:
+                if self.r.llen(ADVICE_PENDING + w):
+                    self.r.delete(ADVICE_PENDING + w)
         self.queue('supervisor', prompt + '\nReply with the JSON format from AGENTS.md.')
         (self.run_dir / 'result.json').unlink(missing_ok=True)  # a new task: this run is not finished
         self.log('task.submitted', task=task_id)
