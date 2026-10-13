@@ -15,7 +15,7 @@ import sys
 
 import pytest
 
-from test_fleet import FakeMgr
+from test_fleet import FakeMgr, traffic
 from test_message_bus_v2 import private_redis_v2
 from cmux_fleet import fleet, pi_adapter, runtime_v2
 from cmux_fleet.agent_bridge import AgentBridge
@@ -110,7 +110,7 @@ def test_operator_input_dispatch_reply_no_files_paste_or_mechanical_model_round(
     assert result(f, rid)['result'] == {'reply': 'OK'}
     assert f.v2.bus.slot_state('worker-1')['pel_count'] == 0
     assert f.agent('worker-1')['state'] == 'idle'
-    assert not f.v2.depth('supervisor') and not f.mgr.sent
+    assert not f.v2.depth('supervisor') and not traffic(f.mgr)
     assert not list(f.run_dir.rglob('.inbox'))
     cards = [json.loads(fields['data']) for _, fields in f.r.xrange(f.v2.prefix + ':ui:supervisor')]
     assert cards[-1]['render'].splitlines()[0] == 'worker-1：OK' and not cards[-1]['wake_model']
@@ -267,7 +267,7 @@ def test_pause_max_busy_fifo_and_context_handoff(fx):
     event(fx,dict(md,kind='startup',text='READY',failed=False,aborted=False,request_id='new-ready'))
     event(fx,dict(md,kind='availability',idle=True))
     fx.pump(); assert receive(fx,'worker-1')['request_id']=='c'
-    assert not fx.mgr.sent
+    assert not traffic(fx.mgr)
 
 
 class Output:
@@ -326,7 +326,7 @@ def test_persistent_bridge_daemon_vertical_with_separate_connections(fx):
             candidates=[{'tool':'fleet_result','value':{'reply':'OK'}}]))
         wait_until(lambda: observer.get(fleet.RESULT+ack['id']))
         assert json.loads(observer.get(fleet.RESULT+ack['id']))['status']=='ok'
-        assert observer_bus.slot_state('worker-1')['pel_count']==0 and not fx.mgr.sent
+        assert observer_bus.slot_state('worker-1')['pel_count']==0 and not traffic(fx.mgr)
         assert not errors
     finally:
         for bridge in bridges.values(): bridge.stop(); bridge.stop()
@@ -387,7 +387,7 @@ def test_service_skip_is_ui_only_and_does_not_dispatch(fx):
     req(fx,to=None); fx.pump(); env=receive(fx,'supervisor')
     settle(fx,'supervisor',env,{'status':'RUNNING','dispatch':[],'skip':[{'reason':'no work required'}]})
     assert result(fx)['status']=='skipped'
-    assert not fx.v2.depth('supervisor') and not fx.v2.depth('worker-1') and not fx.mgr.sent
+    assert not fx.v2.depth('supervisor') and not fx.v2.depth('worker-1') and not traffic(fx.mgr)
 
 
 def test_control_failure_cannot_fail_daemon_recovery_or_shutdown_redis(fx,monkeypatch):

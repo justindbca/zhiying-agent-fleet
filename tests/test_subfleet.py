@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from test_fleet import write_rollout
+from test_fleet import codex_rows, received, write_rollout
 from cmux_fleet import cmux_manager, fleet, redis_runtime, roster, runtime_v2, subfleet
 
 
@@ -248,11 +248,10 @@ def hook(t, f, slot, text, *, prompt=None, thread=None, generation=None):
     gen = int(f.agent(slot)['generation']) if generation is None else generation
     thread = thread or t.threads.setdefault((str(f.run_dir), slot, gen), str(uuid.uuid4()))
     if prompt is None:
-        prompt = [x for p, x in t.world.sent if p == f.agent(slot)['pane']][-1]
+        prompt = received(t.world, f.agent(slot)['pane'])[-1]
     if slot == 'supervisor' and fleet.agent_cli(f.cfg, slot) == 'codex':
-        turn_id = 't-' + uuid.uuid4().hex
-        write_rollout(t.sessions, thread, fleet.agent_cwd(f.cfg, slot), rows=[
-            {'type': 'event_msg', 'payload': {'type': 'task_complete', 'turn_id': turn_id, 'last_agent_message': text}}])
+        turn_id, rows = codex_rows(thread, prompt, text)  # the queued delivery's own turn, or a typed one
+        write_rollout(t.sessions, thread, fleet.agent_cwd(f.cfg, slot), rows=rows)
         payload = json.dumps({'type': 'agent-turn-complete', 'thread-id': thread, 'turn-id': turn_id,
                               'input-messages': [prompt], 'last-assistant-message': text})
         return drive(t, lambda: fleet.notify(f.path, slot, str(gen), payload, t.sessions))
@@ -347,7 +346,7 @@ def test_worker_pane_becomes_subfleet_supervisor_and_comes_back(tree):
     assert ('cmux-fleet:M0' and (sid, 'fx-M0/supervisor-1') in cf.mgr.renamed)
     assert ('ws-cmux-fleet:M0', f.mgr.workspace_id()) in t.world.order  # sidebar: right after the parent
     assert 'Supervisor: observe, judge, dispatch' in (Path(child_cfg['supervisor_cwd']) / 'CLAUDE.md').read_text()
-    role_change = [x for p, x in t.world.sent if p == sid][-1]
+    role_change = received(t.world, sid)[-1]
     assert 'sub-fleet M0' in role_change and 'READY' in role_change
     for w in cf.workers:
         assert hook(t, cf, w, 'READY', prompt='startup')['status'] == 'ready'
@@ -357,7 +356,7 @@ def test_worker_pane_becomes_subfleet_supervisor_and_comes_back(tree):
     assert cf.agent('supervisor')['thread'] == t.threads[(str(f.run_dir), 'worker-1', 0)]  # same session
     assert f.agent('worker-1')['state'] == 'delegated'
     step(t)
-    task_msg = [x for p, x in t.world.sent if p == sid][-1]
+    task_msg = received(t.world, sid)[-1]
     assert 'Research five sources and merge them' in task_msg
     # §26: the child writes the deliverable inside its own workspace, never the parent's path
     inside = Path(rec['run']) / 'workspace' / 'worker-1' / 'm0.md'
@@ -367,8 +366,8 @@ def test_worker_pane_becomes_subfleet_supervisor_and_comes_back(tree):
     assert parent_hook(t, decision, task_msg)['status'] == 'committed'
     step(t)
     for w in cf.workers:
-        assert any('part.md' in x for p, x in t.world.sent if p == cf.agent(w)['pane'])
-    assert not any('part.md' in x for p, x in t.world.sent if p == f.agent('worker-2')['pane'])
+        assert any('part.md' in x for x in received(t.world, cf.agent(w)['pane']))
+    assert not any('part.md' in x for x in received(t.world, f.agent('worker-2')['pane']))
     # the sub-fleet finishes: deliverable written, task completed, result.json written
     inside.parent.mkdir(parents=True, exist_ok=True)
     inside.write_text('merged findings')
@@ -388,7 +387,7 @@ def test_worker_pane_becomes_subfleet_supervisor_and_comes_back(tree):
     assert (fleet.agent_cwd(f.cfg, 'worker-1') / 'CLAUDE.md').read_text() == worker_rules
     info = f.agent('worker-1')
     assert info['pane'] == sid and info['state'] == 'starting' and not info['delegate_cfg']
-    back = [x for p, x in t.world.sent if p == sid][-1]
+    back = received(t.world, sid)[-1]
     assert 'worker of the main fleet again' in back
     assert parent_hook(t, 'READY', back)['status'] == 'ready'  # same generation, same session
     assert f.agent('worker-1')['state'] == 'idle' and f.agent('worker-1')['generation'] == '0'
@@ -422,7 +421,7 @@ def test_failed_subfleet_marks_failure_and_missing_deliverable_fails(tree):
     subfleet.tick(f)
     rec = subfleet.record(rec['run'])
     assert rec['state'] == 'failed' and 'missing or empty' in rec['reason'] and rec['attempt'] == 1
-    back = [x for p, x in t.world.sent if p == rec['pane']][-1]
+    back = received(t.world, rec['pane'])[-1]
     assert parent_hook(t, 'READY', back)['status'] == 'ready'
     rec2, _ = spawn_m0(t)  # a retry keeps the old run (history) and counts the attempt
     assert rec2['attempt'] == 2 and rec2['run'].endswith('M0-attempt-2')
@@ -695,7 +694,7 @@ def test_child_resume_reattaches_adopted_supervisor_instead_of_respawning(tree):
     cf = child_daemon(t, rec)
     for w in cf.workers:
         hook(t, cf, w, 'READY', prompt='startup')
-    role_change = [x for p, x in t.world.sent if p == rec['pane']][-1]
+    role_change = received(t.world, rec['pane'])[-1]
     assert parent_hook(t, 'READY', role_change)['status'] == 'ready'
     die(cf)
     cfg = fleet.load(Path(rec['run']) / 'config.json')
@@ -957,7 +956,7 @@ def test_return_aborts_a_running_turn_before_the_return_prompt(tree):
     subfleet.tick(f)
     stop_child_like_daemon(cf)
     subfleet.tick(f)
-    log = [x for p, x in t.world.sent if p == rec['pane']]
+    log = received(t.world, rec['pane'])
     assert log[-2] == '<key Escape>' and 'worker of the main fleet again' in log[-1]
 
 

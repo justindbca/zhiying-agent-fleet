@@ -46,7 +46,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import brake, cli_pairs, contracts, handoff, history, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, watchdog  # noqa: E402
+from cmux_fleet import brake, cli_pairs, codex_queue, contracts, handoff, history, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, watchdog  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -57,6 +57,30 @@ from cmux_fleet.router import route_task  # noqa: E402
 SESSION = 'cmux-fleet'  # cmux registry name
 HOME = Path(os.environ.get('CMUX_FLEET_HOME') or (Path.home() / '.cmux-fleet'))
 LATEST = HOME / 'latest.json'
+
+
+def pin_paths(cfg):
+    """Apply the locations a run pinned in its config; the config wins over the environment.
+
+    cmux starts the daemon, actors and hooks in fresh login shells that need not inherit the
+    caller's CMUX_FLEET_HOME / CMUX_FLEET_STATE / CMUX_BIN, so `start` writes them into config.json."""
+    global HOME, LATEST
+    from cmux_fleet import cmux_manager
+    if cfg.get('fleet_home'):
+        HOME = Path(cfg['fleet_home'])
+        LATEST = HOME / 'latest.json'
+    if cfg.get('cmux_bin'):
+        cmux_manager.CMUX = cfg['cmux_bin']
+    if cfg.get('cmux_state_dir'):
+        cmux_manager.STATE_DIR = Path(cfg['cmux_state_dir'])
+    return cfg
+
+
+def _pin_from(cfg_path):
+    try:
+        pin_paths(load(cfg_path))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass  # the entry point itself reports an unreadable config
 USER_CODEX_HOME = Path(os.environ.get('CODEX_HOME') or (Path.home() / '.codex'))
 EVENTS, TASK, LOG, NAMES = 'fx:events', 'fx:task', 'fx:log', 'fx:names'
 ROSTER = 'fx:roster'  # notify=1: tell the supervisor the current workers with its next message
@@ -627,11 +651,19 @@ def completed_turn(cwd, data, sessions):
                 except ValueError:
                     continue
                 payload = row.get('payload', {})
+                if turn:
+                    # Known turn id: judge that turn's own end, even if a later (queued) turn has started since.
+                    if row.get('type') == 'event_msg' and payload.get('type') == 'task_complete' \
+                            and payload.get('turn_id') == turn:
+                        return (payload.get('last_agent_message') or '').strip() == text
+                    if row.get('type') == 'event_msg' and payload.get('type') == 'task_started' and (
+                            (payload.get('turn_attribution') or {}).get('turn_id') or payload.get('turn_id')) == turn:
+                        return False  # this turn has not finished (yet)
+                    continue
                 if row.get('type') == 'event_msg' and payload.get('type') == 'task_started':
                     return False
                 if row.get('type') == 'event_msg' and payload.get('type') == 'task_complete':
-                    return ((payload.get('last_agent_message') or '').strip() == text
-                            and (not turn or payload.get('turn_id') == turn))
+                    return (payload.get('last_agent_message') or '').strip() == text
             return False
         except (OSError, ValueError):
             continue
@@ -704,9 +736,11 @@ def notify(cfg_path, name, generation, payload, sessions=None):
         cfg, name, generation = subfleet.delegated_route(cfg, name, int(generation))
         return tui_turn(cfg, name, int(generation), thread=data.get('thread-id') or data.get('thread_id'),
                         transcript='', text=data.get('last-assistant-message') or data.get('last_assistant_message') or '',
-                        inputs=inputs if isinstance(inputs, list) else [])
+                        inputs=inputs if isinstance(inputs, list) else [],
+                        turn=data.get('turn-id') or data.get('turn_id') or '')
     r.rpush(EVENTS, json.dumps({'kind': 'turn', 'agent': name, 'generation': int(generation),
                                 'thread': data.get('thread-id') or data.get('thread_id'),
+                                'turn': data.get('turn-id') or data.get('turn_id') or '',
                                 'text': data.get('last-assistant-message') or data.get('last_assistant_message') or '',
                                 'at': time.time()}, ensure_ascii=False))
     return True
@@ -834,12 +868,13 @@ def claude_prompt(cfg_path, name, generation, raw, wait=PROMPT_WAIT):
         r.close(); r.connection_pool.disconnect()
 
 
-def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=None, settle_wait=30):
+def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=None, settle_wait=30, turn=''):
     """v2 turn end of an official interactive CLI (Codex notify / Claude Stop hook).
 
     First READY turn: bind the session, register the slot and report startup. Later turns:
-    settle only the delivery this generation received, only if the typed delivery text
-    started the turn. The daemon validates identity, lease, fence and schema as for Pi.
+    settle only the delivery this generation received, only if that delivery started the turn
+    (Claude: its typed text; Codex: the rollout proves the queued delivery started `turn`, see
+    codex_queue.bound). The daemon validates identity, lease, fence and schema as for Pi.
     """
     if name not in ['supervisor'] + cfg['workers'] or not runtime_v2.tui_slot(cfg, name):
         raise ValueError('turn hook must name an official-CLI v2 agent in this fleet')
@@ -865,9 +900,36 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
                                    'generation': str(generation), 'error': reason, 'level': 'warn',
                                    'at': str(int(time.time() * 1000))})
             return {'status': status, 'reason': reason}
+        # The CLI of this generation, as delivery sees it (Fleet.runtime_cfg): a profile switch may change it.
+        launch = json.loads(info.get('runtime_launch') or '{}')
+        codex = codex_queue.is_codex(dict(cfg, **launch.get('overrides', {})), name)
+        why = []
+
+        def answered(body_text, delivery):
+            """Did this delivery start the turn? Codex: exact rollout binding, never the cumulative inputs."""
+            if not codex:
+                return runtime_v2.turn_answers(body_text, inputs)
+            # The record and its token are durable before the CLI runs, so a turn end faster than the CLI binds too.
+            rec = codex_queue.record(r.hgetall(key('agent', name)))
+            if rec['cq_delivery'] != delivery:
+                why.append('queued delivery is ' + (rec['cq_delivery'] or 'none') + ', not ' + delivery)
+                return False
+            ok, reason = codex_queue.bound(rec, thread, turn, sessions_dir(cfg), generation)
+            if not ok:
+                why.append(reason)
+                return False
+            if not codex_queue.mark_bound(r, name, turn, rec['cq_token']):
+                why.append('delivery abandoned or replaced while binding')
+                return False
+            return True
         if int(info.get('generation', -1)) != generation or info.get('state') == 'dead':
             return skipped('stale', 'hook generation is not the current runtime')
         if info.get('state') == 'starting':
+            pending = codex_queue.record(info) if codex else {}
+            if pending.get('cq_delivery') and codex_queue.unsettled(info):
+                # A queued startup message (READY nudge / sub-fleet role change) must be the one this turn answers.
+                if not answered(pending.get('cq_text', ''), pending['cq_delivery']):
+                    return skipped('ignored', 'startup turn not bound to ' + pending['cq_delivery'] + ': ' + '; '.join(why))
             if info.get('thread') != thread:
                 answer = call('bridge_session')
                 if answer.get('status') != 'registered':
@@ -886,16 +948,16 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
             # proves its execution stopped. The daemon releases the slot; the result is not applied.
             msg = bus.message(lease['message_id'])
             if (msg.get('generation') != generation or msg.get('session_id') != thread
-                    or not runtime_v2.turn_answers(msg['body']['text'], inputs)):
-                return skipped('ignored', 'held delivery was not answered by this session')
+                    or not answered(msg['body']['text'], lease.get('current_delivery') or '')):
+                return skipped('ignored', 'held delivery was not answered by this session' + (': ' + '; '.join(why) if why else ''))
             return call('turn_ended', delivery={k: msg[k] for k in runtime_v2.IDENTITY})
         if lease.get('status') != 'received' or not lease.get('message_id'):
             return ignored('no received delivery (manual or duplicate turn)')
         msg = bus.message(lease['message_id'])
         if msg.get('generation') != generation or msg.get('session_id') != thread:
             return skipped('stale', 'delivery belongs to another generation/session')
-        if not runtime_v2.turn_answers(msg['body']['text'], inputs):
-            return ignored('turn was not started by the typed delivery')
+        if not answered(msg['body']['text'], lease.get('current_delivery') or ''):
+            return ignored('turn was not started by the delivery' + (': ' + '; '.join(why) if why else ''))
         return call('settled', delivery={k: msg[k] for k in runtime_v2.IDENTITY},
                     candidates=runtime_v2.tui_candidates(name, msg['body'].get('purpose'), text or '',
                                                          msg['body'].get('mode') or cfg.get('mode') or 'task'),
@@ -1320,10 +1382,13 @@ class Fleet:
             trust_claude_dir(cwd)
         elif not is_pi(cfg, name):
             trust_agent_dir(codex_home(self.cfg), cwd)
+        if codex_queue.unsettled(self.agent(name)):
+            codex_queue.clear(self, name, 'respawn')  # audited; its token can never settle in the new session
         self.setf(name, role=role, generation=generation, state='starting', thread='', pane='',
                   transcript='', ctx_used=0, ctx_window=0, msg_id='', msg_done='',
                   busy_since=time.time(), delivered=0, retry_at=0, last_msg='', empty_tries=0,
-                  launch_ready=int(not launch_held), runtime_ready=0, current_profile='', idle_confirmed=0)
+                  launch_ready=int(not launch_held), runtime_ready=0, current_profile='', idle_confirmed=0,
+                  **{k: '' for k in codex_queue.FIELDS})  # a new session starts without a queued delivery
         if self.v2:
             self.setf(name, bridge_available=0, startup_deadline=time.time() + float(self.cfg['profile_ready_timeout']))
         if launch:
@@ -2045,6 +2110,20 @@ class Fleet:
                     peer.unsolicited(self, name, ev['text'][-8000:])  # e.g. woken by a peer SendMessage
                 return
             self.setf(name, msg_done=ev.get('msg_id'))
+        if codex_queue.is_codex(self.runtime_cfg(name), name) and info.get('state') in ('busy', 'handoff', 'starting'):
+            # A queued delivery settles only on the turn the rollout binds to it (a manual or repeated turn does not).
+            rec = codex_queue.record(self.agent(name))
+            if rec['cq_delivery'] and rec['cq_state'] not in ('', 'abandoned'):
+                ok, why = codex_queue.bound(rec, ev.get('thread') or '', ev.get('turn') or '', self.sessions,
+                                           ev.get('generation'))
+                if not ok or rec['cq_turn'] == (ev.get('turn') or ''):
+                    self.log('turn.unbound', agent=name, delivery=rec['cq_delivery'], turn=ev.get('turn'),
+                             reason=why or 'turn already settled')
+                    return
+                if not codex_queue.mark_bound(self.r, name, ev['turn'], rec['cq_token']):
+                    self.log('turn.unbound', agent=name, delivery=rec['cq_delivery'], turn=ev.get('turn'),
+                             reason='delivery abandoned or replaced while binding')
+                    return
         if is_pi(self.runtime_cfg(name), name):
             self.pi_metadata(name, ev)
             failed = ev.get('failed') or ev.get('aborted')
@@ -2125,11 +2204,17 @@ class Fleet:
         # "no worker is busy: RUNNING must dispatch" rule does not apply in those phases.
         if self.contract_phase() in ('interfaces', 'skeleton'):
             return True
-        return any(self.agent(w).get('state') != 'idle' or self.inbox_depth(w) for w in self.workers)
+        # A delivery still queued for the supervisor itself (typically another worker's report) guarantees
+        # another supervisor turn, so "RUNNING, waiting" cannot stall the task.
+        return bool(self.inbox_depth('supervisor')) or any(
+            self.agent(w).get('state') != 'idle' or self.inbox_depth(w) for w in self.workers)
 
-    def on_supervisor(self, text):
+    def on_supervisor(self, text, invalid=None):
+        """`invalid`: the v2 validator's own rejection; the correction must name it, not a parse error."""
         t = self.task()
         try:
+            if invalid:
+                raise ValueError(invalid)
             decision = parse_decision(text, self.dispatch_targets(), self.others_active())
             state = self.contract_state()
             if state is not None:
@@ -2353,6 +2438,7 @@ class Fleet:
         self.log('task.' + status, reason=reason)
         for name in self.names:
             self.r.delete(key('inbox', name))
+            codex_queue.clear(self, name, 'task ' + status)
             pane = self.agent(name).get('pane')
             if pane and self.agent(name).get('state') == 'busy':
                 # An aborted turn fires no notify, so mark idle here; tabs stay open.
@@ -2448,8 +2534,10 @@ class Fleet:
             return
         self.publish(rid, 'ok', worker=self.label(name), result=result)
 
-    def on_service_supervisor(self, text):
+    def on_service_supervisor(self, text, invalid=None):
         try:
+            if invalid:
+                raise ValueError(invalid)
             decision = parse_service_decision(text, self.dispatch_targets())
         except (ValueError, TypeError, KeyError) as exc:
             bad = self.r.hincrby(SERVICE, 'bad_replies', 1)
@@ -2684,8 +2772,13 @@ class Fleet:
         """Codex accepts verbatim paste; Claude and Pi use a file pointer with a delivery id."""
         if self.v2:
             raise ValueError('v2 deliveries use Redis authorization; file/paste fallback forbidden')
-        if not (is_claude(self.runtime_cfg(name), name) or is_pi(self.runtime_cfg(name), name)):
-            return self.mgr.send_prompt_to_idle(pane, text)
+        if codex_queue.is_codex(self.runtime_cfg(name), name):
+            # The TUI takes it from its own queue; on_turn settles only the turn the rollout binds to it.
+            try:
+                codex_queue.deliver(self, name, codex_queue.new_delivery_id('v1'), text)
+            except codex_queue.QueueError:
+                return False  # never falls back to typing
+            return True
         # Claude's Stop hook reads the pointer from its transcript; Pi's extension captures it
         # from before_agent_start. Both bind each turn end to exactly one daemon delivery.
         box = agent_cwd(self.cfg, name) / '.inbox'
@@ -2735,6 +2828,7 @@ class Fleet:
                    'anything the model claims as done must be checked against the artifacts'])
 
     def finish_rotation(self, name, timed_out=False):
+        codex_queue.clear(self, name, 'rotation')  # its token can never settle (Codex's queue is not edited)
         if self.v2 and timed_out:
             # An unfinished handoff can still run tools. Retire it reliably before
             # using a skeleton or advancing generation; Escape alone proves nothing.
@@ -3180,6 +3274,13 @@ class Fleet:
         self.log('agent.stalled', agent=name, state=info.get('state'), idle_s=idle_s, stalls=stalls)
         self.mgr.send_key(info['pane'], 'Escape')  # abort the turn; an aborted turn fires no notify
         self.setf(name, state='idle', idle_confirmed=0, stalls=stalls, busy_since=time.time())
+        queued = False  # a Codex item that never started is still in the TUI's queue (no official withdraw)
+        if codex_queue.unsettled(info):
+            rec = codex_queue.record(info)
+            if codex_queue.token_turn(rec['cq_thread'], rec['cq_token'], self.sessions):
+                codex_queue.clear(self, name, 'stalled turn aborted')  # it left the queue: a retry is not a duplicate
+            else:
+                queued = True
         if info.get('state') == 'starting':
             self.setf(name, state='dead', runtime_ready=0, current_profile='',
                       profile_state='blocked', profile_reason='startup timed out before READY')
@@ -3199,6 +3300,11 @@ class Fleet:
         if name == 'supervisor':
             if stalls >= 2 or not info.get('last_msg'):
                 self.finish('blocked', 'supervisor stalled twice (' + minutes + ' min without activity)')
+            elif queued:
+                # Its queued item has not started and still runs once the TUI is free: wait for it (its own
+                # turn settles it) instead of queueing the same message a second time.
+                self.setf(name, state='busy')
+                self.log('queue.kept', agent=name, delivery=codex_queue.record(info)['cq_delivery'])
             else:
                 self.r.lpush(key('inbox', name), info['last_msg'])  # one retry of the same message
         else:
@@ -3642,6 +3748,10 @@ def resume(run, args):
     from cmux_fleet.cmux_manager import CmuxSessionManager, cmux_available
     path = run / 'config.json'
     cfg = load(path)
+    from cmux_fleet import cmux_manager
+    pin_paths(cfg)  # a resumed run keeps its own locations; an older config gets the current ones pinned
+    cfg.setdefault('fleet_home', str(HOME.expanduser().resolve()))
+    cfg.setdefault('cmux_bin', cmux_manager.CMUX)
     try:
         runtime_v2.validate_config(cfg)
     except ValueError as exc:
@@ -3900,7 +4010,8 @@ def start(args):
     if getattr(args, 'name', None) is not None and not args.name.strip():
         raise SystemExit('--name must not be empty')
     titles = {'agents_title': 'Fleet ' + args.name.strip()} if getattr(args, 'name', None) else {}
-    mgr = manager_for(titles)
+    state_dir = getattr(args, 'cmux_state_dir', None)
+    mgr = manager_for(dict(titles, cmux_state_dir=str(Path(state_dir).expanduser().resolve())) if state_dir else titles)
     if mgr.session_exists():
         raise SystemExit('cmux-fleet tabs already exist; run `stop` and close them with the ✕ first')
     if not roster_path:
@@ -3914,7 +4025,7 @@ def start(args):
     profiles = [args.supervisor_profile or args.profile] if args.supervisor_cli == 'codex' else []
     if args.worker_cli == 'codex':
         profiles.append(args.worker_profile or args.profile)
-    home = Path(args.codex_home).expanduser()
+    home = Path(getattr(args, 'codex_home', None) or HOME / 'codex-home').expanduser()
     if profiles:
         prepare_codex_home(home, profiles)
     token = uuid.uuid4().hex[:8]
@@ -3922,10 +4033,12 @@ def start(args):
         redis_cfg = redis_runtime.prepare(args.redis_runtime_dir, token)
     except (OSError, ValueError) as exc:
         raise SystemExit('cannot prepare private Redis runtime: ' + str(exc)) from exc
-    run = Path(args.runs_dir).expanduser() / ('fleet-' + time.strftime('%Y%m%d-%H%M%S-') + token)
+    run = Path(getattr(args, 'runs_dir', None) or HOME / 'runs').expanduser() / ('fleet-' + time.strftime('%Y%m%d-%H%M%S-') + token)
     (run / 'workspace').mkdir(parents=True)
+    from cmux_fleet import cmux_manager
     cfg = {'run': str(run), 'python': sys.executable, **redis_cfg,
            'cmux_state_dir': str(mgr.meta_path.parent),
+           'fleet_home': str(HOME.expanduser().resolve()), 'cmux_bin': cmux_manager.CMUX,
            'workers': workers, 'mode': args.mode, 'lifecycle': args.lifecycle, 'roles': args.roles, 'max_busy': args.max_busy,
            **({'budget': budget} if budget else {}),
            **({'brake_notify': shlex.split(args.brake_notify)} if getattr(args, 'brake_notify', None) else {}),
@@ -4061,9 +4174,14 @@ def main(argv=None):
     s.add_argument('--redis-server', help='redis-server binary (default: first on PATH)')
     s.add_argument('--redis-runtime-dir', default=str(redis_runtime.DEFAULT_ROOT),
                    help='private Redis runtime root (default: project .runtime/redis; no /tmp fallback)')
-    s.add_argument('--runs-dir', default=str(HOME / 'runs'), help='where run directories are created')
-    s.add_argument('--codex-home', default=str(HOME / 'codex-home'),
-                   help='isolated CODEX_HOME for the agents (login + profile symlinked from yours; no hooks/MCP)')
+    s.add_argument('--fleet-home', help='fleet home (latest.json, default runs/codex-home); pinned in config.json'
+                   ' (default: $CMUX_FLEET_HOME or ~/.cmux-fleet)')
+    s.add_argument('--cmux-bin', help='cmux binary; pinned in config.json (default: $CMUX_BIN or the app bundle)')
+    s.add_argument('--runs-dir', help='where run directories are created (default: <fleet home>/runs)')
+    s.add_argument('--cmux-state-dir', help='cmux registry directory; pinned in config.json'
+                   ' (default: $CMUX_FLEET_STATE or ~/.local/state/cmux-fleet)')
+    s.add_argument('--codex-home', help='isolated CODEX_HOME for the agents (login + profile symlinked from yours;'
+                   ' no hooks/MCP; default: <fleet home>/codex-home)')
     s.add_argument('--handoff-ratio', type=float, default=DEFAULTS['handoff_ratio'],
                    help='rotate a session once its context use reaches this share of the window '
                         '(lowest-priority default; roster handoff: overrides per CLI/model, docs/design.md §22)')
@@ -4233,8 +4351,15 @@ def main(argv=None):
     a.add_argument('--generation', type=int, help='pinned spawn generation (internal)')
     args = p.parse_args(argv)
     if args.cmd == 'start':
+        pin_paths({'fleet_home': args.fleet_home and str(Path(args.fleet_home).expanduser().resolve()),
+                   'cmux_bin': args.cmux_bin and str(Path(args.cmux_bin).expanduser().resolve())})
+        args.runs_dir = args.runs_dir or str(HOME / 'runs')
+        args.codex_home = args.codex_home or str(HOME / 'codex-home')
         start(args)
-    elif args.cmd == 'daemon':
+        return
+    if getattr(args, 'cfg', None):  # internal entry points: daemon, actor, hooks, notify, lifecycle-close
+        _pin_from(args.cfg)
+    if args.cmd == 'daemon':
         daemon(args.cfg, args.resume)
     elif args.cmd == 'lifecycle-close':
         lifecycle_close.close_workspace(args.cfg)
@@ -4253,7 +4378,7 @@ def main(argv=None):
     elif args.cmd in ('agents', 'plan'):
         print_inspection(args)
     else:
-        cfg = load(args.config)
+        cfg = pin_paths(load(args.config))
         if args.cmd == 'logs':
             from cmux_fleet.control_view import iter_events
             for record in iter_events(cfg, after=args.after, limit=args.limit,

@@ -38,6 +38,8 @@ import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from cmux_fleet import codex_queue
+
 LIMITS = {'max_depth': 2, 'max_children': 3, 'max_agents_total': 12, 'child_workers_max': 3}
 ACTIVE = ('starting', 'running', 'stopping')
 TITLE_MAX = 60
@@ -426,6 +428,7 @@ def child_config(f, slot, task_id, workers, rec_dir, sid, info, redis_cfg, name)
                agents_title=title(path), control_title='Fleet control · ' + task_id, tab_prefix=task_id + '/',
                supervisor_cli=fleet.agent_cli(f.runtime_cfg(slot), slot), supervisor_cwd=str(fleet.agent_cwd(parent, slot)),
                adopt={'pane': sid, 'slot': slot, 'generation': int(f.agent(slot).get('generation') or 0),
+                      'thread': f.agent(slot).get('thread') or '',  # Codex: the role change is queued to this session
                       'info': info, 'parent_workspace': f.mgr.workspace_id() if hasattr(f.mgr, 'workspace_id') else None})
     return cfg
 
@@ -641,7 +644,13 @@ def start_adopted(f):
               'directory were replaced with the supervisor rules: read AGENTS.md now and follow it from now on; '
               'your earlier worker rules no longer apply. The daemon sends the task next. In this turn do no task '
               'work: your final reply must be exactly READY.')
-    if not f.mgr.send_prompt_to_idle(sid, prompt, bracketed=fleet.is_claude(f.cfg, 'supervisor')):
+    if codex_queue.is_codex(f.cfg, 'supervisor'):
+        try:  # no typing: the adopted Codex session takes the role change from its queue
+            codex_queue.deliver(f, 'supervisor', 'adopt', prompt, thread=adopt.get('thread') or '')
+        except codex_queue.QueueError as exc:
+            f.setf('supervisor', state='dead', launch_ready=0)
+            return f.finish('blocked', 'could not queue the role change into the delegated pane: ' + str(exc)[:200])
+    elif not f.mgr.send_prompt_to_idle(sid, prompt, bracketed=fleet.is_claude(f.cfg, 'supervisor')):
         f.setf('supervisor', state='dead', launch_ready=0)
         return f.finish('blocked', 'could not type the role change into the delegated pane')
     f.log('subfleet.adopted', pane=sid, slot=adopt['slot'], task=f.cfg['task_id'])
@@ -819,7 +828,13 @@ def collect(f, child_run, notify=True):
                   'changed back: you are fleet agent ' + f.label(slot) + ', a worker of the main fleet again. '
                   'AGENTS.md / CLAUDE.md in your current directory were restored to the worker rules: read '
                   'AGENTS.md now and follow it. Do no task work in this turn: your final reply must be exactly READY.')
-        if not f.mgr.send_prompt_to_idle(rec['pane'], prompt, bracketed=fleet.is_claude(f.runtime_cfg(slot), slot)):
+        if codex_queue.is_codex(f.runtime_cfg(slot), slot):
+            try:  # no typing: the returning Codex session takes it from its queue
+                codex_queue.deliver(f, slot, 'restore', prompt)
+            except codex_queue.QueueError as exc:
+                f.setf(slot, state='dead', launch_ready=0)
+                f.log('subfleet.return_failed', task=rec['task_id'], slot=slot, error=str(exc)[:200])
+        elif not f.mgr.send_prompt_to_idle(rec['pane'], prompt, bracketed=fleet.is_claude(f.runtime_cfg(slot), slot)):
             f.setf(slot, state='dead', launch_ready=0)
             f.log('subfleet.return_failed', task=rec['task_id'], slot=slot)
     else:
