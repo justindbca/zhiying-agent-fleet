@@ -16,7 +16,9 @@ import pytest
 
 from test_fleet import FakeMgr, codex_rows, write_rollout
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
-from cmux_fleet import cmux_manager, fleet, runtime_v2, transport_inventory
+from cmux_fleet import cmux_manager, codex_queue, fleet, runtime_v2, transport_inventory
+
+REAL_ENQUEUE = codex_queue.enqueue  # captured at import, before conftest installs its fake
 
 WORKERS = ['worker-' + str(i) for i in range(1, 7)]
 
@@ -457,3 +459,57 @@ def test_same_text_different_deliveries_each_complete_without_client_id_and_neve
     ids = [e['delivery_id'] for e in committed]
     assert ids.count(one['cq_delivery']) == 1 and ids.count(two['cq_delivery']) == 1
     assert not [p for p, _ in f.mgr.sent if p == f.agent('supervisor')['pane']]  # never typed
+
+
+def test_cli_rc0_without_the_queued_line_is_uncertain_not_failed(mixed):
+    """R1-02: rc 0 but no "Queued message <id> for thread <t>" line: the item may be queued, so the outcome is
+    unknown ('uncertain', which keeps a reattach candidate out), never a refusal ('failed')."""
+    import subprocess
+    f = mixed
+    thread = str(uuid.uuid4())
+    def answered(stdout, rc):
+        return lambda argv, **kw: subprocess.CompletedProcess(argv, rc, stdout=stdout, stderr='')
+    for stdout, rc, kind in (('', 0, 'uncertain'), ('warning: something changed\n', 0, 'uncertain'),
+                             ('error: no such thread\n', 1, 'failed')):
+        try:
+            REAL_ENQUEUE(f.cfg, 'supervisor', thread, 'body', run=answered(stdout, rc))
+            raise AssertionError('no QueueError')
+        except codex_queue.QueueError as exc:
+            assert str(exc).startswith(kind + ':'), (stdout, rc, str(exc))
+    ok = REAL_ENQUEUE(f.cfg, 'supervisor', thread, 'body',
+                      run=answered('Queued message q-1 for thread ' + thread + '.\n', 0))
+    assert ok == {'queued_id': 'q-1', 'thread': thread}
+    assert codex_queue.unsettled({'cq_state': 'uncertain'}) and not codex_queue.unsettled({'cq_state': 'failed'})
+
+
+def test_respawn_abandons_an_unsettled_codex_delivery_with_an_audit(mixed):
+    """P2-06: a respawn that does not go through retire/clear still abandons the slot's unsettled Codex
+    delivery (audited queue.abandoned reason=respawn) before the new session's record is reset."""
+    f = mixed
+    submit(f)
+    old = codex_queue.record(f.agent('supervisor'))
+    assert old['cq_state'] in ('queuing', 'queued') and old['cq_token']
+    f.spawn('supervisor', 'You are fleet agent supervisor.1. Read AGENTS.md first.')
+    events = [e for _, e in f.r.xrange(f.v2.bus.audit_key) if e.get('event') == 'queue.abandoned']
+    assert [e.get('reason') for e in events] == ['respawn'] and events[0].get('delivery') == old['cq_delivery']
+    assert codex_queue.record(f.agent('supervisor'))['cq_state'] == ''  # the new session starts without one
+    f.spawn('supervisor', 'You are fleet agent supervisor.2. Read AGENTS.md first.')  # nothing unsettled now
+    assert len([e for _, e in f.r.xrange(f.v2.bus.audit_key) if e.get('event') == 'queue.abandoned']) == 1
+
+
+def test_turn_end_uses_the_runtime_cli_of_the_generation_not_only_config(mixed, monkeypatch):
+    """R1-01: the turn hook decides Codex vs Claude from the generation's runtime launch overrides, as delivery
+    does (Fleet.runtime_cfg); a profile that switches a worker to codex gets the exact queue binding."""
+    f = mixed
+    seen = []
+    real = codex_queue.is_codex
+    def spy(cfg, name):
+        if sys._getframe(1).f_code.co_name == 'tui_turn':  # only the turn hook's decision
+            seen.append((name, cfg.get('worker_cli')))
+        return real(cfg, name)
+    monkeypatch.setattr(codex_queue, 'is_codex', spy)
+    f.setf('worker-1', runtime_launch=json.dumps({'profile_id': 'p', 'overrides': {'worker_cli': 'codex'}}))
+    dispatch_one(f)
+    answer_turn(f, 'worker-1', 'Done:\n- x\nEvidence:\n- y\nNot done: none\nBlocked: none')
+    assert seen and all(cli == 'codex' for slot, cli in seen if slot == 'worker-1'), seen
+    assert ('worker-1', 'codex') in seen, seen

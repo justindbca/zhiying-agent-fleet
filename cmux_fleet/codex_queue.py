@@ -60,8 +60,9 @@ def queue_argv(cfg, thread, text):
 def enqueue(cfg, name, thread, text, *, run=subprocess.run, timeout=30):
     """Queue `text` (already marked) for the session `thread`; {'queued_id', 'thread'}.
 
-    QueueError('failed: ...') when the CLI answered no, QueueError('uncertain: ...') when there was
-    no answer (the item may or may not be queued); the caller never retries either automatically."""
+    QueueError('failed: ...') when the CLI answered no (rc != 0), QueueError('uncertain: ...') when there
+    was no usable answer (timeout, OSError, rc 0 without the queued line, or another thread): the item may
+    or may not be queued. The caller never retries either automatically."""
     fleet = _fleet()
     if not thread or not re.fullmatch(fleet.THREAD_RE, thread):
         raise QueueError('failed: no bound Codex session to queue into')
@@ -72,8 +73,11 @@ def enqueue(cfg, name, thread, text, *, run=subprocess.run, timeout=30):
     except (OSError, subprocess.SubprocessError) as exc:
         raise QueueError('uncertain: codex queue gave no answer: ' + str(exc)[:300])
     m = QUEUED.search(p.stdout or '')
-    if p.returncode != 0 or not m:
+    if p.returncode != 0:
         raise QueueError('failed: codex queue rc=' + str(p.returncode) + ': '
+                         + ((p.stderr or '') + (p.stdout or '')).strip()[-300:])
+    if not m:  # rc 0 but no confirmation: the item may be queued, so its outcome is unknown, not refused
+        raise QueueError('uncertain: codex queue rc=0 without a queued-message line: '
                          + ((p.stderr or '') + (p.stdout or '')).strip()[-300:])
     if m.group(2) != thread:
         raise QueueError('uncertain: codex queue answered for another thread: ' + m.group(2))

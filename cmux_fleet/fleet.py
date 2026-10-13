@@ -895,7 +895,9 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
                                    'generation': str(generation), 'error': reason, 'level': 'warn',
                                    'at': str(int(time.time() * 1000))})
             return {'status': status, 'reason': reason}
-        codex = codex_queue.is_codex(cfg, name)
+        # The CLI of this generation, as delivery sees it (Fleet.runtime_cfg): a profile switch may change it.
+        launch = json.loads(info.get('runtime_launch') or '{}')
+        codex = codex_queue.is_codex(dict(cfg, **launch.get('overrides', {})), name)
         why = []
 
         def answered(body_text, delivery):
@@ -1365,6 +1367,8 @@ class Fleet:
             trust_claude_dir(cwd)
         elif not is_pi(cfg, name):
             trust_agent_dir(codex_home(self.cfg), cwd)
+        if codex_queue.unsettled(self.agent(name)):
+            codex_queue.clear(self, name, 'respawn')  # audited; its token can never settle in the new session
         self.setf(name, role=role, generation=generation, state='starting', thread='', pane='',
                   transcript='', ctx_used=0, ctx_window=0, msg_id='', msg_done='',
                   busy_since=time.time(), delivered=0, retry_at=0, last_msg='', empty_tries=0,
