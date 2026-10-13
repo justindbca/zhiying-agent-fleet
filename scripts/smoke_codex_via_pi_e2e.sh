@@ -5,11 +5,18 @@
 # receipt committed, and survive one real supervisor handoff (supervisor-1 -> supervisor-1.1).
 #
 #   scripts/smoke_codex_via_pi_e2e.sh            (inside a cmux terminal, CLIs logged in)
+#   E2E_WORK=service scripts/smoke_codex_via_pi_e2e.sh
+#       5 separate submissions instead of one task: `start --lifecycle service` (existing lifecycle; its base
+#       sets mode service, no --mode / CLI / model flag), then 5 requests through the public
+#       `fleet.py request` CLI, each submitted after the previous result is in, one supervisor handoff
+#       between them; at the end the script (as operator) runs `fleet.py stop` and the lifecycle closes
+#       the workspace (close_workspace_after_stop).
 #
 # Environment (optional):
 #   CLAUDE=/path/to/claude   official Claude Code binary (--claude; a shell function / cmux shim is not one)
 #   E2E_TIMEOUT=2400         seconds for READY + the whole task
-#   E2E_LIFECYCLE=smoke      --lifecycle; `smoke` while the pi+claude row is unverified (the only one it allows)
+#   E2E_LIFECYCLE=smoke      --lifecycle (E2E_WORK=service: service)
+#   E2E_WORK=task            task: one task with 5 sequential steps; service: 5 separate requests
 #   PYTHON=python3
 #
 # What is passed to start, and why (nothing else):
@@ -39,7 +46,9 @@ export CMUX_FLEET_HOME="$TMP/home" CMUX_FLEET_STATE="$TMP/state"
 mkdir -p "$CMUX_FLEET_HOME" "$CMUX_FLEET_STATE" "$TMP/evidence/screens"
 CFG="$CMUX_FLEET_HOME/latest.json"
 ROSTER="$TMP/roster.yaml"
-LIFECYCLE=${E2E_LIFECYCLE:-smoke}
+WORK=${E2E_WORK:-task}
+case "$WORK" in task) LIFECYCLE=${E2E_LIFECYCLE:-smoke};; service) LIFECYCLE=${E2E_LIFECYCLE:-service};;
+  *) echo "E2E_WORK must be task or service" >&2; exit 2;; esac
 
 cleanup() {
   set +e
@@ -83,9 +92,9 @@ if ! (cd "$TMP" && "$PY" "$FLEET" "${args[@]}"); then
   exit 4
 fi
 
-"$PY" - "$CFG" "$ROSTER" "${E2E_TIMEOUT:-2400}" "$ROOT" "$TMP/evidence" <<'EOF'
-import json, math, re, secrets, sys, time
-cfg_path, roster_path, timeout, root, ev_dir = sys.argv[1:6]
+"$PY" - "$CFG" "$ROSTER" "${E2E_TIMEOUT:-2400}" "$ROOT" "$TMP/evidence" "$WORK" "$PY" <<'EOF'
+import json, math, re, secrets, subprocess, sys, time
+cfg_path, roster_path, timeout, root, ev_dir, work, py = sys.argv[1:8]
 timeout = float(timeout)
 sys.path.insert(0, root)
 from pathlib import Path
@@ -100,7 +109,8 @@ run = Path(cfg['run'])
 names = ['supervisor'] + cfg['workers']
 mgr = fleet.manager_for(cfg)
 deadline = time.time() + timeout
-snap = {'audit': [], 'agents': {}, 'task': {}, 'alive': True, 'last_id': '-'}
+snap = {'audit': [], 'agents': {}, 'task': {}, 'results': {}, 'alive': True, 'last_id': '-'}
+rids = []
 checks, notes = {}, []
 audit_file = (ev / 'audit.jsonl').open('a')
 
@@ -122,6 +132,10 @@ def refresh():
         audit_file.flush()
         snap['agents'] = {n: r.hgetall(fleet.key('agent', n)) for n in names}
         snap['task'] = r.hgetall(fleet.TASK)
+        for x in rids:
+            raw = r.get(fleet.RESULT + x)
+            if raw:
+                snap['results'][x] = json.loads(raw)
         (ev / 'agents.json').write_text(json.dumps(snap['agents'], ensure_ascii=False, indent=1))
         return True
     except (redis.exceptions.ConnectionError, OSError):
@@ -178,6 +192,7 @@ summary = {'run': str(run), 'run_id': run.name, 'config': {k: cfg.get(k) for k i
     'worker_model', 'claude', 'workers')}}
 log('config ' + json.dumps(summary['config'], ensure_ascii=False))
 checks['0 default config'] = (cfg.get('supervisor_cli'), cfg.get('worker_cli')) == ('pi', 'claude') and \
+    cfg.get('mode') == ('service' if work == 'service' else 'task') and \
     fleet.agent_cfg(cfg, 'supervisor').get('pi_model') == 'openai-codex/gpt-6-astra' and \
     fleet.agent_cfg(cfg, 'supervisor').get('pi_thinking') == 'high' and cfg.get('workers') == ['worker-1', 'worker-2']
 
@@ -196,37 +211,9 @@ titles = {}
 for n in names:
     titles[n] = capture('g0-ready', n)[1]
 
-# --- the task: 5 strictly sequential single-worker steps, each depending on the previous file
-nonce = [secrets.token_hex(4) for _ in range(5)]
-order = ['worker-1', 'worker-2', 'worker-1', 'worker-2', 'worker-1']
-steps, artifacts = [], []
-for k in range(5):
-    w, path = order[k], '%s/step%d.txt' % (order[k], k + 1)
-    line = 'STEP%d %s' % (k + 1, nonce[k])
-    if k == 0:
-        steps.append('Step 1: %s writes %s containing exactly the line "%s".' % (w, path, line))
-        contains = [line]
-    else:
-        prev = '%s/step%d.txt' % (order[k - 1], k)
-        steps.append('Step %d: %s reads ../%s and writes %s with two lines: "%s" and the first line of that file.'
-                     % (k + 1, w, prev, path, line))
-        contains = [line, 'STEP%d %s' % (k, nonce[k - 1])]
-    artifacts.append({'path': path, 'contains': contains})
-goal = ('End-to-end check, 5 steps that must run strictly one after another. Exactly ONE dispatch per decision: '
-        'dispatch one step, wait for that worker\'s report, verify its file, then dispatch the next step. Never '
-        'dispatch two steps at once and never reply COMPLETED before the step 5 report has arrived and all five '
-        'files are verified. ' + ' '.join(steps) + ' Declare all five files as artifacts, then COMPLETED.')
-spec = {'goal': goal, 'hours': 0.75, 'artifacts': artifacts}
-summary['task'] = {'goal': goal, 'artifacts': artifacts}
-runtime_v2.post_event(bus, dict(kind='task', request_id='e2e-task', spec=spec), 'e2e-task')
-log('task posted (5 sequential steps)')
 
-# --- supervisor handoff: after the first committed supervisor decision, threshold just below its context
-rotation = {'armed_at': None, 'ratio': None, 'restored': False}
-ended = lambda: (snap['alive'] and snap['task'].get('status') in ('completed', 'blocked', 'budget_exhausted')) \
-    or (run / 'result.json').is_file()
-while time.time() < deadline and not ended():
-    refresh()
+def rotation_tick():
+    """After the supervisor's first committed decision: threshold just below its context; restore after g1."""
     sup = snap['agents'].get('supervisor', {})
     sup_commits = [a for a in snap['audit'] if a.get('event') == 'committed' and a.get('slot') == 'supervisor']
     if rotation['armed_at'] is None and sup_commits and sup.get('generation') == '0':
@@ -244,9 +231,99 @@ while time.time() < deadline and not ended():
         time.sleep(2)
         foot.append(footer('g1-ready'))
         titles['supervisor-g1'] = capture('g1-ready-title', 'supervisor')[1]
-    if not snap['alive']:
-        break
-    time.sleep(3)
+
+
+rotation = {'armed_at': None, 'ratio': None, 'restored': False}
+if work == 'service':
+    # --- 5 separate submissions through the public CLI, each after the previous result is in
+    order = ['worker-1', 'worker-2', 'worker-1', 'worker-2', 'worker-1']
+    subs = []
+    for k in range(5):
+        w, tok = order[k], 'REQ%d %s' % (k + 1, secrets.token_hex(4))
+        rid = 'e2e-req%d-%s' % (k + 1, tok.split()[1])
+        spec = {'id': rid, 'payload': {'message': 'Submission %d of 5 (independent request). Route it to %s only. '
+                                       '%s writes %s/req%d.txt containing exactly the line "%s" and replies with '
+                                       'reply = "%s".' % (k + 1, w, w, w, k + 1, tok, tok)},
+                'reply': {'required': ['reply'], 'allowed': ['reply']}, 'timeout_s': 900}
+        rids.append(rid)
+        t0 = time.time()
+        cp = subprocess.run([py, str(Path(root) / 'cmux_fleet' / 'fleet.py'), 'request', '-', '--config', cfg_path],
+                            input=json.dumps(spec), capture_output=True, text=True, timeout=120)
+        ack = cp.stdout.strip()
+        log('submit %d %s -> %s rc=%d ack=%s' % (k + 1, rid, w, cp.returncode, ack[:200]))
+        sub = {'k': k + 1, 'id': rid, 'worker': w, 'token': tok, 'cli_rc': cp.returncode, 'ack': ack,
+               'stderr': cp.stderr.strip()[-300:], 'submitted_at': t0}
+        subs.append(sub)
+        if cp.returncode != 0:
+            break
+        while time.time() < deadline and rid not in snap['results'] and snap['alive']:
+            refresh()
+            rotation_tick()
+            time.sleep(3)
+        res = snap['results'].get(rid, {})
+        sub.update(result=res, secs=round(time.time() - t0, 1))
+        log('result %d %s status=%s result=%s (%.0fs)' % (k + 1, rid, res.get('status'),
+                                                          json.dumps(res.get('result'), ensure_ascii=False)[:160],
+                                                          time.time() - t0))
+        if res.get('status') != 'ok':
+            break
+    for _ in range(10):  # successor footer capture if the handoff landed on the last routing turn
+        refresh()
+        rotation_tick()
+        if any(f['tag'] == 'g1-ready' for f in foot):
+            break
+        time.sleep(3)
+    cp = subprocess.run([py, str(Path(root) / 'cmux_fleet' / 'fleet.py'), 'results', '--config', cfg_path],
+                        capture_output=True, text=True, timeout=60)
+    (ev / 'results-cli.txt').write_text(cp.stdout)
+    summary['submissions'] = subs
+    summary['results_cli_lines'] = len([l for l in cp.stdout.splitlines() if l.strip()])
+    refresh()
+    time.sleep(4)
+    refresh()
+    log('operator stop (service lifecycle: stop is user_only; this script is the operator)')
+    cp = subprocess.run([py, str(Path(root) / 'cmux_fleet' / 'fleet.py'), 'stop', '--config', cfg_path],
+                        capture_output=True, text=True, timeout=120)
+    summary['stop'] = {'rc': cp.returncode, 'out': cp.stdout.strip()[-300:]}
+    log('stop rc=%d %s' % (cp.returncode, cp.stdout.strip()[-200:]))
+    for _ in range(40):
+        if (run / 'result.json').is_file():
+            break
+        time.sleep(3)
+else:
+    # --- the task: 5 strictly sequential single-worker steps, each depending on the previous file
+    nonce = [secrets.token_hex(4) for _ in range(5)]
+    order = ['worker-1', 'worker-2', 'worker-1', 'worker-2', 'worker-1']
+    steps, artifacts = [], []
+    for k in range(5):
+        w, path = order[k], '%s/step%d.txt' % (order[k], k + 1)
+        line = 'STEP%d %s' % (k + 1, nonce[k])
+        if k == 0:
+            steps.append('Step 1: %s writes %s containing exactly the line "%s".' % (w, path, line))
+            contains = [line]
+        else:
+            prev = '%s/step%d.txt' % (order[k - 1], k)
+            steps.append('Step %d: %s reads ../%s and writes %s with two lines: "%s" and the first line of that file.'
+                         % (k + 1, w, prev, path, line))
+            contains = [line, 'STEP%d %s' % (k, nonce[k - 1])]
+        artifacts.append({'path': path, 'contains': contains})
+    goal = ('End-to-end check, 5 steps that must run strictly one after another. Exactly ONE dispatch per decision: '
+            'dispatch one step, wait for that worker\'s report, verify its file, then dispatch the next step. Never '
+            'dispatch two steps at once and never reply COMPLETED before the step 5 report has arrived and all five '
+            'files are verified. ' + ' '.join(steps) + ' Declare all five files as artifacts, then COMPLETED.')
+    spec = {'goal': goal, 'hours': 0.75, 'artifacts': artifacts}
+    summary['task'] = {'goal': goal, 'artifacts': artifacts}
+    runtime_v2.post_event(bus, dict(kind='task', request_id='e2e-task', spec=spec), 'e2e-task')
+    log('task posted (5 sequential steps)')
+
+    ended = lambda: (snap['alive'] and snap['task'].get('status') in ('completed', 'blocked', 'budget_exhausted')) \
+        or (run / 'result.json').is_file()
+    while time.time() < deadline and not ended():
+        refresh()
+        rotation_tick()
+        if not snap['alive']:
+            break
+        time.sleep(3)
 refresh()
 time.sleep(4)
 result = json.loads((run / 'result.json').read_text()) if (run / 'result.json').is_file() else {}
@@ -282,10 +359,23 @@ rot_start, rot_done = by('rotate.start'), by('rotate.done')
 for x in rows:
     log('delivery %s %-10s committed=%s events=%s' % (x['delivery_id'][:14], x['slot'], x['committed'], ','.join(x['events'])))
 
-status = result.get('status') or snap['task'].get('status')
-checks['1 task completed + artifacts'] = status == 'completed' and bool(result.get('artifacts')) and \
-    all(not a.get('problems') for a in result.get('artifacts', [])) and len(result.get('artifacts', [])) >= 5
-checks['2 five worker receipts committed'] = len(worker_commits) >= 5 and all(x['committed'] for x in worker_rows)
+if work == 'service':
+    subs = summary['submissions']
+    ws = Path(cfg['run']) / 'workspace'
+    for x in subs:
+        f = ws / x['worker'] / ('req%d.txt' % x['k'])
+        x['file'] = f.read_text().strip() if f.is_file() else None
+    checks['1 five separate submissions ok'] = len(subs) == 5 and all(
+        x['cli_rc'] == 0 and (x.get('result') or {}).get('status') == 'ok'
+        and x['token'] in json.dumps((x.get('result') or {}).get('result'), ensure_ascii=False)
+        and x['file'] == x['token'] for x in subs)
+    checks['2 five worker receipts committed'] = len(worker_commits) >= 5 and all(x['committed'] for x in worker_rows)
+    checks['8 operator stop accepted'] = summary['stop']['rc'] == 0
+else:
+    status = result.get('status') or snap['task'].get('status')
+    checks['1 task completed + artifacts'] = status == 'completed' and bool(result.get('artifacts')) and \
+        all(not a.get('problems') for a in result.get('artifacts', [])) and len(result.get('artifacts', [])) >= 5
+    checks['2 five worker receipts committed'] = len(worker_commits) >= 5 and all(x['committed'] for x in worker_rows)
 checks['3 every delivery committed, zero held/error'] = all(x['committed'] for x in rows) and not held and not errors
 checks['4 supervisor handoff'] = bool(rot_start) and bool(rot_done) and \
     any(a.get('label') == 'supervisor-1.1' or 'supervisor-1.1' in (a.get('detail') or '') for a in rot_done + A) and \

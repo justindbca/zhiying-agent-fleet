@@ -302,11 +302,11 @@ Fleet agents（一个工作区）
 
 unverified 只能 `--lifecycle smoke` 起。`pi+claude` 两行已凭 worker-2 真冒烟（S1d / S2，脚本 exit 0、4/4 PASS）改为 `verified` 并填 `verified_by`，缺省组合可按任意 `--lifecycle` 启动；冒烟跑在未提交的分支树上，提交后的独立复核仍须确认。
 
-**已实测（未提交分支树，2026-10-13）**：缺省 start（不带 CLI / 模型旗标，隔离 `CMUX_FLEET_HOME` / `CMUX_FLEET_STATE`，`--lifecycle smoke`）起「pi Astra 监工 + 2 Claude worker」，一个 task 内 6 次顺序派活、6 条 worker 回执全部 committed、一次监工换代 `supervisor-1` → `supervisor-1.1`（run `fleet-20261013-115851-c4278e1b`，worker-2 S4）；监工模型由 pi 页脚 `… 1.0%/400k (auto)  gpt-6-astra •` 与 pi 会话文件 `model_change openai-codex/gpt-6-astra`、`thinking high` 证明。pi 改写自身进程标题，`ps` 只见 `pi`，进程参数不可得。**窗口标题不改**，保持 §3 的 `supervisor-1` label 基线（2026-10-13 23:50 用户裁定）。
+**已实测（未提交分支树，2026-10-13）**：缺省 start（不带 CLI / 模型旗标，隔离 `CMUX_FLEET_HOME` / `CMUX_FLEET_STATE`，`--lifecycle smoke`）起「pi Astra 监工 + 2 Claude worker」，一个 task 内 6 次顺序派活、6 条 worker 回执全部 committed、一次监工换代 `supervisor-1` → `supervisor-1.1`（run `fleet-20261013-115851-c4278e1b`，worker-2 S4）；另以 `--lifecycle service`（既有生命周期，缺省 CLI / 模型不变）做 5 次独立提交（`fleet.py request`，各自 id、各自 committed 回执与 ok 结果），第 1、2 次之间一次真实监工换代，supervisor-1.1 路由第 2–5 次（run `fleet-20261013-131709-73c31fbf`，worker-1 S4-svc，换代后页脚 `(openai-codex) gpt-6-astra • high`，`fleet stop` 后工作区 closed、无残留进程）；监工模型由 pi 页脚 `… 1.0%/400k (auto)  gpt-6-astra •` 与 pi 会话文件 `model_change openai-codex/gpt-6-astra`、`thinking high` 证明。pi 改写自身进程标题，`ps` 只见 `pi`，进程参数不可得。**窗口标题不改**，保持 §3 的 `supervisor-1` label 基线（2026-10-13 23:50 用户裁定）。
 
 夜间 Astra + FlashNext：`scripts/smoke_pair.sh` 改为在 smoke 生命周期关闭 run 后从其 Redis 持久化数据读最终 UI 卡 / 审计（原先的旧快照会漏掉与 COMPLETED 同刻写入的结果卡）后，独立复跑 `fleet-20261013-130107-a4f4e9a2` 脚本 exit 0、4/4 PASS、审计 error 0、无 `execution.held`，页脚实证监工 `gpt-6-astra • high`、worker `(flashnext) Qwen3.8-Flash-Next-…`（未提交分支树，2026-10-13）。
 
-**未验收**：codex / claude 监工组合未用新版冒烟脚本重跑；「≥5 条任务」按单 task 6 次派活解释（task 模式下 task 结束即关 run），是否认可由用户定；提交后的独立复核尚未做。合并、测试、入队由 fleet 可信程序按 deliver 处理，worker 不自行合并；本任务不含部署。
+**未验收**：codex / claude 监工组合未用新版冒烟脚本重跑；提交后的独立复核尚未做。合并、测试、入队由 fleet 可信程序按 deliver 处理，worker 不自行合并；本任务不含部署。
 
 ## 12. 动态 agent profile 路由（2026-10-11，Phase 5 显式 live opt-in）
 
