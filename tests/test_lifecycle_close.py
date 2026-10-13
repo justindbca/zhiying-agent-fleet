@@ -279,12 +279,13 @@ def test_smoke_failure_closes_at_once(fx, table, notes):
 def test_scheduled_hard_timeout_ends_and_closes(fx, table, notes):
     f = as_task(fx, 'scheduled')
     submit(f, {'goal': 'sector rotation 09:00'})
+    limit = lifecycle.mode_policy('scheduled', 'hard_timeout_min')  # the yaml's value, not a copy of it
     t0 = time.time()
     lifecycle_close.tick(f, now=t0)
-    lifecycle_close.tick(f, now=t0 + 44 * 60)
+    lifecycle_close.tick(f, now=t0 + (limit - 1) * 60)
     assert f.task()['status'] == 'running'
-    lifecycle_close.tick(f, now=t0 + 45 * 60 + 1)
-    assert f.task()['status'] == 'budget_exhausted' and 'hard_timeout_min 45' in f.task()['reason']
+    lifecycle_close.tick(f, now=t0 + limit * 60 + 1)
+    assert f.task()['status'] == 'budget_exhausted' and 'hard_timeout_min ' + str(limit) in f.task()['reason']
     assert f.lifecycle_close['closed_by'] == 'timeout'
 
 

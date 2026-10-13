@@ -32,7 +32,7 @@ modes:
     done_when: last_phase_merged_and_review_pass
   scheduled:
     base: task
-    hard_timeout_min: 45
+    hard_timeout_min: 150            # sector rotation: 150-minute budget, task dispatched within 90 min
     on_complete: stop_and_close
     on_fail: stop_and_close
     clock_gate: true                 # trading-day gate via global_clock; market closed -> not launched
