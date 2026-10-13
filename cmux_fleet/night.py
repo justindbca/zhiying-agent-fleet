@@ -155,4 +155,7 @@ def check_rosters(cfg, day_path, night_path):
             raise ValueError(which + ' roster ' + str(path) + ' rejected:\n' + str(exc)) from exc
         parsed[which] = (workers, roles, profiles)
     same_slots(parsed['day'][0], parsed['night'][0])
+    if roster.advisor(Path(day_path).read_bytes()) != roster.advisor(Path(night_path).read_bytes()):
+        raise ValueError('the day and night rosters must set the same "advisor" (on / off): the advisor is per run, '
+                         'a night on / off must not turn it on or off')
     return parsed

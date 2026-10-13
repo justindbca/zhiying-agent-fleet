@@ -1169,6 +1169,8 @@ class Fleet:
                 info = self.agent(name)
                 if info.get('advice_hold') == '1' and info.get('launch_ready') == '0':
                     self.release_default(name)
+                else:
+                    self.drop_advice_wait(name)
         state = 'on' if on else 'off'
         self.r.hset(SERVICE, mapping={'advisor': state, 'advisor_by': who, 'advisor_at': time.time()})
         self.log('advisor.' + state, who=who)
@@ -2520,7 +2522,8 @@ class Fleet:
             self.r.delete(RESCUE)
         for w in self.workers:
             info = self.agent(w)
-            left = {k: '' for k in RESCUE_FIELDS if info.get(k)}
+            self.drop_advice_wait(w)
+            left = {k: '' for k in RESCUE_FIELDS + ('advice_domains',) if info.get(k)}
             if left:
                 self.setf(w, **left)
         self.queue('supervisor', prompt + '\nReply with the JSON format from AGENTS.md.')
@@ -3023,10 +3026,33 @@ class Fleet:
         return None
 
     def advice_switch(self, name, identity, sheet, launch, card, registry):
-        """Respawn for an advisor sheet once card_gate admits it; False = never deliver now."""
-        if not self.advice_gate(name, identity, sheet, card, registry):
+        """Respawn for an advisor sheet once card_gate admits it; False = never deliver now.
+
+        The sheet becomes the slot's launch record (runtime_launch via switch_profile, advice_domains for
+        the successor's kit) only when a successor really starts. A full model, or a codex slot whose
+        native subagents still run (switch_profile defers without spawning), keeps the sheet in
+        advice_wait for this message: retried every tick, never re-advised, never delivered to the old
+        runtime as if advised."""
+        if self.advice_gate(name, identity, sheet, card, registry):
+            return False
+        self.setf(name, advice_domains=json.dumps(sheet['domains'], ensure_ascii=False))
+        try:
             self.switch_profile(name, launch)
+        except BaseException:
+            self.setf(name, advice_domains='')  # nothing launched with it: never staged for another spawn
+            raise
+        if self.agent(name).get('state') == 'starting':
+            self.record_advice(name, sheet, 'respawn')
+        else:
+            self.setf(name, advice_domains='', advice_wait=json.dumps({'msg': identity, 'sheet': sheet}, ensure_ascii=False))
         return False
+
+    def drop_advice_wait(self, name):
+        """The advisor went off while this slot's sheet waited (model ticket / codex subagents): nothing was
+        launched with it, so the slot keeps its record and the queued message goes to its running runtime."""
+        if self.agent(name).get('advice_wait'):
+            self.setf(name, advice_wait='', capacity_wait='', profile_state='', profile_reason='')
+            self.log('advice.wait_dropped', agent=name)
 
     def advise_before_delivery(self, name, text):
         """True = go on delivering (no change, or a hot-load queued); False = respawning / blocked."""
@@ -3058,8 +3084,6 @@ class Fleet:
         try:
             if effect == 'respawn':
                 launch = self.advice_launch(cli, sheet, cards, registry)
-                self.record_advice(name, sheet, effect)
-                self.setf(name, advice_domains=json.dumps(sheet['domains'], ensure_ascii=False))
                 # Phase 5 path behind the model card gate; blocks the task itself on failure
                 return self.advice_switch(name, identity, sheet, launch, cards[sheet['model']], registry)
             frozen = info.get('runtime_launch')
@@ -3108,7 +3132,7 @@ class Fleet:
             if sheet is None:
                 entry = self.take_pending_advice(name, text) or {'instruction': text[:2000], 'note': ''}
                 sheet, current, cards, registry = self.advise(name, entry, 'claude', self.runtime_cfg(name))
-                self.setf(name, advice_msg=identity, advice_domains=json.dumps(sheet['domains'], ensure_ascii=False))
+                self.setf(name, advice_msg=identity)
             else:  # waited for a model ticket with this sheet: gate again, never re-advise
                 registry = AgentRegistry()
                 cards = advisor.launch_cards(registry, 'claude')
@@ -3117,6 +3141,8 @@ class Fleet:
             if (not isinstance(registry, tuple)
                     and self.advice_gate(name, identity, sheet, cards[sheet['model']] if launch else None, registry)):
                 return  # model full: keep holding the first generation until a ticket frees up
+            # Admitted: only now does the sheet become this slot's launch record (staged domains + launch).
+            self.setf(name, advice_domains=json.dumps(sheet['domains'], ensure_ascii=False))
             generation = int(self.agent(name).get('generation') or 0)
             if launch:
                 self.setf(name, runtime_launch=profile_launch.encode_launch(launch), runtime_profile=launch['profile_id'],
@@ -3147,6 +3173,7 @@ class Fleet:
         launch = json.loads(self.agent(name).get('runtime_launch') or '{}')
         cfg = self.runtime_cfg(name)
         cfg.pop('advisor', None)
+        self.drop_advice_wait(name)
         self.setf(name, installed_domains='', advice_domains='')  # the slot defaults are its launch record now
         try:
             save(self.run_dir / 'runtime' / (name + '-g' + str(generation) + '.json'), cfg)
@@ -3319,8 +3346,8 @@ class Fleet:
         self.setf(target, advice_last=json.dumps({'task': t.get('id', ''), 'sheet': sheet}, ensure_ascii=False))
         try:
             if sheet['action'] == 'respawn':
-                self.r.hincrby(RESCUE_RELAYS, relay_key, 1)
-                self.rescue_respawn(name, task_id, sheet, opts[name], registry, state)
+                if self.rescue_respawn(name, task_id, sheet, opts[name], registry, state):
+                    self.r.hincrby(RESCUE_RELAYS, relay_key, 1)
             else:
                 self.rescue_reassign(name, task_id, sheet, opts[target], registry, state)
         except (OSError, ValueError, RuntimeError, KeyError, SystemExit, subprocess.SubprocessError) as exc:
@@ -3343,6 +3370,16 @@ class Fleet:
         launch = None
         if advisor.fingerprint(opt['cli'], sheet['model'], sheet.get('effort')) != opt['current']:
             launch = self.advice_launch(opt['cli'], sheet, opt['cards'], registry)
+            gate = self.card_gate(name, opt['cards'][sheet['model']], registry)  # same gate as pre-dispatch (P2-9)
+            if gate and gate[0] == 'block':
+                raise ValueError(gate[1])
+            if gate:  # model full: nothing done, the relay is not counted; the supervisor decides
+                self.r.hset(ADVICE + sheet['ticket'], mapping={'effect': 'capacity_wait'})
+                self.log('profile.capacity_wait', agent=name, profile=launch['profile_id'], reason=gate[1], path='rescue')
+                self.queue('supervisor', '[advisor] respawn ' + task_id + ' (' + self.label(name) + ') 未执行：'
+                           + gate[1] + '。Decide yourself: dispatch a correction, consult again later, or BLOCKED.'
+                           '\nReply with the JSON format from AGENTS.md.')
+                return False
             self.preflight_profile(launch)  # Phase 5: dependencies first, never a fallback CLI
         text = (self.rescue_message(task_id, state, name) + '\n[advisor] 上一代已做：见交接单；本代领域：'
                 + (', '.join(sheet['domains']) or '无') + '。')
@@ -3359,6 +3396,7 @@ class Fleet:
         self.record_advice(name, sheet, 'respawn')
         used, window = self.usage(name)
         self.start_rotation(name, used, window, prompt=handoff.RESCUE_PROMPT)
+        return True
 
     def rescue_reassign(self, name, task_id, sheet, opt, registry, state):
         """Take the task back from the stuck worker and start the target slot per the sheet; the
@@ -3389,12 +3427,24 @@ class Fleet:
         held = info.get('advice_hold') == '1' and info.get('state') == 'starting'
         if not held and advisor.fingerprint(opt['cli'], sheet['model'], sheet.get('effort')) != opt['current']:
             launch = self.advice_launch(opt['cli'], sheet, opt['cards'], registry)
-            self.setf(to, advice_domains=json.dumps(sheet['domains'], ensure_ascii=False))
-            self.record_advice(to, sheet, 'respawn')
-            self.switch_profile(to, launch)  # Phase 5 idle switch; the note goes out after its READY
-            if self.agent(to).get('state') == 'starting':
-                self.setf(to, rescue_note=note())
-            elif self.task().get('status') == 'running':  # switch deferred (codex subagents): tell the supervisor now
+            gate = self.card_gate(to, opt['cards'][sheet['model']], registry)  # same gate as pre-dispatch (P2-9)
+            if gate and gate[0] == 'block':
+                raise ValueError(gate[1])
+            if gate is None:
+                self.setf(to, advice_domains=json.dumps(sheet['domains'], ensure_ascii=False))
+                try:
+                    self.switch_profile(to, launch)  # Phase 5 idle switch; the note goes out after its READY
+                except BaseException:
+                    self.setf(to, advice_domains='')
+                    raise
+                if self.agent(to).get('state') == 'starting':
+                    self.record_advice(to, sheet, 'respawn')
+                    self.setf(to, rescue_note=note())
+                    return
+                self.setf(to, advice_domains='')  # deferred (codex subagents): nothing launched with it
+            # Model full or switch deferred: the preset carries the sheet; the re-dispatch applies it through
+            # advice_gate / advice_switch like any pre-dispatch sheet. Tell the supervisor now.
+            if self.task().get('status') == 'running':
                 self.queue('supervisor', note())
             return
         self.r.hset(ADVICE + sheet['ticket'], mapping={'effect': 'reassign'})
@@ -3498,7 +3548,7 @@ class Fleet:
         if (self.v2 and not placed) or not self.mgr.kill_pane(old) or (self.v2 and self.mgr.get_pane_status(old) is not None):
             if self.v2:
                 self.setf(name, state='dead', launch_ready=0, retired_pane=old,
-                          retired_launch=self.agent(name).get('runtime_launch') or '')  # same launch: same model
+                          retired_launch=info.get('runtime_launch') or '')  # the old pane's launch (before rescue_launch)
             self.finish('blocked', 'could not close the old session ' + prev + '; two sessions hold slot ' + name)
             return
         if self.v2:
@@ -4523,7 +4573,9 @@ def start(args):
         raise SystemExit('cannot read agent cards: ' + str(exc)) from exc
     if problem:
         raise SystemExit(problem)
-    if getattr(args, 'advisor', False) and args.worker_kit:
+    # The kit is checked wherever the advisor comes online at start: the --advisor sugar, or a roster that
+    # already says `advisor: on` (the daemon would refuse it only after Redis and the windows are up).
+    if args.worker_kit and (getattr(args, 'advisor', False) or (roster_path and roster.advisor(roster_path.read_bytes()))):
         try:
             kitmod.Kit(args.worker_kit)  # refuse a bad kit before provisioning, like a bad roster
         except (OSError, ValueError) as exc:
