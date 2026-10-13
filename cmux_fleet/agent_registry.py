@@ -33,10 +33,14 @@ class AgentCard:
     risk_rank: Optional[int] = None
     model: Optional[str] = None
     profile: Optional[str] = None
+    # Advisor whitelist of worker-kit domains for this card; None = no restriction.
+    kit_domains: Optional[Tuple[str, ...]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
         data["capabilities"] = list(self.capabilities)
+        if self.kit_domains is not None:
+            data["kit_domains"] = list(self.kit_domains)
         return data
 
 
@@ -111,6 +115,17 @@ def _optional_launch_string(data: Mapping[str, Any], field: str, path: Path) -> 
     return normalized
 
 
+def _optional_kit(data: Mapping[str, Any], path: Path) -> Optional[Tuple[str, ...]]:
+    kit = data.get("kit")
+    if kit is None:
+        return None
+    domains = kit.get("domains") if isinstance(kit, dict) and set(kit) <= {"domains"} else None
+    if (not isinstance(domains, list)
+            or not all(isinstance(item, str) and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", item) for item in domains)):
+        raise AgentRegistryError("agent card %s kit must be {domains: [domain names]}" % path)
+    return tuple(dict.fromkeys(domains))
+
+
 def _card_from_data(data: Mapping[str, Any], path: Path) -> AgentCard:
     agent_id = _required_string(data, "id", path)
     if not AGENT_ID_RE.fullmatch(agent_id):
@@ -131,6 +146,7 @@ def _card_from_data(data: Mapping[str, Any], path: Path) -> AgentCard:
         risk_rank=_optional_rank(data, "risk_rank", path),
         model=_optional_launch_string(data, "model", path),
         profile=_optional_launch_string(data, "profile", path),
+        kit_domains=_optional_kit(data, path),
     )
 
 

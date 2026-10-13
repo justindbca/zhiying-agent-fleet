@@ -1,0 +1,20 @@
+# 模型能力实验表（顾问的唯一软依据；advisor 设计稿 §7）。数据不是代码，每次会诊现读（热载）。
+# 结构：<领域（= context_domains.yaml 的键）>: <任务类型>: <模型卡 id>: {verdict, effort?, evidence?, note?}
+# verdict ∈ enough / enough_simple / not_enough / overkill / untested / reserve
+# untested 的格禁选，除非这一行所有已测格都是 not_enough（daemon 记 capability.gap）。
+# evidence 只引实验编号 / 规则页 / tasks/lessons.md / 复核报告 / 日记，不引 memory。
+research_web:
+  web-research:
+    sonnet: {verdict: enough, effort: medium, evidence: "E-03 2026-10-07 板块轮动两次对比，研究质量 ≥ 本机直派（tasks/plans/sector-fleet-*-review-fable-r2-20261013.md）；用户 10-14：联网搜索 sonnet 够用不派 opus"}
+    opus: {verdict: overkill, evidence: "同上，质量无差，token 更多"}
+    haiku: {verdict: untested}
+  long-form-summary:
+    sonnet: {verdict: enough_simple}
+fleet:
+  code-edit:
+    sonnet: {verdict: enough_simple, note: "单文件、路径已明"}
+    opus: {verdict: enough}
+    fable: {verdict: reserve, note: "只做复核 / 会诊"}
+  review:
+    opus: {verdict: enough, evidence: "R-WKF-033 ~28 个系列"}
+    sonnet: {verdict: not_enough, evidence: "复核卡已由 sonnet 改 opus（model-cards sonnet.evidence）"}
