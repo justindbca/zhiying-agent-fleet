@@ -394,3 +394,66 @@ def test_ignored_turn_is_audited(mixed):
     events = [fields for _, fields in f.r.xrange(f.v2.bus.audit_key)]
     assert any(e.get('event') == 'turn.ignored' and e.get('slot') == 'worker-1' for e in events)
 
+
+
+def _queue_turn_without_client_id(f, queued_text, answer, turn=None):
+    """A queue-triggered supervisor turn whose rollout UserMessage has no client_id (Codex consumed the
+    row before `codex queue` returned), fired through the real notify entry point."""
+    thread = f.agent('supervisor')['thread']
+    turn = turn or 't-' + uuid.uuid4().hex
+    rows = [{'timestamp': '2026-10-13T00:00:00.000Z', 'type': 'event_msg', 'payload': {'type': 'task_started',
+             'turn_attribution': {'turn_id': turn, 'turn_trigger': 'queue', 'root_turn_id': turn}}},
+            {'timestamp': '2026-10-13T00:00:00.001Z', 'type': 'event_msg', 'payload': {'type': 'item_completed',
+             'turn_id': turn, 'item': {'type': 'UserMessage', 'client_id': '',
+                                       'content': [{'type': 'text', 'text': queued_text}]}}},
+            {'timestamp': '2026-10-13T00:00:00.002Z', 'type': 'event_msg', 'payload': {
+             'type': 'task_complete', 'turn_id': turn, 'last_agent_message': answer}}]
+    test_fleet.append_rollout(f.test_sessions, thread, fleet.agent_cwd(f.cfg, 'supervisor'), rows)
+    payload = json.dumps({'type': 'agent-turn-complete', 'thread-id': thread, 'turn-id': turn,
+                          'input-messages': [queued_text], 'last-assistant-message': answer})
+    gen = f.agent('supervisor')['generation']
+    return turn, drive(f, lambda: fleet.notify(f.path, 'supervisor', gen, payload, f.test_sessions))
+
+
+def test_same_text_different_deliveries_each_complete_without_client_id_and_never_cross_bind(mixed):
+    """F1, end to end on the public path, client_id lost every time: worker-1 sends the same report twice,
+    so the supervisor gets two different deliveries with the identical body. Each is settled by its own
+    token's turn, exactly once; the first delivery's turn (late duplicate) never settles the second."""
+    import cmux_fleet.codex_queue as cq
+    f = mixed
+    submit(f)
+    rec = cq.record(f.agent('supervisor'))
+    assert _queue_turn_without_client_id(f, rec['cq_text'], decision(['worker-1']))[1]['status'] == 'committed'
+    f.pump()
+    report = 'Done:\n- wrote worker-1/part.md\nEvidence:\n- worker-1/part.md\nNot done: none\nBlocked: none'
+    texts = []
+    for round_ in (1, 2):
+        assert answer_turn(f, 'worker-1', report)['status'] == 'committed'
+        f.pump()
+        rec = cq.record(f.agent('supervisor'))
+        assert rec['cq_state'] in ('queuing', 'queued') and '[worker-1 report]' in rec['cq_text']
+        texts.append(rec)
+        if round_ == 1:
+            first_turn, out = _queue_turn_without_client_id(f, rec['cq_text'], decision(['worker-1']))
+            assert out['status'] == 'committed', out
+            assert cq.record(f.agent('supervisor'))['cq_turn'] == first_turn
+            f.pump()
+    one, two = texts
+    bare = lambda t: t.rsplit('\n\n(fleet delivery ', 1)[0]  # noqa: E731
+    assert bare(one['cq_text']) == bare(two['cq_text'])  # identical business body
+    assert one['cq_delivery'] != two['cq_delivery'] and one['cq_token'] != two['cq_token']
+    # A second run of the first delivery's item (new turn id, its exact text and token) must not settle the
+    # second delivery, although the business body is identical.
+    late = _queue_turn_without_client_id(f, one['cq_text'], decision(['worker-1']))[1]
+    assert late is False or late['status'] in ('ignored', 'stale'), late
+    assert cq.record(f.agent('supervisor'))['cq_state'] in ('queuing', 'queued')
+    check = json.dumps({'status': 'RUNNING', 'completion': 50, 'reason': 'review',
+                        'dispatch': [{'to': 'worker-2', 'instruction': 'Check worker-1/part.md'}]})
+    second_turn, out = _queue_turn_without_client_id(f, two['cq_text'], check)
+    assert out['status'] == 'committed', out
+    now = cq.record(f.agent('supervisor'))
+    assert now['cq_state'] == 'bound' and now['cq_turn'] == second_turn != first_turn
+    committed = [e for _, e in f.r.xrange(f.v2.bus.audit_key) if e.get('event') == 'committed' and e.get('slot') == 'supervisor']
+    ids = [e['delivery_id'] for e in committed]
+    assert ids.count(one['cq_delivery']) == 1 and ids.count(two['cq_delivery']) == 1
+    assert not [p for p, _ in f.mgr.sent if p == f.agent('supervisor')['pane']]  # never typed
