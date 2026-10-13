@@ -580,17 +580,31 @@ class CmuxSessionManager:
     def close_all(self) -> bool:
         """Close every surface this registry owns, then its now-empty workspaces (history files
         stay on disk). False if anything could not be confirmed closed."""
+        failed = {sid for sid in list(self._meta()['surfaces']) if not self.kill_pane(sid)}
         ok = True
-        for sid in list(self._meta()['surfaces']):
-            ok = self.kill_pane(sid) and ok
         meta = self._meta()
-        for key in ('workspace', 'control_workspace'):
-            ws = meta.get(key)
-            if ws and not self._surfaces(ws):
+        for ws in dict.fromkeys(meta.get(k) for k in ('workspace', 'control_workspace')):
+            if not ws:
+                continue
+            live = self._surfaces(ws)
+            if not live:
                 _run('close-workspace', '--workspace', ws)  # empty only; never --force
-            elif ws:
-                ok = False
-        return ok
+            elif set(live) <= set(meta['surfaces']):
+                # cmux refuses to close a workspace's last surface ("invalid_state: Cannot close the last
+                # surface"; real e2e 2026-10-13: the history tab stayed, close_failed). Its processes were
+                # stopped by kill_pane above and nothing else lives here: close the workspace as a whole.
+                _run('close-workspace', '--workspace', ws)
+                if _wait_until(lambda: not self._surfaces(ws)):
+                    meta = self._meta()
+                    for sid in live:
+                        meta['surfaces'].pop(sid, None)
+                    self._save_meta(meta)
+                    failed -= set(live)  # gone with their workspace
+                else:
+                    ok = False
+            else:
+                ok = False  # someone else's surface lives here: never close it
+        return ok and not failed
 
     def tab_into(self, pane_id: str, peer: str, before: bool = True) -> bool:
         """Move a surface into the pane holding ``peer`` as another tab: just before ``peer`` (a successor

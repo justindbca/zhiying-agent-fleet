@@ -335,7 +335,8 @@ def test_persistent_bridge_daemon_vertical_with_separate_connections(fx):
     assert not thread.is_alive() and not errors
 
 
-@pytest.mark.parametrize('cfg', [dict(transport_version=2,supervisor_cli='pi',worker_cli='claude',allow_development_v2=True),
+# pi+claude left this list on 2026-10-13: both rows verified by a real smoke (cli_pairs.yaml); pi+codex is still unverified.
+@pytest.mark.parametrize('cfg', [dict(transport_version=2,supervisor_cli='pi',worker_cli='codex',allow_development_v2=True),
     dict(transport_version=2,supervisor_cli='codex',worker_cli='codex',allow_development_v2=True),
     dict(transport_version=2,supervisor_cli='pi',worker_cli='pi')])
 def test_v2_rejects_unsupported_config_before_dependencies_or_provisioning(cfg):

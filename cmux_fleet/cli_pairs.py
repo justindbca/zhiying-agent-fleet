@@ -13,6 +13,12 @@ CLIS = ('pi', 'codex', 'claude')
 MODES = ('task', 'service')
 STATUSES = ('verified', 'unverified', 'forbidden')
 SUPPORTED = '(supported: all-Pi, or Codex supervisor + Claude workers)'
+DEFAULT_KEYS = ('supervisor_cli', 'worker_cli', 'mode', 'supervisor_profile',
+                'supervisor_pi_model', 'supervisor_pi_thinking')
+THINKING = ('off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')  # = pi_adapter.THINKING
+# Old Codex supervisor profiles a start may still name while the default supervisor is pi:
+# mapped to the same model on pi (never a silent official Codex TUI). Others are refused.
+LEGACY_SUPERVISOR_PROFILES = {'fleet-astra': ('openai-codex/gpt-6-astra', 'high')}
 
 
 class PairTable:
@@ -21,8 +27,22 @@ class PairTable:
         if not isinstance(data, dict) or data.get('version') != 1:
             raise ValueError(f'{path}: cli pair table needs version: 1')
         self.default = dict(data.get('default') or {})
+        unknown = sorted(set(self.default) - set(DEFAULT_KEYS))
+        if unknown:
+            raise ValueError(f'{path}: unknown default key(s) {unknown}; allowed: {", ".join(DEFAULT_KEYS)}')
         if not isinstance(self.default.get('supervisor_profile', ''), str):
             raise ValueError(f'{path}: default.supervisor_profile must be a Codex profile name')
+        model = self.default.get('supervisor_pi_model')
+        if model is not None and (not isinstance(model, str) or '/' not in model.strip('/')):
+            raise ValueError(f'{path}: default.supervisor_pi_model must be a pi provider/model string')
+        if self.default.get('supervisor_pi_thinking') is False:
+            self.default['supervisor_pi_thinking'] = 'off'  # YAML 1.1 reads a bare `off` as false
+        if self.default.get('supervisor_pi_thinking', 'off') not in THINKING:
+            raise ValueError(f'{path}: default.supervisor_pi_thinking must be one of {THINKING}')
+        if (model or 'supervisor_pi_thinking' in self.default) and self.default.get('supervisor_cli') != 'pi':
+            raise ValueError(f'{path}: default.supervisor_pi_* needs default.supervisor_cli: pi')
+        if self.default.get('supervisor_profile') and self.default.get('supervisor_cli') != 'codex':
+            raise ValueError(f'{path}: default.supervisor_profile is a Codex profile; it needs default.supervisor_cli: codex')
         self.rows = {}
         for row in data.get('pairs') or []:
             key = (row.get('supervisor_cli'), row.get('worker_cli'), row.get('mode'))
@@ -46,6 +66,17 @@ class PairTable:
 def load_pairs(path=None):
     path = Path(path) if path else DEFAULT_PATH
     return PairTable(yaml.safe_load(path.read_text()), path)
+
+
+def legacy_supervisor_profile(profile):
+    """(pi model, thinking) an old Codex supervisor profile maps to; ValueError with the new usage otherwise."""
+    if profile in LEGACY_SUPERVISOR_PROFILES:
+        return LEGACY_SUPERVISOR_PROFILES[profile]
+    raise ValueError(
+        f'--supervisor-profile/--profile {profile!r} names a Codex profile, but the default supervisor is now pi. '
+        f'Use --supervisor-cli codex --supervisor-profile {profile} for the official Codex TUI, or '
+        f'--supervisor-pi-model provider/model [--supervisor-pi-thinking LEVEL] for a pi supervisor '
+        f'(mapped old profiles: {", ".join(sorted(LEGACY_SUPERVISOR_PROFILES))})')
 
 
 def _unlisted_reason(sup, wrk, mode):

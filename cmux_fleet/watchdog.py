@@ -176,6 +176,21 @@ def unwrap_paths(text):
     return '\n'.join(out[:-1])
 
 
+RULE_RE = re.compile(r'^\s*─{10,}\s*$')
+
+
+def dialog_box(text):
+    """The rows below the last full-width rule: the Claude dialog's own box, without the shell lines above it.
+
+    S1a 2026-10-13: the pane's `exec /bin/bash <run>/prompts/<slot>.sh` line sat above the trust box and was
+    read as a dialog path, so a trust dialog for the slot's own directory was held. No rule: the whole tail.
+    A rule below the dialog's path leaves no path to read: held, safe.
+    """
+    rows = text.splitlines()
+    rules = [i for i, row in enumerate(rows) if RULE_RE.match(row)]
+    return '\n'.join(rows[rules[-1] + 1:]) if rules else text
+
+
 def authorize(entry, screen, lines, cwd, workspace):
     """(True, why) only when the dialog's concrete operation is inside an existing grant; else (False, why).
 
@@ -185,7 +200,9 @@ def authorize(entry, screen, lines, cwd, workspace):
     cwd, workspace = _real(str(cwd)), _real(str(workspace))
     kind = entry.get('verify')
     if kind in ('own_cwd', 'paths_in_run'):
-        paths = [_real(m) for m in PATH_RE.findall(unwrap_paths(text))]
+        # own_cwd (trust dialogs) reads only the dialog box; paths_in_run keeps the whole tail (layout not captured).
+        scope = dialog_box(text) if kind == 'own_cwd' else text
+        paths = [_real(m) for m in PATH_RE.findall(unwrap_paths(scope))]
         if not paths:
             return False, 'no path on the dialog: its scope cannot be checked'
         roots = (cwd,) if kind == 'own_cwd' else (cwd, workspace)

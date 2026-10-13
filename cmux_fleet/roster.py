@@ -7,13 +7,16 @@
         window: 1000000       # optional handoff overrides for this worker (docs/design.md §22)
         handoff_ratio: 0.7
         profile: flashnext-coder  # optional agent card id: this slot's next generation runs that card
+      - name: night-1
+        pi_model: flashnext/Qwen3.8-Flash-Next-Uncensored-oQ4e-100K-MTP  # optional, pi workers only:
+        pi_thinking: off      # this slot's own pi model / thinking (not with profile); default --pi-model
     handoff:                  # optional: per CLI / CLI:model (exact runtime model string)
       claude:opus: {window: 1000000}
       codex: {ratio: 0.6}
 
 The daemon re-reads the file while running (hot add / graceful remove). A file with any
 problem is rejected as a whole, with one reason per problem; the running roster stays.
-A changed `profile` swaps that slot to its next generation once it is idle (same slot name,
+A changed `profile` (or `pi_model` / `pi_thinking`) swaps that slot to its next generation once it is idle (same slot name,
 docs/design.md §25 night switch); the card itself is resolved and checked by the daemon.
 """
 import re
@@ -48,9 +51,11 @@ def parse_entries(raw, base):
     errors, workers, roles, profiles = handoff_errors(data), [], {}, {}
     for i, item in enumerate(data['workers']):
         where = 'workers[' + str(i) + ']'
-        if not isinstance(item, dict) or not set(item) <= {'name', 'role', 'profile'} | set(WORKER_HANDOFF) or 'name' not in item:
-            errors.append(where + ': must be a mapping with "name" and optional "role", "profile", "window", "handoff_ratio" only')
+        if not isinstance(item, dict) or not set(item) <= {'name', 'role', 'profile'} | set(WORKER_HANDOFF) | set(PI_KEYS) or 'name' not in item:
+            errors.append(where + ': must be a mapping with "name" and optional "role", "profile", "window", "handoff_ratio" only'
+                          ' (pi workers also "pi_model", "pi_thinking")')
             continue
+        errors += [where + ': ' + e for e in pi_errors(item)]
         name = item['name']
         if not isinstance(name, str) or not re.fullmatch(NAME_RE, name) or name == 'supervisor':
             errors.append(where + ': name must match ' + NAME_RE + ' and not be "supervisor" (no dots)')
@@ -78,6 +83,41 @@ def parse_entries(raw, base):
 
 
 CLIS = ('claude', 'codex', 'pi')
+PI_KEYS = ('pi_model', 'pi_thinking')
+THINKING = ('off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')  # = pi_adapter.THINKING
+
+
+def _thinking(value):
+    return 'off' if value is False else value  # YAML 1.1 reads a bare `off` as false
+
+
+def pi_errors(item):
+    """A row's own pi model / thinking: a provider/model string, a known level, never next to a profile."""
+    errors, model = [], item.get('pi_model')
+    if 'pi_model' in item and (not isinstance(model, str) or '/' not in model.strip('/') or model != model.strip()):
+        errors.append('pi_model must be a pi provider/model string')
+    if 'pi_thinking' in item and _thinking(item['pi_thinking']) not in THINKING:
+        errors.append('pi_thinking must be one of ' + ', '.join(THINKING))
+    if item.get('profile') is not None and any(k in item for k in PI_KEYS):
+        errors.append('pi_model / pi_thinking cannot be combined with profile (the card sets the model)')
+    return errors
+
+
+def pi_settings(raw):
+    """({name: pi model}, {name: pi thinking}) from an already validated roster."""
+    import yaml
+    data = yaml.safe_load(raw)
+    return ({i['name']: i['pi_model'] for i in data['workers'] if i.get('pi_model')},
+            {i['name']: _thinking(i['pi_thinking']) for i in data['workers'] if 'pi_thinking' in i})
+
+
+def pi_cli_problem(pi_models, pi_thinkings, worker_cli):
+    """Roster pi settings only make sense on pi worker slots (this run's worker CLI)."""
+    rows = sorted(set(pi_models) | set(pi_thinkings))
+    if rows and worker_cli != 'pi':
+        return ('pi_model / pi_thinking set for ' + ', '.join(rows) + ' but this run\'s workers run '
+                + str(worker_cli) + ', not pi (use a profile card to switch a slot to pi)')
+    return None
 WORKER_HANDOFF = {'window': 'window', 'handoff_ratio': 'ratio'}  # per-worker key -> resolved field
 
 
