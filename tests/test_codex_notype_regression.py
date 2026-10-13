@@ -1350,3 +1350,129 @@ def test_bound_checks_thread_generation_token_and_turn(tmp_path, monkeypatch):
     assert not codex_queue.bound(dict(rec, cq_token=other), thread, turn, tmp_path, 3)[0]
     facts['users'] = [{'text': 'do it'}]  # same body without this delivery's token
     assert not codex_queue.bound(rec, thread, turn, tmp_path, 3)[0]
+
+
+# ---------------------------------------------------------------- L. F1: no client_id anywhere; timeout identity
+def test_f1_without_any_client_id_consecutive_deliveries_complete_normally_by_their_tokens(sup):
+    """F1 positive, end to end: the rollout never carries a client_id. The task delivery settles on its own
+    token's turn and dispatches the worker; the worker's report reaches the supervisor as a new delivery with a
+    new token, and that one settles too. Each settles exactly once; nothing is typed."""
+    f = sup
+    f.q.readable = False
+    submit(f)
+    first_token, first_text = cq(f, 'cq_token'), last(f)[1]
+    assert first_text.endswith('(fleet delivery ' + first_token + ')')
+    assert codex_turn(f, plan(['worker-1']), users=[('', first_text)])['status'] == 'committed'
+    f.pump()
+    assert typed(f, 'worker-1'), 'worker-1 was dispatched'
+    assert claude_turn(f, 'worker-1', REPORT.format('wrote worker-1', 'worker-1/part.md'))['status'] == 'committed'
+    f.pump()
+    second_token, second_text = cq(f, 'cq_token'), last(f)[1]
+    assert second_token != first_token and '[worker-1 report]' in second_text
+    assert cq(f, 'cq_state') in ('queuing', 'queued')
+    turn = str(uuid.uuid4())
+    assert codex_turn(f, WAIT, turn=turn, users=[('', second_text)])['status'] == 'committed'
+    assert cq(f, 'cq_state') == 'bound' and cq(f, 'cq_turn') == turn
+    again = codex_turn(f, WAIT, turn=turn, users=[('', second_text)])
+    assert again is False or again['status'] == 'ignored', again
+    assert_no_input_box(f)
+
+
+def test_cli_timeout_withdraws_no_pending_item_and_its_late_turn_never_settles(sup, monkeypatch):
+    """`codex queue` times out after it really queued the item. The delivery is `uncertain` and held; nothing
+    in Codex's queue_1.sqlite is deleted or changed: not this thread's own item, not a same-body item of this
+    thread or another thread (their ownership is unprovable). After clear + finish the rows are the same, and
+    the item's late turn, carrying this delivery's token, settles nothing. Nothing is pasted."""
+    import sqlite3
+    f = sup
+    db = fleet.codex_home(f.runtime_cfg('supervisor')) / 'queue_1.sqlite'
+    db.parent.mkdir(parents=True, exist_ok=True)
+    other = str(uuid.uuid4())
+
+    def put(con, th, text, order):
+        con.execute('INSERT INTO queued_items VALUES (?, ?, ?, ?, 1, 1)', (str(uuid.uuid4()), th, json.dumps(
+            {'UserInput': {'content': [{'type': 'text', 'text': text, 'text_elements': []}], 'client_id': ''}}), order))
+
+    def timed_out(cfg, name, th, text, **kw):
+        body = text.rsplit('\n\n(fleet delivery ', 1)[0]
+        con = sqlite3.connect(str(db))
+        con.executescript(QUEUE_SCHEMA)
+        put(con, th, body, 0)     # an older same-body message of another sender on this thread
+        put(con, th, text, 1)     # this delivery's own item: really queued, but the CLI never answered
+        put(con, other, body, 0)  # same body, another thread
+        con.commit()
+        con.close()
+        raise codex_queue.QueueError('uncertain: codex queue gave no answer: timed out after 30 seconds')
+    monkeypatch.setattr(codex_queue, 'enqueue', timed_out)
+
+    def rows():
+        con = sqlite3.connect('file:' + str(db) + '?mode=ro', uri=True)
+        try:
+            return con.execute('SELECT id, thread_id, payload_json, queue_order FROM queued_items ORDER BY id').fetchall()
+        finally:
+            con.close()
+    submit(f)
+    snap = rows()
+    assert len(snap) == 3
+    assert f.agent('supervisor')['state'] == 'held' and f.paused()
+    rec = codex_queue.record(f.agent('supervisor'))
+    assert rec['cq_state'] == 'uncertain' and rec['cq_token'] and rec['cq_generation'] == f.agent('supervisor')['generation']
+    assert any(e.get('event') == 'queue.uncertain' for e in audit(f))
+    assert codex_queue.clear(f, 'supervisor', 'operator')['cq_state'] == 'uncertain'
+    assert cq(f, 'cq_state') == 'abandoned'
+    assert rows() == snap  # clear withdraws nothing from Codex's queue
+    late = codex_turn(f, plan(['worker-1']), users=[('', rec['cq_text'])])  # the item runs after all
+    assert late is False or late['status'] in ('ignored', 'stale'), late
+    assert typed(f, 'worker-1') == []
+    f.v2.finish('stopped', 'operator stop')
+    assert rows() == snap
+    assert_no_input_box(f)
+
+
+# ---------------------------------------------------------------- M. real e2e: candidate.invalid correction (worker-3 runs A2/A3/M11)
+REAL_E2E_ERROR = 'no worker is busy: RUNNING must dispatch at least one instruction'
+
+
+def test_candidate_invalid_correction_names_the_real_error_and_settles_and_dispatches_once(sup):
+    """Real e2e shape (Codex supervisor, worker-3 audit.jsonl of runs A2/A3/M11): both workers already reported,
+    worker-2's report is still queued behind worker-1's, and the supervisor answers worker-1's report with
+    RUNNING + no dispatch ("waiting for worker-2"). The v2 validator rejects it with the error above.
+    - the rejected turn settles its own delivery exactly once (a repeat notify is ignored, no second strike);
+    - nothing is dispatched for it; the queued worker-2 report is still delivered, once;
+    - the correction is queued (never typed), names the validator's real error, not '(substring not found)';
+    - the next valid decision dispatches exactly once; answering the correction adds no duplicate round."""
+    f = sup
+    submit(f)
+    assert codex_turn(f, plan(['worker-1', 'worker-2']))['status'] == 'committed'
+    f.pump()
+    for w in ('worker-1', 'worker-2'):
+        (f.workspace() / w).mkdir(exist_ok=True)
+        (f.workspace() / w / 'part.md').write_text('part of ' + w)
+        assert claude_turn(f, w, REPORT.format('wrote ' + w + '/part.md', w + '/part.md'))['status'] == 'committed'
+        f.pump()
+    assert '[worker-1 report]' in last(f)[1] and len(typed(f, 'worker-1')) == len(typed(f, 'worker-2')) == 1
+    bad = json.dumps({'status': 'RUNNING', 'completion': 50, 'reason': "waiting for worker-2's report", 'dispatch': []})
+    turn, text = str(uuid.uuid4()), last(f)[1]
+    out = codex_turn(f, bad, turn=turn)
+    assert out['status'] == 'committed', out  # the delivery is settled; the decision itself is rejected
+    invalid = [e for e in audit(f) if e.get('event') == 'candidate.invalid' and e.get('slot') == 'supervisor']
+    assert [e.get('error') for e in invalid] == [REAL_E2E_ERROR]
+    assert f.task()['status'] == 'running' and f.task()['bad_replies'] == '1'
+    again = codex_turn(f, bad, turn=turn, users=[('', text)])  # the same turn notified twice
+    assert again is False or again['status'] in ('ignored', 'stale'), again
+    assert len([e for e in audit(f) if e.get('event') == 'candidate.invalid']) == 1 and f.task()['bad_replies'] == '1'
+    f.pump(); f.pump()
+    assert len(typed(f, 'worker-1')) == len(typed(f, 'worker-2')) == 1  # nothing dispatched for the rejected reply
+    assert '[worker-2 report]' in last(f)[1]  # FIFO: the queued report first, not lost
+    assert codex_turn(f, plan(['worker-1'], 'round 2'))['status'] == 'committed'
+    f.pump(); f.pump()
+    correction = last(f)[1]
+    assert REAL_E2E_ERROR in correction and 'substring not found' not in correction
+    assert correction.startswith('Your reply is not a valid decision JSON')
+    assert codex_turn(f, WAIT)['status'] == 'committed'  # worker-1 is busy now: RUNNING without dispatch is valid
+    f.pump(); f.pump()
+    texts = queued_texts(f)
+    assert [sum(m in t for t in texts) for m in ('[worker-1 report]', '[worker-2 report]', REAL_E2E_ERROR)] == [1, 1, 1]
+    assert len(typed(f, 'worker-1')) == 2 and len(typed(f, 'worker-2')) == 1  # round 1 + round 2 only
+    assert f.task()['status'] == 'running' and f.task()['bad_replies'] == '0'
+    assert_no_input_box(f)
