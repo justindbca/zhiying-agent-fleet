@@ -19,7 +19,7 @@ import redis
 from cmux_fleet import cli_pairs, contracts
 from cmux_fleet.message_bus import BusError, MessageBus, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
-from cmux_fleet import lifecycle_close, subfleet, tui_cards
+from cmux_fleet import lifecycle_close, named_subfleet, subfleet, tui_cards
 from cmux_fleet import watchdog
 
 
@@ -872,6 +872,9 @@ class RuntimeV2:
                     item['request_id'] = env['request_id']
                 if not error and len(value.get('dispatch', [])) + len(value.get('skip', [])) > 1:
                     error = 'one route or skip per bound service request'
+                if not error and isinstance(value.get('subfleet'), dict):  # §28: only its bound external op
+                    if value['subfleet'].setdefault('id', env['request_id']) != env['request_id']:
+                        error = 'service decision may answer only its bound sub-fleet request'
                 if not error:
                     text = dumps(value)
             if not error:
@@ -1271,7 +1274,8 @@ class RuntimeV2:
         if not mids:
             return
         msg = self.bus.message(mids[0])
-        if self.f.service and msg['kind'] != 'followup' and not self.f.r.hgetall(REQ + msg['request_id']):
+        if (self.f.service and msg['kind'] != 'followup' and not self.f.r.hgetall(REQ + msg['request_id'])
+                and not self.f.r.hgetall(named_subfleet.OP + msg['request_id'])):  # §28: an open sub-fleet op
             self.transaction('drop-' + msg['message_id'], lambda: self.cancel_queued(slot, msg, 'already terminal'))
             return
         env = self.bus.offer(slot, mids[0])

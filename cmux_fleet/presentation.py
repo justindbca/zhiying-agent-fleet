@@ -31,7 +31,8 @@ SEVERITY_WARN = 'warn'
 SEVERITY_INFO = 'info'
 SEVERITIES = (SEVERITY_ERROR, SEVERITY_INFO, SEVERITY_WARN)
 
-TERMINAL = ('ok', 'timeout', 'invalid', 'stalled', 'blocked', 'cancelled', 'failed', 'skipped')
+TERMINAL = ('ok', 'timeout', 'invalid', 'stalled', 'blocked', 'cancelled', 'failed', 'skipped',
+            'rejected')  # rejected: a named sub-fleet up / down refused (design.md §28)
 NONTERMINAL = ('queued', 'accepted', 'offered', 'received', 'running', 'dispatched',
                'paused', 'retrying', 'handoff', 'uncertain')
 STOP_STATES = (True, False, None)
@@ -63,7 +64,7 @@ MECHANICAL_KINDS = frozenset(('heartbeat', 'tick', 'ack', 'accepted', 'queued',
     'offered', 'received', 'running', 'settled', 'validated', 'committed', 'result',
     'dispatched', 'notice', 'reconnect', 'handoff', 'ready', 'retry', 'retrying',
     'lease', 'renew', 'dedup', 'routing', 'token', 'tokens', 'token_usage', 'context',
-    'timeout', 'invalid', 'failed', 'stalled', 'blocked', 'cancelled', 'skipped'))
+    'timeout', 'invalid', 'failed', 'stalled', 'blocked', 'cancelled', 'skipped', 'rejected'))
 
 _EXTRA_HINTS = ()
 
@@ -403,6 +404,11 @@ def result_card(record, task_title=None, execution_stopped=None, now=None):
 
     if status == 'skipped':
         lines.append('%s 已跳过，本次未执行。' % slot)
+        return _card(SEVERITY_INFO, '\n'.join(lines), meta, now)
+
+    if status == 'rejected':
+        reason = record.get('reason') if isinstance(record.get('reason'), str) else ''
+        lines.append('%s 已拒绝%s。' % (slot, '：' + sanitize_text(mask_secrets(reason), MAX_CELL) if reason else ''))
         return _card(SEVERITY_INFO, '\n'.join(lines), meta, now)
 
     lines.append('%s %s（尚未完成）。' % (slot, status))

@@ -83,15 +83,17 @@ def test_forbidden_and_unlisted_refused_even_for_smoke(tmp_path):
     assert cli_pairs.pair_problem({'supervisor_cli': 'pi', 'worker_cli': 'pi'}, table) is None
 
 
-def test_adopted_claude_subfleet_exception_is_task_only(tmp_path):
+def test_adopted_claude_subfleet_exception_is_task_or_service(tmp_path):
     # Gate logic on a stub table where claude+claude is still unverified (shipped row is verified now).
     table = cli_pairs.load_pairs(write(tmp_path, [row('claude', 'claude', 'task', 'unverified')]))
     base = {'supervisor_cli': 'claude', 'worker_cli': 'claude', 'mode': 'task'}
     assert '--lifecycle smoke' in cli_pairs.pair_problem(base, table)
     assert cli_pairs.pair_problem(dict(base, lifecycle='smoke'), table) is None
     assert cli_pairs.pair_problem(dict(base, adopt={'pane': 'x'}), table) is None
-    assert cli_pairs.pair_problem(dict(base, adopt={'pane': 'x'}, mode='service'), table)
-    assert cli_pairs.pair_problem(dict(base, adopt={'pane': 'x'}, mode='service'))   # shipped: not listed
+    # design.md §28 (design change): an adopted service sub-fleet (named sub-fleet) passes too
+    assert cli_pairs.pair_problem(dict(base, adopt={'pane': 'x'}, mode='service'), table) is None
+    assert cli_pairs.pair_problem(dict(base, adopt={'pane': 'x'}, mode='service')) is None
+    assert cli_pairs.pair_problem(dict(base, mode='service'))   # shipped: not listed without adopt
 
 
 def test_table_is_reread_on_every_check(tmp_path, monkeypatch):

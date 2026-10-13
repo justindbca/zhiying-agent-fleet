@@ -63,8 +63,9 @@ def pair_problem(cfg, table=None):
     """None when this supervisor/worker CLI pair and mode may run transport v2."""
     sup, wrk = cfg.get('supervisor_cli') or 'codex', cfg.get('worker_cli') or 'codex'
     mode = cfg.get('mode') or 'task'
-    if (sup, wrk, mode) == ('claude', 'claude', 'task') and cfg.get('adopt'):
-        # Sub-fleet (docs/design.md §19): the supervisor is an adopted official-Claude worker pane.
+    if (sup, wrk) == ('claude', 'claude') and mode in ('task', 'service') and cfg.get('adopt'):
+        # Sub-fleet (docs/design.md §19; service: a named sub-fleet, §28): the supervisor is an
+        # adopted official-Claude worker pane.
         return None
     table = table or load_pairs()
     row = table.lookup(sup, wrk, mode)

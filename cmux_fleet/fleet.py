@@ -46,7 +46,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import advisor, brake, cli_pairs, contracts, handoff, history, kit as kitmod, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, watchdog  # noqa: E402
+from cmux_fleet import advisor, brake, cli_pairs, contracts, handoff, history, kit as kitmod, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, named_subfleet, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, watchdog  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -584,6 +584,8 @@ def parse_service_decision(text, workers):
         if not isinstance(item, dict) or not isinstance(item.get('request_id'), str) \
                 or not isinstance(item.get('reason'), str):
             raise ValueError('every skip item needs request_id and reason')
+    if decision.get('subfleet') is not None:  # §28: approve / reject one external sub-fleet up / down
+        named_subfleet.validate_decision(decision['subfleet'])
     return decision
 
 
@@ -2408,6 +2410,8 @@ class Fleet:
     def request(self, spec):
         if not self.service:
             raise ValueError('requests need a fleet started with --mode service')
+        if named_subfleet.is_op(spec):  # §28: own branch, never REQQ / validate_request / request_timeout
+            return named_subfleet.request(self, spec)
         validate_request(spec, self.dispatch_targets())
         rid = spec['id']
         if (self.r.hgetall(REQ + rid) or self.r.get(RESULT + rid)
@@ -2515,6 +2519,8 @@ class Fleet:
         for item in decision['skip']:
             if self.r.hget(REQ + item['request_id'], 'status') == 'routing':
                 self.publish(item['request_id'], 'skipped', worker='supervisor', reason=item['reason'])
+        if decision.get('subfleet'):
+            named_subfleet.decide(self, decision['subfleet'])
         if decision['status'] == 'BLOCKED':
             self.pause(decision.get('reason') or 'supervisor needs a human')
 
@@ -3133,6 +3139,7 @@ class Fleet:
                 raise ValueError(problem)
             workers, roles, profiles = roster.parse_entries(raw, Path(path).parent)
             table, per_worker = roster.handoff(raw)
+            subfleets = roster.subfleets(raw, Path(path).parent)  # §28 (exempt from the used-name rule)
             # A slot name used earlier in this run still has Redis state and a workspace.
             used = [n + ': name was already used in this run (agent state or workspace exists); pick a new name'
                     for n in workers if n not in self.workers
@@ -3189,6 +3196,8 @@ class Fleet:
         for name in self.names:  # status shows the effective values without waiting for a delivery
             if self.agent(name):
                 self.handoff_limits(name)
+        if subfleets or named_subfleet.declared(self):
+            named_subfleet.declare(self, subfleets)
 
     def default_capacity_problem(self, adds):
         """None if new default slots ``adds`` fit the default model's card next to the live slots."""
