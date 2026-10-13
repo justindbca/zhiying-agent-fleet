@@ -601,3 +601,36 @@ def test_contract_row_held_by_depends_on_is_advised_when_released(tmp_path):
     asked = [c['instruction'] for c in f.advisor_runner.calls]
     assert 'Do task M9 and write its output file' in asked
     assert f.agent('worker-3')['advice_ticket'] and f.agent('worker-3')['state'] == 'busy'
+
+
+def test_v2_fingerprint_change_respawns_on_the_real_bus(v2adv, monkeypatch):
+    from test_v2_codex_claude import answer_turn, submit, typed
+    f = v2adv
+    monkeypatch.setattr(f, 'preflight_profile', lambda launch: None)
+    submit(f)
+    answer_turn(f, 'supervisor', json.dumps({'status': 'RUNNING', 'completion': 5, 'reason': 'go', 'dispatch': [
+        {'to': 'worker-1', 'instruction': 'Research the semis rotation into worker-1/notes.md'}]}))
+    f.pump()  # release with opus/high
+    answer_turn(f, 'worker-1', 'READY', startup=True)
+    f.pump()
+    answer_turn(f, 'worker-1', 'Done:\n- notes\nEvidence:\n- worker-1/notes.md\nNot done: none\nBlocked: none')
+    f.pump()
+    old = f.agent('worker-1')['pane']
+    f.advisor_runner = Runner({'model': 'sonnet', 'effort': 'medium', 'domains': [],
+                               'reason': '能力表 research_web/web-research：sonnet=enough，降档'})
+    answer_turn(f, 'supervisor', json.dumps({'status': 'RUNNING', 'completion': 50, 'reason': 'go', 'dispatch': [
+        {'to': 'worker-1', 'instruction': 'Summarize worker-1/notes.md into worker-1/summary.md'}]}))
+    f.pump()
+    info = f.agent('worker-1')
+    assert info['generation'] == '1' and info['label'] == 'worker-1.1' and info['state'] == 'starting'
+    assert old in f.mgr.killed and json.loads(info['runtime_launch'])['profile_id'] == 'claude-sonnet'
+    assert info['launch_ready'] == '1'
+    assert len(typed(f, 'worker-1')) == 0  # the successor pane has nothing typed before READY
+    assert answer_turn(f, 'worker-1', 'READY', startup=True, generation=1)['status'] == 'ready'
+    assert f.v2.bus.slot_state('worker-1')['generation'] == '1'
+    f.pump()
+    text, = typed(f, 'worker-1')
+    assert 'Summarize worker-1/notes.md' in text
+    assert len(f.advisor_runner.calls) == 1 and f.agent('worker-1')['state'] == 'busy'
+    snapshot = fleet.load(f.run_dir / 'runtime' / 'worker-1-g1.json')
+    assert snapshot['worker_model'] == 'sonnet' and snapshot['worker_effort'] == 'medium'
