@@ -1434,13 +1434,15 @@ REAL_E2E_ERROR = 'no worker is busy: RUNNING must dispatch at least one instruct
 
 
 def test_candidate_invalid_correction_names_the_real_error_and_settles_and_dispatches_once(sup):
-    """Real e2e shape (Codex supervisor, worker-3 audit.jsonl of runs A2/A3/M11): both workers already reported,
-    worker-2's report is still queued behind worker-1's, and the supervisor answers worker-1's report with
-    RUNNING + no dispatch ("waiting for worker-2"). The v2 validator rejects it with the error above.
-    - the rejected turn settles its own delivery exactly once (a repeat notify is ignored, no second strike);
-    - nothing is dispatched for it; the queued worker-2 report is still delivered, once;
-    - the correction is queued (never typed), names the validator's real error, not '(substring not found)';
-    - the next valid decision dispatches exactly once; answering the correction adds no duplicate round."""
+    """Real e2e (Codex supervisor; worker-3 audit.jsonl of runs A2/A3/M11 and rehearsal w3e2e-fa): the supervisor
+    answers a worker report with RUNNING + no dispatch ("waiting for worker-2's report").
+    - While worker-2's report is still queued for the supervisor, that decision is valid: another supervisor
+      turn is guaranteed (Fleet.others_active), so nothing is rejected, nothing is dispatched, no strike.
+    - Once both reports have been delivered (no worker busy, nothing queued for the supervisor), the same decision
+      is rejected by the v2 validator with the error above, and:
+      the rejected turn settles its own delivery exactly once (a repeat notify is ignored, no second strike);
+      nothing is dispatched for it; the correction is queued (never typed) and names the validator's real error,
+      not '(substring not found)'; the next valid decision dispatches exactly once, with no duplicate round."""
     f = sup
     submit(f)
     assert codex_turn(f, plan(['worker-1', 'worker-2']))['status'] == 'committed'
@@ -1451,25 +1453,30 @@ def test_candidate_invalid_correction_names_the_real_error_and_settles_and_dispa
         assert claude_turn(f, w, REPORT.format('wrote ' + w + '/part.md', w + '/part.md'))['status'] == 'committed'
         f.pump()
     assert '[worker-1 report]' in last(f)[1] and len(typed(f, 'worker-1')) == len(typed(f, 'worker-2')) == 1
-    bad = json.dumps({'status': 'RUNNING', 'completion': 50, 'reason': "waiting for worker-2's report", 'dispatch': []})
+    waiting = json.dumps({'status': 'RUNNING', 'completion': 50, 'reason': "waiting for worker-2's report", 'dispatch': []})
+    # 1) worker-2's report is still queued for the supervisor: "waiting" is a valid decision
+    assert codex_turn(f, waiting)['status'] == 'committed'
+    assert not [e for e in audit(f) if e.get('event') == 'candidate.invalid']
+    assert f.task()['bad_replies'] == '0'
+    f.pump(); f.pump()
+    assert '[worker-2 report]' in last(f)[1]  # FIFO: the queued report is delivered next, not lost
+    assert len(typed(f, 'worker-1')) == len(typed(f, 'worker-2')) == 1
+    # 2) both reports delivered, nobody busy, nothing queued for the supervisor: the same decision is invalid
     turn, text = str(uuid.uuid4()), last(f)[1]
-    out = codex_turn(f, bad, turn=turn)
+    out = codex_turn(f, waiting, turn=turn)
     assert out['status'] == 'committed', out  # the delivery is settled; the decision itself is rejected
     invalid = [e for e in audit(f) if e.get('event') == 'candidate.invalid' and e.get('slot') == 'supervisor']
     assert [e.get('error') for e in invalid] == [REAL_E2E_ERROR]
     assert f.task()['status'] == 'running' and f.task()['bad_replies'] == '1'
-    again = codex_turn(f, bad, turn=turn, users=[('', text)])  # the same turn notified twice
+    again = codex_turn(f, waiting, turn=turn, users=[('', text)])  # the same turn notified twice
     assert again is False or again['status'] in ('ignored', 'stale'), again
     assert len([e for e in audit(f) if e.get('event') == 'candidate.invalid']) == 1 and f.task()['bad_replies'] == '1'
     f.pump(); f.pump()
     assert len(typed(f, 'worker-1')) == len(typed(f, 'worker-2')) == 1  # nothing dispatched for the rejected reply
-    assert '[worker-2 report]' in last(f)[1]  # FIFO: the queued report first, not lost
-    assert codex_turn(f, plan(['worker-1'], 'round 2'))['status'] == 'committed'
-    f.pump(); f.pump()
     correction = last(f)[1]
     assert REAL_E2E_ERROR in correction and 'substring not found' not in correction
     assert correction.startswith('Your reply is not a valid decision JSON')
-    assert codex_turn(f, WAIT)['status'] == 'committed'  # worker-1 is busy now: RUNNING without dispatch is valid
+    assert codex_turn(f, plan(['worker-1'], 'round 2'))['status'] == 'committed'  # the valid answer to the correction
     f.pump(); f.pump()
     texts = queued_texts(f)
     assert [sum(m in t for t in texts) for m in ('[worker-1 report]', '[worker-2 report]', REAL_E2E_ERROR)] == [1, 1, 1]

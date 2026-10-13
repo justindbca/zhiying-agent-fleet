@@ -2191,7 +2191,10 @@ class Fleet:
         # "no worker is busy: RUNNING must dispatch" rule does not apply in those phases.
         if self.contract_phase() in ('interfaces', 'skeleton'):
             return True
-        return any(self.agent(w).get('state') != 'idle' or self.inbox_depth(w) for w in self.workers)
+        # A delivery still queued for the supervisor itself (typically another worker's report) guarantees
+        # another supervisor turn, so "RUNNING, waiting" cannot stall the task.
+        return bool(self.inbox_depth('supervisor')) or any(
+            self.agent(w).get('state') != 'idle' or self.inbox_depth(w) for w in self.workers)
 
     def on_supervisor(self, text, invalid=None):
         """`invalid`: the v2 validator's own rejection; the correction must name it, not a parse error."""

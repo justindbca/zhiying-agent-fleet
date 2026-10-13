@@ -556,3 +556,28 @@ def test_mark_bound_never_revives_an_abandoned_or_superseded_record(mixed):
     assert codex_queue.record(f.agent('supervisor'))['cq_state'] == 'queued'
     assert codex_queue.mark_bound(f.r, 'supervisor', 't-3', got['token']) is True
     assert codex_queue.record(f.agent('supervisor'))['cq_turn'] == 't-3'
+
+
+def test_waiting_for_a_report_already_queued_for_the_supervisor_is_a_valid_decision(mixed):
+    """Real E2E (worker-3 rehearsal A, w3e2e-fa): both workers finished quickly; while the supervisor answers
+    worker-1's report, worker-2's report is already queued for it. "RUNNING, no dispatch, waiting" is then a
+    correct decision (another supervisor turn is certain), not 'no worker is busy'."""
+    f = mixed
+    submit(f)
+    assert answer_turn(f, 'supervisor', decision(['worker-1', 'worker-2']))['status'] == 'committed'
+    f.pump()
+    report = 'Done:\n- wrote {0}/part.md\nEvidence:\n- {0}/part.md\nNot done: none\nBlocked: none'
+    assert answer_turn(f, 'worker-1', report.format('worker-1'))['status'] == 'committed'
+    f.pump()
+    assert '[worker-1 report]' in codex_queue.record(f.agent('supervisor'))['cq_text']
+    assert answer_turn(f, 'worker-2', report.format('worker-2'))['status'] == 'committed'
+    f.pump()
+    assert f.inbox_depth('supervisor') == 1  # worker-2's report waits behind the supervisor's current turn
+    assert all(f.agent(w)['state'] == 'idle' for w in WORKERS)
+    wait = json.dumps({'status': 'RUNNING', 'completion': 50, 'reason': "waiting for worker-2's report", 'dispatch': []})
+    assert answer_turn(f, 'supervisor', wait)['status'] == 'committed'
+    events = [e for _, e in f.r.xrange(f.v2.bus.audit_key)]
+    assert not [e for e in events if e.get('event') == 'candidate.invalid'], 'the wait decision was rejected'
+    assert int(f.r.hget(fleet.TASK, 'bad_replies') or 0) == 0
+    f.pump()
+    assert '[worker-2 report]' in codex_queue.record(f.agent('supervisor'))['cq_text']  # delivered next, once
