@@ -465,7 +465,7 @@ def v2adv2(private_redis_v2, tmp_path, monkeypatch):  # noqa: F811
     yield from v2_advised(private_redis_v2, tmp_path, monkeypatch, ['worker-1', 'worker-2'])
 
 
-def v2_advised(r, tmp_path, monkeypatch, workers, on=True):
+def v2_advised(r, tmp_path, monkeypatch, workers, on=True, **extra):
     import uuid
     from test_v2_codex_claude import answer_turn
     r.flushdb()
@@ -477,7 +477,7 @@ def v2_advised(r, tmp_path, monkeypatch, workers, on=True):
                workers=list(workers), mode='task', supervisor_cli='codex', worker_cli='claude',
                codex_home=str(tmp_path / 'codex-home'), transport_version=2, allow_development_v2=True,
                stall_timeout=0, v2_lease_ms=300000, max_busy=0, worker_kit=str(kit),
-               claude='/bin/claude', token='feedbeef')
+               claude='/bin/claude', token='feedbeef', **extra)
     path = run / 'config.json'
     fleet.save(path, cfg)
     if on:

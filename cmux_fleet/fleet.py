@@ -972,9 +972,18 @@ class Fleet:
             error = self.set_advisor(decision['advisor'] == 'on', 'supervisor', write=True)
             if error:
                 self.r.rpush(ADVICE_NOTES, '[advisor] advisor: "' + decision['advisor'] + '" 未生效：' + error)
-        if decision.get('consult') and not self.advisor_online():
-            self.r.rpush(ADVICE_NOTES, '[advisor off] 顾问不在线，consult 未执行：先在 fleet_decision 里发 '
-                                       'advisor: "on"，再发 consult')
+        if decision.get('consult') and decision['status'] == 'RUNNING' and not self.advisor_online():
+            note = self.consult_off_note(decision['consult'])
+            if decision['dispatch']:
+                self.r.rpush(ADVICE_NOTES, note)  # rides on the next supervisor message (a report will come)
+            else:  # consult-only reply: nothing else would wake the supervisor
+                self.queue('supervisor', note + '\nReply with the JSON format from AGENTS.md.')
+
+    def consult_off_note(self, items):
+        """The one `[advisor off]` answer to consult items (at intake, or queued while on then turned off)."""
+        which = ', '.join(x['task'] + ' (' + self.label(self.resolve(x.get('slot') or x['worker'])) + ')' for x in items)
+        return ('[advisor off] consult ' + which + ' 未执行：顾问不在线。先在 fleet_decision 里发 advisor: "on"，'
+                '再发 consult；或自己派纠正性 dispatch / BLOCKED')
 
     # -- small helpers
     def agent(self, name):
@@ -2705,10 +2714,6 @@ class Fleet:
         self.log('advice.released_default', agent=name)
 
     # -- advisor mid-task rescue (advisor plan §3.2 / §4.2: consult -> respawn | reassign | give_up)
-    def rescue_enabled(self):
-        """The one gate of the rescue path (feat/advisor-hotload replaces this body with its roster switch)."""
-        return self.cfg.get('advisor') is True
-
     def consult_decision(self, decision, state):
         """Validate the supervisor's consult items against the task table (no side effects)."""
         dispatched = {self.resolve(x['to']) for x in decision['dispatch']}
@@ -2731,18 +2736,12 @@ class Fleet:
         return out
 
     def consult_apply(self, consults):
-        for c in consults:
-            if self.rescue_enabled():
+        for c in consults:  # offline: advisor_decision already answered with the one [advisor off] note
+            if self.advisor_online():
                 self.r.rpush(RESCUE, json.dumps(dict(c, run_task=self.task().get('id', '')), ensure_ascii=False))
                 self.log('advice.consult', agent=c['slot'], task=c['task'])
             else:
                 self.log('advice.consult_off', agent=c['slot'], task=c['task'])
-                self.queue('supervisor', self.consult_off_note(c))
-
-    def consult_off_note(self, c):
-        return ('[advisor off] consult ' + c['task'] + ' (' + self.label(c['slot']) + ') ignored: the advisor is '
-                'offline (先 advisor: on). Decide yourself: dispatch a correction to ' + self.label(c['slot'])
-                + ', or BLOCKED.\nReply with the JSON format from AGENTS.md.')
 
     def rescue_tick(self):
         """Ready notes of reassigned slots; then one consult request whose worker is idle."""
@@ -2761,8 +2760,8 @@ class Fleet:
             if self.agent(req['slot']).get('state') != 'idle' or self.inbox_depth(req['slot']):
                 continue  # judged at the worker's next idle boundary
             self.r.lrem(RESCUE, 1, raw)
-            if not self.rescue_enabled():
-                self.queue('supervisor', self.consult_off_note(req))
+            if not self.advisor_online():  # accepted while online, turned off before the worker went idle
+                self.queue('supervisor', self.consult_off_note([req]) + '\nReply with the JSON format from AGENTS.md.')
             else:
                 self.rescue(req)
             return  # at most one consultation per pump

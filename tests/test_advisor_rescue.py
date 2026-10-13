@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from test_advisor import Runner, afx, item, report, send_decision, supervisor_texts, v2adv2, worker_text  # noqa: F401
+from test_advisor import Runner, advisor_on, afx, item, report, send_decision, supervisor_texts, v2adv2, worker_text  # noqa: F401
 from test_fleet import decision, fx, turn  # noqa: F401
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
 from cmux_fleet import advisor, fleet, handoff
@@ -171,13 +171,30 @@ def test_invalid_rescue_sheet_counts_as_unavailable(afx):
 def test_advisor_off_ignores_consult_with_a_note(afx):
     f = afx
     worked(f)
-    f.cfg['advisor'] = False  # the phase-1 gate (rescue_enabled)
+    assert f.set_advisor(False, 'user', write=True) is None  # the roster switch (advisor plan §2.1)
+    calls = len(f.advisor_runner.calls)
     f.advisor_runner = Runner(AssertionError('advisor must not be consulted'))
     f.on_supervisor(rescue_decision(consult()))
     f.pump()
-    assert f.advisor_runner.calls[1:] == [] and f.r.lrange(fleet.RESCUE, 0, -1) == []
-    assert supervisor_texts(f)[-1].startswith('[advisor off] consult M0 (worker-1) ignored')
-    assert '先 advisor: on' in supervisor_texts(f)[-1] and f.task()['bad_replies'] == '0'
+    assert f.advisor_runner.calls == [] and calls == 1 and f.r.lrange(fleet.RESCUE, 0, -1) == []
+    offs = [t for t in supervisor_texts(f) if '[advisor off]' in t]
+    assert len(offs) == 1 and offs[0].startswith('[advisor off] consult M0 (worker-1) 未执行')  # one note, not two
+    assert 'advisor: "on"' in offs[0] and f.task()['bad_replies'] == '0'
+
+
+def test_consult_queued_while_on_then_off_before_idle_gets_the_off_note(afx):
+    f = afx
+    worked(f)
+    f.advisor_runner = Runner(AssertionError('advisor must not be consulted'))
+    f.setf('worker-1', state='busy')  # not idle yet: the consult waits in the queue
+    f.on_supervisor(rescue_decision(consult()))
+    assert len(f.r.lrange(fleet.RESCUE, 0, -1)) == 1
+    assert f.set_advisor(False, 'user', write=True) is None
+    f.setf('worker-1', state='idle')
+    f.pump()
+    assert f.advisor_runner.calls == [] and f.r.lrange(fleet.RESCUE, 0, -1) == []
+    offs = [t for t in supervisor_texts(f) if '[advisor off]' in t]
+    assert len(offs) == 1 and offs[0].startswith('[advisor off] consult M0 (worker-1) 未执行')
 
 
 def test_without_advisor_consult_parses_and_is_answered(fx):
@@ -350,8 +367,9 @@ def test_contract_row_goes_back_to_running_on_reassign(tmp_path, monkeypatch):
     (run / 'workspace').mkdir(parents=True)
     cfg = {'run': str(run), 'redis_socket': '/tmp/cmux-fleet-test.sock', 'python': sys.executable,
            'workers': list(WORKERS), 'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 95000,
-           'codex_home': str(tmp_path / 'codex-home'), 'advisor': True, 'codex_model': 'gpt-6.1-sol'}
+           'codex_home': str(tmp_path / 'codex-home'), 'codex_model': 'gpt-6.1-sol'}
     (run / 'config.json').write_text(json.dumps(cfg))
+    advisor_on(run, WORKERS)  # the roster switch (advisor plan §2.1), not a config key
     sessions = tmp_path / 'sessions'
     f = fleet.Fleet(run / 'config.json', FakeRedis(), FakeMgr(), sessions=sessions)
     f.advisor_runner = Runner({'model': 'gpt-6.1-sol', 'domains': []})

@@ -42,7 +42,8 @@ def cfx(tmp_path, monkeypatch):
     cfg = {'run': str(run), 'redis_socket': '/tmp/cmux-fleet-test.sock', 'python': sys.executable,
            'workers': ['worker-1', 'worker-2'], 'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 95000,
            'codex_home': str(tmp_path / 'codex-home'), 'worker_cli': 'claude', 'worker_kit': str(kit),
-           'claude': '/bin/claude', 'claude_window': 200000, 'token': 'abcd1234'}
+           'claude': '/bin/claude', 'claude_window': 200000, 'token': 'abcd1234',
+           'worker_effort': 'medium'}  # the slot runtime = a medium sheet's fingerprint (no respawn on first advice)
     (run / 'config.json').write_text(json.dumps(cfg))
     f = fleet.Fleet(run / 'config.json', FakeRedis(), FakeMgr(), sessions=tmp_path / 'sessions')
     f.advisor_runner = Runner({'model': 'sonnet', 'effort': 'medium', 'domains': []})
@@ -202,15 +203,27 @@ def test_bad_advisor_key_is_a_bad_reply(cfx, value):
 
 
 def test_consult_while_off_gets_an_advisor_off_note(cfx):
+    """Off: consult is answered with one [advisor off] note; with a dispatch in the same reply it rides
+    on the next supervisor message, a consult-only reply gets it at once (nothing else would wake it)."""
     f = cfx
-    f.on_supervisor(decision(dispatch=[item()], consult=[{'to': 'worker-1', 'why': 'stuck'}]))
+    f.on_supervisor(decision(dispatch=[dict(item(), id='M0')]))
     f.pump()
-    assert f.advisor_runner.calls == []
     report(f, 'worker-1')
+    ask = {'worker': 'worker-1', 'task': 'M0', 'finding': 'two rounds of 403'}
+    f.on_supervisor(decision(dispatch=[item('worker-2', 'Research the energy rotation and write worker-2/notes.md')],
+                             consult=[ask]))
+    assert f.r.llen(fleet.ADVICE_NOTES) == 1 and f.r.lrange(fleet.RESCUE, 0, -1) == []
+    f.pump()
+    report(f, 'worker-2')
     f.pump()
     note = next(t for t in supervisor_texts(f) if '[advisor off]' in t)
-    assert '\n[advisor off] ' in note and 'advisor: "on"' in note
+    assert '\n[advisor off] consult M0 (worker-1) ' in note and 'advisor: "on"' in note
     assert f.r.llen(fleet.ADVICE_NOTES) == 0
+    before = len([t for t in supervisor_texts(f) if '[advisor off]' in t])
+    f.on_supervisor(decision(dispatch=[], consult=[ask]))
+    offs = [t for t in supervisor_texts(f) if '[advisor off]' in t]
+    assert len(offs) == before + 1 and offs[-1].startswith('[advisor off] consult M0 (worker-1) ')
+    assert f.r.llen(fleet.ADVICE_NOTES) == 0 and f.advisor_runner.calls == [] and f.task()['bad_replies'] == '0'
 
 
 def test_bad_kit_refuses_the_switch_and_keeps_it_off(cfx):
@@ -271,7 +284,7 @@ def test_control_state_line_shows_the_switch(daemon, shown):
 # ------------------------------------------------------------------ v2
 @pytest.fixture
 def v2off(private_redis_v2, tmp_path, monkeypatch):  # noqa: F811
-    yield from v2_advised(private_redis_v2, tmp_path, monkeypatch, ['worker-1'], on=False)
+    yield from v2_advised(private_redis_v2, tmp_path, monkeypatch, ['worker-1'], on=False, worker_effort='medium')
 
 
 def test_v2_off_at_start_spawns_with_defaults_immediately(v2off):
