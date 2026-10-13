@@ -893,9 +893,9 @@ class RuntimeV2:
                 self.audit('candidate.invalid', slot=slot, error=error, detail=candidates)
             self.release(env, value, 'failed' if error else 'completed')
             if self.f.service:
-                self.f.on_service_supervisor('invalid candidate' if error else text)
+                self.f.on_service_supervisor(text, invalid=error)
             else:
-                self.f.on_supervisor('invalid candidate' if error else text)
+                self.f.on_supervisor(text, invalid=error)
             invalid = error or int(self.f.r.hget(legacy.SERVICE if self.f.service else legacy.TASK, 'bad_replies') or 0)
             if invalid:
                 self.f.r.hset(self.bus.msg_key(env['message_id']), mapping={'outcome': 'failed'})

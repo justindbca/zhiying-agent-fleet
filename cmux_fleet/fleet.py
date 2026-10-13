@@ -2183,9 +2183,12 @@ class Fleet:
             return True
         return any(self.agent(w).get('state') != 'idle' or self.inbox_depth(w) for w in self.workers)
 
-    def on_supervisor(self, text):
+    def on_supervisor(self, text, invalid=None):
+        """`invalid`: the v2 validator's own rejection; the correction must name it, not a parse error."""
         t = self.task()
         try:
+            if invalid:
+                raise ValueError(invalid)
             decision = parse_decision(text, self.dispatch_targets(), self.others_active())
             state = self.contract_state()
             if state is not None:
@@ -2505,8 +2508,10 @@ class Fleet:
             return
         self.publish(rid, 'ok', worker=self.label(name), result=result)
 
-    def on_service_supervisor(self, text):
+    def on_service_supervisor(self, text, invalid=None):
         try:
+            if invalid:
+                raise ValueError(invalid)
             decision = parse_service_decision(text, self.dispatch_targets())
         except (ValueError, TypeError, KeyError) as exc:
             bad = self.r.hincrby(SERVICE, 'bad_replies', 1)
