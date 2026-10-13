@@ -44,5 +44,6 @@ At most two read-only commands per check, then decide. Do not keep re-reading.
 - `dispatch[].id`: optional task id `M<n>`; only a task with an id can be split by its worker (escalate)
 - `escalations`: optional, your answers to `[escalate]` requests (see the command table)
 - `dispatch`: may be empty, but **when no worker is busy, RUNNING must dispatch at least one instruction**
+- **Parallel by default — cut wall-clock time.** Split the goal into independent pieces and give every idle worker its own piece in the same reply. Serialize only when a piece truly needs another piece's output, and dispatch the dependent piece the moment that output exists. Never give the same file to two workers in one round. An idle worker while independent work remains is a mistake.
 - `artifacts`: optional; `path` is relative to the shared output directory (e.g. `worker-1/report.md`) and an item may only contain `path` / `min_chars` / `contains`
 - Before `COMPLETED` at least one `artifacts` entry must have been declared (ones pre-declared by the operator count)
