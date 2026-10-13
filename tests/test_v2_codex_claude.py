@@ -16,7 +16,7 @@ import pytest
 
 from test_fleet import FakeMgr, codex_rows, write_rollout
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
-from cmux_fleet import cmux_manager, fleet, runtime_v2, transport_inventory
+from cmux_fleet import cmux_manager, codex_queue, fleet, runtime_v2, transport_inventory
 
 WORKERS = ['worker-' + str(i) for i in range(1, 7)]
 
@@ -393,3 +393,56 @@ def test_ignored_turn_is_audited(mixed):
     answer_turn(f, 'worker-1', 'hello', prompt='manual chat')
     events = [fields for _, fields in f.r.xrange(f.v2.bus.audit_key)]
     assert any(e.get('event') == 'turn.ignored' and e.get('slot') == 'worker-1' for e in events)
+
+
+def test_cli_timeout_withdraws_no_pending_item_and_its_late_turn_never_settles(mixed, monkeypatch):
+    """`codex queue` times out after it really queued the item. The delivery is `uncertain` and held; nothing
+    in Codex's queue_1.sqlite is deleted or changed: not this thread's own item, not a same-body item of
+    this thread or another thread (their ownership is unprovable). After clear + finish the rows are the
+    same, and the item's late turn, carrying this delivery's token, settles nothing. Nothing is pasted."""
+    import sqlite3
+    from test_codex_notype_regression import QUEUE_SCHEMA
+    f = mixed
+    db = fleet.codex_home(f.runtime_cfg('supervisor')) / 'queue_1.sqlite'
+    db.parent.mkdir(parents=True, exist_ok=True)
+    thread, other = f.agent('supervisor')['thread'], str(uuid.uuid4())
+
+    def put(con, th, text, order):
+        con.execute('INSERT INTO queued_items VALUES (?, ?, ?, ?, 1, 1)', (str(uuid.uuid4()), th, json.dumps(
+            {'UserInput': {'content': [{'type': 'text', 'text': text, 'text_elements': []}], 'client_id': ''}}), order))
+
+    def timed_out(cfg, name, th, text, **kw):
+        body = text.rsplit('\n\n(fleet delivery ', 1)[0]
+        con = sqlite3.connect(str(db))
+        con.executescript(QUEUE_SCHEMA)
+        put(con, th, body, 0)    # an older same-body message of another sender on this thread
+        put(con, th, text, 1)    # this delivery's own item: really queued, but the CLI never answered
+        put(con, other, body, 0)  # same body, another thread
+        con.commit()
+        con.close()
+        raise codex_queue.QueueError('uncertain: codex queue gave no answer: timed out after 30 seconds')
+    monkeypatch.setattr(codex_queue, 'enqueue', timed_out)
+
+    def rows():
+        con = sqlite3.connect('file:' + str(db) + '?mode=ro', uri=True)
+        try:
+            return con.execute('SELECT id, thread_id, payload_json, queue_order FROM queued_items ORDER BY id').fetchall()
+        finally:
+            con.close()
+    submit(f)
+    snap = rows()
+    assert len(snap) == 3
+    assert f.agent('supervisor')['state'] == 'held' and f.paused()
+    rec = codex_queue.record(f.agent('supervisor'))
+    assert rec['cq_state'] == 'uncertain' and rec['cq_token'] and rec['cq_generation'] == f.agent('supervisor')['generation']
+    events = [x for _, x in f.r.xrange(f.v2.bus.audit_key)]
+    assert any(e.get('event') == 'queue.uncertain' for e in events)
+    assert codex_queue.clear(f, 'supervisor', 'operator')['cq_state'] == 'uncertain'
+    assert codex_queue.record(f.agent('supervisor'))['cq_state'] == 'abandoned'
+    assert rows() == snap  # clear withdraws nothing from Codex's queue
+    late = answer_turn(f, 'supervisor', decision(['worker-1']), prompt=rec['cq_text'])  # the item runs after all
+    assert late is False or late['status'] in ('ignored', 'stale'), late
+    assert not typed(f, 'worker-1')
+    f.v2.finish('stopped', 'operator stop')
+    assert rows() == snap
+    assert not [p for p, _ in f.mgr.sent if p == f.agent('supervisor')['pane']]  # no paste to the Codex pane
