@@ -425,3 +425,57 @@ def test_supervisor_prompts_carry_the_judgement_section(name):
                     '[advisor off] consult M0', 'dispatch M0 to worker-2 yourself'):
         assert message in text
     assert '`dispatch[].advise_note`' in text
+
+
+def test_v2_reassign_to_a_held_slot_starts_it_with_the_sheet_on_redispatch(v2adv2):
+    from test_v2_codex_claude import answer_turn, typed
+    f = v2adv2
+    v2_worked(f)
+    assert f.agent('worker-2')['advice_hold'] == '1'  # never dispatched: still held for its first sheet
+    f.advisor_runner = Runner({'action': 'reassign', 'to': 'worker-2', 'model': 'sonnet', 'effort': 'high',
+                               'domains': ['us_options'], 'reason': '能力表；换槽'})
+    answer_turn(f, 'supervisor', json.dumps({'status': 'RUNNING', 'completion': 30, 'reason': 'consult',
+                                             'dispatch': [], 'consult': [consult()]}))
+    f.pump()
+    assert '[advisor] M0 → worker-2 (sonnet/high, domains: [us_options])' in typed(f, 'supervisor')[-1]
+    assert json.loads(f.r.get(fleet.ITEMS))['M0']['to'] == ''
+    f.advisor_runner = Runner(AssertionError('the reassign sheet holds: no second consult'))
+    answer_turn(f, 'supervisor', json.dumps({'status': 'RUNNING', 'completion': 40, 'reason': 'redispatch', 'dispatch': [
+        {'to': 'worker-2', 'id': 'M0', 'instruction': 'Research the semis rotation into worker-2/notes.md'}]}))
+    f.pump()  # release_hold with the preset sheet
+    assert f.advisor_runner.calls == []
+    snap = fleet.load(f.run_dir / 'runtime' / 'worker-2-g0.json')
+    assert snap['worker_model'] == 'sonnet' and snap['worker_effort'] == 'high'
+    assert 'RULES OF us_options' in (fleet.agent_cwd(f.cfg, 'worker-2') / 'CLAUDE.md').read_text()
+    assert answer_turn(f, 'worker-2', 'READY', startup=True)['status'] == 'ready'
+    f.pump()
+    assert 'semis rotation into worker-2/notes.md' in typed(f, 'worker-2')[-1]
+
+
+def test_respawn_preflight_failure_blocks_without_a_silent_switch(afx, monkeypatch):
+    f = afx
+    worked(f)
+
+    def broken(launch):
+        raise ValueError('profile CLI binary not found: claude')
+    monkeypatch.setattr(f, 'preflight_profile', broken)
+    f.advisor_runner = Runner(respawn_sheet())
+    f.on_supervisor(rescue_decision(consult()))
+    f.pump()
+    assert f.task()['status'] == 'blocked' and 'advisor respawn failed' in f.task()['reason']
+    info = f.agent('worker-1')
+    assert info['generation'] == '0' and info['state'] != 'handoff' and f.r.llen('fx:inbox:worker-1') == 0
+
+
+def test_consult_waits_for_the_worker_to_be_idle(afx):
+    f = afx
+    worked(f)
+    f.on_supervisor(rescue_decision(consult()))
+    f.setf('worker-1', state='busy')
+    f.advisor_runner = Runner(AssertionError('not before the idle boundary'))
+    f.pump()
+    assert f.advisor_runner.calls == [] and len(f.r.lrange(fleet.RESCUE, 0, -1)) == 1
+    f.setf('worker-1', state='idle')
+    f.advisor_runner = Runner({'action': 'give_up', 'reason': 'x'})
+    f.pump()
+    assert len(f.advisor_runner.calls) == 1 and f.r.lrange(fleet.RESCUE, 0, -1) == []
