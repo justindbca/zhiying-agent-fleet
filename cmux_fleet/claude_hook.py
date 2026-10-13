@@ -25,6 +25,7 @@ re-arms; that turn is never settled or reported.
 """
 import json
 import os
+import re
 import time
 
 ENV = {'CLAUDE_CODE_STOP_HOOK_BLOCK_CAP': '0'}
@@ -150,11 +151,14 @@ def rewake_text(content):
     if not isinstance(content, str) or '<summary>Stop hook feedback</summary>' not in content:
         return None
     at = content.find(REWAKE_MESSAGE)
-    if at < 0:
-        return None
-    text = content[at + len(REWAKE_MESSAGE):]
+    if at >= 0:
+        text = content[at + len(REWAKE_MESSAGE):]
+    else:  # rewakeMessage is an internal setting: fall back to Claude Code's default prefix
+        start = content.find('<system-reminder>')
+        text = content[start + len('<system-reminder>'):] if start >= 0 else ''
+        text = re.sub(r'^\s*Stop hook blocking error from command "[^"]*":', '', text)
     end = text.rfind('</system-reminder>')
-    return (text[:end] if end >= 0 else text).strip('\n ').lstrip()
+    return (text[:end] if end >= 0 else text).strip('\n ').lstrip() or None
 
 
 def feedback_text(content):
