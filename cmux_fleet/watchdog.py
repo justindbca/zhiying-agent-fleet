@@ -18,7 +18,6 @@ Only settlements (hold, queue, publish) go through RuntimeV2.transaction.
 import hashlib
 import os
 import re
-import shlex
 import time
 import uuid
 from pathlib import Path
@@ -31,7 +30,6 @@ KEYS = frozenset(('Enter', 'Escape', 'Tab', 'Up', 'Down', 'Left', 'Right', 'Spac
 VERIFY = {
     'own_cwd': 'every path on the dialog is the slot\'s own working directory (trusted at spawn)',
     'paths_in_run': 'every path on the dialog is inside the slot directory or the run workspace (--add-dir)',
-    'rm_in_cwd': 'the rm targets are literal (no variable / substitution) and strictly inside the slot directory',
 }
 DEFAULTS = {'stall_grace': 300, 'stall_escapes': 3, 'watch_interval': 5, 'capture_fail_alarm': 3}
 # Slot states the watchdog never touches: someone else owns the next step.
@@ -210,24 +208,6 @@ def authorize(entry, screen, lines, cwd, workspace):
         if bad:
             return False, 'path outside the granted area: ' + ', '.join(bad[:3])
         return True, ', '.join(sorted({str(p) for p in paths}))[:300]
-    if kind == 'rm_in_cwd':
-        rows = [row for row in text.splitlines()  # the dialog's own title says 'Dangerous rm'
-                if re.search(r'(^|[\s;&|(])rm\s', row) and 'dangerous rm' not in row.lower()]
-        if len(rows) != 1:
-            return False, 'the rm command is not readable on the dialog'
-        command = rows[0][re.search(r'(^|[\s;&|(])rm\s', rows[0]).end():]
-        if any(c in command for c in '$`') or re.search(r'[;&|<>]', command):
-            return False, 'rm target depends on a shell variable / substitution: its scope cannot be checked'
-        try:
-            targets = [t for t in shlex.split(command) if not t.startswith('-')]
-        except ValueError:
-            return False, 'the rm command does not parse'
-        if not targets:
-            return False, 'rm has no target on the dialog'
-        bad = [t for t in targets if not _inside(_real(str(cwd / t) if not t.startswith(('/', '~')) else t), cwd, strict=True)]
-        if bad:
-            return False, 'rm target outside the slot directory: ' + ', '.join(bad[:3])
-        return True, 'rm ' + ' '.join(targets)[:300]
     return False, 'no verification rule'
 
 
