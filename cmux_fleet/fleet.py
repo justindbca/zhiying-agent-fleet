@@ -1297,6 +1297,11 @@ def actor_argv(cfg_path, cfg, name, generation, prompt):
     return argv + [prompt]
 
 
+# Every Claude Code the fleet starts: never self-update. An isolated config (CLAUDE_CONFIG_DIR) has no
+# autoupdater setting of its own, and on 2026-10-14 01:36 such an auto-update broke the shared install.
+CLAUDE_ENV = {'DISABLE_AUTOUPDATER': '1'}
+
+
 def claude_argv(cfg_path, cfg, name, generation, prompt):
     cwd = agent_cwd(cfg, name)
     hook = shlex.join([cfg['python'], str(Path(__file__).resolve()), 'claude-stop', str(cfg_path), name, str(generation)])
@@ -1320,7 +1325,7 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
         # Operator input typed in the supervisor tab is queued as a daemon request (design.md §5).
         hooks['UserPromptSubmit'] = [{'hooks': [{'type': 'command', 'timeout': PROMPT_HOOK_TIMEOUT, 'command': shlex.join(
             [cfg['python'], str(Path(__file__).resolve()), 'claude-prompt', str(cfg_path), name, str(generation)])}]}]
-    settings.write_text(json.dumps(dict({'hooks': hooks}, **({'env': claude_hook.ENV} if hooked else {}))))
+    settings.write_text(json.dumps({'hooks': hooks, 'env': dict(CLAUDE_ENV, **(claude_hook.ENV if hooked else {}))}))
     argv = [cfg.get('claude') or 'claude', '--dangerously-skip-permissions', '--model', claude_model(cfg, name),
             # Unattended panes: a choice dialog would wait for a human forever (acceptance 10/13 P1-5).
             '--disallowedTools', 'AskUserQuestion',
@@ -1395,6 +1400,7 @@ def actor(cfg_path, name, prompt, generation=None):
         for var in ('CLAUDECODE', 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ID',
                     'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_PID'):
             os.environ.pop(var, None)
+        os.environ.update(CLAUDE_ENV)
         if claude_hook.enabled(cfg, name, claude=True):
             os.environ.update(claude_hook.ENV)  # back-to-back deliveries are consecutive Stop blocks
         # Re-check trust at exec time: other Claude Code sessions rewrite ~/.claude.json and can drop
@@ -1730,7 +1736,7 @@ class Fleet:
                                   claude_model(cfg, name) if is_claude(cfg, name) else agent_profile(cfg, name))},
             env_vars=dict({'PATH': os.environ.get('PATH', '')}, **(
                 pi_adapter.environment(cfg_path, cfg, name, generation) if is_pi(cfg, name)
-                else {'CODEX_HOME': str(codex_home(self.cfg))})))
+                else dict({'CODEX_HOME': str(codex_home(self.cfg))}, **(CLAUDE_ENV if is_claude(cfg, name) else {})))))
         if not result.success:
             if result.pane_id:
                 self.setf(name, pane=result.pane_id)

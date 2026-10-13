@@ -12,6 +12,7 @@
 # (a human edits status/verified_by). Env: SUPERVISOR_MODEL (default opus), WORKER_MODEL
 # (default sonnet), PI_MODEL, SMOKE_TIMEOUT seconds (default 900), CLAUDE / PI binaries.
 set -euo pipefail
+export DISABLE_AUTOUPDATER=1  # every Claude Code this smoke starts never self-updates (10/14 01:36 broken shared install)
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="${PYTHON:-python3}"
 cd "$ROOT"

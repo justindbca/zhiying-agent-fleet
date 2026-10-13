@@ -38,6 +38,7 @@
 # script runs `fleet stop` on this run's config and closes this run's own tabs (isolated state dir), then
 # stops processes whose command line names the temp dir. Other workspaces are never touched.
 set -u
+export DISABLE_AUTOUPDATER=1  # every Claude Code this smoke starts never self-updates (10/14 01:36 broken shared install)
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PY=${PYTHON:-python3}
 FLEET="$ROOT/cmux_fleet/fleet.py"

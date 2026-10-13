@@ -13,6 +13,7 @@
 #   C redis frozen     private redis-server SIGSTOPped: same
 # Env: PI_MODEL (required), SUPERVISOR_MODEL (default opus), SMOKE_TIMEOUT (default 900), SMOKE_KEEP=1.
 set -u
+export DISABLE_AUTOUPDATER=1  # every Claude Code this smoke starts never self-updates (10/14 01:36 broken shared install)
 : "${PI_MODEL:?PI_MODEL=provider/model is required}"
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 PY=${PYTHON:-python3}

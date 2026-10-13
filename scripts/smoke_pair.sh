@@ -32,6 +32,7 @@
 # Exit 0 only if the run finished and all four PASS. A PASS does not flip the pair table to
 # verified: a human edits cmux_fleet/config/cli_pairs.yaml (status + verified_by).
 set -u
+export DISABLE_AUTOUPDATER=1  # every Claude Code this smoke starts never self-updates (10/14 01:36 broken shared install)
 SUP=${1:?supervisor cli}; WRK=${2:?worker cli}; MODE=${3:?task|service}
 case "$MODE" in task|service) ;; *) echo "mode must be task or service" >&2; exit 2;; esac
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
