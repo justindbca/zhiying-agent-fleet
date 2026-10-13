@@ -21,7 +21,10 @@ modes:
     base: task
     done_when: merged_to_deploy_branch_and_enqueued
     require_integrator_worker: true
-    review_step: {reviewer: opus, must_pass: true}   # master design v2 §4.14 (draft said fable)
+    # master design v2 §4.14 (draft said fable). Review rounds are capped (10/13 codex-notype ran to r16):
+    # a FAIL verdict at round max_rounds stops the rounds; the open P0/P1 go to the user in the result
+    # (outstanding.json / .md), no new round. Reviewers in a fleet follow cmux_fleet/agents/reviewer.md.
+    review_step: {reviewer: opus, must_pass: true, max_rounds: 3, on_cap: stop_and_report}
     on_complete: stop_and_close
     notify: [tg, parent]
   program:

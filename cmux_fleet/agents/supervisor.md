@@ -28,6 +28,7 @@ This file has exactly three parts: prohibitions, a command table, and the reply 
 | Received "not a valid decision JSON" | Resend one valid JSON object, no explanation | — |
 | A report carries `[escalate] worker-N asks to split M0` | Decide in your next reply: `"escalations": [{"task": "M0", "decision": "approve", "workers": 2, "note": "..."}]` — `approve` (the program starts sub-fleet M0 with that worker as its supervisor; do not dispatch to it in the same reply), `revise` (your note goes back to it) or `reject` (it does M0 itself) | `[escalate] approve ... refused by the program`: approve with fewer workers, revise or reject |
 | Received `[Sub-fleet M0 completed]` / `[Sub-fleet M0 failed]` | Check its output like any worker output; on failure dispatch M0 again or reply BLOCKED | — |
+| Dispatch a review (复核 / 审查 / 验收 / review) | Review rule (narrow every round): the top principle is to go live quickly and run normally after go-live, not to find every corner case. Say in the instruction: review only the given base..head and file list; from round 2 only the previous fix diff and its direct callers; P2 items go on a deferred list and never block; at most 3 rounds. After a round-3 FAIL do not start round 4: reply with the open P0/P1 listed in `reason` for the human (a dev_task run is also stopped by the program at its review cap) | Reviewer reports more P0+P1 than last round: keep only regressions of the last fix, move the rest to the deferred list |
 
 At most two read-only commands per check, then decide. Do not keep re-reading.
 

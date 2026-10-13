@@ -1297,6 +1297,11 @@ def actor_argv(cfg_path, cfg, name, generation, prompt):
     return argv + [prompt]
 
 
+REVIEW_POINTER = ('\n## Review instructions\n\nWhen an instruction asks you to review, audit or accept someone '
+                  'else\'s change (复核 / 审查 / 验收 / review), first read REVIEWER.md in your current directory '
+                  'and follow it for that instruction: the top principle is to go live quickly and run normally '
+                  'after go-live, rounds narrow, P2 items are deferred. It does not apply to other work.\n')
+
 # Every Claude Code the fleet starts: never self-update. An isolated config (CLAUDE_CONFIG_DIR) has no
 # autoupdater setting of its own, and on 2026-10-14 01:36 such an auto-update broke the shared install.
 CLAUDE_ENV = {'DISABLE_AUTOUPDATER': '1'}
@@ -1680,6 +1685,8 @@ class Fleet:
             scope += '\n## 4. Your role (' + name + ')\n\n' + extra.read_text()
         if self.contract_phase():  # successors / roster-added workers inside a contract task
             scope += '\n' + self.contract_doc(role, name)
+        if role == 'worker':  # every review inside a fleet follows the fleet copy of the review rules
+            scope += REVIEW_POINTER
         scope = scope.replace('{{WORKSPACE}}', str(self.workspace())).replace('{{FLEET_CHROME}}', self.fleet_cmd())
         sandbox_notice = ('You run inside a sandbox. Driving the user\'s browser directly (AppleScript, GUI automation) '
                           'fails there with an error. That error means the sandbox stopped you, not that the browser '
@@ -1705,6 +1712,8 @@ class Fleet:
         role = 'supervisor' if name == 'supervisor' else 'worker'
         scope = self.role_scope(name, cfg, launch)
         (cwd / 'AGENTS.md').write_text(scope)
+        if role == 'worker':
+            (cwd / 'REVIEWER.md').write_text((HERE / 'agents' / 'reviewer.md').read_text())
         if is_claude(cfg, name):
             (cwd / 'CLAUDE.md').write_text(scope)  # Claude Code reads CLAUDE.md, not AGENTS.md
             install_kit(self.cfg.get('worker_kit'), cwd)
