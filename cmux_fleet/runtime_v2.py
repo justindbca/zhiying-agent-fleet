@@ -1329,7 +1329,7 @@ class RuntimeV2:
                 # Escape / a hook timeout left the session idle, the next turn end of this session (any
                 # typed line) picks it up; otherwise the watchdog's stall path applies.
                 self.audit('tui.hooked', slot=slot, message_id=env['message_id'], delivery_id=env['delivery_id'],
-                           armed=waiting)
+                           generation=env['generation'], armed=waiting)
                 return True
             claude = self.slot_cfg(slot).get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') == 'claude'
             if pane and self.f.mgr.send_prompt_to_idle(pane, got['body']['text'], bracketed=claude):
