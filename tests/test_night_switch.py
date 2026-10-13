@@ -46,6 +46,20 @@ def ready_all(f, slots):
         assert answer_turn(f, w, 'READY', startup=True)['status'] == 'ready'
 
 
+def real_gate(f, monkeypatch):
+    """BC review r1 P1-01: the night swap runs the REAL preflight_profile (its CLI-change refusal included);
+    only the host-side pi checks (binary on PATH, --version, isolated home) are faked. Returns the kwargs seen."""
+    real_run, calls = fleet.subprocess.run, []
+    monkeypatch.setattr(fleet.shutil, 'which', lambda name: '/usr/bin/' + name)
+    monkeypatch.setattr(fleet.subprocess, 'run', lambda argv, *a, **k: (
+        fleet.subprocess.CompletedProcess(argv, 0, '1.1.0\n', '') if argv[-1:] == ['--version'] else real_run(argv, *a, **k)))
+    (f.run_dir / 'pi-home').mkdir(exist_ok=True)
+    f.cfg['pi_home'], f.cfg['allow_unsandboxed_pi'] = str(f.run_dir / 'pi-home'), True
+    gate = fleet.Fleet.preflight_profile.__get__(f)
+    monkeypatch.setattr(f, 'preflight_profile', lambda launch, **kw: (calls.append(kw), gate(launch, **kw))[1])
+    return calls
+
+
 # ------------------------------------------------------------------ roster file
 def test_roster_profile_column_parses_and_is_optional(tmp_path):
     path = tmp_path / 'r.yaml'
@@ -253,7 +267,7 @@ def test_live_profile_task_defers_the_roster_swap_and_keeps_delivering(nightly):
 def test_failed_preflight_blocks_and_keeps_the_old_runtime(nightly, monkeypatch):
     f = nightly
     submit(f)
-    monkeypatch.setattr(f, 'preflight_profile', lambda launch: (_ for _ in ()).throw(ValueError('claude missing')))
+    monkeypatch.setattr(f, 'preflight_profile', lambda launch, **kw: (_ for _ in ()).throw(ValueError('claude missing')))
     pane = f.agent('worker-1')['pane']
     fleet.night_cmd(fleet.load(f.path), 'on')
     f.tick()
@@ -369,11 +383,17 @@ def test_flashnext_night_is_rejected_whole_until_the_pair_is_admitted(hot, pairs
 def test_flashnext_night_swaps_to_pi_when_the_table_admits_codex_pi(hot, monkeypatch, pairs):
     f = hot
     pairs(('codex', 'claude', 'task', 'verified'), ('codex', 'pi', 'task', 'verified'))
-    monkeypatch.setattr(f, 'preflight_profile', lambda launch: None)
-    f.cfg['pi_home'] = str(f.run_dir / 'pi-home')
+    calls = real_gate(f, monkeypatch)
+    launch = night.resolve_launches(f.cfg, {'worker-2': 'flashnext-coder'})['worker-2']
+    with pytest.raises(ValueError, match='cannot change the worker CLI'):  # other paths: still refused
+        f.preflight_profile(launch)
     path = write_profiles(f, 'roster.yaml', {'worker-2': 'flashnext-coder'})
     f.cfg['roster'] = str(path)
     f.tick()
+    assert calls[-1] == {'cli_change_ok': True}  # the night swap went through the real gate, flag on
+    assert not audits(f, 'profile.blocked') and f.task().get('status') != 'blocked'
+    switched, = audits(f, 'roster.profile_switched')
+    assert switched['agent'] == 'worker-2' and switched['cli'] == 'pi'
     info = f.agent('worker-2')
     assert info['label'] == 'worker-2.1' and info['roster_profile'] == 'flashnext-coder'
     assert f.mgr.spawned[-1]['metadata']['cli_type'] == 'pi'
@@ -448,8 +468,7 @@ def test_swap_waits_for_a_free_model_slot_holds_its_queue_and_retries(hot, pairs
     with_cards()
     f = hot
     flash_ok(pairs)
-    monkeypatch.setattr(f, 'preflight_profile', lambda launch: None)
-    f.cfg['pi_home'] = str(f.run_dir / 'pi-home')
+    real_gate(f, monkeypatch)
     hold_flash(f, 'worker-1', state='busy')   # still on FlashNext, mid-turn: cannot swap back yet
     f.cfg['roster'] = str(write_profiles(f, 'roster.yaml', {'worker-2': FLASH, 'worker-3': FLASH}))
     f.tick()
@@ -474,8 +493,7 @@ def test_same_slot_reuse_needs_no_extra_model_slot(hot, pairs, monkeypatch):
     with_cards()
     f = hot
     flash_ok(pairs)
-    monkeypatch.setattr(f, 'preflight_profile', lambda launch: None)
-    f.cfg['pi_home'] = str(f.run_dir / 'pi-home')
+    real_gate(f, monkeypatch)
     hold_flash(f, 'worker-1', roster_profile='')   # e.g. left by a live profile task
     hold_flash(f, 'worker-2')                      # cap 2 is now full
     f.cfg['roster'] = str(write_profiles(f, 'roster.yaml', {'worker-1': FLASH, 'worker-2': FLASH}))
@@ -489,8 +507,7 @@ def test_host_mismatch_at_swap_time_blocks_instead_of_swapping(hot, pairs, monke
     with_cards()
     f = hot
     flash_ok(pairs)
-    monkeypatch.setattr(f, 'preflight_profile', lambda launch: None)
-    f.cfg['pi_home'] = str(f.run_dir / 'pi-home')
+    real_gate(f, monkeypatch)
     f.setf('worker-2', state='busy')   # roster accepted while the slot is mid-turn
     f.cfg['roster'] = str(write_profiles(f, 'roster.yaml', {'worker-2': FLASH}))
     f.tick()
@@ -508,8 +525,7 @@ def test_night_swapped_slot_takes_its_card_handoff_ratio_through_the_one_resolve
     comes from the single §22 resolver (card layer 3b), not from a second night-specific rule."""
     f = hot
     pairs(('codex', 'claude', 'task', 'verified'), ('codex', 'pi', 'task', 'verified'))
-    monkeypatch.setattr(f, 'preflight_profile', lambda launch: None)
-    f.cfg['pi_home'] = str(f.run_dir / 'pi-home')
+    real_gate(f, monkeypatch)
     f.cfg['roster'] = str(write_profiles(f, 'roster.yaml', {'worker-2': 'flashnext-coder'}))
     f.tick()
     assert f.agent('worker-2')['runtime_profile'] == 'flashnext-coder'

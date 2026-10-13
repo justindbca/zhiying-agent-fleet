@@ -558,6 +558,7 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - **刹车占位**：Redis `fx:night {on, brake_card: night|day, since}` + 审计 `night.on/off`；夜卡封顶的判定归刹车项（总设计 v2 2.5）。
 - **与 live profile 的关系**：task `apply_profiles_live` 生效时，名单换卡推迟到该 task 结束（审计 `roster.profile_deferred`），避免两套来源来回切。
 - **v2 按槽 CLI**：v2 运输里判断「官方 CLI 窗口 / Pi 桥」的地方改读该槽本代的配置（`runtime_cfg`），无 profile 的槽与原来完全相同。
+- **换 CLI 只放行夜间换卡（BC 复核 r1 P1-01）**：`preflight_profile(launch, cli_change_ok=False)` 在 v2 下仍拒「本槽 worker CLI 与 run 不同」；只有名单换卡 `swap_profile` 传 `cli_change_ok=True`——它的每个槽已在 `night.resolve_launches` 过了组合表（`pair_refusal` + `validate_config`）。task 级 live profile 切换等其它路径照旧拒换 CLI。**同 run 内 Claude TUI 槽 + Pi 桥槽混跑尚未真 cmux 验收，生产夜间使用前须先做 §4.13 验收。**
 - **未验收**：只有 fake cmux / 真 Redis 回归；`codex+pi` 未被今天的矩阵放行（等 A 的组合表），真实日间 Opus → 夜间 FlashNext → 早上切回的整场验收（总设计 v2 § 4.13 验收句）未做。
 - **与 §22 换代阈值、§12 模型卡、§23 刹车的统一（集成时定）**：只有一套「按模型」机制——夜间切换只改该槽的 `profile`（即 `runtime_launch` 覆盖），不另带阈值；换代阈值在每次投递前由 §22 `handoff_limits` 按该槽**本代运行模型**重新解析（名单 worker 行 > 名单 `handoff:` 表 > config 表 > 档案卡 `handoff_ratio`（§12，3b 层）> 内置 / 旗标），所以切到 FlashNext 的槽自动用 FlashNext 卡的 0.5、切回 Opus 自动回 1M 窗口。`profile` 列与 §22 的 `window` / `handoff_ratio` 列、`handoff:` 表在**同一份名单、同一个解析器**（`roster.parse_entries` + `roster.handoff`）里校验，任一不合法整份拒收；daemon 跟哪份名单（日 / 夜，`night.json` 决定），就用那份名单的 `handoff:` 表。名单热加的新行：带 `profile` 的由 `night.resolve_launches`（C 在时含 `model_usage.check_slots`）计票，不带的由 C 的 `default_capacity_problem` 按缺省模型计票，同一行不重复计。E 的分池墙降档遇到被本节换过卡的槽作废（§23 `brake.downgrade_superseded`）；E 的夜间现金封顶读本节的 `fx:night.brake_card`。
 

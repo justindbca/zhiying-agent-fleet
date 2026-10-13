@@ -1146,10 +1146,12 @@ class Fleet:
         self.log('profile.blocked', agent=name, reason=reason)
         self.finish('blocked', name + ': ' + reason)
 
-    def preflight_profile(self, launch):
-        """Check dependencies before retiring anything. Never select a fallback CLI."""
+    def preflight_profile(self, launch, cli_change_ok=False):
+        """Check dependencies before retiring anything. Never select a fallback CLI.
+        cli_change_ok: only the roster (night) swap passes True -- each of its slots already passed the
+        pair table in night.resolve_launches (BC review r1 P1-01); every other path keeps the refusal."""
         cfg = dict(self.cfg, **launch['overrides'])
-        if (self.v2 and cfg.get('worker_cli') != (self.cfg.get('worker_cli') or 'codex')):
+        if (self.v2 and not cli_change_ok and cfg.get('worker_cli') != (self.cfg.get('worker_cli') or 'codex')):
             # The pair table admits whole-run supervisor x worker CLI pairs; a v2 profile live switch
             # that changes one slot's CLI (claude <-> pi bridge) mixes worker transports in one run,
             # which no smoke covers. Kept refused explicitly now that mixed pairs can be verified.
@@ -3016,7 +3018,7 @@ class Fleet:
             if gate:
                 raise ValueError(gate[1])  # host mismatch never clears: block, never a silent swap
             if launch:
-                self.preflight_profile(launch)
+                self.preflight_profile(launch, cli_change_ok=True)
         except (OSError, ValueError, KeyError, SystemExit, subprocess.SubprocessError) as exc:
             return self.block_profile(name, 'roster profile ' + (profile or 'run default') + ': ' + str(exc)) or False
         generation, old, prev = int(info['generation']), info.get('pane'), self.label(name)
