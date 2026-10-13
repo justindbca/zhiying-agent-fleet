@@ -111,3 +111,29 @@ def test_v2_handoff_keeps_the_sheet_config_on_or_off(v2adv, online):
     assert_inherited(f, 1)
     assert len(f.advisor_runner.calls) == calls
 
+
+def test_v2_resume_mid_rescue_respawn_starts_the_successor_with_the_sheet(v2adv):
+    """start --resume while an advisor respawn was still handing off: rescue_launch is not lost, and the
+    relay note / hint do not leak into a later rotation. The resumed daemon starts with the advisor off."""
+    from cmux_fleet import profile_launch
+    f = v2adv
+    v2_sheet_launched(f)
+    launch = json.loads(f.agent('worker-1')['runtime_launch'])
+    launch['overrides']['worker_model'], launch['extras'] = 'sonnet', {'effort': 'max'}
+    f.setf('worker-1', handoff_id='h-cut', rescue_launch=profile_launch.encode_launch(launch), rescue_relay=1,
+           rescue_hint='check the links', advice_domains=json.dumps(['research_web', 'us_options']))
+    set_roster(f, False)
+    f.v2.close()
+    f.mgr.dock_control = lambda pane: None  # the control tab re-docks after a resume
+    again = fleet.Fleet(f.path, f.r, f.mgr, sessions=f.test_sessions)
+    assert not again.advisor_online()
+    again.resume_requested = True
+    again.v2.resume_run()
+    info = again.agent('worker-1')
+    assert info['generation'] == '1' and not info.get('rescue_launch') and not info.get('rescue_relay')
+    assert not info.get('rescue_hint') and json.loads(info['installed_domains']) == ['research_web', 'us_options']
+    snap = fleet.load(again.run_dir / 'runtime' / 'worker-1-g1.json')
+    argv = fleet.claude_argv(again.path, snap, 'worker-1', 1, 'READY?')
+    assert argv[argv.index('--model') + 1] == 'sonnet' and argv[argv.index('--effort') + 1] == 'max'
+    assert argv[argv.index('--setting-sources') + 1] == 'project'
+    again.v2.close()

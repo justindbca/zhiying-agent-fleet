@@ -1038,6 +1038,14 @@ class RuntimeV2:
             label = (SUPERVISOR_LABEL if slot == 'supervisor' else slot) + '.' + str(generation + 1)
             self.f.setf(slot, generation=generation + 1, label=label, handoff_id='', retired_pane='',
                         prev_label='' if slot == 'supervisor' else prev)
+            if info.get('rescue_launch') or info.get('rescue_relay'):
+                # An advisor respawn cut off mid-handoff: the successor still starts with the sheet's
+                # runtime (its domains are in advice_domains); the relay note / hint never leak into a later rotation.
+                fields = dict(rescue_launch='', rescue_hint='', rescue_relay='')
+                if info.get('rescue_launch'):
+                    fields['runtime_launch'] = info['rescue_launch']
+                self.f.setf(slot, **fields)
+                self.audit('resume.rescue_launch', slot=slot, generation=generation + 1)
             if slot != 'supervisor':
                 self.f.r.hset(NAMES, mapping={label: slot})
             old[slot] = pane if alive else None
