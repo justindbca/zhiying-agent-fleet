@@ -114,7 +114,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerEntryRenderer<{ render: string }>("fleet-ui", (entry) => new Text(entry.data?.render || "", 0, 0));
   pi.registerMessageRenderer<{ body: { title: string } }>("fleet-delivery", (message) => new Text(message.details?.body.title || "派工任务", 0, 0));
   const artifact = Type.Object({ path: Type.String(), min_chars: Type.Optional(Type.Integer({ minimum: 1 })), contains: Type.Optional(Type.Array(Type.String())) });
-  const dispatch = Type.Object({ to: Type.String(), instruction: Type.String({ minLength: 12 }) });
+  const dispatch = Type.Object({ to: Type.String(), instruction: Type.String({ minLength: 12 }),
+    id: Type.Optional(Type.String()), advise_note: Type.Optional(Type.String()) });
   const decisionSchema = service ? Type.Object({ status: Type.Union([Type.Literal("RUNNING"), Type.Literal("BLOCKED")]),
     reason: Type.Optional(Type.String()), dispatch: Type.Array(dispatch), skip: Type.Optional(Type.Array(Type.Object({ reason: Type.String() }))) }) :
     Type.Object({ status: Type.Union([Type.Literal("RUNNING"), Type.Literal("COMPLETED"), Type.Literal("BLOCKED")]),
