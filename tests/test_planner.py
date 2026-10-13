@@ -106,7 +106,8 @@ def test_inspection_cli_does_not_connect_to_fleet(monkeypatch, capsys):
     fleet.main(["agents", "list"])
     listing = json.loads(capsys.readouterr().out)
     assert {card["id"] for card in listing["agents"]} == {
-        "flashnext-coder", "claude-coder", "claude-reviewer", "researcher"
+        "flashnext-coder", "claude-coder", "claude-reviewer", "researcher",
+        "claude-fable", "claude-opus", "claude-sonnet", "claude-haiku",  # advisor model cards
     }
 
     fleet.main(["agents", "match", "fix failing pytest in router", "--json"])

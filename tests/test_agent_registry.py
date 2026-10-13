@@ -8,7 +8,8 @@ from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError
 def test_default_registry_loads_initial_cards():
     registry = AgentRegistry()
     assert [card.id for card in registry.cards] == [
-        "claude-coder", "claude-reviewer", "flashnext-coder", "researcher"
+        "claude-coder", "claude-fable", "claude-haiku", "claude-opus", "claude-reviewer",
+        "claude-sonnet", "flashnext-coder", "researcher"
     ]
     assert registry.get("flashnext-coder").cli == "pi"
     assert registry.get("claude-reviewer").cli == "claude"

@@ -46,7 +46,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import brake, cli_pairs, contracts, handoff, history, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, watchdog  # noqa: E402
+from cmux_fleet import advisor, brake, cli_pairs, contracts, handoff, history, kit as kitmod, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, watchdog  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -88,6 +88,9 @@ ITEMS = 'fx:items'  # plain task mode: {dispatch id: {to, instruction}} for disp
 ESCALATION_DECISIONS = ('approve', 'revise', 'reject')
 CMD_TIMEOUT, CMD_TIMEOUT_MAX = 120, 600  # artifact cmd_exit (contract tasks): seconds the daemon may block
 BRAKE = 'fx:brake'  # budget card + counters + last trip of the current task / service (cmux_fleet/brake.py)
+# Advisor runs only (start --advisor): audit hash per consultation, its counter, dispatches awaiting
+# advice per worker (instruction -> advise_note), and notes appended to the supervisor's next message.
+ADVICE, ADVICE_SEQ, ADVICE_PENDING, ADVICE_NOTES = 'fx:advice:', 'fx:advice:seq', 'fx:advice:pending:', 'fx:advice:notes'
 
 
 def load(path):
@@ -492,6 +495,8 @@ def parse_decision(text, workers, others_active):
             raise ValueError('instruction must state the action and the expected output (>= 12 chars)')
         if 'id' in item and (not isinstance(item['id'], str) or not re.fullmatch(contracts.M_RE, item['id'])):
             raise ValueError('every dispatch item needs an id (M<n>, e.g. M0)')
+        if 'advise_note' in item and not isinstance(item['advise_note'], str):
+            raise ValueError('dispatch.advise_note must be text')
     escalations = decision.setdefault('escalations', [])
     if not isinstance(escalations, list):
         raise ValueError('escalations must be a list')
@@ -934,18 +939,28 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
     settings = cwd / ('.fleet-settings-g' + str(generation) + '.json')
     # v2: the READY hook waits for the daemon, which may still be spawning other tabs.
     timeout = 30 if cfg.get('transport_version') != 2 else int(float(cfg.get('profile_ready_timeout') or 180)) + 30
+    advised = cfg.get('advisor') is True and name != 'supervisor'
     hooks = {'Stop': [{'hooks': [{'type': 'command', 'command': hook, 'timeout': timeout}]}]}
     if prompt_hook_slot(cfg, name, generation):
         # Operator input typed in the supervisor tab is queued as a daemon request (design.md §5).
         hooks['UserPromptSubmit'] = [{'hooks': [{'type': 'command', 'timeout': PROMPT_HOOK_TIMEOUT, 'command': shlex.join(
             [cfg['python'], str(Path(__file__).resolve()), 'claude-prompt', str(cfg_path), name, str(generation)])}]}]
-    settings.write_text(json.dumps({'hooks': hooks}))
+    data = {'hooks': hooks}
+    if advised:
+        data['autoMemoryEnabled'] = False  # fleet workers have no memory layer (advisor plan §2)
+    settings.write_text(json.dumps(data))
     argv = [cfg.get('claude') or 'claude', '--dangerously-skip-permissions', '--model', claude_model(cfg, name),
             # Unattended panes: a choice dialog would wait for a human forever (acceptance 10/13 P1-5).
             '--disallowedTools', 'AskUserQuestion',
             '--settings', str(settings), '--add-dir', str(Path(cfg['run']) / 'workspace')]
     if name != 'supervisor':  # stable per slot across generations (peer messages address it)
         argv += ['--name', claude_session_name(cfg, name)]
+    if advised:
+        # Only cwd/.claude (the linked domains) and cwd/mcp.json (the full kit set): no user-level
+        # skills / agents / MCP servers. The Stop hook rides on --settings and still fires.
+        argv += ['--setting-sources', 'project', '--strict-mcp-config']
+        if cfg.get('worker_effort'):
+            argv += ['--effort', cfg['worker_effort']]
     if (cwd / 'mcp.json').exists():
         argv += ['--mcp-config', str(cwd / 'mcp.json')]
     return argv + ['--', prompt]  # --add-dir / --mcp-config are variadic: end options first
@@ -992,10 +1007,13 @@ def actor(cfg_path, name, prompt, generation=None):
             raise RuntimeError('actor generation was retired or blocked before launch')
         if info.get('launch_ready', '1') == '1':
             break
+        if info.get('advice_hold') == '1':
+            deadline = time.monotonic() + 60  # held for the first advisor sheet: wait for it or the run's end
         if time.monotonic() >= deadline:
             raise RuntimeError('profile launch gate timed out; old runtime retirement unconfirmed')
         time.sleep(.1)
         info = r.hgetall(key('agent', name))
+    cfg = load(cfg_path)  # an advisor release may have rewritten this generation's snapshot
     os.chdir(agent_cwd(cfg, name))
     if is_pi(cfg, name):
         os.environ.update(pi_adapter.environment(cfg_path, cfg, name, generation))
@@ -1051,6 +1069,11 @@ class Fleet:
             raise ValueError('brake_notify must be an argv list of strings (no shell)')
         self.pending_notify = []  # brake trips recorded inside a v2 event transaction (notified on tick)
         self.v2 = runtime_v2.RuntimeV2(self) if self.transport_version == 2 else None
+        self.kit, self.advisor_runner = None, None  # advisor runs only; tests inject advisor_runner
+        if 'advisor' in self.cfg and type(self.cfg['advisor']) is not bool:
+            raise ValueError('advisor must be a boolean')
+        if self.cfg.get('advisor') is True and self.cfg.get('worker_kit'):
+            self.kit = kitmod.Kit(self.cfg['worker_kit'])  # KitError (ValueError): refuse the whole kit
 
     # -- small helpers
     def agent(self, name):
@@ -1058,7 +1081,10 @@ class Fleet:
 
     def runtime_cfg(self, name):
         launch = json.loads(self.agent(name).get('runtime_launch') or '{}')
-        return dict(self.cfg, **launch.get('overrides', {}))
+        cfg = dict(self.cfg, **launch.get('overrides', {}))
+        if (launch.get('extras') or {}).get('effort'):
+            cfg['worker_effort'] = launch['extras']['effort']  # advisor launch field (Claude --effort)
+        return cfg
 
     def setf(self, name, **fields):
         self.r.hset(key('agent', name), mapping={k: str(v) for k, v in fields.items()})
@@ -1114,6 +1140,10 @@ class Fleet:
             text += '\n[Roster change] Workers you can dispatch to now: ' + ', '.join(self.labels())
         if name == 'supervisor':
             text += peer.drain(self)  # [peer CC] / unsolicited / violation notes (docs/design.md §21)
+            if self.cfg.get('advisor') is True and self.r.llen(ADVICE_NOTES):
+                # Appended, never sent alone: a lone note forces a no-dispatch RUNNING (same as §16 / §21).
+                text += '\n' + '\n'.join(self.r.lrange(ADVICE_NOTES, 0, -1))
+                self.r.delete(ADVICE_NOTES)
         if self.v2:
             return self.v2.queue(name, text)
         self.r.rpush(key('inbox', name), text)
@@ -1187,7 +1217,9 @@ class Fleet:
             raise ValueError('profile switch requires an idle worker slot')
         if info.get('idle_confirmed') == '0':
             raise ValueError('worker idle state is unconfirmed after an abort; restart this dev slot before switching')
-        if not profile_runtime.task_live_setting(self.task(), self.cfg['allow_profile_live_switch']):
+        # start --advisor authorizes advisor-driven respawns; every other safety step below is unchanged.
+        if (self.cfg.get('advisor') is not True
+                and not profile_runtime.task_live_setting(self.task(), self.cfg['allow_profile_live_switch'])):
             raise ValueError('profile switch requires task apply_profiles_live=true')
         if agent_cli(self.runtime_cfg(name), name) == 'codex' and active_children(info.get('thread'), self.sessions):
             self.setf(name, profile_state='pending', profile_reason='waiting for native subagents to finish')
@@ -1287,13 +1319,13 @@ class Fleet:
         return scope
 
     # -- actors
-    def spawn(self, name, prompt, *, launch_held=False):
+    def spawn(self, name, prompt, *, launch_held=False, advice_hold=False):
         cfg = self.runtime_cfg(name)
         info = self.agent(name)
         generation = int(info.get('generation', 0))
         launch = json.loads(info.get('runtime_launch') or '{}')
         cfg_path = self.path
-        if launch:
+        if launch or advice_hold:  # a held first spawn gets its model / effort written here on release
             cfg_path = self.run_dir / 'runtime' / (name + '-g' + str(generation) + '.json')
             save(cfg_path, cfg)  # generation-specific callback config; never edit old snapshots
         cwd = agent_cwd(self.cfg, name)
@@ -1301,7 +1333,13 @@ class Fleet:
         role = 'supervisor' if name == 'supervisor' else 'worker'
         scope = self.role_scope(name, cfg, launch)
         (cwd / 'AGENTS.md').write_text(scope)
-        if is_claude(cfg, name):
+        advised = self.cfg.get('advisor') is True and name != 'supervisor'
+        if is_claude(cfg, name) and advised:
+            self.install_advised_kit(name, cwd, scope)  # CLAUDE.md = scope + core + domain rules
+            # CLAUDE.md already carries the scope: do not make Claude read the same text twice.
+            prompt = prompt.replace(' Read AGENTS.md in the current directory first.', '').replace(' Read AGENTS.md first.', '')
+            trust_claude_dir(cwd)
+        elif is_claude(cfg, name):
             (cwd / 'CLAUDE.md').write_text(scope)  # Claude Code reads CLAUDE.md, not AGENTS.md
             install_kit(self.cfg.get('worker_kit'), cwd)
             trust_claude_dir(cwd)
@@ -1313,6 +1351,8 @@ class Fleet:
                   launch_ready=int(not launch_held), runtime_ready=0, current_profile='', idle_confirmed=0)
         if self.v2:
             self.setf(name, bridge_available=0, startup_deadline=time.time() + float(self.cfg['profile_ready_timeout']))
+        if advised:
+            self.setf(name, advice_hold=int(advice_hold))
         if launch:
             self.setf(name, profile_state='switching', runtime_profile=launch['profile_id'],
                       profile_ready_deadline=time.time() + float(self.cfg['profile_ready_timeout']))
@@ -1345,8 +1385,12 @@ class Fleet:
         self.r.hset(NAMES, mapping={name: name})
 
     def spawn_ready(self, name):
+        # v2 + advisor: a Claude worker waits behind the launch gate for its first sheet (no default
+        # generation that the first dispatch would have to replace).
+        hold = bool(self.v2) and self.cfg.get('advisor') is True and name != 'supervisor' and is_claude(self.runtime_cfg(name), name)
         return self.spawn(name, 'You are fleet agent ' + name + '. Read AGENTS.md in the current directory first. '
-                                'There is no task yet: your final reply must be exactly READY.')
+                                'There is no task yet: your final reply must be exactly READY.',
+                          launch_held=hold, advice_hold=hold)
 
     def start_all(self):
         if self.cfg.get('adopt'):
@@ -2112,7 +2156,12 @@ class Fleet:
         # "no worker is busy: RUNNING must dispatch" rule does not apply in those phases.
         if self.contract_phase() in ('interfaces', 'skeleton'):
             return True
-        return any(self.agent(w).get('state') != 'idle' or self.inbox_depth(w) for w in self.workers)
+        def busy(info):
+            # A Claude worker held for its first advisor sheet with nothing queued is not working (P1-01).
+            if info.get('advice_hold') == '1' and info.get('state') == 'starting':
+                return False
+            return info.get('state') != 'idle'
+        return any(busy(self.agent(w)) or self.inbox_depth(w) for w in self.workers)
 
     def on_supervisor(self, text):
         t = self.task()
@@ -2178,6 +2227,11 @@ class Fleet:
             # Metadata describes the next instruction, not the last appended one.
             # A busy worker records intent only; delivery re-evaluates at idle.
             advisory = profile_runtime.profile_advisory(slot, application)
+            if self.cfg.get('advisor') is True:
+                # Only supervisor dispatches are advised (never [contract] notices or report corrections).
+                # Registered before the depends_on hold: a held row is advised when the daemon releases it.
+                self.r.rpush(ADVICE_PENDING + slot, json.dumps({'instruction': instruction,
+                                                                'note': item.get('advise_note', '')}, ensure_ascii=False))
             if state is not None:
                 row = rows[item['id']]
                 row['message'] = advisory + self.contract_message(t.get('id', ''), row)
@@ -2325,6 +2379,10 @@ class Fleet:
         for stale in (ESCALATIONS, ITEMS):
             if self.r.get(stale) is not None:
                 self.r.delete(stale)
+        if self.cfg.get('advisor') is True:  # an earlier task's unadvised dispatches never match this one
+            for w in self.workers:
+                if self.r.llen(ADVICE_PENDING + w):
+                    self.r.delete(ADVICE_PENDING + w)
         self.queue('supervisor', prompt + '\nReply with the JSON format from AGENTS.md.')
         (self.run_dir / 'result.json').unlink(missing_ok=True)  # a new task: this run is not finished
         self.log('task.submitted', task=task_id)
@@ -2484,6 +2542,10 @@ class Fleet:
             info = self.agent(name)
             if name != 'supervisor' and cap and busy >= cap:
                 continue  # e.g. a local model server that rejects concurrent large requests
+            if (info.get('advice_hold') == '1' and info.get('state') == 'starting'
+                    and info.get('launch_ready') == '0' and self.inbox_depth(name)):
+                self.release_hold(name)  # advisor runs: first sheet decides model / effort / domains
+                continue
             if (info.get('state') == 'idle' and self.inbox_depth(name)
                     and time.time() >= float(info.get('retry_at') or 0)):
                 self.deliver(name)
@@ -2627,6 +2689,9 @@ class Fleet:
                         self.block_profile(name, str(exc))
                         return
                 text = profile_runtime.profile_advisory(name, application) + text[head.start():]
+                if (self.cfg.get('advisor') is True and application.state not in ('switching', 'applied-live')
+                        and not self.advise_before_delivery(name, text)):
+                    return  # respawning / blocked: never pop/deliver until the new generation returns READY
         # Validate profile intent before even the existing context rotation path.
         # Leave the original message queued across handoff; READY triggers another
         # idle-boundary validation. This daemon remains the sole inbox consumer.
@@ -2648,6 +2713,8 @@ class Fleet:
             else:
                 self.start_rotation(name, used, window)
                 return
+        if self.cfg.get('advisor') is True and self.agent(name).get('advice_hotload'):
+            text = self.apply_hotload(name, text)
         if self.v2:
             return self.v2.deliver(name)
         self.r.lpop(key('inbox', name))
@@ -2666,6 +2733,205 @@ class Fleet:
             return
         self.setf(name, last_msg=text)
         self.log('deliver', agent=name, text=text[:120])
+
+    # -- advisor (start --advisor; advisor plan §3.1, pre-dispatch path)
+    def install_advised_kit(self, name, cwd, scope):
+        """Advisor runs: Claude CLAUDE.md = role scope + project core + this generation's domain rules;
+        cwd/.claude/{skills,agents} cleared, then the domains linked; full kit mcp.json."""
+        info = self.agent(name)
+        domains = json.loads(info.get('advice_domains') or info.get('installed_domains') or '[]')
+        if self.kit:
+            domains = [d for d in domains if d in self.kit.domains]
+            self.kit.install(cwd, domains)
+            (cwd / 'CLAUDE.md').write_text(self.kit.claude_md(scope, domains))
+        else:
+            kitmod.Kit.clear(cwd)
+            domains = []
+            (cwd / 'CLAUDE.md').write_text(scope)
+        self.setf(name, installed_domains=json.dumps(domains, ensure_ascii=False), advice_domains='')
+
+    def advice_identity(self, name, text):
+        if self.v2:
+            mids = self.v2.bus.pending(name, 1)
+            return mids[0] if mids else ''
+        return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+    def take_pending_advice(self, name, text):
+        """The supervisor dispatch this queued text carries, or None (notices / corrections)."""
+        for raw in self.r.lrange(ADVICE_PENDING + name, 0, -1):
+            entry = json.loads(raw)
+            if entry['instruction'] and entry['instruction'] in text:
+                self.r.lrem(ADVICE_PENDING + name, 1, raw)
+                return entry
+        return None
+
+    def advise(self, name, entry, cli, cfg, kind='dispatch'):
+        """One consultation (with one retry). Returns the validated or fallback sheet.
+
+        ``kind`` is reserved for the mid-task rescue path (phase 2: consult / respawn / reassign)."""
+        try:
+            registry, registry_error = AgentRegistry(), None
+        except (OSError, ValueError) as exc:  # a broken card file: treat as advisor unavailable (§8), never exit
+            registry, registry_error = (), 'agent registry unreadable: ' + str(exc)[:400]
+        cards = advisor.launch_cards(registry, cli)
+        model, effort = advisor.runtime_model(cfg, cli), advisor.runtime_effort(cfg, cli)
+        current = advisor.fingerprint(cli, model, effort)
+        models = list(dict.fromkeys(([model] if model else []) + list(cards)))
+        whitelist = (cards[model].kit_domains if model in cards else None)
+        info = self.agent(name)
+        installed = json.loads(info.get('installed_domains') or '[]')
+        matrix, matrix_error = advisor.load_matrix()
+        catalog = self.kit.domains_catalog() if self.kit and cli == 'claude' else []
+        payload = advisor.build_input(
+            kind=kind, goal=self.task().get('goal', ''), instruction=entry['instruction'], advise_note=entry.get('note', ''),
+            slot={'name': name, 'cli': cli, 'generation': int(info.get('generation') or 0), 'model': model,
+                  'effort': effort, 'installed_domains': installed},
+            models=models, matrix=matrix, catalog=catalog)
+
+        def check(raw):
+            target = raw.get('model')
+            wl = cards[target].kit_domains if target in cards else whitelist
+            return advisor.validate(raw, cli=cli, models=models, current=current,
+                                    catalog=[c['name'] for c in catalog], whitelist=wl, matrix=matrix, cards=cards)
+        runner = self.advisor_runner or (lambda data: advisor.run_claude(data, cfg=self.cfg, run_dir=self.run_dir))
+        started = time.time()
+        if registry_error:
+            sheet, envelope, errors = None, None, [registry_error]
+        else:
+            sheet, envelope, errors = advisor.consult(payload, runner, check)
+        seq = self.r.hincrby(ADVICE_SEQ, 'n', 1)
+        ticket = 'adv-' + str(self.cfg.get('token') or self.run_dir.name[-8:]) + '-' + str(seq)
+        unavailable = sheet is None
+        if unavailable:
+            last = json.loads(info.get('advice_last') or '{}')
+            if last.get('task') == self.task().get('id') and last.get('sheet', {}).get('model') in models:
+                sheet = dict(last['sheet'], reason='advisor unavailable: previous sheet of this task')
+            else:  # the slot's running runtime, no domains: never forces a respawn (§8 reading, see report)
+                sheet = {'model': model, 'effort': effort, 'domains': [], 'reason': 'advisor unavailable: running runtime, domains []'}
+        sheet['ticket'] = ticket
+        audit = {'slot': name, 'task': self.task().get('id', ''), 'kind': kind,
+                 'input': json.dumps({k: payload[k] for k in ('goal', 'instruction', 'advise_note', 'slot')},
+                                     ensure_ascii=False)[:4000],
+                 'output': json.dumps(sheet, ensure_ascii=False), 'errors': json.dumps(errors, ensure_ascii=False),
+                 'elapsed_s': round(time.time() - started, 3), 'status': 'unavailable' if unavailable else 'ok',
+                 'at': time.time()}
+        audit.update(advisor.usage_fields(envelope))
+        if matrix_error:
+            audit['matrix_error'] = matrix_error[:500]
+        self.r.hset(ADVICE + ticket, mapping=audit)
+        if unavailable:
+            self.log('advice.unavailable', agent=name, ticket=ticket, errors=errors)
+            self.r.rpush(ADVICE_NOTES, '[advisor unavailable] 按缺省派出 ' + self.label(name) + '（' + sheet['reason'] + '）')
+        if sheet.get('capability_gap'):
+            self.log('capability.gap', agent=name, ticket=ticket, capability=sheet.get('capability'), model=sheet['model'])
+        self.setf(name, advice_last=json.dumps({'task': self.task().get('id', ''), 'sheet': sheet}, ensure_ascii=False))
+        return sheet, current, cards, registry
+
+    def advice_launch(self, cli, sheet, cards, registry):
+        card = cards[sheet['model']]
+        extras = {'effort': sheet['effort']} if cli == 'claude' and sheet.get('effort') else None
+        return profile_launch.resolve_launch(card, registry, self.cfg, extras=extras)
+
+    def record_advice(self, name, sheet, effect):
+        shown = sheet['model'] + '/' + (sheet.get('effort') or '-') + '/' + (','.join(sheet['domains']) or '-')
+        self.setf(name, advice_ticket=sheet['ticket'], advice_reason=sheet['reason'], advice_display=shown)
+        self.r.hset(ADVICE + sheet['ticket'], mapping={'effect': effect})
+        self.log('advice', agent=name, ticket=sheet['ticket'], model=sheet['model'], effort=sheet.get('effort', ''),
+                 domains=sheet['domains'], effect=effect)
+        self.r.rpush(ADVICE_NOTES, advisor.notice(self.label(name), sheet, effect))
+
+    def advise_before_delivery(self, name, text):
+        """True = go on delivering (no change, or a hot-load queued); False = respawning / blocked."""
+        identity = self.advice_identity(name, text)
+        info = self.agent(name)
+        if identity and info.get('advice_msg') == identity:
+            return True  # already advised (e.g. delivered again after the respawn's READY)
+        entry = self.take_pending_advice(name, text)
+        if entry is None:
+            return True
+        self.setf(name, advice_msg=identity)
+        cfg = self.runtime_cfg(name)
+        cli = agent_cli(cfg, name)
+        sheet, current, cards, registry = self.advise(name, entry, cli, cfg)
+        installed = json.loads(info.get('installed_domains') or '[]')
+        target = advisor.fingerprint(cli, sheet['model'], sheet.get('effort'))
+        effect = advisor.decide(current, target, installed, sheet['domains'])
+        try:
+            if effect == 'respawn':
+                launch = self.advice_launch(cli, sheet, cards, registry)
+                self.record_advice(name, sheet, effect)
+                self.setf(name, advice_domains=json.dumps(sheet['domains'], ensure_ascii=False))
+                self.switch_profile(name, launch)  # Phase 5 path; blocks the task itself on failure
+                return False
+            frozen = info.get('runtime_launch')
+            if frozen and sheet['model'] in cards and json.loads(frozen).get('profile_id') == cards[sheet['model']].id:
+                drift = profile_runtime.launch_drift(frozen, self.advice_launch(cli, sheet, cards, registry))
+                if drift:
+                    raise ValueError('advisor launch ' + drift + ' changed since spawn; submit a new task after repair')
+        except (OSError, ValueError, RuntimeError, KeyError, SystemExit, subprocess.SubprocessError) as exc:
+            self.block_profile(name, str(exc))
+            return False
+        if effect == 'hotload':
+            new = [d for d in sheet['domains'] if d not in installed]
+            self.setf(name, advice_hotload=json.dumps(new, ensure_ascii=False))
+        self.record_advice(name, sheet, effect)
+        return True
+
+    def apply_hotload(self, name, text):
+        """Link the new domains' skills / agents and put their rules in front of this instruction."""
+        new = json.loads(self.agent(name).get('advice_hotload') or '[]')
+        installed = json.loads(self.agent(name).get('installed_domains') or '[]')
+        linked = self.kit.link_domains(agent_cwd(self.cfg, name), new) if self.kit else {'skills': [], 'agents': []}
+        prefix = ((self.kit.rules_text(new).lstrip() if self.kit else '')
+                  + '\n[本任务领域：' + ', '.join(new) + '；已链入 skill：' + (', '.join(linked['skills']) or '无')
+                  + '；agent：' + (', '.join(linked['agents']) or '无') + ']\n\n')
+        text = prefix + text
+        if self.v2:  # the TUI receives the bus body, so rewrite it before the offer
+            from cmux_fleet.message_bus import _json
+            mid = self.v2.bus.pending(name, 1)[0]
+            body = self.v2.bus.message(mid)['body']
+            body['text'] = prefix + body['text']
+            self.r.hset(self.v2.bus.msg_key(mid), mapping={'body': _json(body)})
+        self.setf(name, advice_hotload='', installed_domains=json.dumps(installed + new, ensure_ascii=False))
+        self.log('advice.hotload', agent=name, domains=new, linked=linked)
+        return text
+
+    def release_hold(self, name):
+        """First dispatch to a held Claude worker: write its launch from the sheet, install, open the gate."""
+        if self.v2:
+            mid = self.v2.bus.pending(name, 1)[0]
+            text = self.v2.bus.message(mid)['body']['text']
+        else:
+            text = self.r.lrange(key('inbox', name), 0, 0)[0]
+        entry = self.take_pending_advice(name, text) or {'instruction': text[:2000], 'note': ''}
+        cfg = self.runtime_cfg(name)
+        sheet, current, cards, registry = self.advise(name, entry, 'claude', cfg)
+        self.setf(name, advice_msg=self.advice_identity(name, text),
+                  advice_domains=json.dumps(sheet['domains'], ensure_ascii=False))
+        try:
+            launch = self.advice_launch('claude', sheet, cards, registry) if sheet['model'] in cards else {}
+            generation = int(self.agent(name).get('generation') or 0)
+            if launch:
+                self.setf(name, runtime_launch=profile_launch.encode_launch(launch), runtime_profile=launch['profile_id'],
+                          profile_state='switching')
+            cfg = self.runtime_cfg(name)
+            save(self.run_dir / 'runtime' / (name + '-g' + str(generation) + '.json'), cfg)
+            cwd = agent_cwd(self.cfg, name)
+            scope = self.role_scope(name, cfg, launch)
+            (cwd / 'AGENTS.md').write_text(scope)
+            self.install_advised_kit(name, cwd, scope)
+        except (OSError, ValueError, KeyError) as exc:
+            self.setf(name, advice_hold=0)
+            self.block_profile(name, 'advisor release failed: ' + str(exc), dead=True)
+            return
+        self.record_advice(name, sheet, 'launch')  # the held first generation starts with this sheet
+        fields = dict(advice_hold=0, launch_ready=1)
+        if self.v2:
+            fields['startup_deadline'] = time.time() + float(self.cfg['profile_ready_timeout'])
+        if launch:
+            fields['profile_ready_deadline'] = time.time() + float(self.cfg['profile_ready_timeout'])
+        self.setf(name, **fields)
+        self.log('advice.released', agent=name, ticket=sheet['ticket'])
 
     def send(self, name, pane, text):
         """Codex accepts verbatim paste; Claude and Pi use a file pointer with a delivery id."""
@@ -3614,6 +3880,11 @@ def resume(run, args):
         except (OSError, ValueError) as exc:
             raise SystemExit('--roster ' + str(roster_path) + ' rejected:\n' + str(exc)) from exc
         cfg['roster'] = str(roster_path)
+    if getattr(args, 'advisor', False) and args.worker_kit:
+        try:
+            kitmod.Kit(args.worker_kit)  # refuse a bad kit before provisioning, like a bad roster
+        except (OSError, ValueError) as exc:
+            raise SystemExit('--worker-kit rejected: ' + str(exc)) from exc
     if not cmux_available():
         raise SystemExit('run this inside a cmux terminal: cmux only accepts processes started in its windows')
     try:
@@ -3770,6 +4041,11 @@ def start(args):
         raise SystemExit('cannot read agent cards: ' + str(exc)) from exc
     if problem:
         raise SystemExit(problem)
+    if getattr(args, 'advisor', False) and args.worker_kit:
+        try:
+            kitmod.Kit(args.worker_kit)  # refuse a bad kit before provisioning, like a bad roster
+        except (OSError, ValueError) as exc:
+            raise SystemExit('--worker-kit rejected: ' + str(exc)) from exc
     if not cmux_available():
         raise SystemExit('run this inside a cmux terminal: cmux only accepts processes started in its windows')
     clis = {args.supervisor_cli, args.worker_cli} | profile_clis  # night cards need their CLI at start
@@ -3840,6 +4116,8 @@ def start(args):
            'transport_version': args.transport_version, 'allow_development_v2': args.allow_development_v2,
            'max_attempts': args.max_attempts or DEFAULTS['max_attempts'], 'token': token,
            'initiator': initiator}
+    if getattr(args, 'advisor', False):
+        cfg['advisor'] = True
     if getattr(args, 'name', None):
         cfg.update(name=args.name.strip(), **titles)
     if roster_path:
@@ -3992,6 +4270,9 @@ def main(argv=None):
     s.add_argument('--allow-profile-live-switch', action='store_true',
                    help='allow task apply_profiles_live=true to respawn idle workers for assigned profiles')
     s.add_argument('--worker-model', default=DEFAULTS['worker_model'], help='claude workers: --model value')
+    s.add_argument('--advisor', action='store_true',
+                   help='consult the advisor (official Claude CLI, fable/high) before every dispatch; it picks the '
+                        'worker model / effort / domains and authorizes the respawns its sheets need')
     s.add_argument('--worker-kit', help='claude workers: dir with .claude/{agents,skills} and mcp.json copied into each worker cwd')
     s.add_argument('--claude', help='claude binary (default: first on PATH)')
     s.add_argument('--claude-window', type=int, default=DEFAULTS['claude_window'], help='claude models not in the built-in 1M list ([1m]/opus/fable/sonnet): context window (§22)')

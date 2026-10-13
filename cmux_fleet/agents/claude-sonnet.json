@@ -1,0 +1,12 @@
+{
+  "id": "claude-sonnet",
+  "display_name": "Claude Sonnet (advisor)",
+  "cli": "claude",
+  "capabilities": [
+    "code-edit",
+    "test-fix",
+    "planning"
+  ],
+  "role_file": "worker.md",
+  "model": "sonnet"
+}

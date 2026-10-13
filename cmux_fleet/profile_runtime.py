@@ -164,6 +164,20 @@ def prepare_profile(
                               "advisory metadata only; running CLI/model is unchanged")
 
 
+def launch_drift(frozen: Optional[str], expected: Mapping[str, Any]) -> Optional[str]:
+    """Which part of a frozen runtime_launch differs from the launch resolved now (None = same).
+
+    Covers the advisor ``extras`` (effort) as well as the card fields and role text."""
+    try:
+        current = json.loads(frozen or "{}")
+    except ValueError:
+        return "runtime_launch is not valid JSON"
+    for part in ("profile_id", "overrides", "role_text", "extras"):
+        if current.get(part) != expected.get(part):
+            return part
+    return None
+
+
 def profile_advisory(slot: str, application: ProfileApplication) -> str:
     if not application.desired_profile:
         return ""

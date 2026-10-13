@@ -5,7 +5,7 @@ import re
 from cmux_fleet.profile_runtime import ProfileRuntimeError
 
 
-def resolve_launch(card, registry, cfg):
+def resolve_launch(card, registry, cfg, extras=None):
     if card.cli not in ('pi', 'claude', 'codex'):
         raise ProfileRuntimeError('unsupported profile CLI: ' + card.cli)
     if card.profile and card.cli != 'codex':
@@ -30,7 +30,10 @@ def resolve_launch(card, registry, cfg):
         if not path.is_relative_to(root) or not path.is_file():
             raise ProfileRuntimeError('profile role_file must exist inside its registry: ' + card.role_file)
         role_text = path.read_text()
-    return {'profile_id': card.id, 'overrides': overrides, 'role_text': role_text}
+    launch = {'profile_id': card.id, 'overrides': overrides, 'role_text': role_text}
+    if extras:  # advisor launch fields (e.g. Claude --effort); absent keys keep the old encoding byte-identical
+        launch['extras'] = dict(extras)
+    return launch
 
 
 def encode_launch(launch):

@@ -1,0 +1,12 @@
+{
+  "id": "claude-fable",
+  "display_name": "Claude Fable (advisor)",
+  "cli": "claude",
+  "capabilities": [
+    "code-edit",
+    "test-fix",
+    "planning"
+  ],
+  "role_file": "worker.md",
+  "model": "fable"
+}

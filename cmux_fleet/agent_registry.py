@@ -61,6 +61,8 @@ class AgentCard:
     measured: Optional[Mapping[str, Any]] = field(default=None, compare=False, hash=False)
     evidence: Optional[str] = None
     unverified: Optional[Tuple[str, ...]] = None
+    # Advisor whitelist of worker-kit domains for this card; None = no restriction.
+    kit_domains: Optional[Tuple[str, ...]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = asdict(self)
@@ -68,6 +70,8 @@ class AgentCard:
         for name in LIST_FIELDS:
             if data[name] is not None:
                 data[name] = list(data[name])
+        if self.kit_domains is not None:
+            data["kit_domains"] = list(self.kit_domains)
         return data
 
 
@@ -241,6 +245,17 @@ def _model_from_data(data: Mapping[str, Any], path: Path) -> ModelCard:
                      **_assessment(data, path))
 
 
+def _optional_kit(data: Mapping[str, Any], path: Path) -> Optional[Tuple[str, ...]]:
+    kit = data.get("kit")
+    if kit is None:
+        return None
+    domains = kit.get("domains") if isinstance(kit, dict) and set(kit) <= {"domains"} else None
+    if (not isinstance(domains, list)
+            or not all(isinstance(item, str) and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", item) for item in domains)):
+        raise AgentRegistryError("agent card %s kit must be {domains: [domain names]}" % path)
+    return tuple(dict.fromkeys(domains))
+
+
 def _card_from_data(data: Mapping[str, Any], path: Path) -> AgentCard:
     agent_id = _required_string(data, "id", path)
     if not AGENT_ID_RE.fullmatch(agent_id):
@@ -263,6 +278,7 @@ def _card_from_data(data: Mapping[str, Any], path: Path) -> AgentCard:
         profile=_optional_launch_string(data, "profile", path),
         model_card=_optional_string(data, "model_card", path),
         **_assessment(data, path),
+        kit_domains=_optional_kit(data, path),
     )
 
 

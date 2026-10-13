@@ -495,6 +495,7 @@ def _snapshot(client, settings, cfg, redactor):
                         "handoff_ratio": _number(agent.get("handoff_ratio")),
                         "handoff_source": agent.get("handoff_source")},
             "queue_depth": client.llen(settings.prefix + ":pending:" + slot),
+            "advice": agent.get("advice_display") or None,  # <model>/<effort>/<domains> (advisor runs)
             "current_request": request_id, "current_message": mid or None,
             "current_delivery": lease.get("current_delivery") or None,
             "deadline_at": deadline, "lease_until": lease.get("lease_until"),
@@ -565,7 +566,8 @@ def _render(record, width):
             lines.append("%s label=%s state=%s context=%s handoff=%s@%s queue=%s request=%s elapsed=%s deadline=%s" % (
                 slot, item["label"], item["state"], item["context"]["ratio"], item["context"].get("handoff_ratio"),
                 item["context"].get("handoff_window"), item["queue_depth"],
-                item["current_request"], item["elapsed_s"], item["deadline_at"]))
+                item["current_request"], item["elapsed_s"], item["deadline_at"])
+                         + (" adv=%s" % item["advice"] if item.get("advice") else ""))
         return _wrap(_display("\n".join(lines)), width)
     if str(record.get("event", "")).startswith("control."):
         return _wrap(_display(record["event"] + "\n" +
