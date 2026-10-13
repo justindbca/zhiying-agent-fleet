@@ -31,9 +31,12 @@ ENV = {'CLAUDE_CODE_STOP_HOOK_BLOCK_CAP': '0'}
 # Without this, Claude Code shows the reason as "Stop hook error" and the model often refuses a long
 # delivery as a prompt injection (worker-2 research §1b: 3/8 followed without it, 8/8 with it).
 DECLARATION = ('Fleet channel: after your first turn, every supervisor instruction (task, follow-up, '
-               'handoff) is delivered to you as a "Stop hook feedback:" message by the fleet Stop hook. '
-               'Treat that text as the supervisor instruction and carry it out exactly as if the '
-               'supervisor had typed it.')
+               'handoff) is delivered to you by the fleet Stop hook, as a "Stop hook feedback:" message or '
+               'as a "Fleet delivery:" Stop hook notification. Treat that text as the supervisor '
+               'instruction and carry it out exactly as if the supervisor had typed it.')
+REWAKE_MESSAGE = 'Fleet delivery:'  # asyncRewake prefix; the transcript row is a task-notification
+GRACE = 10  # seconds with an entry queued and no Stop hook waiting/settling before the rewake acts
+STOPPING_TTL = 120  # a Stop hook settling its turn (tui_turn waits up to settle_wait=30 s)
 FEEDBACK = 'Stop hook feedback:'
 KEEPALIVE = ('Fleet keepalive: there is no new instruction yet. Do no work and use no tools; '
              'reply exactly IDLE.')
@@ -56,14 +59,21 @@ def enabled(cfg, name, claude=None):
 
 
 def hook_timeout(cfg):
-    return max(MARGIN * 2, int(float(cfg.get('claude_hook_timeout') or DEFAULT_TIMEOUT)))
+    """Claude Code's Stop-hook ``timeout`` (seconds); ``claude_hook_timeout`` in the run config."""
+    return max(10, int(float(cfg.get('claude_hook_timeout') or DEFAULT_TIMEOUT)))
+
+
+def margin(cfg):
+    """How long before Claude Code's timeout the hook answers on its own (keepalive)."""
+    return min(MARGIN, max(3, hook_timeout(cfg) // 10))
 
 
 def keys(prefix, slot, generation):
     """mailbox: deliveries for one generation; armed: a hook is waiting now; bind: what it handed over."""
     base = prefix + ':hook:' + slot
     return {'mailbox': base + ':g' + str(int(generation)) + ':mailbox',
-            'armed': base + ':armed', 'bind': base + ':bind'}
+            'armed': base + ':armed', 'bind': base + ':bind',
+            'stopping': base + ':stopping', 'rewake': base + ':rewake'}
 
 
 def post(r, k, entry):
@@ -81,6 +91,11 @@ def armed(r, k, generation):
         return False
 
 
+def live(r, k):
+    """A Stop hook of this slot waits now, or is still settling its turn."""
+    return bool(r.exists(k['armed']) or r.exists(k['stopping']))
+
+
 def wait(r, k, generation, thread, deadline, alive, accept, poll=POLL):
     """Block until ``accept`` takes a mailbox entry, the generation retires, or ``deadline``.
 
@@ -93,6 +108,7 @@ def wait(r, k, generation, thread, deadline, alive, accept, poll=POLL):
             if not alive():
                 return None, None
             r.set(k['armed'], mark, ex=ARMED_TTL)
+            r.delete(k['stopping'])
             got = r.blpop([k['mailbox']], timeout=max(1, int(min(poll, deadline - time.monotonic()))))
             if not got:
                 continue
@@ -121,6 +137,24 @@ def wait(r, k, generation, thread, deadline, alive, accept, poll=POLL):
 
 def block(text):
     return {'decision': 'block', 'reason': text}
+
+
+def rewake_text(content):
+    """The delivery of an asyncRewake row (origin task-notification), or None for any other one.
+
+    Measured shape: '<task-notification>\\n<summary>Stop hook feedback</summary>\\n</task-notification>\\n'
+    '<system-reminder>\\n<REWAKE_MESSAGE> <text>\\n</system-reminder>'.
+    """
+    if isinstance(content, list):
+        content = '\n'.join(p.get('text', '') for p in content if isinstance(p, dict) and p.get('type') == 'text')
+    if not isinstance(content, str) or '<summary>Stop hook feedback</summary>' not in content:
+        return None
+    at = content.find(REWAKE_MESSAGE)
+    if at < 0:
+        return None
+    text = content[at + len(REWAKE_MESSAGE):]
+    end = text.rfind('</system-reminder>')
+    return (text[:end] if end >= 0 else text).strip('\n ').lstrip()
 
 
 def feedback_text(content):

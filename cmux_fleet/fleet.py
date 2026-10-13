@@ -21,6 +21,7 @@ Subcommands
   plan      build an offline dynamic dispatch plan (does not contact a fleet)
   notify    Codex notify hook (internal)
   claude-stop  Claude Code Stop hook for claude agents (internal)
+  claude-rewake  Claude Code asyncRewake Stop hook of hook-channel workers (internal)
   claude-stop-failure  Claude Code StopFailure hook of hook-channel workers (internal)
   claude-prompt  Claude Code UserPromptSubmit hook of a v2 claude supervisor (internal)
   pi-event  Pi settled/session extension callback (internal)
@@ -298,7 +299,9 @@ def claude_stop(cfg_path, name, generation, raw):
             pass
     cfg = load(cfg_path)
     hooked = claude_hook.enabled(cfg, name, claude=True)
-    deadline = started + claude_hook.hook_timeout(cfg) - claude_hook.MARGIN
+    deadline = started + claude_hook.hook_timeout(cfg) - claude_hook.margin(cfg)
+    if hooked:
+        hook_mark_stopping(cfg, name, int(generation))
     if cfg.get('transport_version') == 2:
         cfg, name, generation = subfleet.delegated_route(cfg, name, int(generation))
         # An adopted worker pane that now runs a sub-fleet's supervisor gets typed input: never wait there.
@@ -374,16 +377,71 @@ def hook_delivered(r, k, thread, lease):
             and (not lease.get('current_delivery') or bind.get('delivery_id') == lease.get('current_delivery')))
 
 
-def claude_hook_next(cfg, name, generation, thread, deadline):
-    """Wait for this generation's next delivery; the block decision for it, or None (let Claude idle).
+def hook_session(cfg, r, name, generation, thread, parent):
+    """(keys, alive, accept) of one hook process; shared by the Stop hook and its rewake fallback.
 
-    Entries are re-validated at hand-over: a delivery must still be this session's received lease
-    (v2) or the pointer the daemon sent last (v1); anything else is dropped as stale.
+    ``accept(entry, via)`` re-validates an entry at hand-over: a delivery must still be this
+    session's received lease (v2) or the pointer the daemon sent last (v1); anything else is
+    dropped as stale (audit ``hook.dropped``). It writes the bind on success and returns the text.
     """
-    import redis
+    bus = runtime_v2.bus_for(cfg, r) if cfg.get('transport_version') == 2 else None
+    k = hook_keys(cfg, r, name, generation)
+
+    def alive():
+        if os.getppid() != parent:  # orphaned: never take a delivery a dead session cannot run
+            return False
+        info = r.hgetall(key('agent', name))
+        # delegated: a sub-fleet adopts this pane and types its role change; let that prompt run
+        return int(info.get('generation', -1)) == generation and info.get('state') not in ('dead', 'delegated')
+
+    def audit(event, entry, **fields):
+        if bus:
+            r.xadd(bus.audit_key, dict({'event': event, 'slot': name, 'run_id': bus.run_id,
+                                        'generation': str(generation), 'message_id': str(entry.get('message_id', '')),
+                                        'at': str(int(time.time() * 1000))}, **fields))
+
+    def drop(entry, why):
+        audit('hook.dropped', entry, error=why, level='warn')
+        return None
+
+    def accept(entry, via='stop'):
+        kind, info = entry.get('kind'), r.hgetall(key('agent', name))
+        if entry.get('generation') != generation:
+            return drop(entry, 'entry of another generation')
+        if kind == 'delivery' and bus:
+            lease = r.hgetall(bus.lease_key(name))
+            if (lease.get('status') != 'received' or lease.get('generation') != str(generation)
+                    or lease.get('session_id') != thread
+                    or lease.get('message_id') != entry.get('message_id')
+                    or lease.get('current_delivery') != entry.get('delivery_id')):
+                return drop(entry, 'delivery is no longer this session\'s received lease')
+        elif kind == 'nudge':
+            if info.get('state') != 'starting':
+                return drop(entry, 'startup nudge after startup')
+        elif kind == 'pointer' and not bus:
+            if info.get('msg_id') != entry.get('msg_id') or info.get('state') not in ('busy', 'handoff'):
+                return drop(entry, 'pointer is not the last v1 delivery')
+        else:
+            return drop(entry, 'unknown hook entry')
+        bind = {x: entry.get(x) for x in ('kind', 'message_id', 'delivery_id', 'msg_id') if x in entry}
+        r.set(k['bind'], json.dumps(dict(bind, generation=generation, session_id=thread or '', via=via,
+                                         at=time.time())), ex=claude_hook.BIND_TTL)
+        if via != 'stop':
+            audit('hook.rewake', entry, level='warn')
+        return entry.get('text')
+    return k, alive, accept
+
+
+def hook_on_sigterm():
     if threading.current_thread() is threading.main_thread():
         # Claude Code stops a hook with SIGTERM: unwind so a popped entry goes back to the mailbox.
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+
+
+def claude_hook_next(cfg, name, generation, thread, deadline):
+    """Wait for this generation's next delivery; the block decision for it, or None (let Claude idle)."""
+    import redis
+    hook_on_sigterm()
     parent = os.getppid()  # Claude Code (or its hook shell): once it is gone, nobody reads our answer
     while time.monotonic() < deadline and parent != 1:
         try:
@@ -392,49 +450,7 @@ def claude_hook_next(cfg, name, generation, thread, deadline):
             time.sleep(claude_hook.POLL)
             continue
         try:
-            v2 = cfg.get('transport_version') == 2
-            bus = runtime_v2.bus_for(cfg, r) if v2 else None
-            k = hook_keys(cfg, r, name, generation)
-
-            def alive():
-                if os.getppid() != parent:  # orphaned: never take a delivery a dead session cannot run
-                    return False
-                info = r.hgetall(key('agent', name))
-                # delegated: a sub-fleet adopts this pane and types its role change; let that prompt run
-                return int(info.get('generation', -1)) == generation and info.get('state') not in ('dead', 'delegated')
-
-            def drop(entry, why):
-                if bus:
-                    r.xadd(bus.audit_key, {'event': 'hook.dropped', 'slot': name, 'run_id': bus.run_id,
-                                           'generation': str(generation), 'error': why, 'level': 'warn',
-                                           'message_id': str(entry.get('message_id', '')),
-                                           'at': str(int(time.time() * 1000))})
-                return None
-
-            def accept(entry):
-                kind, info = entry.get('kind'), r.hgetall(key('agent', name))
-                if entry.get('generation') != generation:
-                    return drop(entry, 'entry of another generation')
-                if kind == 'delivery' and bus:
-                    lease = r.hgetall(bus.lease_key(name))
-                    if (lease.get('status') != 'received' or lease.get('generation') != str(generation)
-                            or lease.get('session_id') != thread
-                            or lease.get('message_id') != entry.get('message_id')
-                            or lease.get('current_delivery') != entry.get('delivery_id')):
-                        return drop(entry, 'delivery is no longer this session\'s received lease')
-                elif kind == 'nudge':
-                    if info.get('state') != 'starting':
-                        return drop(entry, 'startup nudge after startup')
-                elif kind == 'pointer' and not bus:
-                    if info.get('msg_id') != entry.get('msg_id') or info.get('state') not in ('busy', 'handoff'):
-                        return drop(entry, 'pointer is not the last v1 delivery')
-                else:
-                    return drop(entry, 'unknown hook entry')
-                bind = {x: entry.get(x) for x in ('kind', 'message_id', 'delivery_id', 'msg_id') if x in entry}
-                r.set(k['bind'], json.dumps(dict(bind, generation=generation, session_id=thread or '',
-                                                 at=time.time())), ex=claude_hook.BIND_TTL)
-                return entry.get('text')
-
+            k, alive, accept = hook_session(cfg, r, name, generation, thread, parent)
             text, _ = claude_hook.wait(r, k, generation, thread, deadline, alive, accept)
             if text:
                 return claude_hook.block(text)
@@ -446,6 +462,85 @@ def claude_hook_next(cfg, name, generation, thread, deadline):
             return claude_hook.block(claude_hook.KEEPALIVE)
         except redis.RedisError:
             time.sleep(claude_hook.POLL)  # Redis restarting: keep the session armed until the deadline
+        finally:
+            r.close(); r.connection_pool.disconnect()
+    return None
+
+
+def hook_mark_stopping(cfg, name, generation):
+    """The Stop hook is settling (before it waits): the rewake fallback must not take over meanwhile."""
+    try:
+        r = connect(cfg)
+    except Exception:
+        return
+    try:
+        r.set(hook_keys(cfg, r, name, generation)['stopping'], str(os.getpid()), ex=claude_hook.STOPPING_TTL)
+    except Exception:
+        pass
+    finally:
+        r.close()
+
+
+def claude_rewake(cfg_path, name, generation, raw):
+    """asyncRewake Stop hook: the fallback when no Stop hook waits (Escape, a hook timeout, StopFailure).
+
+    Runs in the background at every Stop. Only the newest one per slot acts: if this generation's
+    mailbox holds an entry while neither a waiting nor a settling Stop hook exists for
+    ``claude_hook.GRACE`` seconds, it takes the entry and returns its text; the CLI writes it to
+    stderr and exits 2, which wakes Claude Code with it (no typing). None: nothing to do.
+    """
+    import redis
+    started = time.monotonic()
+    data = json.loads(raw or '{}')
+    cfg = load(cfg_path)
+    generation = int(generation)
+    if cfg.get('transport_version') == 2:
+        cfg, name, generation = subfleet.delegated_route(cfg, name, generation)
+    if not claude_hook.enabled(cfg, name, claude=True):
+        return None
+    hook_on_sigterm()
+    thread, parent = data.get('session_id'), os.getppid()
+    deadline = started + claude_hook.hook_timeout(cfg) - claude_hook.margin(cfg)
+    mine = None
+    while time.monotonic() < deadline and parent != 1:
+        try:
+            r = connect(cfg, socket_timeout=claude_hook.POLL + 10)
+        except (redis.RedisError, OSError, ValueError):
+            time.sleep(claude_hook.POLL)
+            continue
+        try:
+            k, alive, accept = hook_session(cfg, r, name, generation, thread, parent)
+            if mine is None:
+                mine = r.incr(k['rewake'])
+                r.expire(k['rewake'], claude_hook.BIND_TTL)
+            unarmed = None
+            while time.monotonic() < deadline:
+                if str(mine) != r.get(k['rewake']) or not alive():
+                    return None  # a newer Stop has its own fallback, or this generation is gone
+                if claude_hook.live(r, k) or not r.llen(k['mailbox']):
+                    unarmed = None
+                    time.sleep(1)
+                    continue
+                unarmed = unarmed or time.monotonic()
+                if time.monotonic() - unarmed < claude_hook.GRACE:
+                    time.sleep(1)
+                    continue
+                got = r.lpop(k['mailbox'])
+                if not got:
+                    continue
+                try:
+                    entry = json.loads(got)
+                    text = accept(entry, via='rewake') if isinstance(entry, dict) else None
+                except ValueError:
+                    continue
+                except BaseException:
+                    r.lpush(k['mailbox'], got)
+                    raise
+                if text:
+                    return text
+            return None
+        except redis.RedisError:
+            time.sleep(claude_hook.POLL)
         finally:
             r.close(); r.connection_pool.disconnect()
     return None
@@ -877,14 +972,18 @@ def claude_user_prompts(path, count=3):
                     continue
                 if row.get('type') != 'user' or row.get('isSidechain'):
                     continue
-                if (row.get('origin') or {}).get('kind') == 'task-notification':
-                    continue  # a background task finishing continues the current turn's work
                 content = (row.get('message') or {}).get('content')
+                if (row.get('origin') or {}).get('kind') == 'task-notification':
+                    # A finished background task continues the current turn's work; a hook-channel
+                    # rewake (Stop hook feedback notification) is a delivery.
+                    content = claude_hook.rewake_text(content)
+                    if content is None:
+                        continue
                 if row.get('isMeta'):  # only a hook-channel delivery (Stop-hook block reason) counts
                     content = claude_hook.feedback_text(content)
                 if isinstance(content, list):
                     content = '\n'.join(p.get('text', '') for p in content if isinstance(p, dict) and p.get('type') == 'text')
-                if isinstance(content, str) and content.strip():
+                if isinstance(content, str) and content.strip() and not content.startswith('[Request interrupted by user'):
                     out.append(content)
     except (OSError, TypeError):
         pass
@@ -1107,6 +1206,11 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
         timeout = claude_hook.hook_timeout(cfg)  # the hook waits here for the next delivery
     hooks = {'Stop': [{'hooks': [{'type': 'command', 'command': hook, 'timeout': timeout}]}]}
     if hooked:
+        # Fallback when no Stop hook waits any more (Escape, hook timeout, StopFailure): a background
+        # hook that wakes Claude with the delivery (exit 2) instead of typing it.
+        hooks['Stop'][0]['hooks'].append({'type': 'command', 'timeout': timeout, 'asyncRewake': True,
+                                          'rewakeMessage': claude_hook.REWAKE_MESSAGE, 'command': shlex.join(
+            [cfg['python'], str(Path(__file__).resolve()), 'claude-rewake', str(cfg_path), name, str(generation)])})
         # An API error ends the turn with StopFailure instead of Stop: no hook waits afterwards.
         hooks['StopFailure'] = [{'hooks': [{'type': 'command', 'timeout': 30, 'command': shlex.join(
             [cfg['python'], str(Path(__file__).resolve()), 'claude-stop-failure', str(cfg_path), name, str(generation)])}]}]
@@ -1178,7 +1282,12 @@ def actor(cfg_path, name, prompt, generation=None):
         os.environ.update(pi_adapter.environment(cfg_path, cfg, name, generation))
         argv = pi_adapter.argv(cfg, name, generation, prompt, agent_cwd(cfg, name), label=info['label'])
     elif is_claude(cfg, name):
-        os.environ.pop('CLAUDECODE', None)
+        # A daemon started from inside a Claude Code session must not pass its session markers on:
+        # with CLAUDE_CODE_CHILD_SESSION set, Claude Code 2.1.280 saves no transcript, and the turn
+        # settlement reads that transcript.
+        for var in ('CLAUDECODE', 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ID',
+                    'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_PID'):
+            os.environ.pop(var, None)
         if claude_hook.enabled(cfg, name, claude=True):
             os.environ.update(claude_hook.ENV)  # back-to-back deliveries are consecutive Stop blocks
         argv = claude_argv(cfg_path, cfg, name, generation, prompt)
@@ -4292,6 +4401,9 @@ def main(argv=None):
     h = sub.add_parser('claude-stop', help='Claude Code Stop hook (internal; hook JSON on stdin)')
     for arg in ('cfg', 'agent', 'generation'):
         h.add_argument(arg)
+    h = sub.add_parser('claude-rewake', help='Claude Code asyncRewake Stop hook of hook-channel workers (internal)')
+    for arg in ('cfg', 'agent', 'generation'):
+        h.add_argument(arg)
     h = sub.add_parser('claude-stop-failure', help='Claude Code StopFailure hook (internal; hook JSON on stdin)')
     for arg in ('cfg', 'agent', 'generation'):
         h.add_argument(arg)
@@ -4318,6 +4430,11 @@ def main(argv=None):
         out = claude_stop(args.cfg, args.agent, args.generation, sys.stdin.read())
         if isinstance(out, dict) and out.get('decision') == 'block':  # hook channel: the next delivery
             print(json.dumps(out, ensure_ascii=False))
+    elif args.cmd == 'claude-rewake':
+        text = claude_rewake(args.cfg, args.agent, args.generation, sys.stdin.read())
+        if text:  # exit 2 wakes Claude Code with stderr as "<rewakeMessage> <text>"
+            sys.stderr.write(text)
+            sys.exit(2)
     elif args.cmd == 'claude-stop-failure':
         claude_stop_failure(args.cfg, args.agent, args.generation, sys.stdin.read())
     elif args.cmd == 'claude-prompt':
