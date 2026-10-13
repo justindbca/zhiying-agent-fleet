@@ -2395,7 +2395,10 @@ class Fleet:
         """One consultation (with one retry). Returns the validated or fallback sheet.
 
         ``kind`` is reserved for the mid-task rescue path (phase 2: consult / respawn / reassign)."""
-        registry = AgentRegistry()
+        try:
+            registry, registry_error = AgentRegistry(), None
+        except (OSError, ValueError) as exc:  # a broken card file: treat as advisor unavailable (§8), never exit
+            registry, registry_error = (), 'agent registry unreadable: ' + str(exc)[:400]
         cards = advisor.launch_cards(registry, cli)
         model, effort = advisor.runtime_model(cfg, cli), advisor.runtime_effort(cfg, cli)
         current = advisor.fingerprint(cli, model, effort)
@@ -2418,7 +2421,10 @@ class Fleet:
                                     catalog=[c['name'] for c in catalog], whitelist=wl, matrix=matrix, cards=cards)
         runner = self.advisor_runner or (lambda data: advisor.run_claude(data, cfg=self.cfg, run_dir=self.run_dir))
         started = time.time()
-        sheet, envelope, errors = advisor.consult(payload, runner, check)
+        if registry_error:
+            sheet, envelope, errors = None, None, [registry_error]
+        else:
+            sheet, envelope, errors = advisor.consult(payload, runner, check)
         seq = self.r.hincrby(ADVICE_SEQ, 'n', 1)
         ticket = 'adv-' + str(self.cfg.get('token') or self.run_dir.name[-8:]) + '-' + str(seq)
         unavailable = sheet is None

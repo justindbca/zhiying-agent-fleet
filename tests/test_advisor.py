@@ -665,3 +665,20 @@ def test_held_worker_does_not_count_as_busy_for_the_dispatch_rule(v2adv2):
     # v2 turns the parse error into the generic correction (existing behavior); the count proves it fired
     assert typed(f, 'supervisor')[-1].startswith('Your reply is not a valid decision JSON')
     assert f.task()['bad_replies'] == '1'
+
+
+def test_broken_card_file_is_advisor_unavailable_not_a_daemon_exit(afx, monkeypatch):
+    """A bad card JSON must not escape pump (the v2 main loop does not catch it): fallback per §8."""
+    f = afx
+    from cmux_fleet.agent_registry import AgentRegistryError
+
+    def broken(*args, **kwargs):
+        raise AgentRegistryError('could not load agent card claude-opus.json: Expecting value')
+    monkeypatch.setattr(fleet, 'AgentRegistry', broken)
+    send_decision(f, [item()])
+    f.pump()  # must not raise
+    info = f.agent('worker-1')
+    assert info['state'] == 'busy' and info['generation'] == '0' and f.advisor_runner.calls == []
+    audit = f.r.hgetall(fleet.ADVICE + info['advice_ticket'])
+    assert audit['status'] == 'unavailable' and 'agent registry unreadable' in audit['errors']
+    assert any('[advisor unavailable]' in x for x in f.r.lrange(fleet.ADVICE_NOTES, 0, -1))
