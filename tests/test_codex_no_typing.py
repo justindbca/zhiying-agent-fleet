@@ -115,6 +115,33 @@ def break_channel(ch, reason='codex queue rc=1: simulated failure'):
 # --------------------------- end of adapter --------------------------------
 
 
+# Independent paste/keys call log (separate from the queue log and from FakeMgr.sent, which the
+# shared conftest may also use for queued text). Spied at class level for this module only.
+PASTE_CALLS, KEY_CALLS = [], []
+
+
+@pytest.fixture(autouse=True)
+def paste_spy(monkeypatch):
+    PASTE_CALLS.clear(); KEY_CALLS.clear()
+    for cls in (FakeMgr, ts.WorldMgr):
+        real_paste, real_key = cls.send_prompt_to_idle, cls.send_key
+
+        def paste(self, pane, text, bracketed=False, _real=real_paste):
+            PASTE_CALLS.append((pane, text))
+            return _real(self, pane, text, bracketed)
+
+        def key(self, pane, k, _real=real_key):
+            KEY_CALLS.append((pane, k))
+            return _real(self, pane, k)
+        monkeypatch.setattr(cls, 'send_prompt_to_idle', paste)
+        monkeypatch.setattr(cls, 'send_key', key)
+
+
+def paste_calls(pane):
+    """Real send_prompt_to_idle calls aimed at `pane`, plus Enter keys (never allowed for Codex)."""
+    return [t for p, t in PASTE_CALLS if p == pane] + [k for p, k in KEY_CALLS if p == pane and k in ENTER_KEYS]
+
+
 def stamp(ms):
     return datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
 
@@ -207,6 +234,7 @@ def claude_turn(f, slot, text, prompt=None):
 
 def assert_no_input_box(f, pane=None):
     pane = pane or f.agent('supervisor')['pane']
+    assert paste_calls(pane) == [], 'send_prompt_to_idle / Enter was called for the Codex pane'
     assert pasted(f.mgr.sent, pane) == [], 'delivery text was typed into the Codex input box'
     assert enters(f.mgr.keys, pane) == [], 'Enter was sent to the Codex pane'
 
@@ -325,7 +353,7 @@ def test_v1_send_to_codex_supervisor_bypasses_input_box(fx, monkeypatch):  # noq
     assert fleet.agent_cli(f.runtime_cfg('supervisor'), 'supervisor') == 'codex'
     pane = f.agent('supervisor')['pane']
     ok = f.send('supervisor', pane, 'v1 delivery to the Codex supervisor')
-    assert pasted(f.mgr.sent, pane) == [] and enters(f.mgr.keys, pane) == []
+    assert pasted(f.mgr.sent, pane) == [] and enters(f.mgr.keys, pane) == [] and paste_calls(pane) == []
     assert (ok and injected(ch) == ['v1 delivery to the Codex supervisor']) or (not ok and injected(ch) == [])
 
 
@@ -553,6 +581,7 @@ def test_old_generation_notify_after_resume_is_stale_and_brief_is_delivered_once
     late = codex_turn(f, WAIT, thread=old_thread, generation=0, users=[('', 'x')])
     assert late is False or late['status'] == 'stale', late
     assert pasted(f.mgr.sent, f.agent('supervisor')['pane']) == [] and pasted(f.mgr.sent, old_pane) == []
+    assert paste_calls(f.agent('supervisor')['pane']) == [] and paste_calls(old_pane) == []
     assert injected(ch, old_thread, 'supervisor')[-1].startswith('[worker-1 report]')  # nothing new for the old session
 
 
@@ -613,7 +642,7 @@ def test_resume_withdraws_the_old_pending_item_and_delivers_once(task_run, monke
     assert startup_ready(f)['status'] == 'ready'
     f.pump(); f.pump()
     assert len([t for t in injected(ch, sup_thread(f), 'supervisor') if t.startswith('[Resumed task ')]) == 1
-    assert pasted(f.mgr.sent, f.agent('supervisor')['pane']) == []
+    assert pasted(f.mgr.sent, f.agent('supervisor')['pane']) == [] and paste_calls(f.agent('supervisor')['pane']) == []
 
 
 # =========================================================================== 5. subfleet adoption / restore (Codex)
@@ -687,7 +716,7 @@ def test_subfleet_refuses_a_codex_worker_pane_before_queueing_or_typing(ctree):
     with pytest.raises(subfleet.Refused, match='only official Claude Code worker panes'):
         ts.spawn_m0(t)
     assert len(t.ch.items) == n
-    assert pasted(t.world.sent, sid) == [] and enters(t.world.keys, sid) == []
+    assert pasted(t.world.sent, sid) == [] and paste_calls(sid) == [] and enters(t.world.keys, sid) == []
     assert f.agent('worker-1')['pane'] == sid and f.agent('worker-1')['state'] != 'delegated'
 
 
@@ -713,7 +742,7 @@ def test_subfleet_adoption_and_restore_of_a_codex_pane_never_type(ctree, monkeyp
     # adoption: the role change is queued into the adopted Codex session, never typed
     role = [i for i in t.ch.items if i['thread'] == parent_thread and 'sub-fleet M0' in i['text']]
     assert len(role) == 1 and 'READY' in role[0]['text']
-    assert pasted(t.world.sent, sid) == [] and enters(t.world.keys, sid) == []
+    assert pasted(t.world.sent, sid) == [] and paste_calls(sid) == [] and enters(t.world.keys, sid) == []
     # its READY turn is reported by the adopted CLI's own (parent worker-1) notify and lands in the child
     assert codex_hook(t, f, 'worker-1', 'READY', thread=parent_thread)['status'] == 'ready'
     assert cf.agent('supervisor')['runtime_ready'] == '1'
@@ -722,7 +751,7 @@ def test_subfleet_adoption_and_restore_of_a_codex_pane_never_type(ctree, monkeyp
     ts.step(t)
     task = [i for i in t.ch.items if i['thread'] == parent_thread][-1]
     assert 'Research five sources and merge them' in task['text']
-    assert pasted(t.world.sent, sid) == []
+    assert pasted(t.world.sent, sid) == [] and paste_calls(sid) == []
     # the child finishes; the parent hands the pane back and the restore prompt is queued too
     inside = Path(rec['run']) / 'workspace' / 'worker-1' / 'm0.md'
     inside.parent.mkdir(parents=True, exist_ok=True)
@@ -735,7 +764,7 @@ def test_subfleet_adoption_and_restore_of_a_codex_pane_never_type(ctree, monkeyp
     assert subfleet.record(rec['run'])['state'] == 'returned'
     back = [i for i in t.ch.items if i['thread'] == parent_thread and 'worker of the main fleet again' in i['text']]
     assert len(back) == 1
-    assert pasted(t.world.sent, sid) == [] and enters(t.world.keys, sid) == []
+    assert pasted(t.world.sent, sid) == [] and paste_calls(sid) == [] and enters(t.world.keys, sid) == []
     assert codex_hook(t, f, 'worker-1', 'READY', thread=parent_thread)['status'] == 'ready'
     assert f.agent('worker-1')['state'] == 'idle' and f.agent('worker-1')['generation'] == '0'
 
@@ -747,5 +776,5 @@ def test_subfleet_adoption_queue_failure_blocks_without_typing(ctree, monkeypatc
     rec, out = ts.spawn_m0(t)
     break_channel(t.ch)
     cf = ts.child_daemon(t, rec)
-    assert pasted(t.world.sent, sid) == [] and enters(t.world.keys, sid) == []
+    assert pasted(t.world.sent, sid) == [] and paste_calls(sid) == [] and enters(t.world.keys, sid) == []
     assert cf.agent('supervisor')['state'] == 'dead'
