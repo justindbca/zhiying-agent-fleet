@@ -190,3 +190,53 @@ def notice(label, sheet, effect):
     shown = sheet['model'] + ('/' + sheet['effort'] if sheet.get('effort') else '')
     return ('[advisor] ' + label + ' → ' + shown + ', domains: [' + ', '.join(sheet['domains']) + ']（'
             + sheet['reason'] + '；' + effect + '）')
+
+
+# ------------------------------------------------------------------ mid-task rescue (advisor plan §3.2 / §4.2)
+ACTIONS = ('respawn', 'reassign', 'give_up')
+RELAY_CAP = 2  # same task, same slot: at most worker-N.1 and worker-N.2 (§3.2-5)
+
+
+def rescue_actions(relays, candidates):
+    """What the advisor may choose: no third relay on one slot, no reassign without an idle slot."""
+    return [a for a in ACTIONS if not (a == 'respawn' and relays >= RELAY_CAP)
+            and not (a == 'reassign' and not candidates)]
+
+
+def build_rescue_input(*, goal, task, instruction, finding, want, slot, previous_sheet, relays, actions,
+                       candidates, matrix, catalog):
+    """Everything a rescue consultation may see: the supervisor's consult item, the task goal and the
+    original instruction, slot state, the previous sheet and the matrix. Never a worker conversation."""
+    return {'kind': 'rescue', 'goal': goal or '', 'task': task, 'instruction': instruction or '',
+            'finding': finding, 'want': want or '', 'slot': slot, 'previous_sheet': previous_sheet,
+            'relays': relays, 'relay_cap': RELAY_CAP, 'actions': actions, 'reassign_candidates': candidates,
+            'capability_matrix': matrix, 'domains': catalog}
+
+
+def validate_rescue(raw, *, actions, check_slot, candidates):
+    """Normalized rescue sheet {action, to?, model?, effort?, domains?, reason, handoff_hint?}.
+
+    check_slot(name, raw) validates the configuration part against that slot's CLI (same rules as
+    the pre-dispatch sheet); candidates = slot names a reassign may go to (first = default)."""
+    action = raw.get('action')
+    if action not in actions:
+        raise AdviceError('action must be one of ' + ', '.join(actions) + ' (relay cap / idle slots apply)')
+    reason = raw.get('reason')
+    if not isinstance(reason, str) or not reason.strip():
+        raise AdviceError('reason must cite the finding or the capability matrix')
+    if action == 'give_up':
+        return {'action': action, 'reason': ' '.join(reason.split())[:500]}
+    target = None
+    if action == 'reassign':
+        target = raw.get('to', candidates[0])
+        if target not in candidates:
+            raise AdviceError('reassign to must be one of the idle slots: ' + ', '.join(candidates))
+    sheet = dict(check_slot(target, raw), action=action)
+    if target:
+        sheet['to'] = target
+    hint = raw.get('handoff_hint', '')
+    if not isinstance(hint, str):
+        raise AdviceError('handoff_hint must be text')
+    if action == 'respawn' and hint.strip():
+        sheet['handoff_hint'] = ' '.join(hint.split())[:500]
+    return sheet
