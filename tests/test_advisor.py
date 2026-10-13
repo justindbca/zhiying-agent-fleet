@@ -450,16 +450,24 @@ def test_held_actor_waits_past_60_seconds_and_rereads_its_snapshot(tmp_path, mon
 # ------------------------------------------------------------------ v2 daemon (real private Redis, fake cmux)
 @pytest.fixture
 def v2adv(private_redis_v2, tmp_path, monkeypatch):  # noqa: F811
+    yield from v2_advised(private_redis_v2, tmp_path, monkeypatch, ['worker-1'])
+
+
+@pytest.fixture
+def v2adv2(private_redis_v2, tmp_path, monkeypatch):  # noqa: F811
+    yield from v2_advised(private_redis_v2, tmp_path, monkeypatch, ['worker-1', 'worker-2'])
+
+
+def v2_advised(r, tmp_path, monkeypatch, workers):
     import uuid
     from test_v2_codex_claude import answer_turn
-    r = private_redis_v2
     r.flushdb()
     kit = make_kit(tmp_path / 'kit')
     run = tmp_path / ('run-' + uuid.uuid4().hex)
     (run / 'workspace').mkdir(parents=True)
     sessions = tmp_path / 'codex-home' / 'sessions'
     cfg = dict(run=str(run), redis_socket=r.connection_pool.connection_kwargs['path'], python=sys.executable,
-               workers=['worker-1'], mode='task', supervisor_cli='codex', worker_cli='claude',
+               workers=list(workers), mode='task', supervisor_cli='codex', worker_cli='claude',
                codex_home=str(tmp_path / 'codex-home'), transport_version=2, allow_development_v2=True,
                stall_timeout=0, v2_lease_ms=300000, max_busy=0, advisor=True, worker_kit=str(kit),
                claude='/bin/claude', token='feedbeef')
@@ -467,7 +475,8 @@ def v2adv(private_redis_v2, tmp_path, monkeypatch):  # noqa: F811
     fleet.save(path, cfg)
     f = fleet.Fleet(path, r, FakeMgr(), sessions=sessions)
     f.test_sessions, f.test_claude = sessions, tmp_path / 'claude-projects'
-    f.test_threads = {'supervisor': str(uuid.uuid4()), 'worker-1': str(uuid.uuid4())}
+    f.test_threads = {'supervisor': str(uuid.uuid4())}
+    f.test_threads.update({w: str(uuid.uuid4()) for w in workers})
     f.advisor_runner = Runner({'model': 'opus', 'effort': 'high', 'domains': ['research_web']})
     monkeypatch.setattr(fleet, 'trust_claude_dir', lambda cwd: None)
     try:
@@ -634,3 +643,25 @@ def test_v2_fingerprint_change_respawns_on_the_real_bus(v2adv, monkeypatch):
     assert len(f.advisor_runner.calls) == 1 and f.agent('worker-1')['state'] == 'busy'
     snapshot = fleet.load(f.run_dir / 'runtime' / 'worker-1-g1.json')
     assert snapshot['worker_model'] == 'sonnet' and snapshot['worker_effort'] == 'medium'
+
+
+def test_held_worker_does_not_count_as_busy_for_the_dispatch_rule(v2adv2):
+    """P1-01: a worker held for its first sheet (nothing queued) must not suppress the
+    'RUNNING must dispatch' correction, or the task hangs until its time budget runs out."""
+    from test_v2_codex_claude import answer_turn, submit, typed
+    f = v2adv2
+    submit(f)
+    answer_turn(f, 'supervisor', json.dumps({'status': 'RUNNING', 'completion': 5, 'reason': 'go', 'dispatch': [
+        {'to': 'worker-1', 'instruction': 'Research the semis rotation into worker-1/notes.md'}]}))
+    f.pump()
+    answer_turn(f, 'worker-1', 'READY', startup=True)
+    f.pump()
+    answer_turn(f, 'worker-1', 'Done:\n- notes\nEvidence:\n- worker-1/notes.md\nNot done: none\nBlocked: none')
+    f.pump()
+    assert f.agent('worker-2')['state'] == 'starting' and f.agent('worker-2')['advice_hold'] == '1'
+    assert not f.others_active()
+    answer_turn(f, 'supervisor', json.dumps({'status': 'RUNNING', 'completion': 50, 'reason': 'wait', 'dispatch': []}))
+    f.pump()
+    # v2 turns the parse error into the generic correction (existing behavior); the count proves it fired
+    assert typed(f, 'supervisor')[-1].startswith('Your reply is not a valid decision JSON')
+    assert f.task()['bad_replies'] == '1'

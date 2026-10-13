@@ -1884,7 +1884,12 @@ class Fleet:
         # "no worker is busy: RUNNING must dispatch" rule does not apply in those phases.
         if self.contract_phase() in ('interfaces', 'skeleton'):
             return True
-        return any(self.agent(w).get('state') != 'idle' or self.inbox_depth(w) for w in self.workers)
+        def busy(info):
+            # A Claude worker held for its first advisor sheet with nothing queued is not working (P1-01).
+            if info.get('advice_hold') == '1' and info.get('state') == 'starting':
+                return False
+            return info.get('state') != 'idle'
+        return any(busy(self.agent(w)) or self.inbox_depth(w) for w in self.workers)
 
     def on_supervisor(self, text):
         t = self.task()
