@@ -57,6 +57,30 @@ from cmux_fleet.router import route_task  # noqa: E402
 SESSION = 'cmux-fleet'  # cmux registry name
 HOME = Path(os.environ.get('CMUX_FLEET_HOME') or (Path.home() / '.cmux-fleet'))
 LATEST = HOME / 'latest.json'
+
+
+def pin_paths(cfg):
+    """Apply the locations a run pinned in its config; the config wins over the environment.
+
+    cmux starts the daemon, actors and hooks in fresh login shells that need not inherit the
+    caller's CMUX_FLEET_HOME / CMUX_FLEET_STATE / CMUX_BIN, so `start` writes them into config.json."""
+    global HOME, LATEST
+    from cmux_fleet import cmux_manager
+    if cfg.get('fleet_home'):
+        HOME = Path(cfg['fleet_home'])
+        LATEST = HOME / 'latest.json'
+    if cfg.get('cmux_bin'):
+        cmux_manager.CMUX = cfg['cmux_bin']
+    if cfg.get('cmux_state_dir'):
+        cmux_manager.STATE_DIR = Path(cfg['cmux_state_dir'])
+    return cfg
+
+
+def _pin_from(cfg_path):
+    try:
+        pin_paths(load(cfg_path))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass  # the entry point itself reports an unreadable config
 USER_CODEX_HOME = Path(os.environ.get('CODEX_HOME') or (Path.home() / '.codex'))
 EVENTS, TASK, LOG, NAMES = 'fx:events', 'fx:task', 'fx:log', 'fx:names'
 ROSTER = 'fx:roster'  # notify=1: tell the supervisor the current workers with its next message
@@ -3650,6 +3674,10 @@ def resume(run, args):
     from cmux_fleet.cmux_manager import CmuxSessionManager, cmux_available
     path = run / 'config.json'
     cfg = load(path)
+    from cmux_fleet import cmux_manager
+    pin_paths(cfg)  # a resumed run keeps its own locations; an older config gets the current ones pinned
+    cfg.setdefault('fleet_home', str(HOME.expanduser().resolve()))
+    cfg.setdefault('cmux_bin', cmux_manager.CMUX)
     try:
         runtime_v2.validate_config(cfg)
     except ValueError as exc:
@@ -3845,7 +3873,8 @@ def start(args):
     if getattr(args, 'name', None) is not None and not args.name.strip():
         raise SystemExit('--name must not be empty')
     titles = {'agents_title': 'Fleet ' + args.name.strip()} if getattr(args, 'name', None) else {}
-    mgr = manager_for(titles)
+    state_dir = getattr(args, 'cmux_state_dir', None)
+    mgr = manager_for(dict(titles, cmux_state_dir=str(Path(state_dir).expanduser().resolve())) if state_dir else titles)
     if mgr.session_exists():
         raise SystemExit('cmux-fleet tabs already exist; run `stop` and close them with the ✕ first')
     if not roster_path:
@@ -3859,7 +3888,7 @@ def start(args):
     profiles = [args.supervisor_profile or args.profile] if args.supervisor_cli == 'codex' else []
     if args.worker_cli == 'codex':
         profiles.append(args.worker_profile or args.profile)
-    home = Path(args.codex_home).expanduser()
+    home = Path(getattr(args, 'codex_home', None) or HOME / 'codex-home').expanduser()
     if profiles:
         prepare_codex_home(home, profiles)
     token = uuid.uuid4().hex[:8]
@@ -3867,10 +3896,12 @@ def start(args):
         redis_cfg = redis_runtime.prepare(args.redis_runtime_dir, token)
     except (OSError, ValueError) as exc:
         raise SystemExit('cannot prepare private Redis runtime: ' + str(exc)) from exc
-    run = Path(args.runs_dir).expanduser() / ('fleet-' + time.strftime('%Y%m%d-%H%M%S-') + token)
+    run = Path(getattr(args, 'runs_dir', None) or HOME / 'runs').expanduser() / ('fleet-' + time.strftime('%Y%m%d-%H%M%S-') + token)
     (run / 'workspace').mkdir(parents=True)
+    from cmux_fleet import cmux_manager
     cfg = {'run': str(run), 'python': sys.executable, **redis_cfg,
            'cmux_state_dir': str(mgr.meta_path.parent),
+           'fleet_home': str(HOME.expanduser().resolve()), 'cmux_bin': cmux_manager.CMUX,
            'workers': workers, 'mode': args.mode, 'lifecycle': args.lifecycle, 'roles': args.roles, 'max_busy': args.max_busy,
            **({'budget': budget} if budget else {}),
            **({'brake_notify': shlex.split(args.brake_notify)} if getattr(args, 'brake_notify', None) else {}),
@@ -4006,9 +4037,14 @@ def main(argv=None):
     s.add_argument('--redis-server', help='redis-server binary (default: first on PATH)')
     s.add_argument('--redis-runtime-dir', default=str(redis_runtime.DEFAULT_ROOT),
                    help='private Redis runtime root (default: project .runtime/redis; no /tmp fallback)')
-    s.add_argument('--runs-dir', default=str(HOME / 'runs'), help='where run directories are created')
-    s.add_argument('--codex-home', default=str(HOME / 'codex-home'),
-                   help='isolated CODEX_HOME for the agents (login + profile symlinked from yours; no hooks/MCP)')
+    s.add_argument('--fleet-home', help='fleet home (latest.json, default runs/codex-home); pinned in config.json'
+                   ' (default: $CMUX_FLEET_HOME or ~/.cmux-fleet)')
+    s.add_argument('--cmux-bin', help='cmux binary; pinned in config.json (default: $CMUX_BIN or the app bundle)')
+    s.add_argument('--runs-dir', help='where run directories are created (default: <fleet home>/runs)')
+    s.add_argument('--cmux-state-dir', help='cmux registry directory; pinned in config.json'
+                   ' (default: $CMUX_FLEET_STATE or ~/.local/state/cmux-fleet)')
+    s.add_argument('--codex-home', help='isolated CODEX_HOME for the agents (login + profile symlinked from yours;'
+                   ' no hooks/MCP; default: <fleet home>/codex-home)')
     s.add_argument('--handoff-ratio', type=float, default=DEFAULTS['handoff_ratio'],
                    help='rotate a session once its context use reaches this share of the window '
                         '(lowest-priority default; roster handoff: overrides per CLI/model, docs/design.md §22)')
@@ -4168,8 +4204,15 @@ def main(argv=None):
     a.add_argument('--generation', type=int, help='pinned spawn generation (internal)')
     args = p.parse_args(argv)
     if args.cmd == 'start':
+        pin_paths({'fleet_home': args.fleet_home and str(Path(args.fleet_home).expanduser().resolve()),
+                   'cmux_bin': args.cmux_bin and str(Path(args.cmux_bin).expanduser().resolve())})
+        args.runs_dir = args.runs_dir or str(HOME / 'runs')
+        args.codex_home = args.codex_home or str(HOME / 'codex-home')
         start(args)
-    elif args.cmd == 'daemon':
+        return
+    if getattr(args, 'cfg', None):  # internal entry points: daemon, actor, hooks, notify, lifecycle-close
+        _pin_from(args.cfg)
+    if args.cmd == 'daemon':
         daemon(args.cfg, args.resume)
     elif args.cmd == 'lifecycle-close':
         lifecycle_close.close_workspace(args.cfg)
@@ -4188,7 +4231,7 @@ def main(argv=None):
     elif args.cmd in ('agents', 'plan'):
         print_inspection(args)
     else:
-        cfg = load(args.config)
+        cfg = pin_paths(load(args.config))
         if args.cmd == 'logs':
             from cmux_fleet.control_view import iter_events
             for record in iter_events(cfg, after=args.after, limit=args.limit,

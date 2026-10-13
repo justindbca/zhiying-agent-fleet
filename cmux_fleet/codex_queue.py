@@ -52,7 +52,8 @@ def marked(text, token):
 
 
 def queue_argv(cfg, thread, text):
-    return [cfg.get('codex') or 'codex', 'queue', '--thread', thread, '--message', text]
+    # One `--message=<text>` token: a body starting with `-` must never be parsed as a flag.
+    return [cfg.get('codex') or 'codex', 'queue', '--thread', thread, '--message=' + text]
 
 
 def enqueue(cfg, name, thread, text, *, run=subprocess.run, timeout=30):
