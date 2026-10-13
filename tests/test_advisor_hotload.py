@@ -12,7 +12,8 @@ import pytest
 from test_fleet import FakeMgr, FakeRedis, decision, turn
 from test_kit import make_kit
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
-from test_advisor import Runner, advisor_on, item, report, send_decision, supervisor_texts, v2_advised, worker_text
+from test_advisor import afx  # noqa: F401  (fixture)
+from test_advisor import Runner, item, report, send_decision, supervisor_texts, v2_advised, worker_text
 from cmux_fleet import control_view, fleet, roster
 
 
@@ -242,6 +243,20 @@ def test_cli_only_edits_the_roster_of_the_latest_or_given_run(cfx, monkeypatch, 
     with pytest.raises(SystemExit, match='--worker-kit rejected'):
         fleet.main(['advisor', 'on', '--config', str(f.path)])
     assert roster.advisor((f.run_dir / 'roster.yaml').read_bytes()) is False
+
+
+def test_sub_fleet_config_never_inherits_the_switch(cfx, tmp_path):
+    from cmux_fleet import subfleet
+    f = cfx
+    set_roster(f, True)
+    f.tick()
+    child = subfleet.child_config(f, 'worker-1', 'M0', 1, tmp_path / 'child', 'pane-x', {}, {'redis_socket': 's'}, 'n')
+    assert f.advisor_online() and 'advisor' not in child  # a sub-fleet starts off; its own roster turns it on
+
+
+def test_online_at_start_is_audited(afx):
+    on, = logs(afx, 'advisor.on')
+    assert on['who'] == 'user' and on['at_start'] is True
 
 
 # ------------------------------------------------------------------ control line

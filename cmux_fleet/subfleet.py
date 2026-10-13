@@ -245,8 +245,9 @@ def child_config(f, slot, task_id, workers, rec_dir, sid, info, redis_cfg, name)
     parent = f.cfg
     root_path = parent.get('root_config') or str(f.path)
     path = list(parent.get('title_path') or [name]) + [slot, task_id]
+    # `advisor` is the parent's in-memory switch (its roster): a sub-fleet starts with the advisor off.
     cfg = {k: v for k, v in parent.items() if k not in ('roster', 'worker_roles', 'roles', 'adopt',
-                                                          'redis_socket', 'redis_runtime_dir')}
+                                                          'redis_socket', 'redis_runtime_dir', 'advisor')}
     cfg.update(redis_cfg)
     cfg.update(run=str(rec_dir), workers=['worker-' + str(i + 1) for i in range(workers)], mode='task',
                session=session_name(task_id), task_id=task_id, parent_config=str(f.path),

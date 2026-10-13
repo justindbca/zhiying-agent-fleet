@@ -890,6 +890,7 @@ class Fleet:
                 self.kit = kitmod.Kit(self.cfg['worker_kit'])  # KitError (ValueError): refuse the whole kit
             self.cfg['advisor'] = True
             self.r.hset(SERVICE, mapping={'advisor': 'on', 'advisor_by': 'user', 'advisor_at': time.time()})
+            self.log('advisor.on', who='user', at_start=True)
         elif self.r.hget(SERVICE, 'advisor') == 'on':  # resumed after the roster turned it off
             self.r.hset(SERVICE, mapping={'advisor': 'off', 'advisor_by': 'user', 'advisor_at': time.time()})
 
