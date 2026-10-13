@@ -116,9 +116,15 @@ def mixed(private_redis_v2, tmp_path):  # noqa: F811
     run = tmp_path / ('run-' + uuid.uuid4().hex)
     (run / 'workspace').mkdir(parents=True)
     sessions = tmp_path / 'codex-home' / 'sessions'
+    # A real start records the resolved claude binary (cfg['claude']); the profile preflight checks
+    # it. A stub that is never run keeps these tests off the host's PATH (no claude installed: fine).
+    claude_bin = tmp_path / 'bin' / 'claude'
+    claude_bin.parent.mkdir()
+    claude_bin.write_text('#!/bin/sh\nexit 1\n')
+    claude_bin.chmod(0o755)
     cfg = dict(run=str(run), redis_socket=r.connection_pool.connection_kwargs['path'],
                python=sys.executable, workers=list(WORKERS), mode='task', supervisor_cli='codex',
-               worker_cli='claude', codex_home=str(tmp_path / 'codex-home'), transport_version=2,
+               worker_cli='claude', claude=str(claude_bin), codex_home=str(tmp_path / 'codex-home'), transport_version=2,
                allow_development_v2=True, stall_timeout=0, v2_lease_ms=300000, max_busy=0)
     path = run / 'config.json'
     fleet.save(path, cfg)
