@@ -2803,7 +2803,7 @@ class Fleet:
                    'anything the model claims as done must be checked against the artifacts'])
 
     def finish_rotation(self, name, timed_out=False):
-        codex_queue.clear(self, name, 'rotation')  # the retiring session must not start a queued item
+        codex_queue.clear(self, name, 'rotation')  # its token can never settle (Codex's queue is not edited)
         if self.v2 and timed_out:
             # An unfinished handoff can still run tools. Retire it reliably before
             # using a skeleton or advancing generation; Escape alone proves nothing.

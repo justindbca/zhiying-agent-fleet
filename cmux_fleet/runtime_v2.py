@@ -1372,7 +1372,7 @@ class RuntimeV2:
             return
         self.f.r.hset(TASK, mapping={'status': status, 'reason': reason})
         for slot in self.f.names:
-            codex_queue.clear(self.f, slot, 'task ' + status)  # a pending queued item must not run after the end
+            codex_queue.clear(self.f, slot, 'task ' + status)  # its token can never settle (Codex's queue is not edited)
             for mid in self.f.r.lrange(self.bus.pending_key(slot), 0, -1):
                 msg = dict(message_id=mid)
                 self.cancel_queued(slot, msg, reason)
