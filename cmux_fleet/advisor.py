@@ -47,9 +47,8 @@ def runtime_effort(cfg, cli):
 
 
 def fingerprint(cli, model, effort):
-    """The launch fingerprint: (model, effort). Effort only exists for Claude; a runtime started
-    without --effort counts as the default, so a sheet asking for the default does not respawn."""
-    return (model or '', (effort or DEFAULT_EFFORT) if cli == 'claude' else '')
+    """The launch fingerprint: (model, effort). Effort only exists for Claude."""
+    return (model or '', (effort or '') if cli == 'claude' else '')
 
 
 def launch_cards(registry, cli):
