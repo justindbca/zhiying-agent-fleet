@@ -197,6 +197,17 @@ workers:
   this run (a removed worker's name cannot come back). Changes are logged as `roster.changed`.
 - **Handoff threshold per model** (docs/design.md §22): optional `handoff:` table and per-worker
   `window` / `handoff_ratio`; edits apply at the next delivery check, no restart.
+- **Advisor switch**: optional top-level `advisor: on|off`, default off. While on, the daemon consults the
+  advisor (official Claude CLI, fable/high) before every supervisor dispatch; it picks the worker model /
+  effort / domains and authorizes the respawns its sheets need. Off: dispatches go out with the slot
+  defaults, exactly as without the advisor. Flipped while running without a restart, by editing the roster,
+  by `cmux-fleet advisor on|off [--config <run>/config.json]` (only edits the roster; a run
+  started without `--roster` gets `<run>/roster.yaml` from its current workers), or by the supervisor's
+  decision key `"advisor": "on"|"off"`. `start --advisor` only writes `advisor: on` into the roster (a
+  `--roster` file is edited in place). On at start: Claude workers open their pane but launch the CLI only
+  when the first dispatch's sheet arrives. Turned off: workers still waiting for a sheet start with the
+  defaults; running workers keep their generation. Logged as `advisor.on` / `advisor.off` (`who`), and the
+  control `STATE` line shows `adv=on|off`.
 - Needs PyYAML in the Python that runs the daemon.
 
 ## Handoff window and ratio per model

@@ -363,6 +363,7 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - 加：先写 `config.json`（`latest.json` 指向本 run 时同步）再启动——钩子/桥按配置文件校验成员；Redis 字段与 `start_all` 相同，READY 提示相同，标签放进右侧 worker 栏末尾（无 worker 时放 supervisor 右侧），刷新历史页。
 - 卸：标记退役中——不再是派活目标（决策/请求/路由校验、profile 分配都排除），但仍计入 `max_busy` 与“有 worker 在忙”；空闲且队列空、v2 无在途投递时，按换代同样的方式存屏、关闭旧 tab（v2 `retire`），从名单删除并写回配置。工作目录保留，历史页继续可查。退役完成前写回文件即取消。
 - 只改 `role`：下一代生效，不重启。
+- 顾问开关（2026-10-14，advisor 设计稿 v0.7 §2.1）：顶层 `advisor: on|off`，缺省 off，随本节检测热载、不重启。改的入口只有 roster：用户改文件、`fleet advisor on|off`（只改 roster；不带 `--roster` 的 run 由它按当前 worker 生成 `<run>/roster.yaml`，daemon 回落读这个文件）、监工 decision 键 `advisor`（daemon 写 roster 后立即生效，同一条 decision 的派单已过顾问）；`start --advisor` 只是往 roster 写 `advisor: on`。config.json 不再存这个开关。坏值随整份拒收；开启时 kit 坏则拒开、不写 roster，审计 `advisor.rejected`。关闭时清掉待会诊登记，举着等首张配置单的槽按缺省放闸（不能永远举着）；已在跑的代与按配置单起的代不回退。审计 `advisor.on` / `advisor.off`（`who`=user|supervisor），control `STATE` 行显示 `adv=on|off`。
 - 通知监工：不单独发一条消息（task 模式下单独一条会让监工回一个无派活的 RUNNING，按原规则判错三次即 blocked）；改为在下一条发给监工的业务消息末尾追加当前可派 worker 名单。
 - 已知边界：新加的 worker 若启动未 READY，按原启动超时规则使在途任务 blocked；退役中 worker 处于 held 时不会退役，需人工处理；暂停中不投递，退役中 worker 的队列不会排空。
 
