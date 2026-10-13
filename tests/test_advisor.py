@@ -682,3 +682,82 @@ def test_broken_card_file_is_advisor_unavailable_not_a_daemon_exit(afx, monkeypa
     audit = f.r.hgetall(fleet.ADVICE + info['advice_ticket'])
     assert audit['status'] == 'unavailable' and 'agent registry unreadable' in audit['errors']
     assert any('[advisor unavailable]' in x for x in f.r.lrange(fleet.ADVICE_NOTES, 0, -1))
+
+
+# ------------------------------------------------------------------ P2-9: advisor respawns pass Fleet.card_gate
+def test_advisor_respawn_waits_for_a_model_ticket_then_switches(afx):
+    """fable max_concurrent 1: the first slot switches, the second waits queued (no re-advice) and
+    switches once the first slot's fable generation is gone."""
+    f = afx
+    from cmux_fleet.agent_registry import AgentRegistry
+    assert AgentRegistry().get('claude-fable').max_concurrent == 1
+    f.advisor_runner = Runner({'model': 'fable', 'effort': 'high', 'domains': []})
+    send_decision(f, [item(), item('worker-2', 'Summarize the advisor plan into worker-2/sum.md')])
+    f.pump()
+    one, two = f.agent('worker-1'), f.agent('worker-2')
+    assert one['generation'] == '1' and json.loads(one['runtime_launch'])['profile_id'] == 'claude-fable'
+    assert two['state'] == 'idle' and two['generation'] == '0' and two['profile_state'] == 'pending'
+    assert 'max_concurrent 1 for model fable' in two['capacity_wait'] and f.r.llen('fx:inbox:worker-2') == 1
+    f.pump()
+    f.pump()
+    from test_model_usage import logs
+    assert len(logs(f, 'profile.capacity_wait')) == 1  # once per reason
+    assert len(f.advisor_runner.calls) == 2 and f.agent('worker-2')['generation'] == '0'
+    f.mgr.kill_pane(one['pane'])  # worker-1's fable generation is gone
+    f.setf('worker-1', state='dead')
+    f.pump()
+    two = f.agent('worker-2')
+    assert two['generation'] == '1' and two['state'] == 'starting' and two['capacity_wait'] == ''
+    assert json.loads(two['runtime_launch'])['profile_id'] == 'claude-fable' and two['advice_wait'] == ''
+    assert len(f.advisor_runner.calls) == 2  # the waiting sheet was reused, not re-advised
+    f.handle(turn('worker-2', 'READY', 1))
+    f.pump()
+    assert f.agent('worker-2')['state'] == 'busy' and 'advisor plan' in worker_text(f, 'worker-2')
+
+
+def test_advisor_respawn_to_a_card_for_another_host_blocks_the_task(afx, monkeypatch, tmp_path):
+    import shutil
+    from cmux_fleet import agent_registry
+    reg = tmp_path / 'agents'
+    shutil.copytree(Path(agent_registry.__file__).parent / 'agents', reg)
+    card = json.loads((reg / 'models' / 'opus.json').read_text())
+    (reg / 'models' / 'opus.json').write_text(json.dumps(dict(card, hosts=['studio'])))
+
+    class Reg(agent_registry.AgentRegistry):
+        def __init__(self, directory=None):
+            super().__init__(reg)
+    monkeypatch.setattr(fleet, 'AgentRegistry', Reg)
+    f = afx
+    f.cfg['host'] = 'macbook'
+    f.advisor_runner = Runner({'model': 'opus', 'effort': 'high', 'domains': []})
+    send_decision(f, [item()])
+    f.pump()
+    info = f.agent('worker-1')
+    assert info['generation'] == '0' and info['profile_state'] == 'blocked' and 'studio' in info['profile_reason']
+    assert f.task()['status'] == 'blocked' and f.mgr.killed == []  # no silent swap, old runtime kept
+
+
+def test_v2_held_first_generation_keeps_holding_while_the_model_is_full(v2adv2):
+    from test_v2_codex_claude import answer_turn, submit
+    f = v2adv2
+    f.advisor_runner = Runner({'model': 'fable', 'effort': 'high', 'domains': []})
+    submit(f)
+    assert answer_turn(f, 'supervisor', json.dumps({'status': 'RUNNING', 'completion': 5, 'reason': 'go', 'dispatch': [
+        {'to': 'worker-1', 'instruction': 'Research the semis rotation into worker-1/notes.md', 'id': 'M0'},
+        {'to': 'worker-2', 'instruction': 'Summarize the advisor plan into worker-2/sum.md', 'id': 'M1'}]}))['status'] == 'committed'
+    f.pump()
+    one, two = f.agent('worker-1'), f.agent('worker-2')
+    assert one['launch_ready'] == '1' and json.loads(one['runtime_launch'])['profile_id'] == 'claude-fable'
+    assert two['advice_hold'] == '1' and two['launch_ready'] == '0' and two['profile_state'] == 'pending'
+    assert 'max_concurrent 1 for model fable' in two['capacity_wait']
+    f.pump()
+    f.v2.tick()
+    assert f.agent('worker-2')['advice_hold'] == '1' and len(f.advisor_runner.calls) == 2  # held, not re-advised
+    assert f.task().get('status') != 'blocked'
+    f.mgr.kill_pane(one['pane'])
+    f.setf('worker-1', state='dead')
+    f.pump()
+    two = f.agent('worker-2')
+    assert two['advice_hold'] == '0' and two['launch_ready'] == '1' and two['capacity_wait'] == ''
+    assert fleet.load(f.run_dir / 'runtime' / 'worker-2-g0.json')['worker_model'] == 'fable'
+    assert len(f.advisor_runner.calls) == 2

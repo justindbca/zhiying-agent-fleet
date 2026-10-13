@@ -2840,10 +2840,51 @@ class Fleet:
                  domains=sheet['domains'], effect=effect)
         self.r.rpush(ADVICE_NOTES, advisor.notice(self.label(name), sheet, effect))
 
+    def advice_waiting(self, name, identity):
+        """The sheet a slot holds while its model is at max_concurrent (this queued message only), or None."""
+        waiting = json.loads(self.agent(name).get('advice_wait') or '{}')
+        return waiting.get('sheet') if identity and waiting.get('msg') == identity else None
+
+    def advice_gate(self, name, identity, sheet, card, registry):
+        """Fleet.card_gate before an advisor sheet starts a generation (same meaning as deliver()'s
+        Phase 5 switch): host mismatch raises (the caller blocks the task, no silent swap); a full
+        model keeps the message queued, profile_state=pending, audits profile.capacity_wait once per
+        reason and returns True (retried every tick). None = may go on."""
+        gate = self.card_gate(name, card, registry)
+        if gate and gate[0] == 'block':
+            raise ValueError(gate[1])
+        info = self.agent(name)
+        if gate:
+            if info.get('capacity_wait') != gate[1]:
+                self.log('profile.capacity_wait', agent=name, profile=card.id if card else '', reason=gate[1])
+            self.setf(name, profile_state='pending', profile_reason=gate[1], capacity_wait=gate[1],
+                      advice_wait=json.dumps({'msg': identity, 'sheet': sheet}, ensure_ascii=False))
+            return True
+        if info.get('capacity_wait') or info.get('advice_wait'):
+            self.setf(name, capacity_wait='', advice_wait='')
+        return None
+
+    def advice_switch(self, name, identity, sheet, launch, card, registry):
+        """Respawn for an advisor sheet once card_gate admits it; False = never deliver now."""
+        if not self.advice_gate(name, identity, sheet, card, registry):
+            self.switch_profile(name, launch)
+        return False
+
     def advise_before_delivery(self, name, text):
         """True = go on delivering (no change, or a hot-load queued); False = respawning / blocked."""
         identity = self.advice_identity(name, text)
         info = self.agent(name)
+        waiting = self.advice_waiting(name, identity)
+        if waiting is not None:  # a decided respawn waiting for its model ticket: gate again, never re-advise
+            cli = agent_cli(self.runtime_cfg(name), name)
+            try:
+                registry = AgentRegistry()
+                cards = advisor.launch_cards(registry, cli)
+                return self.advice_switch(name, identity, waiting, self.advice_launch(cli, waiting, cards, registry),
+                                          cards[waiting['model']], registry)
+            except (OSError, ValueError, RuntimeError, KeyError, SystemExit, subprocess.SubprocessError) as exc:
+                self.block_profile(name, str(exc))
+                return False
         if identity and info.get('advice_msg') == identity:
             return True  # already advised (e.g. delivered again after the respawn's READY)
         entry = self.take_pending_advice(name, text)
@@ -2861,8 +2902,8 @@ class Fleet:
                 launch = self.advice_launch(cli, sheet, cards, registry)
                 self.record_advice(name, sheet, effect)
                 self.setf(name, advice_domains=json.dumps(sheet['domains'], ensure_ascii=False))
-                self.switch_profile(name, launch)  # Phase 5 path; blocks the task itself on failure
-                return False
+                # Phase 5 path behind the model card gate; blocks the task itself on failure
+                return self.advice_switch(name, identity, sheet, launch, cards[sheet['model']], registry)
             frozen = info.get('runtime_launch')
             if frozen and sheet['model'] in cards and json.loads(frozen).get('profile_id') == cards[sheet['model']].id:
                 drift = profile_runtime.launch_drift(frozen, self.advice_launch(cli, sheet, cards, registry))
@@ -2903,13 +2944,21 @@ class Fleet:
             text = self.v2.bus.message(mid)['body']['text']
         else:
             text = self.r.lrange(key('inbox', name), 0, 0)[0]
-        entry = self.take_pending_advice(name, text) or {'instruction': text[:2000], 'note': ''}
-        cfg = self.runtime_cfg(name)
-        sheet, current, cards, registry = self.advise(name, entry, 'claude', cfg)
-        self.setf(name, advice_msg=self.advice_identity(name, text),
-                  advice_domains=json.dumps(sheet['domains'], ensure_ascii=False))
+        identity = self.advice_identity(name, text)
+        sheet = self.advice_waiting(name, identity)
         try:
+            if sheet is None:
+                entry = self.take_pending_advice(name, text) or {'instruction': text[:2000], 'note': ''}
+                sheet, current, cards, registry = self.advise(name, entry, 'claude', self.runtime_cfg(name))
+                self.setf(name, advice_msg=identity, advice_domains=json.dumps(sheet['domains'], ensure_ascii=False))
+            else:  # waited for a model ticket with this sheet: gate again, never re-advise
+                registry = AgentRegistry()
+                cards = advisor.launch_cards(registry, 'claude')
             launch = self.advice_launch('claude', sheet, cards, registry) if sheet['model'] in cards else {}
+            # An unreadable registry (advisor unavailable) has no cards to gate; the fallback never switches.
+            if (not isinstance(registry, tuple)
+                    and self.advice_gate(name, identity, sheet, cards[sheet['model']] if launch else None, registry)):
+                return  # model full: keep holding the first generation until a ticket frees up
             generation = int(self.agent(name).get('generation') or 0)
             if launch:
                 self.setf(name, runtime_launch=profile_launch.encode_launch(launch), runtime_profile=launch['profile_id'],
