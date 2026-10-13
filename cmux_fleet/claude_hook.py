@@ -96,14 +96,18 @@ def wait(r, k, generation, thread, deadline, alive, accept, poll=POLL):
             got = r.blpop([k['mailbox']], timeout=max(1, int(min(poll, deadline - time.monotonic()))))
             if not got:
                 continue
-            if not alive():  # retired or orphaned while blocked: leave the entry for the live hook
-                r.lpush(k['mailbox'], got[1])
-                return None, None
             try:
-                entry = json.loads(got[1])
-            except ValueError:
-                continue
-            text = accept(entry) if isinstance(entry, dict) else None
+                if not alive():  # retired or orphaned while blocked: leave the entry for the live hook
+                    r.lpush(k['mailbox'], got[1])
+                    return None, None
+                try:
+                    entry = json.loads(got[1])
+                except ValueError:
+                    continue
+                text = accept(entry) if isinstance(entry, dict) else None
+            except BaseException:  # SIGTERM (Escape, ctrl+x ctrl+s, timeout) mid hand-over: put it back
+                r.lpush(k['mailbox'], got[1])
+                raise
             if text:
                 return text, entry
         return None, None

@@ -381,6 +381,9 @@ def claude_hook_next(cfg, name, generation, thread, deadline):
     (v2) or the pointer the daemon sent last (v1); anything else is dropped as stale.
     """
     import redis
+    if threading.current_thread() is threading.main_thread():
+        # Claude Code stops a hook with SIGTERM: unwind so a popped entry goes back to the mailbox.
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     parent = os.getppid()  # Claude Code (or its hook shell): once it is gone, nobody reads our answer
     while time.monotonic() < deadline and parent != 1:
         try:
