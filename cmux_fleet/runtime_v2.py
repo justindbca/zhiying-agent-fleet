@@ -1314,7 +1314,8 @@ class RuntimeV2:
             for slot in self.f.names:
                 info = self.f.agent(slot)
                 state = self.f.r.hgetall(self.bus.lease_key(slot))
-                if info.get('state') == 'starting' and now >= float(info.get('startup_deadline') or 0):
+                if (info.get('state') == 'starting' and info.get('advice_hold') != '1'  # held for its first advisor sheet
+                        and now >= float(info.get('startup_deadline') or 0)):
                     self.f.setf(slot, state='dead', bridge_available=0, runtime_ready=0)
                     self.finish('blocked', slot + ' startup timed out before READY')
                 elif state.get('current_delivery') and state.get('status') not in ('uncertain', 'expired'):
