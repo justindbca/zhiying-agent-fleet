@@ -682,3 +682,22 @@ def test_broken_card_file_is_advisor_unavailable_not_a_daemon_exit(afx, monkeypa
     audit = f.r.hgetall(fleet.ADVICE + info['advice_ticket'])
     assert audit['status'] == 'unavailable' and 'agent registry unreadable' in audit['errors']
     assert any('[advisor unavailable]' in x for x in f.r.lrange(fleet.ADVICE_NOTES, 0, -1))
+
+
+def test_runtime_without_effort_equals_a_default_effort_sheet(afx):
+    """Fallback / resumed runtimes carry no effort: a later 'medium' sheet must not cost a respawn."""
+    f = afx
+    f.cfg.pop('worker_effort')
+    assert advisor.fingerprint('claude', 'sonnet', '') == advisor.fingerprint('claude', 'sonnet', 'medium')
+    assert advisor.fingerprint('claude', 'sonnet', '') != advisor.fingerprint('claude', 'sonnet', 'high')
+    f.advisor_runner = Runner(TimeoutError('advisor down'))
+    send_decision(f, [item()])
+    f.pump()
+    assert json.loads(f.r.hgetall(fleet.ADVICE + f.agent('worker-1')['advice_ticket'])['output'])['effort'] == ''
+    report(f, 'worker-1')
+    f.advisor_runner = Runner({'model': 'sonnet', 'effort': 'medium', 'domains': []})
+    send_decision(f, [item(text='Research the memory rotation and write worker-1/more.md')])
+    f.pump()
+    info = f.agent('worker-1')
+    assert info['generation'] == '0' and info['state'] == 'busy'
+    assert f.r.hgetall(fleet.ADVICE + info['advice_ticket'])['effect'] == 'none'
