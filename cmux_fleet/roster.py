@@ -10,12 +10,15 @@
     handoff:                  # optional: per CLI / CLI:model (exact runtime model string)
       claude:opus: {window: 1000000}
       codex: {ratio: 0.6}
+    advisor: off              # optional, default off: on = consult the advisor before every dispatch
 
-The daemon re-reads the file while running (hot add / graceful remove). A file with any
+The daemon re-reads the file while running (hot add / graceful remove; advisor on / off without
+a restart, also via `fleet advisor on|off` or the supervisor's decision key). A file with any
 problem is rejected as a whole, with one reason per problem; the running roster stays.
 A changed `profile` swaps that slot to its next generation once it is idle (same slot name,
 docs/design.md §25 night switch); the card itself is resolved and checked by the daemon.
 """
+import os
 import re
 from pathlib import Path
 
@@ -39,10 +42,12 @@ def parse_entries(raw, base):
         data = yaml.safe_load(raw)
     except yaml.YAMLError as exc:
         raise ValueError('invalid YAML: ' + ' '.join(str(exc).split())) from exc
-    if (not isinstance(data, dict) or 'workers' not in data or not set(data) <= {'workers', 'limits', 'handoff'}
-            or not isinstance(data['workers'], list)):
-        raise ValueError('the roster must be a mapping with only a "workers" list (and optional "limits", "handoff")')
+    if (not isinstance(data, dict) or 'workers' not in data
+            or not set(data) <= {'workers', 'limits', 'handoff', 'advisor'} or not isinstance(data['workers'], list)):
+        raise ValueError('the roster must be a mapping with only a "workers" list '
+                         '(and optional "limits", "handoff", "advisor")')
     parse_limits(data.get('limits'))
+    advisor_value(data)
     if not data['workers']:
         raise ValueError('the roster needs at least one worker')
     errors, workers, roles, profiles = handoff_errors(data), [], {}, {}
@@ -153,3 +158,46 @@ def load(path):
 def load_entries(path):
     path = Path(path).expanduser().resolve()
     return parse_entries(path.read_bytes(), path.parent)
+
+
+ADVISOR_VALUES = {True: True, False: False, 'on': True, 'off': False}  # YAML 1.1 reads bare on/off as booleans
+
+
+def advisor_value(data):
+    """The roster's advisor switch (advisor plan §2.1): True = on. Missing = off."""
+    value = data.get('advisor', False) if isinstance(data, dict) else False
+    if not isinstance(value, (bool, str)) or value not in ADVISOR_VALUES:
+        raise ValueError('advisor must be on or off')
+    return ADVISOR_VALUES[value]
+
+
+def advisor(raw):
+    """advisor_value of an already validated roster file's bytes."""
+    import yaml
+    return advisor_value(yaml.safe_load(raw))
+
+
+def with_advisor(text, on):
+    """The roster text with its top-level advisor line set (other lines and comments untouched)."""
+    line = 'advisor: ' + ('on' if on else 'off')
+    if re.search(r'(?m)^advisor:.*$', text):
+        return re.sub(r'(?m)^advisor:.*$', line, text, count=1)
+    return text + ('' if not text or text.endswith('\n') else '\n') + line + '\n'
+
+
+def write_advisor(path, on, workers=()):
+    """Set advisor on/off in the roster file; a missing file is created from ``workers`` (a run started
+    without --roster). The result must still be a valid roster; written atomically. Returns the path."""
+    path = Path(path).expanduser()
+    if path.exists():
+        text = path.read_text()
+    else:
+        text = ('# Created by cmux-fleet for the advisor switch: the workers of this run.\n'
+                '# Edits apply while the run is running, like any roster.\nworkers:\n'
+                + ''.join('  - name: ' + w + '\n' for w in workers))
+    text = with_advisor(text, on)
+    parse(text.encode(), path.parent)  # never write a roster the daemon would reject
+    tmp = path.with_name('.' + path.name + '.tmp')
+    tmp.write_text(text)
+    os.replace(tmp, path)
+    return path

@@ -88,9 +88,12 @@ ITEMS = 'fx:items'  # plain task mode: {dispatch id: {to, instruction}} for disp
 ESCALATION_DECISIONS = ('approve', 'revise', 'reject')
 CMD_TIMEOUT, CMD_TIMEOUT_MAX = 120, 600  # artifact cmd_exit (contract tasks): seconds the daemon may block
 BRAKE = 'fx:brake'  # budget card + counters + last trip of the current task / service (cmux_fleet/brake.py)
-# Advisor runs only (start --advisor): audit hash per consultation, its counter, dispatches awaiting
+# Advisor online only (roster `advisor: on`): audit hash per consultation, its counter, dispatches awaiting
 # advice per worker (instruction -> advise_note), and notes appended to the supervisor's next message.
 ADVICE, ADVICE_SEQ, ADVICE_PENDING, ADVICE_NOTES = 'fx:advice:', 'fx:advice:seq', 'fx:advice:pending:', 'fx:advice:notes'
+# Mid-task rescue (advisor plan §3.2): supervisor consult items waiting for an idle slot, relays per task+slot.
+RESCUE, RESCUE_RELAYS = 'fx:advice:rescue', 'fx:advice:relays'
+RESCUE_FIELDS = ('rescue_note', 'rescue_launch', 'rescue_hint', 'rescue_relay', 'advice_preset')
 
 
 def load(path):
@@ -476,6 +479,23 @@ def validate_agent_registry_path(value):
     return path
 
 
+def roster_file(cfg):
+    """The roster the daemon follows now: the night roster while night is on (§25), else --roster, else
+    <run>/roster.yaml (created by the advisor switch when absent)."""
+    followed = night.roster_for(cfg)
+    return Path(followed) if followed else Path(cfg['run']) / 'roster.yaml'
+
+
+def advisor_rosters(cfg):
+    """Every roster file the advisor switch writes: the followed one first, then the other of a day /
+    night pair, so a night on / off never flips the advisor (it is per run, not per roster)."""
+    paths = [roster_file(cfg)]
+    for other in (cfg.get('roster'), cfg.get('roster_night')):
+        if other and Path(other) not in paths:
+            paths.append(Path(other))
+    return paths
+
+
 def parse_decision(text, workers, others_active):
     decision = json.loads(text[text.index('{'):text.rindex('}') + 1])
     if not isinstance(decision, dict) or 'checks' in decision:
@@ -511,11 +531,32 @@ def parse_decision(text, workers, others_active):
             raise ValueError('escalations: note must be text')
     if len({x['task'] for x in escalations}) != len(escalations):
         raise ValueError('escalations: one answer per task')
+    if 'advisor' in decision and decision['advisor'] not in ('on', 'off'):
+        raise ValueError('advisor must be "on" or "off"')
+    consult = decision.setdefault('consult', [])
+    validate_consult(consult, workers)
     if 'artifacts' in decision:
         validate_artifacts(decision['artifacts'])
-    if decision['status'] == 'RUNNING' and not dispatch and not escalations and not others_active:
+    if decision['status'] == 'RUNNING' and not dispatch and not escalations and not consult and not others_active:
         raise ValueError('no worker is busy: RUNNING must dispatch at least one instruction')
     return decision
+
+
+def validate_consult(consult, workers):
+    """Supervisor's mid-task consult items (advisor plan §3.2): {worker, task, finding, want?}."""
+    if not isinstance(consult, list):
+        raise ValueError('consult must be a list')
+    for item in consult:
+        if not isinstance(item, dict) or item.get('worker') not in workers:
+            raise ValueError('consult.worker must be one of ' + ', '.join(workers))
+        if not isinstance(item.get('task'), str) or not re.fullmatch(contracts.M_RE, item['task']):
+            raise ValueError('consult.task must be the dispatch id of the task (M<n>, e.g. M0)')
+        if not isinstance(item.get('finding'), str) or not item['finding'].strip():
+            raise ValueError('consult.finding must say in your own words what went wrong')
+        if not isinstance(item.get('want', ''), str):
+            raise ValueError('consult.want must be text')
+    if len({x['task'] for x in consult}) != len(consult):
+        raise ValueError('consult: one item per task')
 
 
 def validate_request(spec, workers):
@@ -1069,11 +1110,88 @@ class Fleet:
             raise ValueError('brake_notify must be an argv list of strings (no shell)')
         self.pending_notify = []  # brake trips recorded inside a v2 event transaction (notified on tick)
         self.v2 = runtime_v2.RuntimeV2(self) if self.transport_version == 2 else None
-        self.kit, self.advisor_runner = None, None  # advisor runs only; tests inject advisor_runner
-        if 'advisor' in self.cfg and type(self.cfg['advisor']) is not bool:
-            raise ValueError('advisor must be a boolean')
-        if self.cfg.get('advisor') is True and self.cfg.get('worker_kit'):
-            self.kit = kitmod.Kit(self.cfg['worker_kit'])  # KitError (ValueError): refuse the whole kit
+        self.kit, self.advisor_runner = None, None  # advisor online only; tests inject advisor_runner
+        # The roster's `advisor: on|off` is the only switch (advisor plan §2.1). self.cfg['advisor'] is its
+        # in-memory mirror, never saved to config.json; per-generation snapshots carry it to the actor.
+        self.cfg.pop('advisor', None)
+        if self.roster_advisor():
+            if self.cfg.get('worker_kit'):
+                self.kit = kitmod.Kit(self.cfg['worker_kit'])  # KitError (ValueError): refuse the whole kit
+            self.cfg['advisor'] = True
+            self.r.hset(SERVICE, mapping={'advisor': 'on', 'advisor_by': 'user', 'advisor_at': time.time()})
+            self.log('advisor.on', who='user', at_start=True)
+        elif self.r.hget(SERVICE, 'advisor') == 'on':  # resumed after the roster turned it off
+            self.r.hset(SERVICE, mapping={'advisor': 'off', 'advisor_by': 'user', 'advisor_at': time.time()})
+
+    # -- advisor switch (advisor plan §2.1): every advisor gate asks advisor_online()
+    def advisor_online(self):
+        return self.cfg.get('advisor') is True
+
+    def roster_advisor(self):
+        """advisor on/off from the roster file at daemon start (a bad file: off; roster_tick reports it)."""
+        path = roster_file(self.cfg)
+        try:
+            raw = path.read_bytes()
+            roster.parse(raw, path.parent)
+            return roster.advisor(raw)
+        except (OSError, ValueError):
+            return False
+
+    def set_advisor(self, on, who, *, write=False):
+        """Turn the advisor on / off without a restart. ``write``: also set it in the roster file (the
+        supervisor's decision key). Returns None, or why nothing changed. Idempotent on equal values."""
+        kit = self.kit
+        if on and not self.advisor_online() and self.cfg.get('worker_kit'):
+            try:
+                kit = kitmod.Kit(self.cfg['worker_kit'])  # a bad kit refuses the switch, like at start
+            except (OSError, ValueError) as exc:
+                self.log('advisor.rejected', level='error', who=who, error=str(exc)[:500])
+                return 'worker kit rejected: ' + str(exc)[:500]
+        if write:
+            try:
+                for path in advisor_rosters(self.cfg):  # the roster stays the truth (day and night alike)
+                    roster.write_advisor(path, on, self.desired)
+            except (OSError, ValueError) as exc:
+                self.log('advisor.rejected', level='error', who=who, error=str(exc)[:500])
+                return 'roster not written: ' + str(exc)[:500]
+        if on == self.advisor_online():
+            return None
+        if on:
+            self.kit = kit
+            self.cfg['advisor'] = True
+        else:
+            # Running workers and their sheet-launched generations stay; a consultation already made
+            # finishes (a queued hot-load still applies). No new consultations, no slot stays held.
+            self.cfg.pop('advisor', None)
+            for name in self.workers:
+                if self.r.llen(ADVICE_PENDING + name):
+                    self.r.delete(ADVICE_PENDING + name)
+                info = self.agent(name)
+                if info.get('advice_hold') == '1' and info.get('launch_ready') == '0':
+                    self.release_default(name)
+        state = 'on' if on else 'off'
+        self.r.hset(SERVICE, mapping={'advisor': state, 'advisor_by': who, 'advisor_at': time.time()})
+        self.log('advisor.' + state, who=who)
+        return None
+
+    def advisor_decision(self, decision):
+        """The supervisor's `advisor` key, and the off-gate for `consult` (advisor plan §2.1)."""
+        if decision.get('advisor') in ('on', 'off'):
+            error = self.set_advisor(decision['advisor'] == 'on', 'supervisor', write=True)
+            if error:
+                self.r.rpush(ADVICE_NOTES, '[advisor] advisor: "' + decision['advisor'] + '" 未生效：' + error)
+        if decision.get('consult') and decision['status'] == 'RUNNING' and not self.advisor_online():
+            note = self.consult_off_note(decision['consult'])
+            if decision['dispatch']:
+                self.r.rpush(ADVICE_NOTES, note)  # rides on the next supervisor message (a report will come)
+            else:  # consult-only reply: nothing else would wake the supervisor
+                self.queue('supervisor', note + '\nReply with the JSON format from AGENTS.md.')
+
+    def consult_off_note(self, items):
+        """The one `[advisor off]` answer to consult items (at intake, or queued while on then turned off)."""
+        which = ', '.join(x['task'] + ' (' + self.label(self.resolve(x.get('slot') or x['worker'])) + ')' for x in items)
+        return ('[advisor off] consult ' + which + ' 未执行：顾问不在线。先在 fleet_decision 里发 advisor: "on"，'
+                '再发 consult；或自己派纠正性 dispatch / BLOCKED')
 
     # -- small helpers
     def agent(self, name):
@@ -1140,7 +1258,7 @@ class Fleet:
             text += '\n[Roster change] Workers you can dispatch to now: ' + ', '.join(self.labels())
         if name == 'supervisor':
             text += peer.drain(self)  # [peer CC] / unsolicited / violation notes (docs/design.md §21)
-            if self.cfg.get('advisor') is True and self.r.llen(ADVICE_NOTES):
+            if self.r.llen(ADVICE_NOTES):
                 # Appended, never sent alone: a lone note forces a no-dispatch RUNNING (same as §16 / §21).
                 text += '\n' + '\n'.join(self.r.lrange(ADVICE_NOTES, 0, -1))
                 self.r.delete(ADVICE_NOTES)
@@ -1217,8 +1335,8 @@ class Fleet:
             raise ValueError('profile switch requires an idle worker slot')
         if info.get('idle_confirmed') == '0':
             raise ValueError('worker idle state is unconfirmed after an abort; restart this dev slot before switching')
-        # start --advisor authorizes advisor-driven respawns; every other safety step below is unchanged.
-        if (self.cfg.get('advisor') is not True
+        # An online advisor authorizes its sheets' respawns; every other safety step below is unchanged.
+        if (not self.advisor_online()
                 and not profile_runtime.task_live_setting(self.task(), self.cfg['allow_profile_live_switch'])):
             raise ValueError('profile switch requires task apply_profiles_live=true')
         if agent_cli(self.runtime_cfg(name), name) == 'codex' and active_children(info.get('thread'), self.sessions):
@@ -1325,7 +1443,12 @@ class Fleet:
         generation = int(info.get('generation', 0))
         launch = json.loads(info.get('runtime_launch') or '{}')
         cfg_path = self.path
-        if launch or advice_hold:  # a held first spawn gets its model / effort written here on release
+        advised = self.advised_layout(name)
+        if advised and is_claude(cfg, name):
+            cfg['advisor'] = True  # this generation's argv: --effort / --setting-sources project, also while off
+        # A held first spawn gets its model / effort written here on release; an advised Claude
+        # generation keeps `advisor` in its own snapshot (the actor builds its argv from it).
+        if launch or advice_hold or (advised and is_claude(cfg, name)):
             cfg_path = self.run_dir / 'runtime' / (name + '-g' + str(generation) + '.json')
             save(cfg_path, cfg)  # generation-specific callback config; never edit old snapshots
         cwd = agent_cwd(self.cfg, name)
@@ -1333,7 +1456,6 @@ class Fleet:
         role = 'supervisor' if name == 'supervisor' else 'worker'
         scope = self.role_scope(name, cfg, launch)
         (cwd / 'AGENTS.md').write_text(scope)
-        advised = self.cfg.get('advisor') is True and name != 'supervisor'
         if is_claude(cfg, name) and advised:
             self.install_advised_kit(name, cwd, scope)  # CLAUDE.md = scope + core + domain rules
             # CLAUDE.md already carries the scope: do not make Claude read the same text twice.
@@ -1378,16 +1500,25 @@ class Fleet:
         self.log('spawn', agent=name, generation=generation, pane=result.pane_id)
         return result.pane_id
 
+    def advised_layout(self, name):
+        """Whether this slot's next generation is laid out advised (domain kit links + RULES in CLAUDE.md,
+        --setting-sources project, --effort). Online: every worker. Off: a slot whose persisted launch record
+        is an advisor-applied one (installed_domains, written only by install_advised_kit / a hot-load) keeps
+        it across handoffs and resumes; turning the advisor off never strips config from running work."""
+        if name == 'supervisor':
+            return False
+        return self.advisor_online() or bool(self.agent(name).get('installed_domains'))
+
     def init_worker(self, name):
         self.setf(name, label=name, current_profile='', runtime_profile='', advisory_profile='',
-                  runtime_ready=0, runtime_launch='', profile_task='',
+                  runtime_ready=0, runtime_launch='', profile_task='', installed_domains='', advice_domains='',
                   **profile_runtime.ProfileApplication().metadata())
         self.r.hset(NAMES, mapping={name: name})
 
     def spawn_ready(self, name):
-        # v2 + advisor: a Claude worker waits behind the launch gate for its first sheet (no default
-        # generation that the first dispatch would have to replace).
-        hold = bool(self.v2) and self.cfg.get('advisor') is True and name != 'supervisor' and is_claude(self.runtime_cfg(name), name)
+        # v2 + advisor online: a Claude worker waits behind the launch gate for its first sheet (no
+        # default generation that the first dispatch would have to replace).
+        hold = bool(self.v2) and self.advisor_online() and name != 'supervisor' and is_claude(self.runtime_cfg(name), name)
         return self.spawn(name, 'You are fleet agent ' + name + '. Read AGENTS.md in the current directory first. '
                                 'There is no task yet: your final reply must be exactly READY.',
                           launch_held=hold, advice_hold=hold)
@@ -2180,6 +2311,7 @@ class Fleet:
                 instruction = item['instruction'].strip()
                 prepared.append((slot, instruction, self.prepare_worker_profile(slot, instruction)))
             escalations = self.escalation_decision(decision, state) if decision['status'] == 'RUNNING' else []
+            consults = self.consult_decision(decision, state) if decision['status'] == 'RUNNING' else []
         except (ValueError, TypeError, KeyError) as exc:
             # P0 gap lists never count toward the three-strike limit (user 10/13): the supervisor
             # keeps fixing interfaces until all checks pass; the task `hours` budget is the bound.
@@ -2202,6 +2334,7 @@ class Fleet:
         self.r.hset(TASK, mapping={'bad_replies': 0, 'completion': decision['completion'],
                                    'reason': decision.get('reason', ''),
                                    'artifacts': json.dumps(artifacts, ensure_ascii=False)})
+        self.advisor_decision(decision)  # before the dispatches below: `advisor: "on"` advises them already
         if decision['status'] == 'BLOCKED':
             self.finish('blocked', decision.get('reason', 'needs a human'))
             return
@@ -2227,11 +2360,11 @@ class Fleet:
             # Metadata describes the next instruction, not the last appended one.
             # A busy worker records intent only; delivery re-evaluates at idle.
             advisory = profile_runtime.profile_advisory(slot, application)
-            if self.cfg.get('advisor') is True:
+            if self.advisor_online():
                 # Only supervisor dispatches are advised (never [contract] notices or report corrections).
                 # Registered before the depends_on hold: a held row is advised when the daemon releases it.
-                self.r.rpush(ADVICE_PENDING + slot, json.dumps({'instruction': instruction,
-                                                                'note': item.get('advise_note', '')}, ensure_ascii=False))
+                self.r.rpush(ADVICE_PENDING + slot, json.dumps({'instruction': instruction, 'note': item.get('advise_note', ''),
+                                                                'task': item.get('id', '')}, ensure_ascii=False))
             if state is not None:
                 row = rows[item['id']]
                 row['message'] = advisory + self.contract_message(t.get('id', ''), row)
@@ -2258,6 +2391,7 @@ class Fleet:
             self.save_escalations({k: v for k, v in esc.items() if k not in redispatched})
         for task_id, rec, answer in escalations:
             self.escalation_apply(t, state, task_id, rec, answer)
+        self.consult_apply(consults)
         if state is not None:
             self.save_contract(state)
         self.log('dispatch', count=len(decision['dispatch']), completion=decision['completion'])
@@ -2379,10 +2513,16 @@ class Fleet:
         for stale in (ESCALATIONS, ITEMS):
             if self.r.get(stale) is not None:
                 self.r.delete(stale)
-        if self.cfg.get('advisor') is True:  # an earlier task's unadvised dispatches never match this one
-            for w in self.workers:
-                if self.r.llen(ADVICE_PENDING + w):
-                    self.r.delete(ADVICE_PENDING + w)
+        for w in self.workers:  # an earlier task's unadvised dispatches never match this one
+            if self.r.llen(ADVICE_PENDING + w):
+                self.r.delete(ADVICE_PENDING + w)
+        if self.r.llen(RESCUE):  # an earlier task's consults and rescue leftovers never act in this one
+            self.r.delete(RESCUE)
+        for w in self.workers:
+            info = self.agent(w)
+            left = {k: '' for k in RESCUE_FIELDS if info.get(k)}
+            if left:
+                self.setf(w, **left)
         self.queue('supervisor', prompt + '\nReply with the JSON format from AGENTS.md.')
         (self.run_dir / 'result.json').unlink(missing_ok=True)  # a new task: this run is not finished
         self.log('task.submitted', task=task_id)
@@ -2533,6 +2673,8 @@ class Fleet:
     def pump(self):
         if self.paused():
             return  # nothing is delivered and nothing rotates; requests keep queuing (and may time out)
+        if not self.service:
+            self.rescue_tick()  # advisor rescue (§3.2): outside any v2 transaction, like the pre-dispatch advice
         cap = int(self.cfg.get('max_busy') or 0)
         card = (self.brake_budget() or {}).get('max_busy')
         if card:  # the budget card can only tighten --max-busy
@@ -2543,8 +2685,11 @@ class Fleet:
             if name != 'supervisor' and cap and busy >= cap:
                 continue  # e.g. a local model server that rejects concurrent large requests
             if (info.get('advice_hold') == '1' and info.get('state') == 'starting'
-                    and info.get('launch_ready') == '0' and self.inbox_depth(name)):
-                self.release_hold(name)  # advisor runs: first sheet decides model / effort / domains
+                    and info.get('launch_ready') == '0' and (self.inbox_depth(name) or not self.advisor_online())):
+                if self.advisor_online():
+                    self.release_hold(name)  # first sheet decides model / effort / domains
+                else:
+                    self.release_default(name)  # advisor went offline: never stay held
                 continue
             if (info.get('state') == 'idle' and self.inbox_depth(name)
                     and time.time() >= float(info.get('retry_at') or 0)):
@@ -2689,7 +2834,7 @@ class Fleet:
                         self.block_profile(name, str(exc))
                         return
                 text = profile_runtime.profile_advisory(name, application) + text[head.start():]
-                if (self.cfg.get('advisor') is True and application.state not in ('switching', 'applied-live')
+                if (self.advisor_online() and application.state not in ('switching', 'applied-live')
                         and not self.advise_before_delivery(name, text)):
                     return  # respawning / blocked: never pop/deliver until the new generation returns READY
         # Validate profile intent before even the existing context rotation path.
@@ -2713,7 +2858,7 @@ class Fleet:
             else:
                 self.start_rotation(name, used, window)
                 return
-        if self.cfg.get('advisor') is True and self.agent(name).get('advice_hotload'):
+        if self.agent(name).get('advice_hotload'):  # set by a consultation made while online
             text = self.apply_hotload(name, text)
         if self.v2:
             return self.v2.deliver(name)
@@ -2734,12 +2879,17 @@ class Fleet:
         self.setf(name, last_msg=text)
         self.log('deliver', agent=name, text=text[:120])
 
-    # -- advisor (start --advisor; advisor plan §3.1, pre-dispatch path)
+    # -- advisor (roster advisor: on; advisor plan §3.1, pre-dispatch path)
     def install_advised_kit(self, name, cwd, scope):
         """Advisor runs: Claude CLAUDE.md = role scope + project core + this generation's domain rules;
         cwd/.claude/{skills,agents} cleared, then the domains linked; full kit mcp.json."""
         info = self.agent(name)
         domains = json.loads(info.get('advice_domains') or info.get('installed_domains') or '[]')
+        if self.kit is None and self.cfg.get('worker_kit'):  # off at daemon start: an inherited layout still needs it
+            try:
+                self.kit = kitmod.Kit(self.cfg['worker_kit'])
+            except (OSError, ValueError) as exc:
+                self.log('advice.kit_unavailable', level='error', agent=name, domains=domains, error=str(exc)[:500])
         if self.kit:
             domains = [d for d in domains if d in self.kit.domains]
             self.kit.install(cwd, domains)
@@ -2780,6 +2930,14 @@ class Fleet:
         whitelist = (cards[model].kit_domains if model in cards else None)
         info = self.agent(name)
         installed = json.loads(info.get('installed_domains') or '[]')
+        preset = json.loads(info.get('advice_preset') or '{}')
+        if (kind == 'dispatch' and entry.get('task') and preset.get('task') == entry['task']
+                and preset.get('run_task') == self.task().get('id')):
+            # The supervisor re-dispatches a task the advisor reassigned here: that sheet holds (no second consult).
+            self.setf(name, advice_preset='')
+            self.log('advice.preset', agent=name, ticket=preset['sheet']['ticket'], task=entry['task'])
+            sheet = {k: v for k, v in preset['sheet'].items() if k not in ('action', 'to', 'handoff_hint')}
+            return sheet, current, cards, registry
         matrix, matrix_error = advisor.load_matrix()
         catalog = self.kit.domains_catalog() if self.kit and cli == 'claude' else []
         payload = advisor.build_input(
@@ -2982,6 +3140,266 @@ class Fleet:
         self.setf(name, **fields)
         self.log('advice.released', agent=name, ticket=sheet['ticket'])
 
+    def release_default(self, name):
+        """The advisor went offline while this Claude slot waited for its first sheet: open its gate with
+        the slot defaults, laid out like a spawn without the advisor (snapshot, CLAUDE.md, kit copy)."""
+        generation = int(self.agent(name).get('generation') or 0)
+        launch = json.loads(self.agent(name).get('runtime_launch') or '{}')
+        cfg = self.runtime_cfg(name)
+        cfg.pop('advisor', None)
+        self.setf(name, installed_domains='', advice_domains='')  # the slot defaults are its launch record now
+        try:
+            save(self.run_dir / 'runtime' / (name + '-g' + str(generation) + '.json'), cfg)
+            cwd = agent_cwd(self.cfg, name)
+            scope = self.role_scope(name, cfg, launch)
+            (cwd / 'AGENTS.md').write_text(scope)
+            kitmod.Kit.clear(cwd)
+            (cwd / 'CLAUDE.md').write_text(scope)
+            install_kit(self.cfg.get('worker_kit'), cwd)
+        except (OSError, ValueError) as exc:
+            self.setf(name, advice_hold=0)
+            self.block_profile(name, 'release without advisor failed: ' + str(exc), dead=True)
+            return
+        fields = dict(advice_hold=0, launch_ready=1)
+        if self.v2:
+            fields['startup_deadline'] = time.time() + float(self.cfg['profile_ready_timeout'])
+        self.setf(name, **fields)
+        self.log('advice.released_default', agent=name)
+
+    # -- advisor mid-task rescue (advisor plan §3.2 / §4.2: consult -> respawn | reassign | give_up)
+    def consult_decision(self, decision, state):
+        """Validate the supervisor's consult items against the task table (no side effects)."""
+        dispatched = {self.resolve(x['to']) for x in decision['dispatch']}
+        ids = {x.get('id') for x in decision['dispatch']}
+        waiting = {json.loads(x)['task'] for x in self.r.lrange(RESCUE, 0, -1)}
+        out = []
+        for item in decision['consult']:
+            slot, task_id = self.resolve(item['worker']), item['task']
+            owner, instruction, status = self.escalation_item(task_id, state)
+            if owner != slot or not instruction or status in ('escalated', 'delegated'):
+                raise ValueError('consult: ' + task_id + ' is not a task of ' + self.label(slot)
+                                 + ' (consult names the dispatch id that worker last ran)')
+            if slot in dispatched or task_id in ids:
+                raise ValueError('consult: ' + task_id + ' / ' + self.label(slot) + ' is also dispatched in this '
+                                 'reply; consult first, then act on the advisor\'s answer')
+            if task_id in waiting:
+                raise ValueError('consult: ' + task_id + ' is already with the advisor; wait for its answer')
+            out.append({'slot': slot, 'task': task_id, 'finding': ' '.join(item['finding'].split())[:2000],
+                        'want': ' '.join(item.get('want', '').split())[:1000]})
+        return out
+
+    def consult_apply(self, consults):
+        for c in consults:  # offline: advisor_decision already answered with the one [advisor off] note
+            if self.advisor_online():
+                self.r.rpush(RESCUE, json.dumps(dict(c, run_task=self.task().get('id', '')), ensure_ascii=False))
+                self.log('advice.consult', agent=c['slot'], task=c['task'])
+            else:
+                self.log('advice.consult_off', agent=c['slot'], task=c['task'])
+
+    def rescue_tick(self):
+        """Ready notes of reassigned slots; then one consult request whose worker is idle."""
+        if not self.running():
+            return
+        for w in self.workers:
+            info = self.agent(w)
+            if info.get('rescue_note') and info.get('state') == 'idle':
+                self.setf(w, rescue_note='')
+                self.queue('supervisor', info['rescue_note'])
+        for raw in self.r.lrange(RESCUE, 0, -1):
+            req = json.loads(raw)
+            if req.get('run_task') != self.task().get('id'):
+                self.r.lrem(RESCUE, 1, raw)  # left over from an earlier task
+                continue
+            if self.agent(req['slot']).get('state') != 'idle' or self.inbox_depth(req['slot']):
+                continue  # judged at the worker's next idle boundary
+            self.r.lrem(RESCUE, 1, raw)
+            if not self.advisor_online():  # accepted while online, turned off before the worker went idle
+                self.queue('supervisor', self.consult_off_note([req]) + '\nReply with the JSON format from AGENTS.md.')
+            else:
+                self.rescue(req)
+            return  # at most one consultation per pump
+
+    def advice_options(self, name, registry):
+        cfg = self.runtime_cfg(name)
+        cli = agent_cli(cfg, name)
+        cards = advisor.launch_cards(registry, cli)
+        model, effort = advisor.runtime_model(cfg, cli), advisor.runtime_effort(cfg, cli)
+        info = self.agent(name)
+        return {'name': name, 'cli': cli, 'cards': cards, 'model': model, 'effort': effort,
+                'current': advisor.fingerprint(cli, model, effort),
+                'models': list(dict.fromkeys(([model] if model else []) + list(cards))),
+                'generation': int(info.get('generation') or 0),
+                'installed_domains': json.loads(info.get('installed_domains') or '[]')}
+
+    def rescue_candidates(self, name):
+        """Idle slots a reassign may go to (a v2 Claude slot still held for its first sheet counts)."""
+        out = []
+        for w in self.active_workers():
+            info = self.agent(w)
+            held = (info.get('advice_hold') == '1' and info.get('state') == 'starting'
+                    and info.get('launch_ready') == '0')
+            if (w != name and (info.get('state') == 'idle' or held) and not self.inbox_depth(w)
+                    and not info.get('rescue_note') and not info.get('rescue_relay')):
+                out.append(w)
+        return out
+
+    def rescue(self, req):
+        """One rescue consultation. Unavailable advisor = no action, the supervisor is told (§8)."""
+        name, task_id, t = req['slot'], req['task'], self.task()
+        state = self.contract_state()
+        instruction = self.escalation_item(task_id, state)[1] or ''
+        relay_key = t.get('id', '') + '|' + task_id + '|' + name
+        relays = int(self.r.hget(RESCUE_RELAYS, relay_key) or 0)
+        try:
+            registry, registry_error = AgentRegistry(), None
+        except (OSError, ValueError) as exc:
+            registry, registry_error = (), 'agent registry unreadable: ' + str(exc)[:400]
+        candidates = self.rescue_candidates(name)
+        opts = {w: self.advice_options(w, registry) for w in [name] + candidates}
+        actions = advisor.rescue_actions(relays, candidates)
+        matrix, matrix_error = advisor.load_matrix()
+        catalog = self.kit.domains_catalog() if self.kit else []
+        names = [c['name'] for c in catalog]
+
+        def view(o, models=False):
+            out = {k: o[k] for k in ('name', 'cli', 'generation', 'model', 'effort', 'installed_domains')}
+            return dict(out, models=o['models']) if models else out
+        last = json.loads(self.agent(name).get('advice_last') or '{}')
+        payload = advisor.build_rescue_input(
+            goal=t.get('goal', ''), task=task_id, instruction=instruction, finding=req['finding'], want=req['want'],
+            slot=view(opts[name], True), previous_sheet=last.get('sheet') if last.get('task') == t.get('id') else None,
+            relays=relays, actions=actions, candidates=[view(opts[c], True) for c in candidates],
+            matrix=matrix, catalog=catalog)
+
+        def check_slot(target, raw):
+            o = opts[target or name]
+            wl = (o['cards'][raw.get('model')].kit_domains if raw.get('model') in o['cards']
+                  else o['cards'][o['model']].kit_domains if o['model'] in o['cards'] else None)
+            return advisor.validate(raw, cli=o['cli'], models=o['models'], current=o['current'],
+                                    catalog=names if o['cli'] == 'claude' else [], whitelist=wl, matrix=matrix,
+                                    cards=o['cards'])
+
+        def check(raw):
+            return advisor.validate_rescue(raw, actions=actions, check_slot=check_slot, candidates=candidates)
+        runner = self.advisor_runner or (lambda data: advisor.run_claude(data, cfg=self.cfg, run_dir=self.run_dir))
+        started = time.time()
+        if registry_error:
+            sheet, envelope, errors = None, None, [registry_error]
+        else:
+            sheet, envelope, errors = advisor.consult(payload, runner, check)
+        seq = self.r.hincrby(ADVICE_SEQ, 'n', 1)
+        ticket = 'adv-' + str(self.cfg.get('token') or self.run_dir.name[-8:]) + '-' + str(seq)
+        audit = {'slot': name, 'task': t.get('id', ''), 'kind': 'rescue', 'item': task_id,
+                 'input': json.dumps({k: payload[k] for k in ('goal', 'task', 'instruction', 'finding', 'want', 'slot',
+                                                              'relays', 'actions')}, ensure_ascii=False)[:4000],
+                 'output': json.dumps(sheet, ensure_ascii=False), 'errors': json.dumps(errors, ensure_ascii=False),
+                 'elapsed_s': round(time.time() - started, 3), 'status': 'unavailable' if sheet is None else 'ok',
+                 'action': (sheet or {}).get('action', 'none'), 'at': time.time()}
+        audit.update(advisor.usage_fields(envelope))
+        if matrix_error:
+            audit['matrix_error'] = matrix_error[:500]
+        self.r.hset(ADVICE + ticket, mapping=audit)
+        who = task_id + ' (' + self.label(name) + ')'
+        if sheet is None:
+            self.log('advice.unavailable', agent=name, ticket=ticket, path='rescue', errors=errors)
+            self.queue('supervisor', '[advisor unavailable] consult ' + who + '：顾问不可用，未做任何动作（'
+                       + (errors[-1] if errors else '')[:300] + '）。Decide yourself: dispatch a correction, or BLOCKED.'
+                       '\nReply with the JSON format from AGENTS.md.')
+            return
+        sheet['ticket'] = ticket
+        self.log('advice.rescue', agent=name, ticket=ticket, task=task_id, action=sheet['action'])
+        if sheet.get('capability_gap'):
+            self.log('capability.gap', agent=name, ticket=ticket, capability=sheet.get('capability'), model=sheet['model'])
+        if sheet['action'] == 'give_up':
+            self.queue('supervisor', '[advisor] give_up ' + task_id + ': ' + sheet['reason']
+                       + '\nNo configuration of ' + self.label(name) + ' or another slot is expected to finish '
+                       + task_id + ': reply BLOCKED with this reason.\nReply with the JSON format from AGENTS.md.')
+            return
+        target = sheet.get('to', name)
+        self.setf(target, advice_last=json.dumps({'task': t.get('id', ''), 'sheet': sheet}, ensure_ascii=False))
+        try:
+            if sheet['action'] == 'respawn':
+                self.r.hincrby(RESCUE_RELAYS, relay_key, 1)
+                self.rescue_respawn(name, task_id, sheet, opts[name], registry, state)
+            else:
+                self.rescue_reassign(name, task_id, sheet, opts[target], registry, state)
+        except (OSError, ValueError, RuntimeError, KeyError, SystemExit, subprocess.SubprocessError) as exc:
+            self.block_profile(target, 'advisor ' + sheet['action'] + ' failed: ' + str(exc))
+
+    def rescue_message(self, task_id, state, slot):
+        """The original instruction of a task, in the same envelope the supervisor's dispatch had."""
+        t = self.task()
+        if state is not None:
+            row = state['tasks'][task_id]
+            return row.get('message') or self.contract_message(t.get('id', ''), row)
+        instruction = self.escalation_item(task_id, None)[1]
+        return ('[Supervisor instruction ' + t.get('id', '') + '] [' + task_id + '] ' + instruction
+                + '\nShared output directory: ' + str(self.workspace()) + ' (write only inside your own '
+                'subdirectory ' + slot + '/). Reply in the AGENTS.md format when done.')
+
+    def rescue_respawn(self, name, task_id, sheet, opt, registry, state):
+        """Same slot, next generation: the old one writes the three-section handoff, the successor starts
+        with the new sheet (finish_rotation), reads the note, returns READY, then gets the task again."""
+        launch = None
+        if advisor.fingerprint(opt['cli'], sheet['model'], sheet.get('effort')) != opt['current']:
+            launch = self.advice_launch(opt['cli'], sheet, opt['cards'], registry)
+            self.preflight_profile(launch)  # Phase 5: dependencies first, never a fallback CLI
+        text = (self.rescue_message(task_id, state, name) + '\n[advisor] 上一代已做：见交接单；本代领域：'
+                + (', '.join(sheet['domains']) or '无') + '。')
+        if state is not None:
+            row = state['tasks'][task_id]
+            row.update(status='running', attempts=row.get('attempts', 0) + 1, reason='advisor respawn')
+            self.contract_queue(state, name, text, task_id)  # queued behind the handoff, delivered after READY
+            self.save_contract(state)
+        else:
+            self.queue(name, text)
+        self.setf(name, advice_domains=json.dumps(sheet['domains'], ensure_ascii=False),
+                  rescue_hint=sheet.get('handoff_hint', ''), rescue_relay=1,
+                  rescue_launch=profile_launch.encode_launch(launch) if launch else '')
+        self.record_advice(name, sheet, 'respawn')
+        used, window = self.usage(name)
+        self.start_rotation(name, used, window, prompt=handoff.RESCUE_PROMPT)
+
+    def rescue_reassign(self, name, task_id, sheet, opt, registry, state):
+        """Take the task back from the stuck worker and start the target slot per the sheet; the
+        supervisor re-dispatches (dispatch stays with the supervisor). The old worker gets no handoff."""
+        to, t = sheet['to'], self.task()
+        if state is not None:
+            row = state['tasks'][task_id]
+            row.update(status='running', attempts=row.get('attempts', 0) + 1,
+                       reason='reassigned by the advisor: ' + self.label(name) + ' -> ' + self.label(to)
+                       + '; waits for the supervisor to dispatch it again')
+            self.contract_log('task.reassigned', task=task_id, by='advisor', frm=name, to=to)
+            self.save_contract(state)
+        else:
+            items = json.loads(self.r.get(ITEMS) or '{}')
+            items.setdefault(task_id, {})['to'] = ''
+            self.r.set(ITEMS, json.dumps(items, ensure_ascii=False))
+        shown = sheet['model'] + ('/' + sheet['effort'] if sheet.get('effort') else '')
+
+        def note():  # after a switch the slot's label is the new generation's
+            return ('[advisor] ' + task_id + ' → ' + self.label(to) + ' (' + shown + ', domains: ['
+                    + ', '.join(sheet['domains']) + '])：reassign，' + self.label(name) + ' 不再负责 ' + task_id
+                    + '；请重新 dispatch ' + task_id + ' 给 ' + self.label(to) + '（' + sheet['reason'] + '）'
+                    + '\nReply with the JSON format from AGENTS.md.')
+        # The re-dispatch of this task to `to` uses this sheet instead of a second consultation.
+        self.setf(to, advice_preset=json.dumps({'task': task_id, 'run_task': t.get('id', ''), 'sheet': sheet},
+                                               ensure_ascii=False))
+        info = self.agent(to)
+        held = info.get('advice_hold') == '1' and info.get('state') == 'starting'
+        if not held and advisor.fingerprint(opt['cli'], sheet['model'], sheet.get('effort')) != opt['current']:
+            launch = self.advice_launch(opt['cli'], sheet, opt['cards'], registry)
+            self.setf(to, advice_domains=json.dumps(sheet['domains'], ensure_ascii=False))
+            self.record_advice(to, sheet, 'respawn')
+            self.switch_profile(to, launch)  # Phase 5 idle switch; the note goes out after its READY
+            if self.agent(to).get('state') == 'starting':
+                self.setf(to, rescue_note=note())
+            elif self.task().get('status') == 'running':  # switch deferred (codex subagents): tell the supervisor now
+                self.queue('supervisor', note())
+            return
+        self.r.hset(ADVICE + sheet['ticket'], mapping={'effect': 'reassign'})
+        self.queue('supervisor', note())  # held slot: released by the re-dispatch with this sheet
+
     def send(self, name, pane, text):
         """Codex accepts verbatim paste; Claude and Pi use a file pointer with a delivery id."""
         if self.v2:
@@ -3000,7 +3418,7 @@ class Fleet:
         return self.mgr.send_prompt_to_idle(pane, first + ' -- the full message is in ' + str(msg)
                                             + ' . Read that whole file first and follow it.')
 
-    def start_rotation(self, name, used, window):
+    def start_rotation(self, name, used, window, prompt=None):
         info = self.agent(name)
         hid = uuid.uuid4().hex[:10]
         draft = agent_cwd(self.cfg, name) / '.handoff' / ('draft-' + hid + '.md')
@@ -3010,7 +3428,7 @@ class Fleet:
                   handoff_mtime=draft.stat().st_mtime_ns,
                   handoff_deadline=time.time() + float(self.cfg['handoff_timeout']))
         self.log('rotate.start', agent=name, used=used, window=window, generation=info.get('generation'))
-        prompt = (handoff.DUMP_PROMPT.format(path=draft, used=used, window=window)
+        prompt = ((prompt or handoff.DUMP_PROMPT).format(path=draft, used=used, window=window)
                   + ' This is a same-task handoff: do not open windows, do not continue the task itself.')
         if self.v2:
             self.v2.offer_handoff(name, prompt)
@@ -3056,6 +3474,8 @@ class Fleet:
                 source = 'skeleton'
         if source == 'skeleton':
             out.write_text(base)  # never fail a rotation because the model did not write
+        if info.get('rescue_hint'):  # advisor rescue: its handoff_hint goes after the merge, never dropped
+            out.write_text(handoff.add_next_step(out.read_text(), info['rescue_hint']))
         old = info['pane']
         snapshot = out.with_suffix('.terminal.txt')
         self.mgr.capture_to(old, str(snapshot))
@@ -3068,6 +3488,8 @@ class Fleet:
             self.r.hset(NAMES, mapping={label: name})  # old names keep routing to this slot
         history.record(self.run_dir, slot=name, label=prev, generation=generation, handoff=str(out),
                        snapshot=str(snapshot), source=source, timed_out=timed_out)
+        if info.get('rescue_launch'):  # advisor rescue respawn: the successor starts with the new sheet's runtime
+            self.setf(name, runtime_launch=info['rescue_launch'], rescue_launch='')
         new = self.spawn(name, '[Same-task takeover] You are ' + label + ' (taking over from ' + prev
                          + '). Read the handoff note ' + str(out) + ' and continue from it. In this turn only read '
                          'the note, do no task work, and make your final reply exactly READY.',
@@ -3085,6 +3507,9 @@ class Fleet:
         self.refresh_history()
         self.log('rotate.done', agent=name, label=label, prev=prev, generation=generation + 1,
                  handoff=str(out), source=source, timed_out=timed_out)
+        if info.get('rescue_relay'):
+            self.setf(name, rescue_relay='', rescue_hint='')
+            self.r.rpush(ADVICE_NOTES, '[advisor] respawn ' + prev + ' → ' + label + ' done')
 
     def refresh_history(self):
         history.write_page(self.run_dir, self.history_slots(), self.history_links())
@@ -3092,10 +3517,10 @@ class Fleet:
         if pane:
             self.mgr.reload_browser(pane)
 
-    # -- hot roster (start --roster)
+    # -- hot roster (start --roster, or <run>/roster.yaml written by the advisor switch)
     def roster_tick(self):
-        path = night.roster_for(self.cfg)
-        if not path:
+        path = roster_file(self.cfg)
+        if not self.cfg.get('roster') and not path.exists():
             return
         self.night_tick(path)
         if path != self.roster_followed:  # night on/off: follow the other file from now on
@@ -3180,6 +3605,8 @@ class Fleet:
         if adds or roles != old_roles or profiles != old_profiles:
             # Hooks and bridges check membership in the config file: write it before spawning.
             self.persist_roster()
+        # Before the adds: a worker added together with `advisor: on` is spawned advised (held for its sheet).
+        self.set_advisor(roster.advisor(raw), 'user')  # no-op when equal (e.g. the supervisor's own write)
         for name in adds:
             results[name] = self.add_worker(name)
         if adds or any(n not in workers for n in before) or any(n not in before for n in workers):
@@ -3929,11 +4356,17 @@ def resume(run, args):
         except (OSError, ValueError) as exc:
             raise SystemExit('--roster ' + str(roster_path) + ' rejected:\n' + str(exc)) from exc
         cfg['roster'] = str(roster_path)
-    if getattr(args, 'advisor', False) and args.worker_kit:
+    if getattr(args, 'advisor', False):  # sugar: writes `advisor: on` into this run's roster (§2.1)
+        if cfg.get('worker_kit'):
+            try:
+                kitmod.Kit(cfg['worker_kit'])  # refuse a bad kit before provisioning, like a bad roster
+            except (OSError, ValueError) as exc:
+                raise SystemExit('--worker-kit rejected: ' + str(exc)) from exc
         try:
-            kitmod.Kit(args.worker_kit)  # refuse a bad kit before provisioning, like a bad roster
+            for path in advisor_rosters(cfg):
+                roster.write_advisor(path, True, cfg['workers'])
         except (OSError, ValueError) as exc:
-            raise SystemExit('--worker-kit rejected: ' + str(exc)) from exc
+            raise SystemExit('--advisor: roster not written: ' + str(exc)) from exc
     if not cmux_available():
         raise SystemExit('run this inside a cmux terminal: cmux only accepts processes started in its windows')
     try:
@@ -4165,8 +4598,13 @@ def start(args):
            'transport_version': args.transport_version, 'allow_development_v2': args.allow_development_v2,
            'max_attempts': args.max_attempts or DEFAULTS['max_attempts'], 'token': token,
            'initiator': initiator}
-    if getattr(args, 'advisor', False):
-        cfg['advisor'] = True
+    if getattr(args, 'advisor', False):  # sugar: the switch lives in the roster, never in config.json (§2.1)
+        try:
+            for path in advisor_rosters({'run': str(run), 'roster': roster_path and str(roster_path),
+                                         'roster_night': night_path and str(night_path)}):
+                roster.write_advisor(path, True, workers)
+        except (OSError, ValueError) as exc:
+            raise SystemExit('--advisor: roster not written: ' + str(exc)) from exc
     if getattr(args, 'name', None):
         cfg.update(name=args.name.strip(), **titles)
     if roster_path:
@@ -4206,6 +4644,22 @@ def night_cmd(cfg, state):
     except (OSError, ValueError) as exc:
         raise SystemExit('night ' + state + ' refused, nothing changed:\n' + str(exc)) from exc
     return dict(night.write_state(run, state == 'on'), roster=cfg['roster_night' if state == 'on' else 'roster'])
+
+
+def advisor_switch(cfg, on):
+    """`fleet advisor on|off`: only edits the run's roster; the daemon's roster_tick applies it."""
+    run_cfg = load(Path(cfg['run']) / 'config.json')
+    if on and run_cfg.get('worker_kit'):
+        try:
+            kitmod.Kit(run_cfg['worker_kit'])
+        except (OSError, ValueError) as exc:
+            raise SystemExit('--worker-kit rejected: ' + str(exc)) from exc
+    try:
+        paths = [roster.write_advisor(path, on, run_cfg['workers']) for path in advisor_rosters(run_cfg)]
+    except (OSError, ValueError) as exc:
+        raise SystemExit('roster not changed: ' + str(exc)) from exc
+    return ('advisor ' + ('on' if on else 'off') + ' written to ' + ', '.join(map(str, paths))
+            + '; the daemon applies it on its next tick')
 
 
 def request(cfg, event, wait=30):
@@ -4320,8 +4774,10 @@ def main(argv=None):
                    help='allow task apply_profiles_live=true to respawn idle workers for assigned profiles')
     s.add_argument('--worker-model', default=DEFAULTS['worker_model'], help='claude workers: --model value')
     s.add_argument('--advisor', action='store_true',
-                   help='consult the advisor (official Claude CLI, fable/high) before every dispatch; it picks the '
-                        'worker model / effort / domains and authorizes the respawns its sheets need')
+                   help='start with the advisor online: only writes "advisor: on" into the roster (--roster, else '
+                        '<run>/roster.yaml). Online, the advisor (official Claude CLI, fable/high) is consulted before '
+                        'every dispatch, picks worker model / effort / domains and authorizes the respawns its sheets '
+                        'need. Default off; turn it on / off while running with `advisor on|off`')
     s.add_argument('--worker-kit', help='claude workers: dir with .claude/{agents,skills} and mcp.json copied into each worker cwd')
     s.add_argument('--claude', help='claude binary (default: first on PATH)')
     s.add_argument('--claude-window', type=int, default=DEFAULTS['claude_window'], help='claude models not in the built-in 1M list ([1m]/opus/fable/sonnet): context window (§22)')
@@ -4400,6 +4856,10 @@ def main(argv=None):
         sp.add_argument('--config', default=str(LATEST))
     sp.add_argument('--raise', dest='raise_', action='append', metavar='LIMIT=VALUE',
                     help='after a budget pause: raise a budget line (e.g. max_calls=400); repeatable')
+    av = sub.add_parser('advisor', help='turn the advisor on / off for a run: edits its roster (--roster, else '
+                                        '<run>/roster.yaml); the daemon applies it without a restart')
+    av.add_argument('state', choices=('on', 'off'))
+    av.add_argument('--config', default=str(LATEST))
     ls = sub.add_parser('logs', help='read-only v2 audit timeline/details')
     ls.add_argument('--config', default=str(LATEST))
     for field in ('request', 'slot', 'event', 'level'):
@@ -4479,6 +4939,8 @@ def main(argv=None):
             status(cfg)
         elif args.cmd == 'night':
             print(json.dumps(night_cmd(cfg, args.state), ensure_ascii=False))
+        elif args.cmd == 'advisor':
+            print(advisor_switch(cfg, args.state == 'on'))
         elif args.cmd == 'subfleet':
             print(json.dumps(subfleet.cli_spawn(cfg, args), ensure_ascii=False))
         elif args.cmd == 'chrome':
