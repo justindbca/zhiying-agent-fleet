@@ -208,7 +208,7 @@ def test_aof_restart_resumes_task_redoes_only_the_lost_dispatch_and_writes_resul
     assert [(a['path'], a['problems']) for a in out['artifacts']] == [('worker-1/a.md', []), ('worker-2/b.md', [])]
 
 
-def test_alive_worker_pane_is_reattached_not_respawned(task_run):
+def test_resume_reattaches_idle_hook_worker_and_replaces_in_flight_one(task_run):
     state = task_run
     half_done(state)
     mgr = state['mgr']
