@@ -8,5 +8,6 @@
     "planning"
   ],
   "role_file": "worker.md",
-  "model": "sonnet"
+  "model": "sonnet",
+  "model_card": "sonnet"
 }

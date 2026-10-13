@@ -8,5 +8,6 @@
     "planning"
   ],
   "role_file": "worker.md",
-  "model": "haiku"
+  "model": "haiku",
+  "model_card": "haiku"
 }

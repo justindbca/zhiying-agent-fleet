@@ -15,7 +15,8 @@ SEVEN = ['astra', 'fable', 'flashnext', 'haiku', 'opus', 'sol', 'sonnet']
 def test_default_registry_has_seven_model_cards_and_the_same_four_profiles():
     registry = AgentRegistry()
     assert [m.id for m in registry.models] == SEVEN
-    assert [c.id for c in registry] == ['claude-coder', 'claude-reviewer', 'flashnext-coder', 'researcher']
+    assert [c.id for c in registry] == ['claude-coder', 'claude-fable', 'claude-haiku', 'claude-opus', 'claude-reviewer',
+                                        'claude-sonnet', 'flashnext-coder', 'researcher']  # + four advisor launch cards
     for model in registry.models:
         assert model.judgement and model.quota_pool and model.roles_allowed and model.evidence
         assert model.night_ok is not None and model.measured is None  # measured: bookkeeper fills it

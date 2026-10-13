@@ -8,5 +8,6 @@
     "planning"
   ],
   "role_file": "worker.md",
-  "model": "opus"
+  "model": "opus",
+  "model_card": "opus"
 }

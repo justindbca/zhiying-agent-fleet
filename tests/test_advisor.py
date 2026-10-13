@@ -557,7 +557,7 @@ def fake_start(monkeypatch, tmp_path):
     monkeypatch.setattr(fleet, 'start_redis', lambda cfg: None)
     monkeypatch.setattr(fleet, 'prepare_codex_home', lambda home, profiles: None)
     monkeypatch.setattr(fleet, 'LATEST', tmp_path / 'latest.json')
-    return ['start', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--allow-development-v2',
+    return ['start', '--lifecycle', 'dev_task', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--allow-development-v2',
             '--runs-dir', str(tmp_path / 'runs'), '--codex-home', str(tmp_path / 'codex-home')]
 
 

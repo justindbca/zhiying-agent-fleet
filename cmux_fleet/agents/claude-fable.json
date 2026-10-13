@@ -8,5 +8,6 @@
     "planning"
   ],
   "role_file": "worker.md",
-  "model": "fable"
+  "model": "fable",
+  "model_card": "fable"
 }

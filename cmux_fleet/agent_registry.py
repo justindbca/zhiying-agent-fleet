@@ -18,6 +18,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 CARD_SUFFIXES = (".json", ".yaml", ".yml")
 MODELS_SUBDIR = "models"
+# Data files kept beside the model cards that are not model cards (advisor capability matrix).
+MODELS_NON_CARDS = ("capability_matrix.yaml",)
 JUDGEMENTS = ("high", "mid", "low-mid", "low")
 LIST_FIELDS = ("hosts", "domains", "roles_allowed", "roles_denied", "unverified")
 # Assessment fields shared by model cards and profile cards (profile value wins).
@@ -317,6 +319,8 @@ class AgentRegistry:
         if not directory.is_dir():
             return models
         for path in cls._paths(directory):
+            if path.name in MODELS_NON_CARDS:
+                continue
             model = _model_from_data(_read_card(path), path)
             if model.id in models:
                 raise AgentRegistryError("duplicate model card id %s in %s" % (model.id, directory))
