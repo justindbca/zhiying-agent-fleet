@@ -212,4 +212,6 @@ def test_a_failing_copy_still_returns_the_pane_and_fails_the_subfleet(tree):
     f.tick()
     rec = subfleet.record(rec['run'])
     assert rec['state'] == 'failed' and 'missing or empty' in rec['reason']
-    assert f.agent('worker-1')['state'] == 'starting' and f.agent('worker-1')['pane'] == rec['pane']
+    # the pane still comes back (hook-channel worker: as its next generation, never typed into)
+    assert f.agent('worker-1')['state'] == 'starting' and f.agent('worker-1')['generation'] == '1'
+    assert f.agent('worker-1')['pane'] != rec['pane'] and rec['pane'] not in t.world.alive

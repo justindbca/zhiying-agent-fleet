@@ -899,3 +899,214 @@ def test_delegated_slot_hook_lets_go_and_takes_nothing(hooked):
     f.setf('worker-1', state='delegated')
     assert step(f, lambda: not hook.alive(), timeout=15), 'the hook kept the delegated pane busy'
     assert hook.decision() is None
+
+
+# ------------------------------------------------------------------ R1-02: operator lines while the hook waits
+# Row shapes measured on Claude Code 2.1.280 (worker-1/evidence/manual_input/run_*/transcript.jsonl):
+# Enter writes {"type":"queue-operation","operation":"enqueue","content":<line>} at once (<0.5 s);
+# the line starts its own turn with a content-less "dequeue" and a plain user row
+# (origin.kind=human, promptSource=queued); absorbed into a running tool turn it is a "remove"
+# (reason absorbed_mid_turn) plus a queued_command attachment. <task-notification> entries are
+# rewakes / background tasks, never an operator.
+YIELD_WITHIN = 12  # one hook POLL (5 s) plus margin
+
+
+def queue_op(f, hook, operation, content=None, **extra):
+    row = dict({'type': 'queue-operation', 'operation': operation, 'sessionId': hook.session}, **extra)
+    if content is not None:
+        row['content'] = content
+    append(hook.transcript, [row])
+
+
+def operator_turn(f, slot, line, answer):
+    """Claude runs the queued operator line as its own turn, then its Stop hook fires."""
+    thread = thread_of(f, slot, int(f.agent(slot)['generation']))
+    append(transcript_of(f, slot, thread), [
+        {'type': 'queue-operation', 'operation': 'dequeue', 'sessionId': thread},
+        {'type': 'user', 'origin': {'kind': 'human'}, 'promptSource': 'queued', 'promptId': 'p-' + uuid.uuid4().hex[:8],
+         'message': {'role': 'user', 'content': line}}])
+    return stop(f, slot, answer, active=False)
+
+
+def mailbox_len(f, slot='worker-1'):
+    return f.r.llen(f.v2.bus.prefix + ':hook:' + slot + ':g' + f.agent(slot)['generation'] + ':mailbox')
+
+
+def test_operator_line_queued_while_idle_makes_the_hook_yield(hooked):
+    f = hooked
+    hook = f.test_ready['worker-1']
+    queue_op(f, hook, 'enqueue', 'Reply with exactly HUMAN1')
+    assert step(f, lambda: not hook.alive(), timeout=YIELD_WITHIN), 'the hook kept the operator line queued'
+    assert hook.decision() is None, 'yielding must not hand anything over'
+    assert mailbox_len(f) == 0 and reports(f) == 0
+    # the operator's own turn settles nothing and the next Stop hook waits again
+    again = operator_turn(f, 'worker-1', 'Reply with exactly HUMAN1', 'HUMAN1')
+    step(f, lambda: False, timeout=3)
+    assert again.alive(), 'after the operator turn the hook must wait for deliveries again'
+    assert any(e.get('event') in ('turn.ignored', 'turn.unsolicited') for e in audit(f, 'worker-1'))
+    assert reports(f) == 0
+    # business is neither lost nor duplicated
+    dispatch(f, ['worker-1'])
+    got = delivered(f, again)
+    assert 'Write worker-1/part.md' in got['reason']
+    env = f.v2.bus.slot_state('worker-1')
+    stop(f, 'worker-1', REPORT.format(name='part.md'))
+    assert step(f, lambda: status_of(f, env) == 'committed') and step(f, lambda: reports(f) == 1)
+    assert typed_any(f, 'worker-1') == []
+
+
+def test_task_notification_in_the_queue_is_not_an_operator(hooked):
+    f = hooked
+    hook = f.test_ready['worker-1']
+    queue_op(f, hook, 'enqueue', '<task-notification>\n<summary>Background command finished</summary>\n</task-notification>')
+    step(f, lambda: False, timeout=YIELD_WITHIN)
+    assert hook.alive(), 'a background-task notification made the hook yield'
+    dispatch(f, ['worker-1'])
+    assert 'Write worker-1/part.md' in delivered(f, hook)['reason']
+
+
+def test_operator_line_absorbed_mid_turn_does_not_make_the_hook_yield(hooked):
+    f = hooked
+    got, env = handed(f)
+    hook = f.test_ready['worker-1']
+    # typed while the delivery turn runs a tool: Claude Code absorbs it into that turn
+    queue_op(f, hook, 'enqueue', 'Reply with exactly HUMAN2')
+    queue_op(f, hook, 'remove', 'Reply with exactly HUMAN2', reason='absorbed_mid_turn')
+    append(hook.transcript, [{'type': 'attachment', 'attachment': {'type': 'queued_command', 'prompt': 'Reply with exactly HUMAN2',
+                                                                    'origin': {'kind': 'human'}, 'humanTurn': True}}])
+    waiting = stop(f, 'worker-1', REPORT.format(name='part.md'))
+    # the delivery turn settles as before (R2-02, Claude Code's own behaviour) and nothing is pending:
+    # the injected line is part of that turn, never a separate operator turn
+    assert step(f, lambda: status_of(f, env) == 'committed')
+    assert step(f, lambda: reports(f) == 1)
+    step(f, lambda: False, timeout=YIELD_WITHIN)
+    assert waiting.alive(), 'a balanced (removed) operator entry made the hook yield'
+    assert not any(e.get('event') in ('turn.ignored', 'turn.unsolicited') for e in audit(f, 'worker-1')
+                   if e.get('error') != 'no received delivery (manual or duplicate turn)'), \
+        'the injected line was treated as its own operator turn'
+
+
+def test_line_queued_during_a_delivery_turn_settles_it_then_yields_and_loses_nothing(hooked):
+    f = hooked
+    got, env1 = handed(f)
+    hook = f.test_ready['worker-1']
+    # typed while the delivery turn generates text: stays queued until the turn ends (no dequeue yet)
+    queue_op(f, hook, 'enqueue', 'Reply with exactly HUMAN3')
+    after = stop(f, 'worker-1', REPORT.format(name='part.md'))
+    assert step(f, lambda: status_of(f, env1) == 'committed'), 'the delivery turn must still settle first'
+    assert step(f, lambda: not after.alive(), timeout=YIELD_WITHIN), 'the hook did not yield to the queued line'
+    assert after.decision() is None
+    # a delivery arriving while the operator turn runs waits in the mailbox: not typed, not lost
+    dispatch(f, ['worker-1'], what='second.md')
+    step(f, lambda: False, timeout=2)
+    assert typed_any(f, 'worker-1') == [] and mailbox_len(f) == 1
+    env2 = f.v2.bus.slot_state('worker-1')
+    again = operator_turn(f, 'worker-1', 'Reply with exactly HUMAN3', 'HUMAN3')
+    got = delivered(f, again)
+    assert 'second.md' in got['reason']
+    assert mailbox_len(f) == 0
+    stop(f, 'worker-1', REPORT.format(name='second.md'))
+    assert step(f, lambda: status_of(f, env2) == 'committed')
+    assert step(f, lambda: reports(f) == 2) and reports(f) == 2, 'a delivery was lost or reported twice'
+    assert typed_any(f, 'worker-1') == []
+
+
+def test_rewake_keeps_off_the_mailbox_during_the_operator_turn(hooked):
+    f = hooked
+    hook = f.test_ready['worker-1']
+    entry, proc = rewake(f, 'worker-1')
+    try:
+        queue_op(f, hook, 'enqueue', 'Reply with exactly HUMAN4')
+        assert step(f, lambda: not hook.alive(), timeout=YIELD_WITHIN)
+        dispatch(f, ['worker-1'])
+        step(f, lambda: proc.poll() is not None, timeout=25)  # longer than claude_hook.GRACE
+        assert proc.poll() != 2, 'the rewake took the delivery into the operator turn'
+        assert mailbox_len(f) == 1 and typed_any(f, 'worker-1') == []
+        again = operator_turn(f, 'worker-1', 'Reply with exactly HUMAN4', 'HUMAN4')
+        assert 'Write worker-1/part.md' in delivered(f, again)['reason']
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_an_operator_entry_never_dequeued_makes_the_hook_yield_only_once(hooked):
+    f = hooked
+    hook = f.test_ready['worker-1']
+    queue_op(f, hook, 'enqueue', 'Reply with exactly HUMAN5')
+    assert step(f, lambda: not hook.alive(), timeout=YIELD_WITHIN)
+    # the queued row is never dequeued (e.g. Claude Code crashed mid-write); the next Stop must not
+    # yield to the same row again, or the channel would never re-arm
+    again = stop(f, 'worker-1', 'idle', active=False)
+    step(f, lambda: False, timeout=YIELD_WITHIN)
+    assert again.alive(), 'the hook yielded twice to the same queued row'
+    dispatch(f, ['worker-1'])
+    assert 'Write worker-1/part.md' in delivered(f, again)['reason']
+
+
+def test_operator_retyping_the_delivery_verbatim_is_not_the_delivery(hooked):
+    # R2-01 (review round 2): settlement must look at where the latest start input came from (hook
+    # feedback / rewake vs a typed row), not only at its text. Failed on 9df19c2c (verbatim retype settled).
+    f = hooked
+    got, env = handed(f)
+    # the delivery turn is interrupted (Escape kills the waiting hook; no Stop for that turn) ...
+    f.mgr.send_key(f.agent('worker-1')['pane'], 'Escape')
+    # ... and the operator then resends the same instruction by hand: a plain user row, not hook feedback
+    manual = stop(f, 'worker-1', REPORT.format(name='part.md'), active=False, user_prompt=got['reason'])
+    step(f, lambda: status_of(f, env) == 'committed', timeout=5)
+    assert status_of(f, env) != 'committed', 'an operator-typed row settled the hook delivery'
+    manual.kill()
+
+
+def test_line_queued_before_the_ready_hook_starts_makes_it_yield_at_once(hooked):
+    f = hooked
+    f.test_ready['worker-2'].kill()
+    # the operator typed while the READY turn was still running: the enqueue row is already there
+    # when that turn's Stop hook starts (measured scenario C, worker-1/manual-input-measurement.md)
+    thread = thread_of(f, 'worker-2', 0)
+    append(transcript_of(f, 'worker-2', thread), [
+        {'type': 'queue-operation', 'operation': 'enqueue', 'sessionId': thread, 'content': 'Reply with exactly EARLY'}])
+    hook = stop(f, 'worker-2', 'READY', active=False)
+    assert step(f, lambda: not hook.alive(), timeout=YIELD_WITHIN), 'a line queued before the wait was not seen'
+    assert hook.decision() is None
+
+
+def test_dequeue_without_content_balances_fifo_and_the_second_line_still_runs(hooked):
+    f = hooked
+    hook = f.test_ready['worker-1']
+    queue_op(f, hook, 'enqueue', 'Reply with exactly FIRST')
+    queue_op(f, hook, 'enqueue', 'Reply with exactly SECOND')
+    assert step(f, lambda: not hook.alive(), timeout=YIELD_WITHIN)
+    # Claude Code runs the oldest line: one content-less dequeue pops FIRST (FIFO), SECOND stays queued
+    after_first = operator_turn(f, 'worker-1', 'Reply with exactly FIRST', 'FIRST')
+    assert step(f, lambda: not after_first.alive(), timeout=YIELD_WITHIN), \
+        'SECOND is still queued, but the hook did not yield to it (starved until the next delivery)'
+    after_second = operator_turn(f, 'worker-1', 'Reply with exactly SECOND', 'SECOND')
+    step(f, lambda: False, timeout=YIELD_WITHIN)
+    assert after_second.alive(), 'nothing is queued any more: the hook must wait for deliveries'
+
+
+def test_remove_matches_by_content_and_leaves_the_other_line_queued(hooked):
+    f = hooked
+    got, env = handed(f)
+    hook = f.test_ready['worker-1']
+    queue_op(f, hook, 'enqueue', 'Reply with exactly KEEP')
+    queue_op(f, hook, 'enqueue', 'Reply with exactly ABSORBED')
+    # only the second (not the oldest) line is absorbed into the running tool turn
+    queue_op(f, hook, 'remove', 'Reply with exactly ABSORBED', reason='absorbed_mid_turn')
+    after = stop(f, 'worker-1', REPORT.format(name='part.md'))
+    assert step(f, lambda: status_of(f, env) == 'committed')
+    assert step(f, lambda: not after.alive(), timeout=YIELD_WITHIN), 'KEEP is still queued but the hook did not yield'
+    again = operator_turn(f, 'worker-1', 'Reply with exactly KEEP', 'KEEP')
+    step(f, lambda: False, timeout=YIELD_WITHIN)
+    assert again.alive()
+
+
+def test_notification_ahead_of_an_operator_line_is_skipped_but_the_line_is_not(hooked):
+    f = hooked
+    hook = f.test_ready['worker-1']
+    queue_op(f, hook, 'enqueue', '<task-notification>\n<summary>Stop hook feedback</summary>\n</task-notification>')
+    step(f, lambda: False, timeout=YIELD_WITHIN)
+    assert hook.alive(), 'a notification alone made the hook yield'
+    queue_op(f, hook, 'enqueue', 'Reply with exactly AFTER-NOTE')
+    assert step(f, lambda: not hook.alive(), timeout=YIELD_WITHIN), 'the operator line behind a notification was missed'
+    assert hook.decision() is None

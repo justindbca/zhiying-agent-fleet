@@ -54,11 +54,18 @@ def _take(r, cfg, slot, generation, thread, k):
             return text
 
 
-def next_delivery(cfg, name, generation, thread, deadline):
-    """Replacement for fleet.claude_hook_next: hand over what is queued, else stay armed."""
+def next_delivery(cfg, name, generation, thread, deadline, transcript=''):
+    """Replacement for fleet.claude_hook_next: hand over what is queued, else stay armed.
+
+    Like the real wait, it first yields (takes nothing, stays unarmed) to an operator line queued in
+    this session's transcript (claude_hook.OperatorQueue / yielding)."""
     r = fleet.connect(cfg)
     try:
         k = fleet.hook_keys(cfg, r, name, generation)
+        queue = claude_hook.OperatorQueue(transcript) if transcript else None
+        if queue is not None and claude_hook.yielding(r, k, thread, queue):
+            _armed.pop(k['mailbox'], None)
+            return None
         text = _take(r, cfg, name, generation, thread, k)
         if text:
             return claude_hook.block(text)

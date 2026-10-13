@@ -316,7 +316,8 @@ def claude_stop(cfg_path, name, generation, raw):
                      inputs=claude_user_prompts(data.get('transcript_path', '')))
         except Exception as exc:  # still arm the channel: the daemon holds/expires the lease itself
             print('fleet claude-stop: turn not reported: ' + str(exc)[:300], file=sys.stderr)
-        return claude_hook_next(cfg, name, int(generation), data.get('session_id'), deadline)
+        return claude_hook_next(cfg, name, int(generation), data.get('session_id'), deadline,
+                                transcript=data.get('transcript_path', ''))
     # Which delivery this turn answers: the last user message in the transcript that points at an
     # .inbox/msg-*.md file. User messages are written when the turn starts, so they are present even
     # when the final assistant message has not been flushed yet.
@@ -335,14 +336,16 @@ def claude_stop(cfg_path, name, generation, raw):
     # message. The daemon drops a turn for a claude worker that is already idle (see on_turn).
     if hooked and claude_hook_keepalive(cfg, r, name, int(generation), data.get('session_id')):
         r.close()
-        return claude_hook_next(cfg, name, int(generation), data.get('session_id'), deadline)
+        return claude_hook_next(cfg, name, int(generation), data.get('session_id'), deadline,
+                                transcript=data.get('transcript_path', ''))
     r.rpush(EVENTS, json.dumps({'kind': 'turn', 'agent': name, 'generation': int(generation),
                                 'thread': data.get('session_id'), 'transcript': data.get('transcript_path', ''),
                                 'msg_id': msg_id, 'text': text, 'at': time.time()}, ensure_ascii=False))
     if not hooked:
         return True
     r.close()
-    return claude_hook_next(cfg, name, int(generation), data.get('session_id'), deadline)
+    return claude_hook_next(cfg, name, int(generation), data.get('session_id'), deadline,
+                            transcript=data.get('transcript_path', ''))
 
 
 def hook_keys(cfg, r, name, generation):
@@ -438,10 +441,15 @@ def hook_on_sigterm():
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
 
-def claude_hook_next(cfg, name, generation, thread, deadline):
-    """Wait for this generation's next delivery; the block decision for it, or None (let Claude idle)."""
+def claude_hook_next(cfg, name, generation, thread, deadline, transcript=''):
+    """Wait for this generation's next delivery; the block decision for it, or None (let Claude idle).
+
+    None also when the operator typed into the pane meanwhile (``transcript``: claude_hook.OperatorQueue):
+    the hook yields so that line runs now instead of after the next delivery or the keepalive.
+    """
     import redis
     hook_on_sigterm()
+    queue = claude_hook.OperatorQueue(transcript) if transcript else None
     parent = os.getppid()  # Claude Code (or its hook shell): once it is gone, nobody reads our answer
     while time.monotonic() < deadline and parent != 1:
         try:
@@ -451,7 +459,7 @@ def claude_hook_next(cfg, name, generation, thread, deadline):
             continue
         try:
             k, alive, accept = hook_session(cfg, r, name, generation, thread, parent)
-            text, _ = claude_hook.wait(r, k, generation, thread, deadline, alive, accept)
+            text, _ = claude_hook.wait(r, k, generation, thread, deadline, alive, accept, queue=queue)
             if text:
                 return claude_hook.block(text)
             if time.monotonic() < deadline or not alive():
@@ -482,7 +490,10 @@ def hook_mark_stopping(cfg, name, generation):
 
 
 def claude_rewake(cfg_path, name, generation, raw):
-    """asyncRewake Stop hook: the fallback when no Stop hook waits (Escape, a hook timeout, StopFailure).
+    """asyncRewake Stop hook: the fallback when no Stop hook waits (Escape, a killed hook at its timeout).
+
+    It never recovers a StopFailure (API error) turn: that delivery was already taken from the mailbox,
+    so it goes the watchdog's stall / frozen path (claude_stop_failure).
 
     Runs in the background at every Stop. Only the newest one per slot acts: if this generation's
     mailbox holds an entry while neither a waiting nor a settling Stop hook exists for
@@ -954,8 +965,14 @@ def notify(cfg_path, name, generation, payload, sessions=None):
     return True
 
 
+class Prompt(str):
+    """A transcript prompt with where it came from: ``hook`` (a Stop-hook feedback or rewake row, i.e. a
+    hook-channel delivery) or ``user`` (typed / CLI argument). Plain strings count as ``hook``."""
+    origin = 'hook'
+
+
 def claude_user_prompts(path, count=3):
-    """Last real user prompts of a Claude transcript (not tool results, meta or sidechains).
+    """Last real user prompts of a Claude transcript (not tool results, meta or sidechains), as ``Prompt``.
 
     Scan the whole file like the v1 pointer scan: tool output after the prompt can be
     megabytes, so a tail read would lose the prompt and silently drop the settlement.
@@ -972,19 +989,21 @@ def claude_user_prompts(path, count=3):
                     continue
                 if row.get('type') != 'user' or row.get('isSidechain'):
                     continue
-                content = (row.get('message') or {}).get('content')
+                content, origin = (row.get('message') or {}).get('content'), 'user'
                 if (row.get('origin') or {}).get('kind') == 'task-notification':
                     # A finished background task continues the current turn's work; a hook-channel
                     # rewake (Stop hook feedback notification) is a delivery.
-                    content = claude_hook.rewake_text(content)
+                    content, origin = claude_hook.rewake_text(content), 'hook'
                     if content is None:
                         continue
                 if row.get('isMeta'):  # only a hook-channel delivery (Stop-hook block reason) counts
-                    content = claude_hook.feedback_text(content)
+                    content, origin = claude_hook.feedback_text(content), 'hook'
                 if isinstance(content, list):
                     content = '\n'.join(p.get('text', '') for p in content if isinstance(p, dict) and p.get('type') == 'text')
                 if isinstance(content, str) and content.strip() and not content.startswith('[Request interrupted by user'):
-                    out.append(content)
+                    prompt = Prompt(content)
+                    prompt.origin = origin
+                    out.append(prompt)
     except (OSError, TypeError):
         pass
     return list(out)
@@ -1131,10 +1150,12 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
         def answered(body_text, lease):
             # Hook channel: this session's Stop hook must have handed over this very delivery, and it
             # must be the row that started this turn (its isMeta "Stop hook feedback" row is the latest
-            # prompt, see claude_user_prompts): an older feedback row never settles a manual turn.
+            # prompt, see claude_user_prompts): an older feedback row never settles a manual turn, nor
+            # does an operator line that repeats the delivery text word for word (origin 'user').
             if k is None:
                 return runtime_v2.turn_answers(body_text, inputs)
-            return runtime_v2.turn_answers(body_text, inputs[-1:]) and hook_delivered(r, k, thread, lease)
+            return (bool(inputs) and getattr(inputs[-1], 'origin', 'hook') == 'hook'
+                    and runtime_v2.turn_answers(body_text, inputs[-1:]) and hook_delivered(r, k, thread, lease))
 
         def ignored(reason):
             # §21: a turn no delivery started (a peer SendMessage woke it, or the operator typed):

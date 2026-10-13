@@ -329,7 +329,8 @@ def die(cf):
 
 
 # ------------------------------------------------------------------ acceptance 2 + 3: hand over and back
-def test_worker_pane_becomes_subfleet_supervisor_and_comes_back(tree):
+@pytest.mark.parametrize('path', ['hook', 'typed_fallback'])
+def test_worker_pane_becomes_subfleet_supervisor_and_comes_back(tree, path):
     t, f = tree, tree.f
     sid = f.agent('worker-1')['pane']
     worker_rules = (fleet.agent_cwd(f.cfg, 'worker-1') / 'CLAUDE.md').read_text()
@@ -386,33 +387,70 @@ def test_worker_pane_becomes_subfleet_supervisor_and_comes_back(tree):
     stop_child_like_daemon(cf)
     assert fleet.load(Path(rec['run']) / 'handback.json')['pane'] == sid
     assert sid in t.world.alive  # the adopted pane was released, never killed
+    if path == 'typed_fallback':
+        # the documented non-hook path keeps the typed return (daemon and hooks read the same config)
+        f.cfg['claude_hook_delivery'] = False
+        fleet.save(f.path, dict(fleet.load(f.path), claude_hook_delivery=False))
+    # Baseline BEFORE the return: everything typed / keyed so far (take-over role change included).
+    sent_before, keys_before = list(t.world.sent), list(t.world.keys)
+    gen_before = int(f.agent('worker-1')['generation'])
     subfleet.tick(f)  # parent collects: pane back in place of the placeholder, child tabs closed
     rec = subfleet.record(rec['run'])
     assert rec['state'] == 'returned' and rec['outcome'] == 'completed'
     assert out.read_text() == 'merged findings'  # the parent daemon copied it back before checking
-    assert t.world.owner[sid] == 'cmux-fleet' and rec['placeholder'] not in t.world.alive
+    assert rec['placeholder'] not in t.world.alive
     assert 'cmux-fleet:M0' in t.world.closed and redis_down(child_cfg)
     assert (fleet.agent_cwd(f.cfg, 'worker-1') / 'CLAUDE.md').read_text() == worker_rules
-    info = f.agent('worker-1')
-    assert info['pane'] == sid and info['state'] == 'starting' and not info['delegate_cfg']
-    back = [x for p, x in t.world.sent if p == sid][-1]
-    assert 'worker of the main fleet again' in back
-    assert parent_hook(t, 'READY', back)['status'] == 'ready'  # same generation, same session
-    assert f.agent('worker-1')['state'] == 'idle' and f.agent('worker-1')['generation'] == '0'
-    assert any('[Sub-fleet M0 completed]' in f.v2.bus.message(m)['body']['text']
-               for m in f.v2.bus.pending('supervisor') + [f.v2.bus.slot_state('supervisor').get('message_id') or 'x']
-               if f.v2.bus.message(m))
     assert 'cmux-fleet:M0' not in [p.stem for p in t.world.state_dir.glob('*.json')]
-    # Back in the parent fleet: the next delivery to worker-1 goes through its Stop hook again,
-    # never typed into the returned pane (only the role-change prompts above are typed).
-    typed_before = [x for p, x in t.world.sent if p == sid]
-    f.queue('worker-1', '[Supervisor instruction ' + f.task()['id'] + '] Write worker-1/after.md now')
-    step(t)
-    after = given(t, f, 'worker-1')[-1]
-    assert 'worker-1/after.md' in after and after in hook_sim.handed_to(f, 'worker-1')
-    assert [x for p, x in t.world.sent if p == sid] == typed_before
+    info = f.agent('worker-1')
+    assert not info['delegate_cfg']
+    new_typed = [(p, x) for p, x in t.world.sent[len(sent_before):]]
+    new_keys = [(p, k) for p, k in t.world.keys[len(keys_before):]]
     report = 'Done:\n- wrote after.md\nEvidence:\n- worker-1/after.md\nNot done: none\nBlocked: none'
-    assert parent_hook(t, report, after)['status'] == 'committed'
+    if path == 'hook':
+        # R1-01: a hook-channel Claude worker is never typed into after its launch prompt. The
+        # returned session is retired and the next generation starts from its CLI-argument prompt.
+        panes = {sid, info['pane']}
+        assert info['pane'] != sid and int(info['generation']) == gen_before + 1
+        assert info['state'] == 'starting'
+        assert not [x for p, x in new_typed if p in panes], 'the return typed into a hook worker pane'
+        assert not [k for p, k in new_keys if p in panes and k == 'Enter'], 'Enter was sent to a hook worker pane'
+        assert sid not in t.world.alive or t.world.owner.get(sid) != 'cmux-fleet:M0'
+        # the new generation becomes READY through its own Stop hook, then work reaches it through the hook
+        assert hook(t, f, 'worker-1', 'READY', prompt='startup')['status'] == 'ready'
+        assert f.agent('worker-1')['state'] == 'idle'
+        f.queue('worker-1', '[Supervisor instruction ' + f.task()['id'] + '] Write worker-1/after.md now')
+        step(t)
+        after = given(t, f, 'worker-1')[-1]
+        assert 'worker-1/after.md' in after and after in hook_sim.handed_to(f, 'worker-1')
+        assert not [x for p, x in t.world.sent[len(sent_before):] if p in panes | {f.agent('worker-1')['pane']}]
+        assert hook(t, f, 'worker-1', report, prompt=after)['status'] == 'committed'
+        notice = [f.v2.bus.message(m)['body']['text'] for m in f.v2.bus.pending('supervisor')
+                  + [f.v2.bus.slot_state('supervisor').get('message_id') or 'x'] if f.v2.bus.message(m)]
+        assert any('[Sub-fleet M0 completed]' in x and 'new generation' in x for x in notice)
+        # whole run (before, during and after the delegation): no parent-fleet business delivery was
+        # ever typed into any pane worker-1 had; only the sub-fleet role change / child supervisor
+        # traffic reached the adopted pane, and that is the child's own (typed) supervisor path
+        parent_marker = 'Shared output directory: ' + str(f.workspace())
+        all_panes = panes | {f.agent('worker-1')['pane']}
+        assert not [x for p, x in t.world.sent if p in all_panes and (parent_marker in x or '[Supervisor instruction' in x)]
+        assert any('worker-1/after.md' in x for x in hook_sim.texts('worker-1')), 'parent work reached worker-1 through the hook'
+    else:
+        # control: without the hook channel the returned session keeps its generation and is
+        # told by a typed role-change prompt (the pre-hook behaviour)
+        assert t.world.owner[sid] == 'cmux-fleet' and info['pane'] == sid and info['state'] == 'starting'
+        back = [x for p, x in new_typed if p == sid][-1]
+        assert 'worker of the main fleet again' in back
+        assert parent_hook(t, 'READY', back)['status'] == 'ready'  # same generation, same session
+        assert f.agent('worker-1')['state'] == 'idle' and int(f.agent('worker-1')['generation']) == gen_before
+        assert any('[Sub-fleet M0 completed]' in f.v2.bus.message(m)['body']['text']
+                   for m in f.v2.bus.pending('supervisor') + [f.v2.bus.slot_state('supervisor').get('message_id') or 'x']
+                   if f.v2.bus.message(m))
+        f.queue('worker-1', '[Supervisor instruction ' + f.task()['id'] + '] Write worker-1/after.md now')
+        step(t)
+        after = [x for p, x in t.world.sent if p == sid][-1]
+        assert 'worker-1/after.md' in after and after not in hook_sim.handed_to(f, 'worker-1')
+        assert parent_hook(t, report, after)['status'] == 'committed'
 
 
 def test_delegated_slot_is_not_delivered_held_or_timed_out(tree):
@@ -439,8 +477,10 @@ def test_failed_subfleet_marks_failure_and_missing_deliverable_fails(tree):
     subfleet.tick(f)
     rec = subfleet.record(rec['run'])
     assert rec['state'] == 'failed' and 'missing or empty' in rec['reason'] and rec['attempt'] == 1
-    back = [x for p, x in t.world.sent if p == rec['pane']][-1]
-    assert parent_hook(t, 'READY', back)['status'] == 'ready'
+    # hook-channel worker: the returned session is replaced by its next generation (never typed into)
+    assert f.agent('worker-1')['generation'] == '1' and f.agent('worker-1')['pane'] != rec['pane']
+    assert not [x for p, x in t.world.sent if p == rec['pane'] and 'worker of the main fleet again' in x]
+    assert hook(t, f, 'worker-1', 'READY', prompt='startup')['status'] == 'ready'
     rec2, _ = spawn_m0(t)  # a retry keeps the old run (history) and counts the attempt
     assert rec2['attempt'] == 2 and rec2['run'].endswith('M0-attempt-2')
 
@@ -689,7 +729,9 @@ def test_root_stop_stops_children_first_without_orphans(tree):
     assert redis_down(child_cfg)
     rec = subfleet.record(rec['run'])
     assert rec['state'] == 'failed' and rec['outcome'] == 'stopped'
-    assert t.world.owner[sid] == 'cmux-fleet'  # taken back so the parent's own stop retires it
+    # taken back from the child: a hook-channel worker's returned session is retired at once (its
+    # next generation replaces it), so no orphan stays with the child; the parent's stop retires the rest
+    assert sid not in t.world.alive or t.world.owner.get(sid) == 'cmux-fleet'
     assert all(f.v2.retire(s, 'explicit fleet stop') for s in f.names)
     assert sid not in t.world.alive
 
@@ -966,16 +1008,26 @@ def test_failed_child_redis_start_rolls_back_without_killing_the_parent(tree, mo
     assert len([p for p in t.world.alive if t.world.owner.get(p) == 'cmux-fleet']) == 4  # sup, 2 workers, history
 
 
-def test_return_aborts_a_running_turn_before_the_return_prompt(tree):
+@pytest.mark.parametrize('path', ['hook', 'typed_fallback'])
+def test_return_aborts_a_running_turn_before_the_return_prompt(tree, path):
     t, f = tree, tree.f
+    if path == 'typed_fallback':
+        f.cfg['claude_hook_delivery'] = False
+        fleet.save(f.path, dict(fleet.load(f.path), claude_hook_delivery=False))
     rec, _ = spawn_m0(t)
     cf = child_daemon(t, rec)
     f.v2.finish('blocked', 'main task blocked')
     subfleet.tick(f)
     stop_child_like_daemon(cf)
+    before = len(t.world.sent)
     subfleet.tick(f)
-    log = [x for p, x in t.world.sent if p == rec['pane']]
-    assert log[-2] == '<key Escape>' and 'worker of the main fleet again' in log[-1]
+    log = [x for p, x in t.world.sent[before:] if p == rec['pane']]
+    if path == 'hook':
+        # no return prompt at all: the possibly still running session is killed, not typed into
+        assert log == [] and rec['pane'] not in t.world.alive
+        assert f.agent('worker-1')['generation'] == '1'
+    else:
+        assert log[-2] == '<key Escape>' and 'worker of the main fleet again' in log[-1]
 
 
 def test_lost_session_is_replaced_by_the_next_generation_in_place(tree):

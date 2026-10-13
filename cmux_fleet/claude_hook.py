@@ -15,9 +15,12 @@ Measured on Claude Code 2.1.280 (docs: claude-hook-report.md):
     CLAUDE_CODE_STOP_HOOK_BLOCK_CAP is raised; 0 turns that cap off (``ENV``).
   * The reason is written to the transcript as a ``"type":"user"``, ``isMeta`` row
     ``"Stop hook feedback:\\n<reason>"`` (``FEEDBACK``).
-  * Text typed into the pane while the hook waits is queued: the hook's delivery runs first,
-    then the typed text runs as its own turn. Escape interrupts the turn and kills the waiting
-    hook, so the session stays idle (unarmed) until its next turn ends.
+  * Text typed into the pane while the hook waits is queued, not run: Claude Code writes a
+    ``queue-operation`` ``enqueue`` row to the transcript at Enter (<0.5 s) and runs the line only
+    once the hook returns. The hook therefore yields (``OperatorQueue``): it returns without taking
+    anything as soon as an operator line is queued, and the line runs about 3 s later as its own
+    turn (manual-input-measurement.md). Escape interrupts the turn and kills the waiting hook, so
+    the session stays idle (unarmed) until its next turn ends.
 
 Long idle: the hook waits up to ``hook_timeout(cfg)`` (default one day) without starting any turn.
 Shortly before that it hands Claude one tiny keepalive turn (``KEEPALIVE``) so the next Stop hook
@@ -38,6 +41,10 @@ DECLARATION = ('Fleet channel: after your first turn, every supervisor instructi
 REWAKE_MESSAGE = 'Fleet delivery:'  # asyncRewake prefix; the transcript row is a task-notification
 GRACE = 10  # seconds with an entry queued and no Stop hook waiting/settling before the rewake acts
 STOPPING_TTL = 120  # a Stop hook settling its turn (tui_turn waits up to settle_wait=30 s)
+# After the hook yielded to an operator line, the rewake fallback keeps off the mailbox this long
+# (or until the next Stop): its notification would otherwise be absorbed into the operator's turn.
+HUMAN_HOLD = 600
+TASK_NOTIFICATION = '<task-notification>'  # queued rewakes / background tasks: not operator input
 FEEDBACK = 'Stop hook feedback:'
 KEEPALIVE = ('Fleet keepalive: there is no new instruction yet. Do no work and use no tools; '
              'reply exactly IDLE.')
@@ -74,7 +81,8 @@ def keys(prefix, slot, generation):
     base = prefix + ':hook:' + slot
     return {'mailbox': base + ':g' + str(int(generation)) + ':mailbox',
             'armed': base + ':armed', 'bind': base + ':bind',
-            'stopping': base + ':stopping', 'rewake': base + ':rewake'}
+            'stopping': base + ':stopping', 'rewake': base + ':rewake',
+            'human': base + ':human', 'yielded': base + ':yielded'}
 
 
 def post(r, k, entry):
@@ -93,20 +101,102 @@ def armed(r, k, generation):
 
 
 def live(r, k):
-    """A Stop hook of this slot waits now, or is still settling its turn."""
-    return bool(r.exists(k['armed']) or r.exists(k['stopping']))
+    """A Stop hook of this slot waits now, is still settling its turn, or yielded to an operator line."""
+    return bool(r.exists(k['armed']) or r.exists(k['stopping']) or r.exists(k['human']))
 
 
-def wait(r, k, generation, thread, deadline, alive, accept, poll=POLL):
-    """Block until ``accept`` takes a mailbox entry, the generation retires, or ``deadline``.
+class OperatorQueue:
+    """Operator lines Claude Code queued in a transcript while the Stop hook blocks.
+
+    Measured rows (2.1.280): ``{"type":"queue-operation","operation":"enqueue","content":<line>}``
+    at Enter; ``dequeue`` (no content, oldest first) when the line starts its own turn; ``remove``
+    (with content) when it is absorbed into a running turn. Entries starting with
+    ``<task-notification>`` are rewakes / background tasks, never an operator. Reads incrementally:
+    the first call scans the whole file, later calls only the complete rows added since.
+    """
+
+    def __init__(self, path):
+        self.path, self.offset, self.queue = path, 0, []
+
+    def pending(self):
+        """Byte offsets of the enqueue rows of operator lines still queued."""
+        try:
+            with open(self.path, 'rb') as f:
+                f.seek(self.offset)
+                while True:
+                    line = f.readline()
+                    if not line.endswith(b'\n'):  # EOF, or a row still being written
+                        break
+                    at, self.offset = self.offset, self.offset + len(line)
+                    if b'queue-operation' in line:
+                        self.row(at, line)
+        except (OSError, TypeError, ValueError):
+            pass
+        return [at for at, text in self.queue if not text.lstrip().startswith(TASK_NOTIFICATION)]
+
+    def row(self, at, line):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            return
+        if not isinstance(row, dict) or row.get('type') != 'queue-operation':
+            return
+        op, text = row.get('operation'), row.get('content')
+        text = text if isinstance(text, str) else json.dumps(text, ensure_ascii=False)
+        if op == 'enqueue':
+            self.queue.append((at, text))
+        elif op == 'remove':
+            same = next((i for i, (_, t) in enumerate(self.queue) if t == text), 0 if self.queue else None)
+            if same is not None:
+                self.queue.pop(same)
+        elif op == 'dequeue' and self.queue:
+            self.queue.pop(0)
+
+
+def yielding(r, k, thread, queue):
+    """True (and recorded) if an operator line is queued that this session has not yielded to yet.
+
+    The yielded offsets are kept per session, so a queued row Claude Code never dequeued (a crash
+    mid-write) makes the hook yield once, not at every Stop for ever.
+    """
+    if queue is None:
+        return False
+    pending = queue.pending()
+    if not pending:
+        return False
+    try:
+        seen = json.loads(r.get(k['yielded']) or '{}')
+    except ValueError:
+        seen = {}
+    done = set(seen.get('offsets') or []) if seen.get('session_id') == (thread or '') else set()
+    new = [at for at in pending if at not in done]
+    if not new:
+        return False
+    # Claude Code runs the oldest queued line first: record only that one, so a second line still
+    # queued after it ran makes the next Stop yield again.
+    r.set(k['yielded'], json.dumps({'session_id': thread or '', 'offsets': sorted(done | {new[0]})[-50:]}),
+          ex=BIND_TTL)
+    r.set(k['human'], json.dumps({'session_id': thread or '', 'pid': os.getpid()}), ex=HUMAN_HOLD)
+    return True
+
+
+def wait(r, k, generation, thread, deadline, alive, accept, poll=POLL, queue=None):
+    """Block until ``accept`` takes a mailbox entry, the generation retires, an operator line is
+    queued (``queue``: OperatorQueue of this session's transcript), or ``deadline``.
 
     ``alive()`` -> False ends the wait (retired / dead generation). ``accept(entry)`` -> the text to
-    hand Claude, or None to drop a stale entry. Returns (text, entry) or (None, None).
+    hand Claude, or None to drop a stale entry. Returns (text, entry) or (None, None). Yielding
+    takes nothing: the mailbox, the bind and the lease stay as they are, and the operator's turn
+    settles as unsolicited; its Stop hook then waits here again.
     """
     mark = json.dumps({'generation': int(generation), 'session_id': thread or '', 'pid': os.getpid()})
     try:
+        if alive():  # a Stop of this generation fired: the operator turn it yielded to (if any) has ended
+            r.delete(k['human'])
         while time.monotonic() < deadline:
             if not alive():
+                return None, None
+            if yielding(r, k, thread, queue):  # checked first: a line queued during the last turn
                 return None, None
             r.set(k['armed'], mark, ex=ARMED_TTL)
             r.delete(k['stopping'])
@@ -115,6 +205,9 @@ def wait(r, k, generation, thread, deadline, alive, accept, poll=POLL):
                 continue
             try:
                 if not alive():  # retired or orphaned while blocked: leave the entry for the live hook
+                    r.lpush(k['mailbox'], got[1])
+                    return None, None
+                if yielding(r, k, thread, queue):  # the operator came first: the entry waits for the next Stop
                     r.lpush(k['mailbox'], got[1])
                     return None, None
                 try:
