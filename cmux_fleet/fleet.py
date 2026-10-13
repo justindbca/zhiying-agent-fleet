@@ -495,6 +495,11 @@ def claude_rewake(cfg_path, name, generation, raw):
     It never recovers a StopFailure (API error) turn: that delivery was already taken from the mailbox,
     so it goes the watchdog's stall / frozen path (claude_stop_failure).
 
+    It never acts while another turn of the session runs (``claude_hook.TurnWatch`` on the Stop's
+    transcript): a turn the Stop hook did not start (operator after Escape or ctrl+x ctrl+s, a peer
+    message, a background task) ends with its own Stop, whose hooks take over. Escape or a
+    StopFailure ending that turn makes this fallback eligible again.
+
     Runs in the background at every Stop. Only the newest one per slot acts: if this generation's
     mailbox holds an entry while neither a waiting nor a settling Stop hook exists for
     ``claude_hook.GRACE`` seconds, it takes the entry and returns its text; the CLI writes it to
@@ -512,6 +517,7 @@ def claude_rewake(cfg_path, name, generation, raw):
     hook_on_sigterm()
     thread, parent = data.get('session_id'), os.getppid()
     deadline = started + claude_hook.hook_timeout(cfg) - claude_hook.margin(cfg)
+    watch = claude_hook.TurnWatch(data.get('transcript_path') or '')
     mine = None
     while time.monotonic() < deadline and parent != 1:
         try:
@@ -528,7 +534,12 @@ def claude_rewake(cfg_path, name, generation, raw):
             while time.monotonic() < deadline:
                 if str(mine) != r.get(k['rewake']) or not alive():
                     return None  # a newer Stop has its own fallback, or this generation is gone
-                if claude_hook.live(r, k) or not r.llen(k['mailbox']):
+                if watch.poll():
+                    try:
+                        watch.ended(float(r.get(k['turnend']) or 0))
+                    except ValueError:
+                        pass
+                if watch.busy or claude_hook.live(r, k) or not r.llen(k['mailbox']):
                     unarmed = None
                     time.sleep(1)
                     continue
@@ -573,6 +584,9 @@ def claude_stop_failure(cfg_path, name, generation, raw):
             r.xadd(bus.audit_key, dict(fields, event='hook.stop_failure', run_id=bus.run_id, slot=name))
         else:
             r.rpush(LOG, json.dumps(dict(fields, time=time.time(), kind='hook.stop_failure'), ensure_ascii=False))
+        if claude_hook.enabled(cfg, name, claude=True):
+            # The turn ended without a Stop: a waiting rewake fallback may act again (TurnWatch.ended).
+            r.set(hook_keys(cfg, r, name, int(generation))['turnend'], str(time.time()), ex=claude_hook.BIND_TTL)
     finally:
         r.close()
 

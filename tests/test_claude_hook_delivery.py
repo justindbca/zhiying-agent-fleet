@@ -29,7 +29,7 @@ import pytest
 
 from test_fleet import FakeMgr, write_rollout
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
-from cmux_fleet import fleet, runtime_v2
+from cmux_fleet import claude_hook, fleet, runtime_v2
 
 HOOK_CHANNEL = True  # tests/conftest.py keeps the channel on for this module
 
@@ -906,8 +906,8 @@ def test_delegated_slot_hook_lets_go_and_takes_nothing(hooked):
 # Enter writes {"type":"queue-operation","operation":"enqueue","content":<line>} at once (<0.5 s);
 # the line starts its own turn with a content-less "dequeue" and a plain user row
 # (origin.kind=human, promptSource=queued); absorbed into a running tool turn it is a "remove"
-# (reason absorbed_mid_turn) plus a queued_command attachment. <task-notification> entries are
-# rewakes / background tasks, never an operator.
+# (reason absorbed_mid_turn) plus a queued_command attachment. Peer messages and <task-notification>
+# entries (rewakes, background tasks) queue the same way and make the hook yield too (D-1).
 YIELD_WITHIN = 12  # one hook POLL (5 s) plus margin
 
 
@@ -955,14 +955,21 @@ def test_operator_line_queued_while_idle_makes_the_hook_yield(hooked):
     assert typed_any(f, 'worker-1') == []
 
 
-def test_task_notification_in_the_queue_is_not_an_operator(hooked):
+def test_queued_rewake_notification_makes_the_hook_yield_once_and_keeps_the_mailbox(hooked):
+    # D-1: a queued notification behind a waiting hook would starve (measured > 5 min, worker-2 lab2)
     f = hooked
     hook = f.test_ready['worker-1']
-    queue_op(f, hook, 'enqueue', '<task-notification>\n<summary>Background command finished</summary>\n</task-notification>')
-    step(f, lambda: False, timeout=YIELD_WITHIN)
-    assert hook.alive(), 'a background-task notification made the hook yield'
+    queue_op(f, hook, 'enqueue', '<task-notification>\n<summary>Stop hook feedback</summary>\n</task-notification>')
+    assert step(f, lambda: not hook.alive(), timeout=YIELD_WITHIN), 'the hook kept a queued notification waiting'
+    assert hook.decision() is None, 'yielding must not hand anything over'
+    # a delivery posted meanwhile stays in the mailbox: neither typed nor taken
     dispatch(f, ['worker-1'])
-    assert 'Write worker-1/part.md' in delivered(f, hook)['reason']
+    step(f, lambda: False, timeout=2)
+    assert mailbox_len(f) == 1 and typed_any(f, 'worker-1') == []
+    # the notification row is never dequeued: the next Stop must not yield to it again
+    again = stop(f, 'worker-1', 'idle', active=False)
+    got = delivered(f, again)
+    assert 'Write worker-1/part.md' in got['reason'] and mailbox_len(f) == 0
 
 
 def test_operator_line_absorbed_mid_turn_does_not_make_the_hook_yield(hooked):
@@ -1043,7 +1050,8 @@ def test_an_operator_entry_never_dequeued_makes_the_hook_yield_only_once(hooked)
     assert 'Write worker-1/part.md' in delivered(f, again)['reason']
 
 
-def test_operator_retyping_the_delivery_verbatim_is_not_the_delivery(hooked):
+@pytest.mark.parametrize('source', ['hook', 'rewake'])
+def test_operator_retyping_the_delivery_verbatim_is_not_the_delivery(hooked, source):
     # R2-01 (review round 2): settlement must look at where the latest start input came from (hook
     # feedback / rewake vs a typed row), not only at its text. Failed on 9df19c2c (verbatim retype settled).
     f = hooked
@@ -1055,6 +1063,12 @@ def test_operator_retyping_the_delivery_verbatim_is_not_the_delivery(hooked):
     step(f, lambda: status_of(f, env) == 'committed', timeout=5)
     assert status_of(f, env) != 'committed', 'an operator-typed row settled the hook delivery'
     manual.kill()
+    # the same delivery arriving through a legitimate source (hook feedback / rewake wake-up) still settles
+    transcript = transcript_of(f, 'worker-1', f.test_threads['worker-1'])
+    append(transcript, feedback_rows(got['reason']) if source == 'hook' else rewake_rows(got['reason']))
+    stop(f, 'worker-1', REPORT.format(name='part.md'), active=source == 'hook')
+    assert step(f, lambda: status_of(f, env) == 'committed'), 'a %s-delivered turn did not settle' % source
+    assert f.v2.bus.message(env['message_id'])['outcome'] == 'completed'
 
 
 def test_line_queued_before_the_ready_hook_starts_makes_it_yield_at_once(hooked):
@@ -1101,12 +1115,183 @@ def test_remove_matches_by_content_and_leaves_the_other_line_queued(hooked):
     assert again.alive()
 
 
-def test_notification_ahead_of_an_operator_line_is_skipped_but_the_line_is_not(hooked):
+def test_notification_and_a_later_operator_line_each_get_their_own_yield(hooked):
     f = hooked
     hook = f.test_ready['worker-1']
-    queue_op(f, hook, 'enqueue', '<task-notification>\n<summary>Stop hook feedback</summary>\n</task-notification>')
-    step(f, lambda: False, timeout=YIELD_WITHIN)
-    assert hook.alive(), 'a notification alone made the hook yield'
-    queue_op(f, hook, 'enqueue', 'Reply with exactly AFTER-NOTE')
-    assert step(f, lambda: not hook.alive(), timeout=YIELD_WITHIN), 'the operator line behind a notification was missed'
+    note = '<task-notification>\n<summary>Background command finished</summary>\n</task-notification>'
+    queue_op(f, hook, 'enqueue', note)
+    assert step(f, lambda: not hook.alive(), timeout=YIELD_WITHIN), 'a queued notification did not make the hook yield'
     assert hook.decision() is None
+    # the notification runs as its own turn; the operator types while it runs
+    thread = hook.session
+    append(hook.transcript, [{'type': 'queue-operation', 'operation': 'dequeue', 'sessionId': thread},
+                             {'type': 'user', 'origin': {'kind': 'task-notification'}, 'message': {'role': 'user', 'content': note}}])
+    queue_op(f, hook, 'enqueue', 'Reply with exactly AFTER-NOTE')
+    after_note = stop(f, 'worker-1', 'noted', active=False)
+    assert step(f, lambda: not after_note.alive(), timeout=YIELD_WITHIN), 'the operator line behind a notification was missed'
+    assert after_note.decision() is None
+    # once both ran, the hook waits for deliveries again and hands the next one over
+    after_line = operator_turn(f, 'worker-1', 'Reply with exactly AFTER-NOTE', 'AFTER-NOTE')
+    step(f, lambda: False, timeout=YIELD_WITHIN)
+    assert after_line.alive(), 'nothing is queued any more: the hook must wait for deliveries'
+    dispatch(f, ['worker-1'])
+    assert 'Write worker-1/part.md' in delivered(f, after_line)['reason']
+
+
+def test_queued_peer_message_makes_the_hook_yield(hooked):
+    f = hooked
+    hook = f.test_ready['worker-1']
+    queue_op(f, hook, 'enqueue', '<cross-session-message from="uds:/tmp/cc-socks/1.sock" from-name="peer">\n'
+                                 'status?\n</cross-session-message>')
+    assert step(f, lambda: not hook.alive(), timeout=YIELD_WITHIN), 'the hook kept a queued peer message waiting'
+    assert hook.decision() is None and mailbox_len(f) == 0
+
+
+# ------------------------------------------------------------------ D-1: turns the hook did not start
+# A turn can start without the Stop hook yielding to it: the operator types after Escape killed the
+# waiting hook, or a queued entry starts while no hook waits. The rewake fallback of the last Stop
+# must not take a delivery into such a turn (TurnWatch); Escape (an interrupted row) or a StopFailure
+# ending it makes the rewake eligible again, and a normal Stop hands the delivery over itself.
+INTERRUPTED_ROW = {'type': 'user', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': '[Request interrupted by user]'}]}}
+TURN_STARTS = {
+    'typed': lambda thread: [{'type': 'user', 'origin': {'kind': 'human'}, 'promptId': 'p-typed',
+                              'message': {'role': 'user', 'content': 'Reply with exactly TYPED'}}],
+    'dequeue': lambda thread: [{'type': 'queue-operation', 'operation': 'dequeue', 'sessionId': thread}],
+    'peer': lambda thread: [{'type': 'user', 'origin': {'kind': 'peer'}, 'promptId': 'p-peer',
+                             'message': {'role': 'user', 'content': '<cross-session-message from="x">hi</cross-session-message>'}}],
+}
+TAKES_WITHIN = claude_hook.GRACE + 15
+
+
+def rewake_watching(f, slot='worker-1'):
+    """Start the rewake of the READY Stop and wait until it watches the transcript (TurnWatch takes
+    the transcript size at its start: rows written before that are not seen)."""
+    key = f.v2.bus.prefix + ':hook:' + slot + ':rewake'
+    before = f.r.get(key)
+    entry, proc = rewake(f, slot)
+    assert step(f, lambda: f.r.get(key) != before, timeout=10), 'the rewake never started'
+    return proc
+
+
+def unarmed_turn(f, start='typed'):
+    """Escape kills the waiting READY hook, then a turn starts that the hook did not yield to."""
+    hook = f.test_ready['worker-1']
+    proc = rewake_watching(f)
+    f.mgr.send_key(hook.pane, 'Escape')
+    hook.proc.wait(10)
+    append(hook.transcript, TURN_STARTS[start](hook.session))
+    return hook, proc
+
+
+def stays_off(f, proc):
+    step(f, lambda: proc.poll() is not None, timeout=claude_hook.GRACE + 5)
+    assert proc.poll() != 2, 'the rewake took the delivery into a running turn'
+    assert mailbox_len(f) == 1 and typed_any(f, 'worker-1') == []
+
+
+@pytest.mark.parametrize('start', sorted(TURN_STARTS))
+def test_rewake_keeps_off_a_turn_the_hook_did_not_start(hooked, start):
+    f = hooked
+    hook, proc = unarmed_turn(f, start)
+    try:
+        dispatch(f, ['worker-1'])
+        env = f.v2.bus.slot_state('worker-1')
+        stays_off(f, proc)
+        # that turn ends with its own Stop: the sync hook hands the delivery over and it settles
+        after = stop(f, 'worker-1', 'TURN', active=False)
+        got = delivered(f, after)
+        assert 'Write worker-1/part.md' in got['reason'] and mailbox_len(f) == 0
+        assert any(e.get('event') == 'tui.hooked' for e in audit(f, 'worker-1'))
+        stop(f, 'worker-1', REPORT.format(name='part.md'))
+        assert step(f, lambda: status_of(f, env) == 'committed')
+        assert step(f, lambda: reports(f) == 1) and proc.poll() != 2
+        assert typed_any(f, 'worker-1') == []
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_escape_during_a_turn_the_hook_did_not_start_lets_the_rewake_recover(hooked):
+    f = hooked
+    hook, proc = unarmed_turn(f)
+    try:
+        dispatch(f, ['worker-1'])
+        env = f.v2.bus.slot_state('worker-1')
+        stays_off(f, proc)
+        append(hook.transcript, [INTERRUPTED_ROW])  # Escape ends that turn without a Stop
+        assert step(f, lambda: proc.poll() is not None, timeout=TAKES_WITHIN), 'the rewake never recovered'
+        err = proc.stderr.read()
+        assert proc.returncode == 2 and 'Write worker-1/part.md' in err and mailbox_len(f) == 0
+        append(hook.transcript, rewake_rows(err))
+        stop(f, 'worker-1', REPORT.format(name='part.md'), active=False)
+        assert step(f, lambda: status_of(f, env) == 'committed'), 'the rewake-delivered turn did not settle'
+        assert typed_any(f, 'worker-1') == []
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_stop_failure_ending_a_busy_turn_lets_the_rewake_recover(hooked):
+    f = hooked
+    hook, proc = unarmed_turn(f)
+    try:
+        dispatch(f, ['worker-1'])
+        stays_off(f, proc)
+        failure, = settings(f, 'worker-1')['hooks']['StopFailure']
+        data = payload(f, 'worker-1', hook.session, 'API Error: 529 overloaded', False)
+        data.update(hook_event_name='StopFailure', error='overloaded')
+        done = subprocess.run(shlex.split(failure['hooks'][0]['command']), input=json.dumps(data),
+                              capture_output=True, text=True, timeout=30)
+        assert done.returncode == 0
+        assert f.r.get(f.v2.bus.prefix + ':hook:worker-1:turnend'), 'StopFailure did not mark the turn end'
+        assert step(f, lambda: proc.poll() is not None, timeout=TAKES_WITHIN), 'the rewake never recovered'
+        assert proc.returncode == 2 and 'Write worker-1/part.md' in proc.stderr.read()
+        assert typed_any(f, 'worker-1') == []
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_rewake_ignores_the_final_assistant_row_of_the_stopped_turn(hooked):
+    f = hooked
+    hook = f.test_ready['worker-1']
+    proc = rewake_watching(f)
+    try:
+        f.mgr.send_key(hook.pane, 'Escape')
+        hook.proc.wait(10)
+        # Claude Code flushes the stopped turn's final assistant row after the Stop event
+        append(hook.transcript, [{'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'READY'}]}}])
+        dispatch(f, ['worker-1'])
+        assert step(f, lambda: proc.poll() is not None, timeout=TAKES_WITHIN), 'an assistant row kept the rewake off'
+        assert proc.returncode == 2 and 'Write worker-1/part.md' in proc.stderr.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_human_hold_expiry_does_not_let_the_rewake_into_a_running_turn(hooked):
+    # 622aebea: once the 600 s HUMAN_HOLD ran out, a still running operator turn got the delivery
+    # mid-turn. The expiry is simulated by deleting the key; no real-time wait.
+    f = hooked
+    hook = f.test_ready['worker-1']
+    proc = rewake_watching(f)
+    try:
+        queue_op(f, hook, 'enqueue', 'Reply with exactly LONG')
+        assert step(f, lambda: not hook.alive(), timeout=YIELD_WITHIN)
+        human = f.v2.bus.prefix + ':hook:worker-1:human'
+        ttl = f.r.ttl(human)
+        assert claude_hook.HUMAN_HOLD - 60 < ttl <= claude_hook.HUMAN_HOLD == 600
+        # the operator's turn starts and outlives the hold
+        append(hook.transcript, [{'type': 'queue-operation', 'operation': 'dequeue', 'sessionId': hook.session},
+                                 {'type': 'user', 'origin': {'kind': 'human'}, 'promptSource': 'queued',
+                                  'message': {'role': 'user', 'content': 'Reply with exactly LONG'}}])
+        f.r.delete(human)
+        dispatch(f, ['worker-1'])
+        stays_off(f, proc)
+        # the long turn ends (Escape): the rewake recovers the delivery
+        append(hook.transcript, [INTERRUPTED_ROW])
+        assert step(f, lambda: proc.poll() is not None, timeout=TAKES_WITHIN), 'the rewake never recovered'
+        assert proc.returncode == 2 and 'Write worker-1/part.md' in proc.stderr.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()

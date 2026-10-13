@@ -5,6 +5,7 @@ goes through the real ``fleet.hook_session`` accept (lease re-validation, bind w
 needs this session's bind plus the delivery's isMeta feedback row as the latest start input, and the
 daemon's ``tui.hooked`` audit names the generation and message that the hook actually handed over.
 """
+import inspect
 import json
 
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
@@ -116,3 +117,11 @@ def test_generation_change_hands_queued_work_to_the_new_generation_only(mixed):
     assert answer_turn(f, 'worker-1', REPORT.format('after.md'), generation=0)['status'] == 'stale'
     assert answer_turn(f, 'worker-1', REPORT.format('after.md'))['status'] == 'committed'
     assert not [t for p, t in f.mgr.sent if p in (f.agent('worker-1')['pane'],)]
+
+
+def test_stand_in_takes_exactly_the_real_wait_signature():
+    # hook_sim replaces only the blocking wait: an argument the real wait gains (e.g. transcript=)
+    # must not be swallowed by a catch-all, or the legacy tests would hide an interface break
+    stand_in = inspect.signature(hook_sim.next_delivery).parameters
+    assert list(stand_in.items()) == list(inspect.signature(fleet.claude_hook_next).parameters.items())
+    assert not [p for p in stand_in.values() if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD)]

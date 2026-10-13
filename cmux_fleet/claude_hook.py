@@ -17,9 +17,13 @@ Measured on Claude Code 2.1.280 (docs: claude-hook-report.md):
     ``"Stop hook feedback:\\n<reason>"`` (``FEEDBACK``).
   * Text typed into the pane while the hook waits is queued, not run: Claude Code writes a
     ``queue-operation`` ``enqueue`` row to the transcript at Enter (<0.5 s) and runs the line only
-    once the hook returns. The hook therefore yields (``OperatorQueue``): it returns without taking
-    anything as soon as an operator line is queued, and the line runs about 3 s later as its own
-    turn (manual-input-measurement.md). Escape interrupts the turn and kills the waiting hook, so
+    once the hook returns. Peer messages (``<cross-session-message>``), finished background tasks
+    and the rewake's own notification (``<task-notification>``) queue the same way. The hook
+    therefore yields (``OperatorQueue``): it returns without taking anything as soon as any entry
+    is queued, and the entry runs about 2 s later as its own turn (manual-input-measurement.md).
+  * The rewake fallback must not act while another turn runs: its notification would be absorbed
+    into that turn (lost) or queued behind a Stop hook that waits on the emptied mailbox
+    (``TurnWatch``). Escape interrupts the turn and kills the waiting hook, so
     the session stays idle (unarmed) until its next turn ends.
 
 Long idle: the hook waits up to ``hook_timeout(cfg)`` (default one day) without starting any turn.
@@ -41,10 +45,10 @@ DECLARATION = ('Fleet channel: after your first turn, every supervisor instructi
 REWAKE_MESSAGE = 'Fleet delivery:'  # asyncRewake prefix; the transcript row is a task-notification
 GRACE = 10  # seconds with an entry queued and no Stop hook waiting/settling before the rewake acts
 STOPPING_TTL = 120  # a Stop hook settling its turn (tui_turn waits up to settle_wait=30 s)
-# After the hook yielded to an operator line, the rewake fallback keeps off the mailbox this long
-# (or until the next Stop): its notification would otherwise be absorbed into the operator's turn.
+# After the hook yielded to a queued entry, the rewake fallback keeps off the mailbox this long
+# (or until the next Stop): its notification would otherwise be absorbed into the yielded-to turn.
 HUMAN_HOLD = 600
-TASK_NOTIFICATION = '<task-notification>'  # queued rewakes / background tasks: not operator input
+INTERRUPTED = '[Request interrupted by user'  # the row Escape writes; it ends a turn without a Stop
 FEEDBACK = 'Stop hook feedback:'
 KEEPALIVE = ('Fleet keepalive: there is no new instruction yet. Do no work and use no tools; '
              'reply exactly IDLE.')
@@ -82,7 +86,7 @@ def keys(prefix, slot, generation):
     return {'mailbox': base + ':g' + str(int(generation)) + ':mailbox',
             'armed': base + ':armed', 'bind': base + ':bind',
             'stopping': base + ':stopping', 'rewake': base + ':rewake',
-            'human': base + ':human', 'yielded': base + ':yielded'}
+            'human': base + ':human', 'yielded': base + ':yielded', 'turnend': base + ':turnend'}
 
 
 def post(r, k, entry):
@@ -106,20 +110,21 @@ def live(r, k):
 
 
 class OperatorQueue:
-    """Operator lines Claude Code queued in a transcript while the Stop hook blocks.
+    """Entries Claude Code queued in a transcript while the Stop hook blocks.
 
-    Measured rows (2.1.280): ``{"type":"queue-operation","operation":"enqueue","content":<line>}``
-    at Enter; ``dequeue`` (no content, oldest first) when the line starts its own turn; ``remove``
-    (with content) when it is absorbed into a running turn. Entries starting with
-    ``<task-notification>`` are rewakes / background tasks, never an operator. Reads incrementally:
-    the first call scans the whole file, later calls only the complete rows added since.
+    Measured rows (2.1.280): ``{"type":"queue-operation","operation":"enqueue","content":<text>}``
+    when an operator line, a peer message or a task notification arrives; ``dequeue`` (no content,
+    oldest first) when it starts its own turn; ``remove`` (with content) when it is absorbed into a
+    running turn. Every kind counts: a queued rewake notification or peer message starves behind a
+    waiting hook exactly like a typed line. Reads incrementally: the first call scans the whole
+    file, later calls only the complete rows added since.
     """
 
     def __init__(self, path):
         self.path, self.offset, self.queue = path, 0, []
 
     def pending(self):
-        """Byte offsets of the enqueue rows of operator lines still queued."""
+        """Byte offsets of the enqueue rows still queued (operator, peer or task notification)."""
         try:
             with open(self.path, 'rb') as f:
                 f.seek(self.offset)
@@ -132,7 +137,7 @@ class OperatorQueue:
                         self.row(at, line)
         except (OSError, TypeError, ValueError):
             pass
-        return [at for at, text in self.queue if not text.lstrip().startswith(TASK_NOTIFICATION)]
+        return [at for at, _ in self.queue]
 
     def row(self, at, line):
         try:
@@ -153,8 +158,76 @@ class OperatorQueue:
             self.queue.pop(0)
 
 
+class TurnWatch:
+    """Whether another turn of this session runs, from the transcript rows written after ``start``.
+
+    The rewake fallback starts at a Stop; a row it sees afterwards that starts a turn makes the
+    session busy: a non-meta user row with ``origin.kind`` (typed, peer, task notification), a
+    Stop-hook feedback row (a block), or a ``queue-operation dequeue``. The final assistant row of
+    the turn that just stopped lands after the Stop and is ignored. Escape ends a turn without a
+    Stop and writes a ``[Request interrupted by user…]`` user row (no origin): the session is idle
+    again. A StopFailure ends it without a Stop too: ``ended(at)`` (the ``turnend`` key).
+    """
+
+    def __init__(self, path):
+        self.path, self.busy, self.since = path, False, 0.0
+        try:
+            self.offset = os.path.getsize(path)
+        except (OSError, TypeError, ValueError):
+            self.offset, self.path = 0, None
+
+    def poll(self):
+        if self.path:
+            try:
+                with open(self.path, 'rb') as f:
+                    f.seek(self.offset)
+                    while True:
+                        line = f.readline()
+                        if not line.endswith(b'\n'):
+                            break
+                        self.offset += len(line)
+                        self.row(line)
+            except (OSError, ValueError):
+                pass
+        return self.busy
+
+    def ended(self, at):
+        """A StopFailure at ``at`` (epoch) ended the turn that made the session busy."""
+        if self.busy and at > self.since:
+            self.busy = False
+
+    def row(self, line):
+        if b'"queue-operation"' not in line and b'"user"' not in line:
+            return
+        try:
+            row = json.loads(line)
+        except ValueError:
+            return
+        if not isinstance(row, dict) or row.get('isSidechain'):
+            return
+        if row.get('type') == 'queue-operation':
+            if row.get('operation') == 'dequeue':
+                self.start()
+            return
+        if row.get('type') != 'user':
+            return
+        content = (row.get('message') or {}).get('content')
+        if isinstance(content, list):
+            content = '\n'.join(p.get('text', '') for p in content if isinstance(p, dict) and p.get('type') == 'text')
+        content = content if isinstance(content, str) else ''
+        if content.startswith(INTERRUPTED):
+            self.busy = False
+        elif (row.get('origin') or {}).get('kind') and not row.get('isMeta'):
+            self.start()
+        elif row.get('isMeta') and content.startswith(FEEDBACK):
+            self.start()
+
+    def start(self):
+        self.busy, self.since = True, time.time()
+
+
 def yielding(r, k, thread, queue):
-    """True (and recorded) if an operator line is queued that this session has not yielded to yet.
+    """True (and recorded) if an entry is queued that this session has not yielded to yet.
 
     The yielded offsets are kept per session, so a queued row Claude Code never dequeued (a crash
     mid-write) makes the hook yield once, not at every Stop for ever.
