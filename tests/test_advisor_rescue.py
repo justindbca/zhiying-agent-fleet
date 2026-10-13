@@ -413,3 +413,15 @@ def test_v2_consult_respawn_on_the_real_bus(v2adv2, monkeypatch):
     text = typed(f, 'worker-1')[-1]
     assert 'Research the semis rotation into worker-1/notes.md' in text and '本代领域：research_web' in text
     assert len(f.advisor_runner.calls) == 1  # the rescue only: no re-consult on re-delivery
+
+
+@pytest.mark.parametrize('name', ['supervisor.md', 'supervisor_v2.md'])
+def test_supervisor_prompts_carry_the_judgement_section(name):
+    text = (Path(fleet.HERE) / 'agents' / name).read_text()
+    assert '### Judging a report when the fleet advisor is on' in text and 'the worker never judges itself' in text
+    assert '"consult": [{"worker": "worker-1", "task": "M0", "finding"' in text
+    assert 'first one corrective dispatch; if the second result still fails, `consult`' in text
+    for message in ('[advisor] respawn worker-1 → worker-1.1 done', '[advisor] give_up M0', '[advisor unavailable] consult M0',
+                    '[advisor off] consult M0', 'dispatch M0 to worker-2 yourself'):
+        assert message in text
+    assert '`dispatch[].advise_note`' in text
