@@ -913,7 +913,9 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
             if not ok:
                 why.append(reason)
                 return False
-            codex_queue.mark_bound(r, name, turn)
+            if not codex_queue.mark_bound(r, name, turn, rec['cq_token']):
+                why.append('delivery abandoned or replaced while binding')
+                return False
             return True
         if int(info.get('generation', -1)) != generation or info.get('state') == 'dead':
             return skipped('stale', 'hook generation is not the current runtime')
@@ -2105,7 +2107,10 @@ class Fleet:
                     self.log('turn.unbound', agent=name, delivery=rec['cq_delivery'], turn=ev.get('turn'),
                              reason=why or 'turn already settled')
                     return
-                codex_queue.mark_bound(self.r, name, ev['turn'])
+                if not codex_queue.mark_bound(self.r, name, ev['turn'], rec['cq_token']):
+                    self.log('turn.unbound', agent=name, delivery=rec['cq_delivery'], turn=ev.get('turn'),
+                             reason='delivery abandoned or replaced while binding')
+                    return
         if is_pi(self.runtime_cfg(name), name):
             self.pi_metadata(name, ev)
             failed = ev.get('failed') or ev.get('aborted')

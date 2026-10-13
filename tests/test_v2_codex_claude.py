@@ -513,3 +513,46 @@ def test_turn_end_uses_the_runtime_cli_of_the_generation_not_only_config(mixed, 
     answer_turn(f, 'worker-1', 'Done:\n- x\nEvidence:\n- y\nNot done: none\nBlocked: none')
     assert seen and all(cli == 'codex' for slot, cli in seen if slot == 'worker-1'), seen
     assert ('worker-1', 'codex') in seen, seen
+
+
+def _raising_after(f, monkeypatch, during):
+    """A `codex queue` stand-in that runs `during(record)` while the CLI is 'running', then times out."""
+    def enqueue(cfg, name, thread, text, **kw):
+        during(codex_queue.record(f.agent(name)))
+        raise codex_queue.QueueError('uncertain: codex queue gave no answer: timed out after 30 seconds')
+    monkeypatch.setattr(codex_queue, 'enqueue', enqueue)
+
+
+def test_cli_error_after_a_fast_bind_neither_overwrites_bound_nor_holds_the_slot(mixed, monkeypatch):
+    """R1-04 race (D2 shape): the queued item's turn is proven (bound) while `codex queue` still hangs; the late
+    timeout must not turn 'bound' back into 'uncertain' or hold a delivery the rollout already proved."""
+    f = mixed
+    _raising_after(f, monkeypatch, lambda rec: codex_queue.mark_bound(f.r, 'supervisor', 't-fast', rec['cq_token']))
+    submit(f)
+    rec = codex_queue.record(f.agent('supervisor'))
+    assert rec['cq_state'] == 'bound' and rec['cq_turn'] == 't-fast'
+    assert f.agent('supervisor')['state'] != 'held' and not f.paused()
+    events = [e.get('event') for _, e in f.r.xrange(f.v2.bus.audit_key)]
+    assert 'queue.late_cli_error' in events and 'queue.uncertain' not in events
+
+
+def test_cli_error_after_clear_keeps_abandoned(mixed, monkeypatch):
+    f = mixed
+    _raising_after(f, monkeypatch, lambda rec: codex_queue.clear(f, 'supervisor', 'operator stop'))
+    submit(f)
+    assert codex_queue.record(f.agent('supervisor'))['cq_state'] == 'abandoned'  # not revived as 'uncertain'
+    assert f.agent('supervisor')['state'] == 'held'  # the delivery itself is still unproven: fail closed
+
+
+def test_mark_bound_never_revives_an_abandoned_or_superseded_record(mixed):
+    f = mixed
+    submit(f)
+    first = codex_queue.record(f.agent('supervisor'))
+    codex_queue.clear(f, 'supervisor', 'test')
+    assert codex_queue.mark_bound(f.r, 'supervisor', 't-1', first['cq_token']) is False
+    assert codex_queue.record(f.agent('supervisor'))['cq_state'] == 'abandoned'
+    got = codex_queue.deliver(f, 'supervisor', 'd-again', 'same body')
+    assert codex_queue.mark_bound(f.r, 'supervisor', 't-2', first['cq_token']) is False  # old token, new record
+    assert codex_queue.record(f.agent('supervisor'))['cq_state'] == 'queued'
+    assert codex_queue.mark_bound(f.r, 'supervisor', 't-3', got['token']) is True
+    assert codex_queue.record(f.agent('supervisor'))['cq_turn'] == 't-3'

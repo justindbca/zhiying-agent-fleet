@@ -157,6 +157,23 @@ def bound(rec, thread, turn, sessions, generation=None):
     return True, ''
 
 
+_CAS = ("local s = redis.call('HGET', KEYS[1], 'cq_state') "
+        "if s == ARGV[1] then redis.call('HSET', KEYS[1], unpack(ARGV, 2)) return 1 end return 0")
+_BIND = ("local s = redis.call('HGET', KEYS[1], 'cq_state') "
+         "if s and s ~= '' and s ~= 'abandoned' and redis.call('HGET', KEYS[1], 'cq_token') == ARGV[1] then "
+         "redis.call('HSET', KEYS[1], 'cq_state', 'bound', 'cq_turn', ARGV[2]) return 1 end return 0")
+
+
+def _set_if(r, key, expect, mapping):
+    """Atomic compare-and-set on cq_state (a Lua script on Redis; the v1 test double is single-threaded)."""
+    if hasattr(r, 'eval'):
+        return bool(r.eval(_CAS, 1, key, expect, *[x for kv in mapping.items() for x in kv]))
+    if r.hget(key, 'cq_state') == expect:
+        r.hset(key, mapping=mapping)
+        return True
+    return False
+
+
 def _real(r):
     """The real Redis client behind runtime_v2's lazy Effects overlay: the record must be durable
     before the CLI runs, not deferred to the end of a transaction."""
@@ -188,12 +205,16 @@ def deliver(f, slot, delivery, text, thread=None):
         got = enqueue(f.runtime_cfg(slot), slot, thread, queued)
     except QueueError as exc:
         state = 'uncertain' if str(exc).startswith('uncertain') else 'failed'
-        r.hset(fleet.key('agent', slot), mapping={'cq_state': state})
+        # Only from 'queuing': a fast turn end may have bound (and settled) it, or clear abandoned it, meanwhile.
+        if not _set_if(r, fleet.key('agent', slot), 'queuing', {'cq_state': state}) \
+                and r.hget(fleet.key('agent', slot), 'cq_state') == 'bound':
+            # The rollout already proved the item ran: a late CLI error must not hold a settled delivery.
+            f.log('queue.late_cli_error', agent=slot, delivery=delivery, token=token, error=str(exc)[:300])
+            return {'queued_id': '', 'thread': thread, 'token': token, 'text': queued}
         f.log('queue.' + state, agent=slot, delivery=delivery, token=token, error=str(exc)[:300])
         raise
     # Compare-and-set: a fast turn end may already have bound it; queued is not completion either way.
-    if r.hget(fleet.key('agent', slot), 'cq_state') == 'queuing':
-        r.hset(fleet.key('agent', slot), mapping={'cq_state': 'queued', 'cq_queued_id': got['queued_id']})
+    _set_if(r, fleet.key('agent', slot), 'queuing', {'cq_state': 'queued', 'cq_queued_id': got['queued_id']})
     f.log('queue.delivered', agent=slot, delivery=delivery, token=token, queued_id=got['queued_id'], thread=thread)
     return dict(got, token=token, text=queued)
 
@@ -219,8 +240,16 @@ def unsettled(info):
     return record(info)['cq_state'] in ('queuing', 'queued', 'uncertain')
 
 
-def mark_bound(r, slot, turn):
-    _real(r).hset(_fleet().key('agent', slot), mapping={'cq_state': 'bound', 'cq_turn': turn})
+def mark_bound(r, slot, turn, token):
+    """Bind atomically, only while the record is still the live delivery with `token` (never revives an
+    abandoned or superseded record). False: nothing was bound."""
+    r, key = _real(r), _fleet().key('agent', slot)
+    if hasattr(r, 'eval'):
+        return bool(r.eval(_BIND, 1, key, token, turn))
+    if r.hget(key, 'cq_state') not in (None, '', 'abandoned') and r.hget(key, 'cq_token') == token:
+        r.hset(key, mapping={'cq_state': 'bound', 'cq_turn': turn})
+        return True
+    return False
 
 
 def new_delivery_id(prefix):
