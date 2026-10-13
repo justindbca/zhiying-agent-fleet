@@ -32,8 +32,15 @@ def write_profiles(f, name, profiles):
 
 
 @pytest.fixture
-def nightly(hot):  # noqa: F811
+def nightly(hot, tmp_path, monkeypatch):  # noqa: F811
     f = hot
+    # Fake CLIs: the night card's preflight looks the official `claude` binary up on PATH; give it a stub
+    # instead of depending on the host's install (the suite runs with a fixed PATH without it).
+    stub = tmp_path / 'cli-bin'
+    stub.mkdir()
+    (stub / 'claude').write_text('#!/bin/sh\nexit 0\n')
+    (stub / 'claude').chmod(0o755)
+    monkeypatch.setenv('PATH', str(stub) + os.pathsep + os.environ.get('PATH', ''))
     night_path = write_profiles(f, 'night.yaml', {w: NIGHT_CARD for w in WORKERS})
     f.cfg['roster_night'] = str(night_path)
     fleet.save(f.path, dict(fleet.load(f.path), roster_night=str(night_path)))
