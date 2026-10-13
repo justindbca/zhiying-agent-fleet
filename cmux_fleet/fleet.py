@@ -3230,6 +3230,13 @@ class Fleet:
         self.log('agent.stalled', agent=name, state=info.get('state'), idle_s=idle_s, stalls=stalls)
         self.mgr.send_key(info['pane'], 'Escape')  # abort the turn; an aborted turn fires no notify
         self.setf(name, state='idle', idle_confirmed=0, stalls=stalls, busy_since=time.time())
+        queued = False  # a Codex item that never started is still in the TUI's queue (no official withdraw)
+        if codex_queue.unsettled(info):
+            rec = codex_queue.record(info)
+            if codex_queue.token_turn(rec['cq_thread'], rec['cq_token'], self.sessions):
+                codex_queue.clear(self, name, 'stalled turn aborted')  # it left the queue: a retry is not a duplicate
+            else:
+                queued = True
         if info.get('state') == 'starting':
             self.setf(name, state='dead', runtime_ready=0, current_profile='',
                       profile_state='blocked', profile_reason='startup timed out before READY')
@@ -3249,6 +3256,11 @@ class Fleet:
         if name == 'supervisor':
             if stalls >= 2 or not info.get('last_msg'):
                 self.finish('blocked', 'supervisor stalled twice (' + minutes + ' min without activity)')
+            elif queued:
+                # Its queued item has not started and still runs once the TUI is free: wait for it (its own
+                # turn settles it) instead of queueing the same message a second time.
+                self.setf(name, state='busy')
+                self.log('queue.kept', agent=name, delivery=codex_queue.record(info)['cq_delivery'])
             else:
                 self.r.lpush(key('inbox', name), info['last_msg'])  # one retry of the same message
         else:

@@ -25,7 +25,9 @@ import uuid
 FIELDS = ('cq_delivery', 'cq_token', 'cq_text', 'cq_thread', 'cq_generation', 'cq_queued_at', 'cq_state', 'cq_queued_id',
           'cq_turn')
 # States: queuing -> queued (CLI confirmed) | failed (CLI said no) | uncertain (no answer) ; -> bound (turn proven);
-# abandoned (cleared on resume / rotation / retire / finish: a later turn carrying its token never settles).
+# abandoned (cleared on resume / rotation / retire / finish: a later turn carrying its token never settles). Abandoned
+# is not cancelled: Codex has no official withdraw, so an item still queued in a live TUI runs. Hence deliver refuses
+# to queue behind an unsettled item, and --resume kills the old session before it decides (token_turn) on a replay.
 QUEUED = re.compile(r'Queued message (\S+) for thread (\S+?)\.?\s*$', re.M)
 MARK = '(fleet delivery {})'
 
@@ -127,6 +129,42 @@ def turn_record(thread, turn, sessions):
     return None
 
 
+def token_turn(thread, token, sessions):
+    """The turn whose one user message carries `token` in the rollout of `thread`: {'turn', 'complete'}
+    (complete: task_complete seen; an aborted or unfinished turn is not complete), or None if no turn
+    carrying it has started."""
+    fleet = _fleet()
+    mark = MARK.format(token)
+    for path in fleet.rollouts(thread, sessions):
+        try:
+            if fleet._is_subagent(fleet._meta(path)):
+                continue
+            lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+        except (OSError, ValueError):
+            continue
+        turn = None
+        for line in lines:
+            if turn is None and mark not in line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            payload = row.get('payload') or {}
+            if row.get('type') != 'event_msg':
+                continue
+            if turn is None:
+                item = payload.get('item') or {}
+                if payload.get('type') == 'item_completed' and item.get('type') == 'UserMessage' and any(
+                        isinstance(c, dict) and mark in c.get('text', '') for c in item.get('content') or []):
+                    turn = payload.get('turn_id') or ''
+            elif payload.get('type') == 'task_complete' and payload.get('turn_id') == turn:
+                return {'turn': turn, 'complete': True}
+        if turn is not None:
+            return {'turn': turn, 'complete': False}
+    return None
+
+
 def record(info):
     return {k: info.get(k, '') for k in FIELDS}
 
@@ -193,8 +231,13 @@ def deliver(f, slot, delivery, text, thread=None):
         # A queued item outlives its TUI and runs whenever the session is resumed later; never queue blind.
         f.log('queue.failed', agent=slot, delivery=delivery, error='runtime pane is gone')
         raise QueueError('failed: runtime pane is gone; not queued')
-    if record(info)['cq_state'] in ('queuing', 'queued', 'uncertain'):
-        clear(f, slot, 'superseded by ' + delivery)
+    prev = record(info)
+    if prev['cq_state'] in ('queuing', 'queued', 'uncertain'):
+        # Abandoning only stops settlement: the older item may still sit in this live TUI's queue and run, and
+        # Codex offers no official way to withdraw it. Never queue a second item behind it.
+        f.log('queue.refused', agent=slot, delivery=delivery, unsettled=prev['cq_delivery'], token=prev['cq_token'])
+        raise QueueError('failed: delivery ' + prev['cq_delivery'] + ' is still unsettled (' + prev['cq_state']
+                         + ') in this session; not queued behind it')
     token = new_token()
     queued = marked(text, token)
     r.hset(fleet.key('agent', slot), mapping={'cq_delivery': delivery, 'cq_token': token, 'cq_text': queued,

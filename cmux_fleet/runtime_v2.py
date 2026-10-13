@@ -1053,6 +1053,7 @@ class RuntimeV2:
             self.audit('resume.refused', level='error', error='ambiguous effect intent; held like a plain restart')
             return self.recover()
         previous = self.bus.r.hget(SERVICE, 'reason') if self.f.paused() else ''
+        unsettled = self.codex_unsettled()  # read before clear_slot abandons them and releases their leases
         lost = self.lost_dispatches()
         sup = self.f.agent('supervisor').get('pane')
         page = bool(sup) and self.f.mgr.get_pane_status(sup) is not None
@@ -1069,13 +1070,47 @@ class RuntimeV2:
         # A delegated slot's pane is run by its sub-fleet (resumed below): never replace it here.
         delegated = [s for s in self.f.workers if self.f.agent(s).get('state') == 'delegated']
         self.respawn([s for s in self.f.names if s not in reattach and s not in delegated], page)
+        ran = self.codex_ran(unsettled)  # only now: respawn closed those sessions (never reattached)
+        lost = [m for m in lost if m['message_id'] not in ran]
         self.f.resume()
         if self.f.service:
-            self.transaction('resume-requests-' + uuid.uuid4().hex, self.requeue_requests)
+            self.transaction('resume-requests-' + uuid.uuid4().hex, lambda: self.requeue_requests(ran))
         elif self.f.task().get('status') == 'running':
-            self.transaction('resume-task-' + uuid.uuid4().hex, lambda: self.brief(lost))
+            self.transaction('resume-task-' + uuid.uuid4().hex, lambda: self.brief(lost, ran))
         self.audit('daemon.resumed', level='warn', reattached=reattach, lost=len(lost), previous_pause=previous or '')
         subfleet.resume_children(self.f)  # children whose daemon is gone run again (--resume)
+
+    def codex_unsettled(self):
+        """Codex slots with a queued delivery never settled: [(slot, record, pane, lease message id or '')].
+        Abandoning does not withdraw such an item (Codex has no official way to), so a live TUI would still
+        run it next to the replay: clear_slot never reattaches these slots and respawn closes their session."""
+        out = []
+        for slot in self.f.names:
+            info = self.f.agent(slot)
+            if codex_queue.is_codex(self.slot_cfg(slot), slot) and codex_queue.unsettled(info):
+                rec = codex_queue.record(info)
+                lease = self.bus.r.hgetall(self.bus.lease_key(slot))
+                current = lease.get('message_id') if lease.get('current_delivery') == rec['cq_delivery'] else ''
+                out.append((slot, rec, info.get('pane') or '', current or ''))
+        return out
+
+    def codex_ran(self, unsettled):
+        """After the old sessions are closed, the old rollout decides by the delivery's token: no turn -> it
+        never ran (replayed); started -> interrupted by the close (replayed, like an aborted typed turn);
+        completed -> it ran while the daemon was down: never replayed. A session still open (respawn could
+        not close it; the task is blocked) is never replayed either. Returns {message_id: (slot, record, turn)}."""
+        ran = {}
+        for slot, rec, pane, current in unsettled:
+            open_ = bool(pane) and self.f.mgr.get_pane_status(pane) is not None
+            hit = codex_queue.token_turn(rec['cq_thread'], rec['cq_token'], self.f.sessions)
+            if current and (open_ or (hit and hit['complete'])):
+                ran[current] = (slot, rec, (hit or {}).get('turn', ''))
+            event = 'resume.codex_open' if open_ else 'resume.codex_ran' if hit and hit['complete'] else (
+                'resume.codex_interrupted' if hit else 'resume.codex_not_started')
+            self.audit(event, slot=slot, level='warn', delivery_id=rec['cq_delivery'],
+                       turn=(hit or {}).get('turn', ''), message_id=current,
+                       replay='no' if current in ran else 'yes')
+        return ran
 
     def lost_dispatches(self):
         """Task-mode worker instructions of the running task that were queued or in flight."""
@@ -1222,8 +1257,9 @@ class RuntimeV2:
                 + '\nCompleted dispatches (their reports were accepted; do not redo them):\n'
                 + ('\n'.join(x for _, x in sorted(done)) or '- none'))
 
-    def brief(self, lost):
-        """Re-queue lost dispatches (attempt-capped) and brief the new supervisor generation."""
+    def brief(self, lost, ran=None):
+        """Re-queue lost dispatches (attempt-capped) and brief the new supervisor generation. `ran`: worker
+        instructions that ran to completion before the interruption (never re-queued, reported instead)."""
         task = self.f.task()
         cap = int(self.f.cfg['max_attempts'])
         head = lambda text: ' '.join(text.split())[:200]
@@ -1239,6 +1275,8 @@ class RuntimeV2:
             self.effects.hset(self.bus.msg_key(mid), {'replay': attempt})
             requeued.append('- ' + self.f.label(msg['slot']) + ' (attempt ' + str(attempt) + ' of ' + str(cap)
                             + '): ' + head(msg['body']['text']))
+        done = ['- ' + self.f.label(slot) + ': ' + head(self.bus.message(mid).get('body', {}).get('text', ''))
+                for mid, (slot, _rec, _turn) in (ran or {}).items() if slot != 'supervisor']
         progress = self.progress(task)
         state = self.f.contract_state()
         self.f.queue('supervisor', '[Resumed task ' + task['id'] + '] This run was interrupted and resumed with '
@@ -1250,15 +1288,20 @@ class RuntimeV2:
                      + progress
                      + '\nLost dispatches the daemon already re-queued (do NOT dispatch them again):\n'
                      + ('\n'.join(requeued) or '- none')
+                     + (('\nInstructions that already ran to completion before the interruption; their reports were '
+                         'not received (check their files; do NOT dispatch them again):\n' + '\n'.join(done))
+                        if done else '')
                      + (('\nInterface contracts are on: read CONTRACTS.md in your directory and '
                          + str(self.f.workspace() / 'contracts.json') + '. ' + contracts.table_line(state))
                         if state else '')
                      + '\nDispatch only work that is still missing. Reply with the JSON format from AGENTS.md.')
 
-    def requeue_requests(self):
-        """Service: accepted requests without a public result run once more (unless replay is false)."""
+    def requeue_requests(self, ran=None):
+        """Service: accepted requests without a public result run once more (unless replay is false, or a
+        Codex item of theirs already ran to completion before the interruption)."""
         from cmux_fleet.fleet import REQ, REQQ
         cap = int(self.f.cfg['max_attempts'])
+        done = {self.bus.message(mid).get('request_id') for mid in (ran or {})}
         for rid in self.f.r.lrange(REQQ, 0, -1):
             req = self.f.r.hgetall(REQ + rid)
             if not req:
@@ -1266,7 +1309,10 @@ class RuntimeV2:
             spec = json.loads(req['spec'])
             attempt = int(req.get('replay') or 1) + 1
             worker = req.get('worker') or 'supervisor'
-            if spec.get('replay') is False:
+            if rid in done:
+                self.publish(rid, 'timeout', worker=worker, error='not replayed on resume: it already ran to '
+                             'completion before the interruption and its result was not received')
+            elif spec.get('replay') is False:
                 self.publish(rid, 'timeout', worker=worker, error='not replayed on resume (request has replay: false)')
             elif attempt > cap:
                 self.publish(rid, 'timeout', worker=worker, error='not replayed on resume: ' + str(cap)

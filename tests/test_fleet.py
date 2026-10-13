@@ -638,13 +638,24 @@ def test_stalled_worker_is_aborted_and_reported_to_supervisor(fx):
     assert fx.agent('worker-1')['stalls'] == '0'
 
 
+def _started_turn(fx, text):
+    """The rollout of a Codex turn that took `text` from the queue and then went silent (no task_complete)."""
+    t = str(uuid.uuid4())
+    return [{'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': t,
+                                              'turn_attribution': {'turn_id': t, 'turn_trigger': 'queue'}}},
+            {'type': 'event_msg', 'payload': {'type': 'item_completed', 'turn_id': t, 'item': {
+                'type': 'UserMessage', 'content': [{'type': 'text', 'text': text}]}}}]
+
+
 def test_stalled_supervisor_gets_one_retry_then_blocks(fx):
+    """The stalled turn had taken the message from Codex's queue (Escape aborts it), so one retry is safe."""
     import time as _t
     fx.cfg['stall_timeout'] = 600
     fx.pump()
     first = last_to(fx, 'supervisor')
     stale = _t.time() - 1000
-    path = write_rollout(fx.sessions, THREADS['supervisor'], fleet.agent_cwd(fx.cfg, 'supervisor'))
+    path = write_rollout(fx.sessions, THREADS['supervisor'], fleet.agent_cwd(fx.cfg, 'supervisor'),
+                         rows=_started_turn(fx, fx.agent('supervisor')['cq_text']))
     os.utime(path, (stale, stale))
     fx.setf('supervisor', busy_since=stale)
     fx.tick()
@@ -654,6 +665,25 @@ def test_stalled_supervisor_gets_one_retry_then_blocks(fx):
     fx.setf('supervisor', busy_since=stale); os.utime(path, (stale, stale))
     fx.tick()
     assert fx.task()['status'] == 'blocked' and 'stalled twice' in fx.task()['reason']
+
+
+def test_stalled_supervisor_whose_queued_item_never_started_is_not_queued_twice(fx):
+    """No turn carries the delivery's token: the item still sits in Codex's queue (abandoning cannot withdraw
+    it) and runs once the TUI is free. No second copy is queued; its own turn still settles it."""
+    import time as _t
+    fx.cfg['stall_timeout'] = 600
+    fx.pump()
+    first, rec = last_to(fx, 'supervisor'), dict(fx.agent('supervisor'))
+    stale = _t.time() - 1000
+    path = write_rollout(fx.sessions, THREADS['supervisor'], fleet.agent_cwd(fx.cfg, 'supervisor'))
+    os.utime(path, (stale, stale))
+    fx.setf('supervisor', busy_since=stale)
+    fx.tick()
+    assert fx.r.llen('fx:inbox:supervisor') == 0 and fx.agent('supervisor')['state'] == 'busy'
+    assert fx.agent('supervisor')['cq_token'] == rec['cq_token'] and fx.agent('supervisor')['cq_state'] == 'queued'
+    fx.pump()
+    assert last_to(fx, 'supervisor') == first and fx.task()['status'] == 'running'
+    assert any(json.loads(x)['kind'] == 'queue.kept' for x in fx.r.l['fx:log'])
 
 
 def test_rollout_activity_keeps_a_busy_agent_alive(fx):

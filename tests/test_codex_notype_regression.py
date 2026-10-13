@@ -709,6 +709,7 @@ def test_identical_text_redelivery_is_not_settled_by_the_previous_turn(sup):
     t_old, start_old = str(uuid.uuid4()), int(time.time() * 1000)
     old_rows = turn_rows(t_old, 'queue', [(client, text)], 'first answer', start_old)
     time.sleep(.2)
+    codex_queue.clear(f, 'supervisor', 'test: the first copy is abandoned before the same text is queued again')
     codex_queue.deliver(f, 'supervisor', 'replay-' + uuid.uuid4().hex[:6], text)
     assert cq(f, 'cq_state') == 'queued'
     write_rollout(f.test_sessions, session(f, 'supervisor'), fleet.agent_cwd(f.cfg, 'supervisor'), rows=old_rows)
@@ -899,6 +900,73 @@ def test_resume_replays_once_with_a_new_token_and_the_old_item_never_settles(tas
     again = codex_turn(f, WAIT, turn=turn, users=[('', briefs[0])])
     assert again is False or again['status'] in ('ignored', 'stale'), again
     assert input_box_use(f.agent('supervisor')['pane'], f.mgr.sent) == []
+
+
+def _resume_events(f, event):
+    return [e for e in audit(f) if e.get('event') == event]
+
+
+@pytest.mark.parametrize('ran', ['not-started', 'interrupted', 'completed'])
+def test_resume_kills_the_old_codex_session_before_it_reads_the_token_turn(task_run, monkeypatch, ran):  # noqa: F811
+    """start --resume with the supervisor's report still queued (unsettled): the old Codex session is killed
+    first (a live TUI would run the old item next to the replay; abandoning does not withdraw it), then the
+    old rollout decides by the delivery's token. Nothing new is ever queued into the old thread."""
+    state = task_run
+    q = install_queue(monkeypatch)
+    f = _report_in_flight(state, q)
+    old_pane, old_thread = f.agent('supervisor')['pane'], session(f, 'supervisor')
+    old = codex_queue.record(f.r.hgetall(fleet.key('agent', 'supervisor')))
+    if ran != 'not-started':
+        rows = turn_rows(str(uuid.uuid4()), 'queue', [('', old['cq_text'])], WAIT, complete=ran == 'completed')
+        write_rollout(f.test_sessions, old_thread, fleet.agent_cwd(f.cfg, 'supervisor'), rows=rows)
+    f = crash_and_resume(state)
+    f.q = q
+    assert old_pane in state['mgr'].killed and f.agent('supervisor')['pane'] != old_pane
+    event = {'not-started': 'resume.codex_not_started', 'interrupted': 'resume.codex_interrupted',
+             'completed': 'resume.codex_ran'}[ran]
+    got = _resume_events(f, event)
+    assert len(got) == 1 and got[0]['delivery_id'] == old['cq_delivery'] and got[0]['slot'] == 'supervisor', audit(f)
+    assert got[0]['replay'] == ('no' if ran == 'completed' else 'yes')
+    assert queued_texts(f, thread=old_thread)[-1] == old['cq_text']  # nothing new into the old thread
+    assert startup_ready(f)['status'] == 'ready'
+    f.pump(); f.pump()
+    assert len([t for t in queued_texts(f) if '[Resumed task ' in t]) == 1
+    late = codex_turn(f, WAIT, thread=old_thread, generation=0, users=[('', old['cq_text'])])
+    assert late is False or late['status'] in ('ignored', 'stale'), late
+    assert_no_input_box(f)
+
+
+def test_resume_never_replays_a_codex_worker_instruction_that_already_ran(task_run, monkeypatch):  # noqa: F811
+    """A Codex worker's queued instruction ran to completion while the daemon was down (its token's turn is
+    complete in the rollout, the report never settled). --resume must not re-queue it (it would run twice):
+    the supervisor's brief lists it as already run instead; worker-2's not-started peer case is replayed."""
+    state = task_run
+    q = install_queue(monkeypatch)
+    f = _report_in_flight(state, q)
+    real = codex_queue.is_codex
+    monkeypatch.setattr(codex_queue, 'is_codex', lambda cfg, name: name == 'worker-2' or real(cfg, name))
+    lease2 = f.r.hgetall(f.v2.bus.lease_key('worker-2'))
+    msg = f.v2.bus.message(lease2['message_id'])
+    token = codex_queue.new_token()
+    text = codex_queue.marked(msg['body']['text'], token)
+    thread = session(f, 'worker-2')
+    f.r.hset(fleet.key('agent', 'worker-2'), mapping={
+        'cq_delivery': lease2['current_delivery'], 'cq_token': token, 'cq_text': text, 'cq_thread': thread,
+        'cq_generation': f.agent('worker-2')['generation'], 'cq_queued_at': str(int(time.time() * 1000)),
+        'cq_state': 'queued', 'cq_queued_id': 'q-1', 'cq_turn': ''})
+    write_rollout(f.test_sessions, thread, fleet.agent_cwd(f.cfg, 'worker-2'),
+                  rows=turn_rows(str(uuid.uuid4()), 'queue', [('', text)], 'Done: wrote worker-2/b.md'))
+    old_pane = f.agent('worker-2')['pane']
+    f = crash_and_resume(state)
+    f.q = q
+    assert old_pane in state['mgr'].killed
+    got = _resume_events(f, 'resume.codex_ran')
+    assert len(got) == 1 and got[0]['slot'] == 'worker-2' and got[0]['replay'] == 'no', audit(f)
+    again = [f.v2.bus.message(m)['body']['text'] for m in f.v2.bus.pending('worker-2')]
+    assert not [t for t in again if 'Write worker-2/b.md' in t], again  # never re-queued
+    brief = [f.v2.bus.message(m)['body']['text'] for m in f.v2.bus.pending('supervisor')]
+    brief = [t for t in brief if '[Resumed task ' in t]
+    assert len(brief) == 1 and 'already ran to completion' in brief[0] and 'Write worker-2/b.md' in brief[0], brief
 
 
 def test_finish_then_resume_does_not_replay_the_abandoned_delivery(task_run, monkeypatch):  # noqa: F811
@@ -1138,12 +1206,32 @@ def test_same_body_queue_turn_of_another_message_never_settles_this_delivery(sup
 
 
 # ================================================================ J. same-body redelivery, CLI timeout, awkward bodies (argv + binding)
-def test_same_body_redelivery_supersedes_only_the_older_token(sup):
-    """Same business body queued twice: the older delivery is abandoned, a turn carrying its token never
-    settles the newer one, and the newer delivery's own turn settles."""
+@pytest.mark.parametrize('state', ['queuing', 'queued', 'uncertain'])
+def test_deliver_refuses_to_queue_behind_an_unsettled_item_in_the_same_thread(sup, state):
+    """Abandoning never withdraws an item from a live Codex queue (no official cancel), so the older item
+    would still run. A second delivery while one may still run is refused (the caller holds); nothing is
+    queued and the live record keeps its token. (Was: the older token was superseded and both items ran.)"""
     f = sup
     f.q.readable = False
     submit(f)
+    f.r.hset(fleet.key('agent', 'supervisor'), 'cq_state', state)
+    old = codex_queue.record(f.r.hgetall(fleet.key('agent', 'supervisor')))
+    before = len(f.q.items)
+    with pytest.raises(codex_queue.QueueError, match='still unsettled'):
+        codex_queue.deliver(f, 'supervisor', 'second-' + uuid.uuid4().hex[:6], _bare(old['cq_text']))
+    assert len(f.q.items) == before
+    assert codex_queue.record(f.r.hgetall(fleet.key('agent', 'supervisor'))) == old
+    assert_no_input_box(f)
+
+
+@pytest.mark.parametrize('state', ['failed', 'abandoned', 'bound'])
+def test_deliver_after_a_settled_or_never_queued_item_queues_with_a_new_token(sup, state):
+    """failed (the CLI said nothing was queued), abandoned or bound: a new delivery is queued with its own
+    token, and a turn carrying the older token never settles it."""
+    f = sup
+    f.q.readable = False
+    submit(f)
+    f.r.hset(fleet.key('agent', 'supervisor'), 'cq_state', state)
     old = codex_queue.record(f.r.hgetall(fleet.key('agent', 'supervisor')))
     got = codex_queue.deliver(f, 'supervisor', old['cq_delivery'], _bare(old['cq_text']))
     assert got['token'] != old['cq_token'] and _bare(got['text']) == _bare(old['cq_text'])
