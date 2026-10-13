@@ -21,6 +21,7 @@ Subcommands
   plan      build an offline dynamic dispatch plan (does not contact a fleet)
   notify    Codex notify hook (internal)
   claude-stop  Claude Code Stop hook for claude agents (internal)
+  claude-stop-failure  Claude Code StopFailure hook of hook-channel workers (internal)
   claude-prompt  Claude Code UserPromptSubmit hook of a v2 claude supervisor (internal)
   pi-event  Pi settled/session extension callback (internal)
   actor     exec the configured CLI for one agent (internal)
@@ -46,7 +47,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import brake, cli_pairs, contracts, handoff, history, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, watchdog  # noqa: E402
+from cmux_fleet import brake, claude_hook, cli_pairs, contracts, handoff, history, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, watchdog  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -101,11 +102,11 @@ def save(path, data):
     os.replace(tmp, path)
 
 
-def connect(cfg):
+def connect(cfg, socket_timeout=5):
     import redis
     sock = redis_runtime.validate_socket(cfg)
     client = redis.Redis(unix_socket_path=str(sock), db=0, decode_responses=True,
-                         socket_connect_timeout=3, socket_timeout=5)
+                         socket_connect_timeout=3, socket_timeout=socket_timeout)
     client.ping()  # Fail closed: never fall back to localhost:6379.
     return client
 
@@ -273,7 +274,12 @@ def handoff_limits(cli, model, cfg, table=None, worker=None, card=None):
 
 
 def claude_stop(cfg_path, name, generation, raw):
-    """Claude Code Stop hook. Pushes a turn event unless background work will resume the turn."""
+    """Claude Code Stop hook. Pushes a turn event unless background work will resume the turn.
+
+    A Claude worker on the hook channel (cmux_fleet/claude_hook.py) then waits here for its next
+    delivery and returns it as ``{"decision": "block", "reason": text}``; the CLI prints that.
+    """
+    started = time.monotonic()
     data = json.loads(raw or '{}')
     if data.get('background_tasks'):
         return False  # subagents still running in the background: the session will wake and stop again
@@ -291,11 +297,23 @@ def claude_stop(cfg_path, name, generation, raw):
         except (OSError, ValueError):
             pass
     cfg = load(cfg_path)
+    hooked = claude_hook.enabled(cfg, name, claude=True)
+    deadline = started + claude_hook.hook_timeout(cfg) - claude_hook.MARGIN
     if cfg.get('transport_version') == 2:
         cfg, name, generation = subfleet.delegated_route(cfg, name, int(generation))
-        return tui_turn(cfg, name, int(generation), thread=data.get('session_id'),
-                        transcript=data.get('transcript_path', ''), text=text,
-                        inputs=claude_user_prompts(data.get('transcript_path', '')))
+        # An adopted worker pane that now runs a sub-fleet's supervisor gets typed input: never wait there.
+        hooked = hooked and claude_hook.enabled(cfg, name, claude=True)
+        if not hooked:
+            return tui_turn(cfg, name, int(generation), thread=data.get('session_id'),
+                            transcript=data.get('transcript_path', ''), text=text,
+                            inputs=claude_user_prompts(data.get('transcript_path', '')))
+        try:
+            tui_turn(cfg, name, int(generation), thread=data.get('session_id'),
+                     transcript=data.get('transcript_path', ''), text=text,
+                     inputs=claude_user_prompts(data.get('transcript_path', '')))
+        except Exception as exc:  # still arm the channel: the daemon holds/expires the lease itself
+            print('fleet claude-stop: turn not reported: ' + str(exc)[:300], file=sys.stderr)
+        return claude_hook_next(cfg, name, int(generation), data.get('session_id'), deadline)
     # Which delivery this turn answers: the last user message in the transcript that points at an
     # .inbox/msg-*.md file. User messages are written when the turn starts, so they are present even
     # when the final assistant message has not been flushed yet.
@@ -312,11 +330,142 @@ def claude_stop(cfg_path, name, generation, raw):
     r = connect(cfg)
     # No hook-side de-dup: the Stop payload carries no turn id and the transcript may lag the final
     # message. The daemon drops a turn for a claude worker that is already idle (see on_turn).
+    if hooked and claude_hook_keepalive(cfg, r, name, int(generation), data.get('session_id')):
+        r.close()
+        return claude_hook_next(cfg, name, int(generation), data.get('session_id'), deadline)
     r.rpush(EVENTS, json.dumps({'kind': 'turn', 'agent': name, 'generation': int(generation),
                                 'thread': data.get('session_id'), 'transcript': data.get('transcript_path', ''),
                                 'msg_id': msg_id, 'text': text, 'at': time.time()}, ensure_ascii=False))
+    if not hooked:
+        return True
+    r.close()
+    return claude_hook_next(cfg, name, int(generation), data.get('session_id'), deadline)
+
+
+def hook_keys(cfg, r, name, generation):
+    """Redis keys of one slot's hook channel: run-scoped on v2, the fleet's fx: space on v1."""
+    prefix = runtime_v2.bus_for(cfg, r).prefix if cfg.get('transport_version') == 2 else 'fx'
+    return claude_hook.keys(prefix, name, generation)
+
+
+def hook_bind(r, k):
+    try:
+        bind = json.loads(r.get(k['bind']) or '{}')
+    except ValueError:
+        return {}
+    return bind if isinstance(bind, dict) else {}
+
+
+def claude_hook_keepalive(cfg, r, name, generation, thread):
+    """True once for the turn our own keepalive started: it is never settled nor reported."""
+    k = hook_keys(cfg, r, name, generation)
+    bind = hook_bind(r, k)
+    if bind.get('kind') != 'keepalive' or bind.get('session_id') != thread or bind.get('generation') != generation:
+        return False
+    r.delete(k['bind'])
     return True
 
+
+def hook_delivered(r, k, thread, lease):
+    """The hook of this session handed this very delivery to Claude (v2 binding, design.md §21)."""
+    bind = hook_bind(r, k)
+    return (bind.get('kind') == 'delivery' and bool(lease.get('message_id'))
+            and bind.get('message_id') == lease.get('message_id') and bind.get('session_id') == thread
+            and (not lease.get('current_delivery') or bind.get('delivery_id') == lease.get('current_delivery')))
+
+
+def claude_hook_next(cfg, name, generation, thread, deadline):
+    """Wait for this generation's next delivery; the block decision for it, or None (let Claude idle).
+
+    Entries are re-validated at hand-over: a delivery must still be this session's received lease
+    (v2) or the pointer the daemon sent last (v1); anything else is dropped as stale.
+    """
+    import redis
+    parent = os.getppid()  # Claude Code (or its hook shell): once it is gone, nobody reads our answer
+    while time.monotonic() < deadline and parent != 1:
+        try:
+            r = connect(cfg, socket_timeout=claude_hook.POLL + 10)
+        except (redis.RedisError, OSError, ValueError):
+            time.sleep(claude_hook.POLL)
+            continue
+        try:
+            v2 = cfg.get('transport_version') == 2
+            bus = runtime_v2.bus_for(cfg, r) if v2 else None
+            k = hook_keys(cfg, r, name, generation)
+
+            def alive():
+                if os.getppid() != parent:  # orphaned: never take a delivery a dead session cannot run
+                    return False
+                info = r.hgetall(key('agent', name))
+                # delegated: a sub-fleet adopts this pane and types its role change; let that prompt run
+                return int(info.get('generation', -1)) == generation and info.get('state') not in ('dead', 'delegated')
+
+            def drop(entry, why):
+                if bus:
+                    r.xadd(bus.audit_key, {'event': 'hook.dropped', 'slot': name, 'run_id': bus.run_id,
+                                           'generation': str(generation), 'error': why, 'level': 'warn',
+                                           'message_id': str(entry.get('message_id', '')),
+                                           'at': str(int(time.time() * 1000))})
+                return None
+
+            def accept(entry):
+                kind, info = entry.get('kind'), r.hgetall(key('agent', name))
+                if entry.get('generation') != generation:
+                    return drop(entry, 'entry of another generation')
+                if kind == 'delivery' and bus:
+                    lease = r.hgetall(bus.lease_key(name))
+                    if (lease.get('status') != 'received' or lease.get('generation') != str(generation)
+                            or lease.get('session_id') != thread
+                            or lease.get('message_id') != entry.get('message_id')
+                            or lease.get('current_delivery') != entry.get('delivery_id')):
+                        return drop(entry, 'delivery is no longer this session\'s received lease')
+                elif kind == 'nudge':
+                    if info.get('state') != 'starting':
+                        return drop(entry, 'startup nudge after startup')
+                elif kind == 'pointer' and not bus:
+                    if info.get('msg_id') != entry.get('msg_id') or info.get('state') not in ('busy', 'handoff'):
+                        return drop(entry, 'pointer is not the last v1 delivery')
+                else:
+                    return drop(entry, 'unknown hook entry')
+                bind = {x: entry.get(x) for x in ('kind', 'message_id', 'delivery_id', 'msg_id') if x in entry}
+                r.set(k['bind'], json.dumps(dict(bind, generation=generation, session_id=thread or '',
+                                                 at=time.time())), ex=claude_hook.BIND_TTL)
+                return entry.get('text')
+
+            text, _ = claude_hook.wait(r, k, generation, thread, deadline, alive, accept)
+            if text:
+                return claude_hook.block(text)
+            if time.monotonic() < deadline or not alive():
+                return None
+            # Claude Code would kill this hook soon and leave the session unarmed: one tiny turn re-arms it.
+            r.set(k['bind'], json.dumps({'kind': 'keepalive', 'generation': generation, 'session_id': thread or '',
+                                         'at': time.time()}), ex=claude_hook.BIND_TTL)
+            return claude_hook.block(claude_hook.KEEPALIVE)
+        except redis.RedisError:
+            time.sleep(claude_hook.POLL)  # Redis restarting: keep the session armed until the deadline
+        finally:
+            r.close(); r.connection_pool.disconnect()
+    return None
+
+
+def claude_stop_failure(cfg_path, name, generation, raw):
+    """Claude Code StopFailure hook (output ignored): an API error ended the turn, so no Stop hook
+    waits for the next delivery. Record it; an in-flight delivery then goes the watchdog's stall path."""
+    data = json.loads(raw or '{}')
+    cfg = load(cfg_path)
+    fields = {'slot': name, 'generation': str(generation), 'error': str(data.get('error') or 'unknown')[:200],
+              'session_id': str(data.get('session_id') or ''), 'level': 'warn',
+              'text': str(data.get('last_assistant_message') or '')[-500:], 'at': str(int(time.time() * 1000))}
+    r = connect(cfg)
+    try:
+        if cfg.get('transport_version') == 2:
+            cfg, name, generation = subfleet.delegated_route(cfg, name, int(generation))
+            bus = runtime_v2.bus_for(cfg, r)
+            r.xadd(bus.audit_key, dict(fields, event='hook.stop_failure', run_id=bus.run_id, slot=name))
+        else:
+            r.rpush(LOG, json.dumps(dict(fields, time=time.time(), kind='hook.stop_failure'), ensure_ascii=False))
+    finally:
+        r.close()
 
 # ---------------------------------------------------------------- trust gate
 def validate_artifacts(artifacts, extended=False):
@@ -723,9 +872,13 @@ def claude_user_prompts(path, count=3):
                     row = json.loads(line)
                 except ValueError:
                     continue
-                if row.get('type') != 'user' or row.get('isSidechain') or row.get('isMeta'):
+                if row.get('type') != 'user' or row.get('isSidechain'):
                     continue
+                if (row.get('origin') or {}).get('kind') == 'task-notification':
+                    continue  # a background task finishing continues the current turn's work
                 content = (row.get('message') or {}).get('content')
+                if row.get('isMeta'):  # only a hook-channel delivery (Stop-hook block reason) counts
+                    content = claude_hook.feedback_text(content)
                 if isinstance(content, list):
                     content = '\n'.join(p.get('text', '') for p in content if isinstance(p, dict) and p.get('type') == 'text')
                 if isinstance(content, str) and content.strip():
@@ -869,6 +1022,18 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
                     return answer
             bus.register_slot(name, generation, thread)
             return call('startup', text=text, failed=False, aborted=False)
+        k = hook_keys(cfg, r, name, generation) if claude_hook.enabled(cfg, name) else None
+        if k and claude_hook_keepalive(cfg, r, name, generation, thread):
+            return skipped('ignored', 'hook channel keepalive turn')
+
+        def answered(body_text, lease):
+            # Hook channel: this session's Stop hook must have handed over this very delivery, and it
+            # must be the row that started this turn (its isMeta "Stop hook feedback" row is the latest
+            # prompt, see claude_user_prompts): an older feedback row never settles a manual turn.
+            if k is None:
+                return runtime_v2.turn_answers(body_text, inputs)
+            return runtime_v2.turn_answers(body_text, inputs[-1:]) and hook_delivered(r, k, thread, lease)
+
         def ignored(reason):
             # §21: a turn no delivery started (a peer SendMessage woke it, or the operator typed):
             # the daemon records it as unsolicited and forwards its Peer notices / question lines.
@@ -881,7 +1046,7 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
             # proves its execution stopped. The daemon releases the slot; the result is not applied.
             msg = bus.message(lease['message_id'])
             if (msg.get('generation') != generation or msg.get('session_id') != thread
-                    or not runtime_v2.turn_answers(msg['body']['text'], inputs)):
+                    or not answered(msg['body']['text'], lease)):
                 return skipped('ignored', 'held delivery was not answered by this session')
             return call('turn_ended', delivery={k: msg[k] for k in runtime_v2.IDENTITY})
         if lease.get('status') != 'received' or not lease.get('message_id'):
@@ -889,8 +1054,8 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
         msg = bus.message(lease['message_id'])
         if msg.get('generation') != generation or msg.get('session_id') != thread:
             return skipped('stale', 'delivery belongs to another generation/session')
-        if not runtime_v2.turn_answers(msg['body']['text'], inputs):
-            return ignored('turn was not started by the typed delivery')
+        if not answered(msg['body']['text'], lease):
+            return ignored('turn was not started by the delivery')
         return call('settled', delivery={k: msg[k] for k in runtime_v2.IDENTITY},
                     candidates=runtime_v2.tui_candidates(name, msg['body'].get('purpose'), text or '',
                                                          msg['body'].get('mode') or cfg.get('mode') or 'task'),
@@ -934,18 +1099,27 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
     settings = cwd / ('.fleet-settings-g' + str(generation) + '.json')
     # v2: the READY hook waits for the daemon, which may still be spawning other tabs.
     timeout = 30 if cfg.get('transport_version') != 2 else int(float(cfg.get('profile_ready_timeout') or 180)) + 30
+    hooked = claude_hook.enabled(cfg, name, claude=True)
+    if hooked:
+        timeout = claude_hook.hook_timeout(cfg)  # the hook waits here for the next delivery
     hooks = {'Stop': [{'hooks': [{'type': 'command', 'command': hook, 'timeout': timeout}]}]}
+    if hooked:
+        # An API error ends the turn with StopFailure instead of Stop: no hook waits afterwards.
+        hooks['StopFailure'] = [{'hooks': [{'type': 'command', 'timeout': 30, 'command': shlex.join(
+            [cfg['python'], str(Path(__file__).resolve()), 'claude-stop-failure', str(cfg_path), name, str(generation)])}]}]
     if prompt_hook_slot(cfg, name, generation):
         # Operator input typed in the supervisor tab is queued as a daemon request (design.md §5).
         hooks['UserPromptSubmit'] = [{'hooks': [{'type': 'command', 'timeout': PROMPT_HOOK_TIMEOUT, 'command': shlex.join(
             [cfg['python'], str(Path(__file__).resolve()), 'claude-prompt', str(cfg_path), name, str(generation)])}]}]
-    settings.write_text(json.dumps({'hooks': hooks}))
+    settings.write_text(json.dumps(dict({'hooks': hooks}, **({'env': claude_hook.ENV} if hooked else {}))))
     argv = [cfg.get('claude') or 'claude', '--dangerously-skip-permissions', '--model', claude_model(cfg, name),
             # Unattended panes: a choice dialog would wait for a human forever (acceptance 10/13 P1-5).
             '--disallowedTools', 'AskUserQuestion',
             '--settings', str(settings), '--add-dir', str(Path(cfg['run']) / 'workspace')]
     if name != 'supervisor':  # stable per slot across generations (peer messages address it)
         argv += ['--name', claude_session_name(cfg, name)]
+    if hooked:
+        argv += ['--append-system-prompt', claude_hook.DECLARATION]
     if (cwd / 'mcp.json').exists():
         argv += ['--mcp-config', str(cwd / 'mcp.json')]
     return argv + ['--', prompt]  # --add-dir / --mcp-config are variadic: end options first
@@ -1002,6 +1176,8 @@ def actor(cfg_path, name, prompt, generation=None):
         argv = pi_adapter.argv(cfg, name, generation, prompt, agent_cwd(cfg, name), label=info['label'])
     elif is_claude(cfg, name):
         os.environ.pop('CLAUDECODE', None)
+        if claude_hook.enabled(cfg, name, claude=True):
+            os.environ.update(claude_hook.ENV)  # back-to-back deliveries are consecutive Stop blocks
         argv = claude_argv(cfg_path, cfg, name, generation, prompt)
     else:
         argv = actor_argv(cfg_path, cfg, name, generation, prompt)
@@ -2682,8 +2858,17 @@ class Fleet:
         msg.write_text(text)
         self.setf(name, msg_id=mid)
         first = ' '.join(text.split('\n', 1)[0].split())[:200]
-        return self.mgr.send_prompt_to_idle(pane, first + ' -- the full message is in ' + str(msg)
-                                            + ' . Read that whole file first and follow it.')
+        pointer = first + ' -- the full message is in ' + str(msg) + ' . Read that whole file first and follow it.'
+        if claude_hook.enabled(self.runtime_cfg(name), name):
+            # The Stop hook hands the pointer over; on_turn binds by the msg id in its feedback row.
+            generation = int(self.agent(name).get('generation') or 0)
+            k = claude_hook.keys('fx', name, generation)
+            if not claude_hook.post(self.r, k, {'kind': 'pointer', 'msg_id': mid, 'generation': generation,
+                                                 'text': pointer}):
+                self.log('hook.unarmed', agent=name, msg_id=mid,
+                         reason='no Stop hook waiting; the next turn end of this session picks it up')
+            return True
+        return self.mgr.send_prompt_to_idle(pane, pointer)
 
     def start_rotation(self, name, used, window):
         info = self.agent(name)
@@ -4104,6 +4289,9 @@ def main(argv=None):
     h = sub.add_parser('claude-stop', help='Claude Code Stop hook (internal; hook JSON on stdin)')
     for arg in ('cfg', 'agent', 'generation'):
         h.add_argument(arg)
+    h = sub.add_parser('claude-stop-failure', help='Claude Code StopFailure hook (internal; hook JSON on stdin)')
+    for arg in ('cfg', 'agent', 'generation'):
+        h.add_argument(arg)
     h = sub.add_parser('claude-prompt', help='Claude Code UserPromptSubmit hook (internal; hook JSON on stdin)')
     for arg in ('cfg', 'agent', 'generation'):
         h.add_argument(arg)
@@ -4124,7 +4312,11 @@ def main(argv=None):
     elif args.cmd == 'notify':
         notify(args.cfg, args.agent, args.generation, args.payload)
     elif args.cmd == 'claude-stop':
-        claude_stop(args.cfg, args.agent, args.generation, sys.stdin.read())
+        out = claude_stop(args.cfg, args.agent, args.generation, sys.stdin.read())
+        if isinstance(out, dict) and out.get('decision') == 'block':  # hook channel: the next delivery
+            print(json.dumps(out, ensure_ascii=False))
+    elif args.cmd == 'claude-stop-failure':
+        claude_stop_failure(args.cfg, args.agent, args.generation, sys.stdin.read())
     elif args.cmd == 'claude-prompt':
         reason = claude_prompt_main(args.cfg, args.agent, args.generation, sys.stdin.read())
         if reason:  # nothing at all on pass: a UserPromptSubmit hook's stdout becomes model context
