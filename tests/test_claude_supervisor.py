@@ -269,6 +269,8 @@ def test_non_ready_startup_blocks_the_task(private_redis_v2, tmp_path, no_trust)
     f.r.set(f.v2.prefix + ':boot', 'running')
     try:
         assert stop_hook(f, 'supervisor', 'Hello! How can I help?', prompt=spawn_prompt(f, 'supervisor'))['status'] == 'rejected'
+        assert f.agent('supervisor')['state'] == 'starting'  # one correction first (acceptance 10/13 P1-3)
+        assert stop_hook(f, 'supervisor', 'Hello again', prompt=spawn_prompt(f, 'supervisor'))['status'] == 'rejected'
         assert f.agent('supervisor')['state'] == 'dead'
     finally:
         f.v2.close()

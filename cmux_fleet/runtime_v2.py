@@ -69,6 +69,17 @@ def _norm(text):
     return ' '.join(str(text).split())
 
 
+def ready_reply(text):
+    """Startup settles when the reply's last non-empty line is READY (markdown emphasis and a
+    trailing period tolerated): models often put a sentence first. 'NOT READY' is not READY."""
+    lines = [x.strip().strip('*_`').rstrip('.').strip() for x in str(text or '').splitlines() if x.strip()]
+    return bool(lines) and lines[-1] == 'READY'
+
+
+STARTUP_NUDGE = ('Your startup reply was not READY. Do no task work in this turn: '
+                 'reply exactly READY (one word, nothing else).')
+
+
 def turn_answers(body_text, inputs):
     """The turn must have been started by the typed delivery text (not a manual turn)."""
     head = _norm(body_text)[:120]
@@ -327,6 +338,7 @@ class RuntimeV2:
         self.context = None
         self.queue_index = 0
         self.rotation_pending = set()
+        self.startup_nudges = set()  # slots to re-ask for READY once, typed after the transaction
         self.pending_cursor = '0-0'
         self.held_events = set()
         self.renewed = {}
@@ -513,6 +525,7 @@ class RuntimeV2:
                     self.effects.values.clear()
                     self.effects.commands.clear()
                     self.rotation_pending.clear()
+                    self.startup_nudges.clear()
                     self.audit('event.rejected', error=str(exc), level='error', detail=ev)
                     self.reply(ev, {'status': 'rejected', 'reason': str(exc)})
             self.transaction(fields['event_id'], handle, event_stream_id=sid)
@@ -522,6 +535,12 @@ class RuntimeV2:
             for slot in list(self.rotation_pending):
                 self.rotation_pending.remove(slot)
                 self.f.finish_rotation(slot)
+            for slot in list(self.startup_nudges):  # pane typing is not a Redis effect either
+                self.startup_nudges.remove(slot)
+                pane = self.f.agent(slot).get('pane')
+                if pane:
+                    from cmux_fleet.fleet import is_claude
+                    self.f.mgr.send_prompt_to_idle(pane, STARTUP_NUDGE, bracketed=is_claude(self.f.runtime_cfg(slot), slot))
             return True
         return False
 
@@ -563,16 +582,25 @@ class RuntimeV2:
                     self.audit('startup.duplicate', slot=slot)
                     self.reply(ev, {'status': 'rejected', 'reason': 'startup belongs to an already settled or held runtime'})
                     return
+                text_ok = ready_reply(ev.get('text', ''))
                 walled = None
-                if (info.get('launch_ready', '1') == '1' and ev.get('text', '').strip() != 'READY'
+                if (info.get('launch_ready', '1') == '1' and not text_ok
                         and slot in self.f.workers + ['supervisor']):
                     # E: a wall instead of READY pauses resumable (Pi also reports the model error text).
                     walled = self.f.startup_wall(slot, '\n'.join(str(ev.get(k) or '') for k in ('text', 'error')))
+                nudged = info.get('startup_nudged') == info.get('startup_deadline', '')
                 if walled:
                     self.f.notify_later(walled)
                     self.reply(ev, {'status': 'rejected', 'reason': 'usage wall at startup: slot walled, fleet paused'})
+                elif (not text_ok and info.get('launch_ready', '1') == '1' and not ev.get('failed')
+                        and not ev.get('aborted') and not nudged):
+                    # One correction per READY ask (keyed by its deadline), then block as before.
+                    self.f.setf(slot, startup_nudged=info.get('startup_deadline', ''))
+                    self.startup_nudges.add(slot)
+                    self.audit('startup.nudged', slot=slot)
+                    self.reply(ev, {'status': 'rejected', 'reason': 'startup reply was not READY; asked once more'})
                 elif (info.get('launch_ready', '1') != '1'
-                        or ev.get('failed') or ev.get('aborted') or ev.get('text', '').strip() != 'READY'):
+                        or ev.get('failed') or ev.get('aborted') or not text_ok):
                     self.f.setf(slot, state='dead', runtime_ready=0, bridge_available=0)
                     self.f.finish('blocked', slot + ': startup failed before READY')
                     self.reply(ev, {'status': 'rejected', 'reason': 'startup did not settle with READY'})

@@ -315,7 +315,9 @@ def test_child_interfaces_notify_the_parent_and_the_top_can_veto(cf, tmp_path):
     fleet.save(cf.run_dir / 'subfleet-notices' / 'n1.json', dict(note, origin_run=str(cf.run_dir)))
     cf.relay_notices()
     up = inbox(cf, 'supervisor')[-1]
-    assert up.startswith('[sub-fleet interfaces] sub-fleet M0 registered: IF-M0-src@1 (new, worker-1/sources.md)')
+    # §26: the path is absolute (the child's workspace), not readable as the parent's worker-1/...
+    assert up.startswith('[sub-fleet interfaces] sub-fleet M0 registered: IF-M0-src@1 (new, '
+                         + str(cf.workspace() / 'worker-1/sources.md') + ')')
     assert '"decision": "veto"' in up and not (cf.run_dir / 'subfleet-notices' / 'n1.json').exists()
     sup(cf, {'status': 'RUNNING', 'completion': 5, 'interfaces': [
         {'id': 'IF-M0-src', 'version': 1, 'decision': 'veto', 'note': 'duplicates M1'}],

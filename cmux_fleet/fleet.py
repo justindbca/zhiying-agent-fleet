@@ -70,7 +70,7 @@ WORKER_NAME_RE = r'[a-z][a-z0-9-]{0,30}'
 # (same <slot>.<generation> pattern as worker-1 -> worker-1.1). Redis keys and the cwd stay 'supervisor'.
 SUPERVISOR_LABEL = 'supervisor-1'
 RESULT_TTL = 7 * 86400
-RESUME_CLIS = ('codex', 'claude', 'pi', 'node')  # process names that prove a reattachable CLI pane
+RESUME_CLIS = ('codex', 'claude')  # CLIs whose live process proves a reattachable pane (cmux_manager._is_cli)
 # Sandboxed agents cannot drive the user's browser themselves (and must never be allowed
 # to kill it). If the operator supplies a broker script, the daemon runs these verbs for them.
 CHROME_VERBS = {'check', 'tabs', 'newtab', 'go', 'url', 'js'}
@@ -941,6 +941,8 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
             [cfg['python'], str(Path(__file__).resolve()), 'claude-prompt', str(cfg_path), name, str(generation)])}]}]
     settings.write_text(json.dumps({'hooks': hooks}))
     argv = [cfg.get('claude') or 'claude', '--dangerously-skip-permissions', '--model', claude_model(cfg, name),
+            # Unattended panes: a choice dialog would wait for a human forever (acceptance 10/13 P1-5).
+            '--disallowedTools', 'AskUserQuestion',
             '--settings', str(settings), '--add-dir', str(Path(cfg['run']) / 'workspace')]
     if name != 'supervisor':  # stable per slot across generations (peer messages address it)
         argv += ['--name', claude_session_name(cfg, name)]
@@ -1643,7 +1645,11 @@ class Fleet:
         if fields.get('escalate') is not None:
             task_id, ok, note, reply = self.escalate_intake(name, fields, s)
             hold = task_id if task_id in s['tasks'] else (mine or {}).get('id')
-            if hold:
+            if hold and ok is None:  # sub-fleet attempts used up (escalate_intake): no new spawn
+                s['tasks'][hold].update(status='failed', reason='escalate refused: ' + subfleet.EXHAUSTED
+                                        + ' reached, no new sub-fleet')
+                self.contract_log('task.failed', task=hold, by='program', reason=s['tasks'][hold]['reason'])
+            elif hold:
                 s['tasks'][hold].update(status='escalated' if ok else 'running',
                                         reason='asked to split' if ok else 'escalate refused; worker continues')
             if reply:
@@ -1691,6 +1697,17 @@ class Fleet:
             unready = [r for r, e in zip(row.get('provides') or [], current) if not e or e['status'] != 'ready']
             row['status'] = 'failed' if unready else 'done'
             row['reason'] = ('reported, but not ready: ' + ', '.join(unready)) if unready else 'outputs verified'
+            claimed = {i + '@' + str(v) for i, v in contracts.ready_claims(str(fields.get('interfaces', '')))}
+            unclaimed = [contracts.ref(e) for e in current if e and e['status'] != 'ready'
+                         and contracts.ref(e) not in claimed and not contracts.file_failures(e, ws)]
+            if unclaimed:  # file passes, announcement line missing/garbled: say which literal line
+                line = 'Interfaces: ' + ', '.join(x + ' provided: ready' for x in unclaimed)
+                row['reason'] += ' (the report has no line `' + line + '`; ' + self.label(name) + ' was asked for it)'
+                self.contract_queue(s, name, '[contract] ' + row['id'] + ' is not done: your report did not announce '
+                                    + ', '.join(unclaimed) + '. If the file is written, reply in the AGENTS.md format '
+                                    'with this exact line: ' + line, row['id'])
+                notes.append('[contract] ' + row['id'] + ': the file passes but the report misses `' + line + '`; '
+                             + self.label(name) + ' was asked for that line (no re-dispatch needed)')
             self.contract_log('task.' + row['status'], task=row['id'], by=name, reason=row['reason'])
             for held in contracts.releasable(s) if not unready else []:
                 held['status'] = 'running'
@@ -1759,6 +1776,11 @@ class Fleet:
             task_id, rec = self.escalate_check(name, fields, state)
         except ValueError as exc:
             self.log('escalate.refused', agent=name, reason=str(exc))
+            if state is not None and str(exc).startswith(subfleet.EXHAUSTED):
+                # Contract task out of sub-fleet attempts: the task fails here, the supervisor decides.
+                return None, None, ('\n[escalate] refused for ' + self.label(name) + ': ' + str(exc)
+                                    + '. The task is marked failed; re-dispatch it (another approach or worker) '
+                                    'or end the task.'), None
             return None, False, ('\n[escalate] refused for ' + self.label(name) + ': ' + str(exc)
                                  + ' (the worker was told and continues its task)'), \
                 ('[escalate] your split request was refused by the program: ' + str(exc)
@@ -1810,19 +1832,20 @@ class Fleet:
                            + '. ' + task_id + ' still waits for your answer (approve with fewer workers / revise / '
                            'reject). Reply with the JSON format from AGENTS.md.')
                 return
-            output, goal = None, rec['instruction']
+            output, outputs, goal = None, None, rec['instruction']
             if row is not None:
-                paths = [e['path'] for e in (contracts.current(state, i) for i in row.get('provides') or []) if e]
-                output = str(self.workspace() / paths[0]) if paths else None
-                if paths:
+                entries = [e for e in (contracts.current(state, i) for i in row.get('provides') or []) if e]
+                outputs = [str(self.workspace() / e['path']) for e in entries]  # parent paths stay parent paths
+                output = outputs[0] if outputs else None
+                if entries:  # refs only: the child writes inside its own workspace (subfleet.goal_text)
                     goal += ('\nThe parent fleet verifies these interfaces of ' + task_id + ' (shapes in '
-                             + str(self.workspace() / 'contracts.json') + '): '
-                             + ', '.join(str(self.workspace() / x) for x in paths))
+                             + str(self.workspace() / 'contracts.json') + ', read only): '
+                             + ', '.join(contracts.ref(e) for e in entries))
                 row.update(status='delegated', attempts=row.get('attempts', 0) + 1, reason='sub-fleet ' + task_id)
             if note:
                 goal += '\nSupervisor note: ' + note
             rid = subfleet.request(self.run_dir, slot, task_id, goal, workers, output=output,
-                                   proposal=rec['proposal'], contracts=state is not None)
+                                   proposal=rec['proposal'], contracts=state is not None, outputs=outputs)
             rec.update(status='approved', rid=rid, workers=workers, note=note)
             esc[task_id] = rec
             self.log('escalate.approved', task=task_id, request=rid, workers=workers)
@@ -1917,7 +1940,7 @@ class Fleet:
             return
         folder = Path(load(self.cfg['parent_config'])['run']) / 'subfleet-notices'
         folder.mkdir(parents=True, exist_ok=True)
-        items = [{'ref': k, 'change': kind, 'path': state['interfaces'][k]['path'],
+        items = [{'ref': k, 'change': kind, 'path': str(self.workspace() / state['interfaces'][k]['path']),
                   'producer': state['interfaces'][k]['producer']} for k, kind in changes if k in state['interfaces']]
         save(folder / (uuid.uuid4().hex[:12] + '.json'),
              {'origin_run': str(self.run_dir), 'task': self.cfg.get('task_id'), 'interfaces': items})
