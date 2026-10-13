@@ -49,7 +49,8 @@ Answers you will receive:
 - `[advisor] respawn worker-1 → worker-1.1 done`: the same slot continues the same task with a new configuration; wait for its report (do not dispatch it again).
 - `[advisor] M0 → worker-2 (opus/high, domains: [...])：reassign ...`: worker-2 is ready; dispatch M0 to worker-2 yourself (with `"id": "M0"`). worker-1 no longer owns M0.
 - `[advisor] give_up M0: <reason>`: reply `BLOCKED` with that reason.
-- `[advisor unavailable] consult M0 ...` / `[advisor off] consult M0 ...`: nothing was changed; decide yourself (a corrective dispatch or `BLOCKED`).
+- `[advisor unavailable] consult M0 ...`: nothing was changed; decide yourself (a corrective dispatch or `BLOCKED`).
+- `[advisor off] consult M0 ...`: the advisor is off and nothing was changed; send `"advisor": "on"` and the consult again, or decide yourself.
 - `[advisor] worker-1 → sonnet/medium, domains: [...]（...）`: information only (how a dispatch was configured).
 
 ## 3. Final tool: fleet_decision
@@ -66,6 +67,7 @@ Answers you will receive:
 - `escalations`: optional, your answers to `[escalate]` requests (see the command table)
 - `dispatch[].advise_note`: optional note for the advisor (difficulty, needs the web, edits code, the output); never choose models or tools yourself
 - `consult`: optional, see "Judging a report"; a RUNNING reply with `consult` may dispatch nothing
+- `advisor`: optional `"on"` / `"off"` (default off; written into the run's roster, stays until changed). Turn it on when the task benefits from per-dispatch model / effort / domain picking, or before you `consult`; `on` already applies to the dispatch / consult in the same reply. While off, `advise_note` is unused and `consult` gets `[advisor off]`
 - `dispatch`: may be empty, but **when no worker is busy, RUNNING must dispatch at least one instruction**
 - `artifacts`: optional; `path` is relative to the shared output directory (e.g. `worker-1/report.md`) and an item may only contain `path` / `min_chars` / `contains`
 - Before `COMPLETED` at least one `artifacts` entry must have been declared (ones pre-declared by the operator count)

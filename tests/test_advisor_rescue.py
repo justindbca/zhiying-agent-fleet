@@ -443,6 +443,7 @@ def test_supervisor_prompts_carry_the_judgement_section(name):
                     '[advisor off] consult M0', 'dispatch M0 to worker-2 yourself'):
         assert message in text
     assert '`dispatch[].advise_note`' in text
+    assert '- `advisor`: optional `"on"` / `"off"` (default off' in text and 'send `"advisor": "on"` and the consult again' in text
 
 
 def test_v2_reassign_to_a_held_slot_starts_it_with_the_sheet_on_redispatch(v2adv2):
