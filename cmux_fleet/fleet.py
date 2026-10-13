@@ -1208,7 +1208,9 @@ class Fleet:
         generation = int(info.get('generation', 0))
         launch = json.loads(info.get('runtime_launch') or '{}')
         cfg_path = self.path
-        advised = self.advisor_online() and name != 'supervisor'
+        advised = self.advised_layout(name)
+        if advised and is_claude(cfg, name):
+            cfg['advisor'] = True  # this generation's argv: --effort / --setting-sources project, also while off
         # A held first spawn gets its model / effort written here on release; an advised Claude
         # generation keeps `advisor` in its own snapshot (the actor builds its argv from it).
         if launch or advice_hold or (advised and is_claude(cfg, name)):
@@ -1263,9 +1265,18 @@ class Fleet:
         self.log('spawn', agent=name, generation=generation, pane=result.pane_id)
         return result.pane_id
 
+    def advised_layout(self, name):
+        """Whether this slot's next generation is laid out advised (domain kit links + RULES in CLAUDE.md,
+        --setting-sources project, --effort). Online: every worker. Off: a slot whose persisted launch record
+        is an advisor-applied one (installed_domains, written only by install_advised_kit / a hot-load) keeps
+        it across handoffs and resumes; turning the advisor off never strips config from running work."""
+        if name == 'supervisor':
+            return False
+        return self.advisor_online() or bool(self.agent(name).get('installed_domains'))
+
     def init_worker(self, name):
         self.setf(name, label=name, current_profile='', runtime_profile='', advisory_profile='',
-                  runtime_ready=0, runtime_launch='', profile_task='',
+                  runtime_ready=0, runtime_launch='', profile_task='', installed_domains='', advice_domains='',
                   **profile_runtime.ProfileApplication().metadata())
         self.r.hset(NAMES, mapping={name: name})
 
@@ -2487,6 +2498,11 @@ class Fleet:
         cwd/.claude/{skills,agents} cleared, then the domains linked; full kit mcp.json."""
         info = self.agent(name)
         domains = json.loads(info.get('advice_domains') or info.get('installed_domains') or '[]')
+        if self.kit is None and self.cfg.get('worker_kit'):  # off at daemon start: an inherited layout still needs it
+            try:
+                self.kit = kitmod.Kit(self.cfg['worker_kit'])
+            except (OSError, ValueError) as exc:
+                self.log('advice.kit_unavailable', level='error', agent=name, domains=domains, error=str(exc)[:500])
         if self.kit:
             domains = [d for d in domains if d in self.kit.domains]
             self.kit.install(cwd, domains)
@@ -2695,6 +2711,7 @@ class Fleet:
         launch = json.loads(self.agent(name).get('runtime_launch') or '{}')
         cfg = self.runtime_cfg(name)
         cfg.pop('advisor', None)
+        self.setf(name, installed_domains='', advice_domains='')  # the slot defaults are its launch record now
         try:
             save(self.run_dir / 'runtime' / (name + '-g' + str(generation) + '.json'), cfg)
             cwd = agent_cwd(self.cfg, name)
