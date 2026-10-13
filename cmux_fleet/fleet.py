@@ -89,6 +89,7 @@ CMD_TIMEOUT, CMD_TIMEOUT_MAX = 120, 600  # artifact cmd_exit (contract tasks): s
 ADVICE, ADVICE_SEQ, ADVICE_PENDING, ADVICE_NOTES = 'fx:advice:', 'fx:advice:seq', 'fx:advice:pending:', 'fx:advice:notes'
 # Mid-task rescue (advisor plan §3.2): supervisor consult items waiting for an idle slot, relays per task+slot.
 RESCUE, RESCUE_RELAYS = 'fx:advice:rescue', 'fx:advice:relays'
+RESCUE_FIELDS = ('rescue_note', 'rescue_launch', 'rescue_hint', 'rescue_relay', 'advice_preset')
 
 
 def load(path):
@@ -2098,6 +2099,13 @@ class Fleet:
             for w in self.workers:
                 if self.r.llen(ADVICE_PENDING + w):
                     self.r.delete(ADVICE_PENDING + w)
+        if self.r.llen(RESCUE):  # an earlier task's consults and rescue leftovers never act in this one
+            self.r.delete(RESCUE)
+        for w in self.workers:
+            info = self.agent(w)
+            left = {k: '' for k in RESCUE_FIELDS if info.get(k)}
+            if left:
+                self.setf(w, **left)
         self.queue('supervisor', prompt + '\nReply with the JSON format from AGENTS.md.')
         (self.run_dir / 'result.json').unlink(missing_ok=True)  # a new task: this run is not finished
         self.log('task.submitted', task=task_id)
@@ -2634,13 +2642,13 @@ class Fleet:
 
     def rescue_tick(self):
         """Ready notes of reassigned slots; then one consult request whose worker is idle."""
+        if not self.running():
+            return
         for w in self.workers:
             info = self.agent(w)
             if info.get('rescue_note') and info.get('state') == 'idle':
                 self.setf(w, rescue_note='')
                 self.queue('supervisor', info['rescue_note'])
-        if not self.running():
-            return
         for raw in self.r.lrange(RESCUE, 0, -1):
             req = json.loads(raw)
             if req.get('run_task') != self.task().get('id'):
@@ -2830,6 +2838,8 @@ class Fleet:
             self.switch_profile(to, launch)  # Phase 5 idle switch; the note goes out after its READY
             if self.agent(to).get('state') == 'starting':
                 self.setf(to, rescue_note=note())
+            elif self.task().get('status') == 'running':  # switch deferred (codex subagents): tell the supervisor now
+                self.queue('supervisor', note())
             return
         self.r.hset(ADVICE + sheet['ticket'], mapping={'effect': 'reassign'})
         self.queue('supervisor', note())  # held slot: released by the re-dispatch with this sheet

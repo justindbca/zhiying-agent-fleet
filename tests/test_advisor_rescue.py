@@ -479,3 +479,32 @@ def test_consult_waits_for_the_worker_to_be_idle(afx):
     f.advisor_runner = Runner({'action': 'give_up', 'reason': 'x'})
     f.pump()
     assert len(f.advisor_runner.calls) == 1 and f.r.lrange(fleet.RESCUE, 0, -1) == []
+
+
+def test_deferred_switch_on_reassign_still_tells_the_supervisor(afx, monkeypatch):
+    f = afx
+    worked(f)
+    f.advisor_runner = Runner({'action': 'reassign', 'to': 'worker-2', 'model': 'opus', 'effort': 'high',
+                               'domains': [], 'reason': '换槽'})
+
+    def deferred(name, launch):  # e.g. a codex slot whose native subagents still run (switch_profile returns)
+        f.setf(name, profile_state='pending', profile_reason='waiting for native subagents to finish')
+    monkeypatch.setattr(f, 'switch_profile', deferred)
+    f.on_supervisor(rescue_decision(consult()))
+    f.pump()
+    assert f.agent('worker-2')['state'] == 'idle' and not f.agent('worker-2').get('rescue_note')
+    assert '[advisor] M0 → worker-2 (opus/high, domains: [])' in supervisor_texts(f)[-1]
+
+
+def test_new_task_clears_rescue_leftovers(afx):
+    f = afx
+    worked(f)
+    f.r.rpush(fleet.RESCUE, json.dumps({'slot': 'worker-1', 'task': 'M0', 'run_task': f.task()['id']}))
+    f.setf('worker-2', rescue_note='[advisor] M0 → worker-2 old', rescue_launch='{"x":1}', advice_preset='{"task":"M0"}')
+    f.finish('blocked', 'operator stop')
+    f.handle({'kind': 'task', 'request_id': 'r2', 'spec': {'goal': 'another task'}})
+    assert f.r.lrange(fleet.RESCUE, 0, -1) == []
+    info = f.agent('worker-2')
+    assert all(not info.get(k) for k in fleet.RESCUE_FIELDS)
+    f.pump()
+    assert not any('old' in t for t in supervisor_texts(f) if t.startswith('[advisor] M0'))
