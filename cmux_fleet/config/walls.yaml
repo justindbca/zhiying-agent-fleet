@@ -1,23 +1,23 @@
 # Wall table (one table for the whole fleet; brake.py reads it, the watchdog only "sees").
 # Absorbs us-stock-option config/cli_tier_map.yaml (same_cli_downgrade / aliases / default) and
 # the wall regexes of OpenClaw multi_agent_daemon.py (_RATE_LIMIT_PATTERNS, _MODEL_POOL_WALL_PATTERNS).
-# MAD keeps its own copy: change both together.
+# MAD keeps its own copy: change the CLI wall wording in both together (generic patterns: see below).
 #
-# account   : the whole account / CLI is walled (weekly / session / usage limit, 429). Changing the
+# account   : the whole account / CLI is walled (weekly / session / usage limit). Changing the
 #             model does not help -> switch side (other CLI) or stop. Inside one fleet the brake pauses
 #             (stop, keep resumable); switching side is the CLI pairs table's job (item A).
 # model_pool: only one model tier is walled ("You've reached your Fable limit"). Same CLI one tier
 #             down usually still has quota -> same_cli_downgrade.
+# Only the CLIs' own wall wording (Claude / Codex) belongs here. Generic "rate limited" / "429 Too Many
+# Requests" / "quota exceeded" are NOT walls: third-party tools (Tavily, reddit, WebFetch) print them, and a
+# worker report pasted into the supervisor pane puts them on that screen (EF review r1 P1-01). MAD keeps
+# them because it only judges `-p` text; the two tables differ on purpose here.
 # Account patterns are checked first: a weekly-limit screen that also says /usage-credits is account-level.
 # Auth errors (401, Not logged in, expired OAuth) are not walls: the watchdog handles them.
 account:
   - "You've (?:hit|reached) your (?:usage|weekly|session|daily|monthly|5-hour) limit"
   - "\\b(?:weekly|session|daily|5-hour|usage) limit reached"
   - "Claude (?:AI )?usage limit reached"
-  - "(?:error|ERR|⚠|❌|429).*rate limit"
-  - "rate limit(?:ed|s)\\b"
-  - "(?:429|HTTP\\s*429).*too many requests"
-  - "quota (?:exceeded|exhausted)"
 model_pool:
   - "You've (?:hit|reached) your\\s+(?!(?:usage|weekly|session|daily|monthly|5-hour)\\b)[\\w.\\-]+.{0,20}?\\blimit\\b"
   - "/usage-credits"

@@ -18,6 +18,10 @@ REAL_FABLE_WALL = ("⎿  You've reached your Fable limit. Run /usage-credits to 
                    "or switch models with /model.")
 REAL_CODEX_WALL = ("■ You've hit your usage limit. To continue using Codex and get access to "
                    "GPT-5.3-Codex, start a free trial of Plus today, or try again at Sep 27th, 2026.")
+# Third-party tool errors a worker sees or reports (EF review r1 P1-01): never a CLI wall.
+TOOL_ERRORS = ('⎿  Error: 429 Too Many Requests (reddit)', 'WebFetch: rate limited by host, retrying in 30s',
+               'Tavily: all keys exhausted; quota exceeded for today',
+               '{"status":"BLOCKED","reason":"reddit API rate limited; need human"}')
 TIER_MAP = Path.home() / 'Documents/projects/us-stock-option/config/cli_tier_map.yaml'
 THREADS = dict(THREADS, **{'worker-2': '33333333-3333-3333-3333-333333333333'})
 
@@ -66,9 +70,9 @@ def test_wall_table_classifies_real_wall_texts_and_ignores_work_screens():
     assert brake.classify_wall("You've hit your weekly limit · resets Oct 14\nRun /usage-credits")['scope'] == 'account'
     assert brake.classify_wall("You've reached your session limit")['scope'] == 'account'
     assert brake.classify_wall('Claude AI usage limit reached|1760000000')['scope'] == 'account'
-    assert brake.classify_wall('HTTP 429: Too Many Requests')['scope'] == 'account'
+    # EF review r1 P1-01 (spec change): generic tool errors are not CLI walls, only the CLIs' own wording is.
     for clean in ('正在分析 cu 的库存与基差', 'Read 20 files, no limit issues found', '设置 position limit 为 5 手',
-                  'the API rate limit is 5/s', '', None):
+                  'the API rate limit is 5/s', 'HTTP 429: Too Many Requests', *TOOL_ERRORS, '', None):
         assert brake.classify_wall(clean) is None
 
 
@@ -696,6 +700,29 @@ def test_v2_claude_account_wall_stays_paused_and_hold_release_cannot_resume(mixe
     f.tick(); f.pump()
     assert f.paused() and len(typed(f, 'worker-1')) == 1
     assert f.wall_gate('worker-2', 'Do you trust the files in this folder?\n❯ 1. Yes') is None
+
+
+def test_tool_errors_on_a_worker_or_supervisor_screen_do_not_pause(tmp_path):
+    f = make(tmp_path, {'goal': 'x'}, worker_cli='claude', worker_model='fable')
+    f.pump(); f.handle(turn('supervisor', decision())); f.pump()
+    for text in TOOL_ERRORS:  # last lines of the screen, where the gate looks
+        for slot in ('worker-1', 'supervisor'):  # a worker report pasted into the supervisor pane
+            assert f.wall_gate(slot, 'working...\n' + text + '\n> ') is None and not f.paused()
+    assert f.wall_gate('supervisor', 'thinking...\n' + REAL_CODEX_WALL)['wall']['scope'] == 'account'
+    assert f.paused()  # the CLI's own wording still trips
+
+
+def test_v2_short_reply_with_tool_errors_is_a_report_not_a_wall(mixed):
+    f = mixed
+    mixed_submit(f)
+    answer_turn(f, 'supervisor', mixed_decision(['worker-1', 'worker-2']))
+    f.pump()
+    env = f.v2.bus.slot_state('worker-1')
+    assert answer_turn(f, 'worker-1', '\n'.join(TOOL_ERRORS))['status'] == 'committed'  # ≤400 chars
+    assert f.v2.bus.message(env['message_id'])['outcome'] != 'walled' and not f.paused()
+    assert not f.agent('worker-1').get('wall')
+    assert answer_turn(f, 'worker-2', CLAUDE_ACCOUNT_WALL)['status'] == 'committed'
+    assert f.paused() and json.loads(f.agent('worker-2')['wall'])['action'] == 'stop'
 
 
 def test_v2_claude_startup_wall_then_resume_retries_the_same_launch(mixed):
