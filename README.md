@@ -201,7 +201,7 @@ workers:
   advisor (official Claude CLI, fable/high) before every supervisor dispatch; it picks the worker model /
   effort / domains and authorizes the respawns its sheets need. Off: dispatches go out with the slot
   defaults, exactly as without the advisor. Flipped while running without a restart, by editing the roster,
-  by `python3 -m cmux_fleet.fleet advisor on|off [--config <run>/config.json]` (only edits the roster; a run
+  by `cmux-fleet advisor on|off [--config <run>/config.json]` (only edits the roster; a run
   started without `--roster` gets `<run>/roster.yaml` from its current workers), or by the supervisor's
   decision key `"advisor": "on"|"off"`. `start --advisor` only writes `advisor: on` into the roster (a
   `--roster` file is edited in place). On at start: Claude workers open their pane but launch the CLI only
