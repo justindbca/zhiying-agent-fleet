@@ -29,7 +29,6 @@ import os
 from pathlib import Path
 import shutil
 import signal
-import sqlite3
 import sys
 import threading
 import time
@@ -38,18 +37,21 @@ from types import SimpleNamespace
 
 import pytest
 
-from test_fleet import FakeMgr, write_rollout, fx  # noqa: F401  (fx fixture)
+from test_fleet import FakeMgr, write_rollout, fx, turn as fleet_turn  # noqa: F401  (fx fixture)
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
 from test_resume import managed, task_run, crash_and_resume  # noqa: F401  (fixtures)
 import test_subfleet as ts
 from cmux_fleet import codex_queue, fleet, runtime_v2, subfleet
 
 WORKERS = ['worker-1', 'worker-2']
+ORIGINAL_ENQUEUE = codex_queue.enqueue  # the real CLI wrapper, captured before any stub is installed
 ENTER_KEYS = ('Enter', 'Return', 'C-m', 'KP_Enter')
 REPORT = 'Done:\n- {0}\nEvidence:\n- {1}\nNot done: none\nBlocked: none'
 WAIT = json.dumps({'status': 'RUNNING', 'completion': 50, 'reason': 'waiting', 'dispatch': []})
 # Long enough that two report follow-ups share their first 120 normalised characters.
 SHARED = 'compared the eight vendor quotes line by line against the frozen bill of materials and the approved budget sheet'
+
+
 QUEUE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS queued_items (id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL,
     payload_json TEXT NOT NULL, queue_order INTEGER NOT NULL, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
@@ -61,7 +63,7 @@ CREATE TRIGGER IF NOT EXISTS queued_items_revision_after_insert AFTER INSERT ON 
 CREATE TRIGGER IF NOT EXISTS queued_items_revision_after_delete AFTER DELETE ON queued_items BEGIN
     INSERT INTO queued_thread_revisions (thread_id) VALUES (OLD.thread_id) ON CONFLICT(thread_id) DO UPDATE
     SET revision = (SELECT COALESCE(MAX(revision), 0) + 1 FROM queued_thread_revisions); END;
-"""  # queue_1.sqlite of codex-cli 0.162.1 (worker-1 probe/w2copy .schema; migrations table omitted)
+"""  # shared fixture: queue_1.sqlite of codex-cli 0.162.1 (worker-1 probe/w2copy .schema; migrations table omitted)
 
 
 def plan(workers, note='split the work'):
@@ -98,11 +100,11 @@ class Queue:
 
     Each message gets a unique queued id and a unique *real* client_id (the one the rollout will
     carry). `readable=False` models the measured idle case (row consumed before the CLI returned,
-    enqueue reports client_id ''). `sqlite=True` leaves the item pending in
-    $CODEX_HOME/queue_1.sqlite. `hook(item)` runs while the CLI is still "running"."""
+    enqueue reports client_id ''). Since plan v3 the product never reads either id and never touches
+    Codex's queue_1.sqlite. `hook(item)` runs while the CLI is still "running"."""
 
-    def __init__(self, sqlite=False):
-        self.items, self.fail, self.readable, self.sqlite, self.hook = [], None, True, sqlite, None
+    def __init__(self):
+        self.items, self.fail, self.readable, self.hook = [], None, True, None
 
     def enqueue(self, cfg, name, thread, text, **kw):
         if self.fail:
@@ -110,17 +112,6 @@ class Queue:
         real = str(uuid.uuid4())
         item = {'queued_id': str(uuid.uuid4()), 'client_id': real if self.readable else '', 'thread': thread}
         self.items.append(dict(item, name=name, text=text, real_client=real))
-        if self.sqlite:
-            path = codex_queue.db_path(cfg)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with sqlite3.connect(str(path)) as con:
-                con.executescript(QUEUE_SCHEMA)
-                order = con.execute('SELECT COALESCE(MAX(queue_order), -1) + 1 FROM queued_items WHERE thread_id=?',
-                                    (thread,)).fetchone()[0]
-                now = int(time.time() * 1000)
-                payload = {'UserInput': {'content': [{'type': 'text', 'text': text, 'text_elements': []}], 'client_id': real}}
-                con.execute('INSERT INTO queued_items VALUES (?,?,?,?,?,?)',
-                            (item['queued_id'], thread, json.dumps(payload), order, now, now))
         if self.hook:
             self.hook(self.items[-1])
         return item
@@ -130,12 +121,6 @@ def install_queue(monkeypatch, q=None):
     q = q or Queue()
     monkeypatch.setattr(codex_queue, 'enqueue', q.enqueue)
     return q
-
-
-def consume_all(cfg):
-    """The TUI took every pending row (it is now running)."""
-    with sqlite3.connect(str(codex_queue.db_path(cfg))) as con:
-        con.execute('DELETE FROM queued_items')
 
 
 # Independent log of real paste / key calls, separate from the queue log and from FakeMgr.sent
@@ -541,7 +526,8 @@ def test_notify_before_rollout_flush_settles_within_retry_window(sup):
 
 def test_fast_bind_callback_while_delivery_is_still_queuing(sup):
     """The turn ends and notify fires before `codex queue` has returned (cq_state 'queuing').
-    tui_turn must wait for the record and then settle exactly once (I2/I4)."""
+    The token is durable before the CLI runs, so the turn binds at once (I3/I4, no waiting); the late
+    CLI answer (compare-and-set) must not turn 'bound' back into 'queued'; settled exactly once."""
     f = sup
     box = {}
 
@@ -552,6 +538,7 @@ def test_fast_bind_callback_while_delivery_is_still_queuing(sup):
                       rows=turn_rows(turn, 'queue', [(item['real_client'], item['text'])], answer))
         payload = json.dumps({'type': 'agent-turn-complete', 'thread-id': thread, 'turn-id': turn,
                               'input-messages': ['startup prompt', item['text']], 'last-assistant-message': answer})
+        box['payload'] = payload
         th = threading.Thread(target=lambda: box.setdefault('out', fleet.notify(f.path, 'supervisor', '0', payload, f.test_sessions)))
         th.start()
         box['thread'] = th
@@ -565,9 +552,13 @@ def test_fast_bind_callback_while_delivery_is_still_queuing(sup):
     while box['thread'].is_alive() and time.time() < deadline:
         f.v2.step(20)
     box['thread'].join(2)
-    assert box['state_during'] == 'queuing'
+    assert box['state_during'] in ('queuing', 'bound')  # the CLI had not returned yet
     assert box['out'] is not False and box['out']['status'] == 'committed', box['out']
-    assert cq(f, 'cq_state') == 'bound'
+    assert cq(f, 'cq_state') == 'bound'  # not overwritten by the late CLI answer
+    again = drive(f, lambda: fleet.notify(f.path, 'supervisor', '0', box['payload'], f.test_sessions))
+    assert again is False or again['status'] == 'ignored', again  # settled exactly once
+    f.pump()
+    assert len(typed(f, 'worker-1')) == 1  # the plan was dispatched once
 
 
 def test_busy_supervisor_gets_followups_one_at_a_time_and_each_once(sup):
@@ -587,111 +578,115 @@ def test_busy_supervisor_gets_followups_one_at_a_time_and_each_once(sup):
     assert_no_input_box(f)
 
 
-# ================================================================ E. codex_queue.bound (plan §2 rules, I3)
-def _rec(thread, text, client, queued_ms, **kw):
-    rec = {'cq_delivery': 'd-' + uuid.uuid4().hex[:8], 'cq_text': text, 'cq_thread': thread,
-           'cq_queued_at': str(queued_ms), 'cq_state': 'queued', 'cq_queued_id': str(uuid.uuid4()),
-           'cq_client_id': client, 'cq_turn': ''}
+# ================================================================ E. codex_queue.bound (plan v3 I3: the pre-send token, nothing else)
+def _rec(thread, body, queued_ms, **kw):
+    """A live delivery record as deliver() writes it before the CLI runs (I2)."""
+    token = codex_queue.new_token()
+    rec = {'cq_delivery': 'd-' + uuid.uuid4().hex[:8], 'cq_token': token, 'cq_text': codex_queue.marked(body, token),
+           'cq_thread': thread, 'cq_queued_at': str(queued_ms), 'cq_state': 'queued', 'cq_queued_id': str(uuid.uuid4()),
+           'cq_turn': ''}
     rec.update(kw)
     return rec
 
 
-def _sessions(tmp_path, rows):
+def _bind(tmp_path, rows_of, rec_kw=None):
+    """rows_of(rec) -> rollout rows; returns (rec, thread, sessions) with the rows written for rec's thread."""
     cwd = tmp_path / 'agents' / 'supervisor'
     cwd.mkdir(parents=True, exist_ok=True)
     thread, sessions = str(uuid.uuid4()), tmp_path / 'sessions'
-    write_rollout(sessions, thread, cwd, rows=rows)
-    return thread, sessions
+    rec = _rec(thread, 'DELIVERY', int(time.time() * 1000), **(rec_kw or {}))
+    write_rollout(sessions, thread, cwd, rows=rows_of(rec))
+    return rec, thread, sessions
 
 
-def test_bound_accepts_the_queue_turn_that_carries_the_delivery_with_or_without_client_id(tmp_path):
+def test_bound_accepts_the_queue_turn_carrying_this_token_with_or_without_client_id(tmp_path):
     now = int(time.time() * 1000)
-    thread, sessions = _sessions(tmp_path, turn_rows('TQ', 'queue', [('client-1', 'DELIVERY')], 'OK', now + 100))
-    assert codex_queue.bound(_rec(thread, 'DELIVERY', 'client-1', now), thread, 'TQ', sessions) == (True, '')
-    assert codex_queue.bound(_rec(thread, 'DELIVERY', '', now), thread, 'TQ', sessions) == (True, '')  # id unreadable
+    rec, thread, sessions = _bind(tmp_path, lambda rec: turn_rows('TQ', 'queue', [('', rec['cq_text'])], 'OK', now + 100)
+                                  + turn_rows('TC', 'queue', [('client-1', rec['cq_text'])], 'OK', now + 200))
+    assert codex_queue.bound(rec, thread, 'TQ', sessions) == (True, '')            # no client_id at all
+    assert codex_queue.bound(rec, thread, 'TC', sessions) == (True, '')            # a client_id is irrelevant
 
 
 def test_race_idle_check_then_user_turn_absorbs_the_delivery_is_rejected(tmp_path):
-    """Looked idle, the operator started an unknown turn, the delivery was absorbed into it:
-    new turn-id, started after queueing, even carrying the delivery's client_id. Rejected (rule 2)."""
+    """Looked idle, the operator started an unknown turn, the delivery was absorbed into it: even with this
+    delivery's exact text (token included) a user-triggered turn is rejected."""
     now = int(time.time() * 1000)
-    rows = turn_rows('TU', 'user', [('', 'operator question'), ('client-1', 'DELIVERY')], 'answer to operator', now + 50)
-    thread, sessions = _sessions(tmp_path, rows)
-    for client in ('client-1', ''):
-        ok, why = codex_queue.bound(_rec(thread, 'DELIVERY', client, now), thread, 'TU', sessions)
-        assert ok is False, why
+    rec, thread, sessions = _bind(tmp_path, lambda rec: turn_rows('TU', 'user', [('', 'operator question'), ('', rec['cq_text'])], 'x', now + 50)
+                                  + turn_rows('TU1', 'user', [('', rec['cq_text'])], 'x', now + 150))
+    for turn in ('TU', 'TU1'):
+        ok, why = codex_queue.bound(rec, thread, turn, sessions)
+        assert ok is False, (turn, why)
 
 
 def test_race_operator_input_merged_into_the_queue_turn_is_rejected(tmp_path):
     now = int(time.time() * 1000)
-    rows = turn_rows('TQ', 'queue', [('client-1', 'DELIVERY'), ('', 'operator steer')], 'mixed answer', now + 50)
-    thread, sessions = _sessions(tmp_path, rows)
-    ok, why = codex_queue.bound(_rec(thread, 'DELIVERY', 'client-1', now), thread, 'TQ', sessions)
+    rec, thread, sessions = _bind(tmp_path, lambda rec: turn_rows('TQ', 'queue', [('', rec['cq_text']), ('', 'operator steer')], 'm', now + 50))
+    ok, why = codex_queue.bound(rec, thread, 'TQ', sessions)
     assert ok is False, why
 
 
 def test_queued_item_id_is_not_a_turn_id(tmp_path):
     now = int(time.time() * 1000)
-    thread, sessions = _sessions(tmp_path, turn_rows('TQ', 'queue', [('client-1', 'DELIVERY')], 'OK', now + 50))
-    rec = _rec(thread, 'DELIVERY', 'client-1', now)
+    rec, thread, sessions = _bind(tmp_path, lambda rec: turn_rows('TQ', 'queue', [('', rec['cq_text'])], 'OK', now + 50))
     ok, why = codex_queue.bound(rec, thread, rec['cq_queued_id'], sessions)
     assert ok is False, why
 
 
-def test_unique_client_id_decides_between_identical_texts(tmp_path):
+def test_token_decides_between_identical_bodies(tmp_path):
     now = int(time.time() * 1000)
-    rows = turn_rows('T1', 'queue', [('client-1', 'SAME')], 'OK', now + 20) + \
-        turn_rows('T2', 'queue', [('client-2', 'SAME')], 'OK', now + 120)
-    thread, sessions = _sessions(tmp_path, rows)
-    r1, r2 = _rec(thread, 'SAME', 'client-1', now), _rec(thread, 'SAME', 'client-2', now + 100)
+    cwd = tmp_path / 'agents' / 'supervisor'
+    cwd.mkdir(parents=True)
+    thread, sessions = str(uuid.uuid4()), tmp_path / 'sessions'
+    r1, r2 = _rec(thread, 'SAME', now), _rec(thread, 'SAME', now + 100)
+    write_rollout(sessions, thread, cwd, rows=turn_rows('T1', 'queue', [('', r1['cq_text'])], 'OK', now + 20)
+                  + turn_rows('T2', 'queue', [('', r2['cq_text'])], 'OK', now + 120))
     assert codex_queue.bound(r1, thread, 'T1', sessions)[0] and codex_queue.bound(r2, thread, 'T2', sessions)[0]
     assert not codex_queue.bound(r1, thread, 'T2', sessions)[0]
     assert not codex_queue.bound(r2, thread, 'T1', sessions)[0]
 
 
-def test_identical_text_without_client_id_never_binds_the_older_turn(tmp_path):
+def test_identical_body_without_this_token_never_binds_even_when_it_is_the_first_queue_turn(tmp_path):
+    """The first same-body queue turn after queueing (bare body, or another delivery's token) is not this
+    delivery; only the later turn carrying this delivery's own token binds."""
     now = int(time.time() * 1000)
-    thread, sessions = _sessions(tmp_path, turn_rows('TOLD', 'queue', [('client-old', 'DELIVERY')], 'OK', now - 1000))
-    ok, why = codex_queue.bound(_rec(thread, 'DELIVERY', '', now), thread, 'TOLD', sessions)
-    assert ok is False, why
+    other = codex_queue.marked('DELIVERY', codex_queue.new_token())
+    rec, thread, sessions = _bind(tmp_path, lambda rec: turn_rows('TOLD', 'queue', [('', 'DELIVERY')], 'OK', now - 1000)
+                                  + turn_rows('TA', 'queue', [('', 'DELIVERY')], 'OK', now + 10)
+                                  + turn_rows('TB', 'queue', [('', other)], 'OK', now + 50)
+                                  + turn_rows('TMINE', 'queue', [('', rec['cq_text'])], 'OK', now + 100))
+    for turn in ('TOLD', 'TA', 'TB'):
+        assert codex_queue.bound(rec, thread, turn, sessions)[0] is False, turn
+    assert codex_queue.bound(rec, thread, 'TMINE', sessions) == (True, '')
 
 
-def test_identical_text_without_client_id_binds_only_the_first_queue_turn_after_queueing(tmp_path):
+def test_bound_rejects_other_thread_edited_text_rebinding_and_closed_states(tmp_path):
     now = int(time.time() * 1000)
-    rows = turn_rows('TA', 'queue', [('c-a', 'DELIVERY')], 'OK', now + 10) + \
-        turn_rows('TB', 'queue', [('c-b', 'DELIVERY')], 'OK', now + 100)
-    thread, sessions = _sessions(tmp_path, rows)
-    rec = _rec(thread, 'DELIVERY', '', now)
-    assert codex_queue.bound(rec, thread, 'TA', sessions)[0] is True
-    assert codex_queue.bound(rec, thread, 'TB', sessions)[0] is False
-
-
-def test_bound_rejects_other_thread_edited_text_old_turn_rebinding_and_closed_states(tmp_path):
-    now = int(time.time() * 1000)
-    rows = turn_rows('TQ', 'queue', [('client-1', 'DELIVERY edited by operator')], 'OK', now + 50) + \
-        turn_rows('TOLD', 'queue', [('client-1', 'DELIVERY')], 'OK', now - 60000)
-    thread, sessions = _sessions(tmp_path, rows)
-    rec = _rec(thread, 'DELIVERY', 'client-1', now)
-    assert codex_queue.bound(rec, str(uuid.uuid4()), 'TQ', sessions)[0] is False          # rule 1
-    assert codex_queue.bound(rec, thread, 'TQ', sessions)[0] is False                     # rule 3 (text edited)
-    assert codex_queue.bound(rec, thread, 'TOLD', sessions)[0] is False                   # rule 5 (older turn)
-    assert codex_queue.bound(dict(rec, cq_turn='TX', cq_state='bound'), thread, 'TQ', sessions)[0] is False  # rule 6
-    for state in ('withdrawn', 'failed', 'queuing', ''):
-        assert codex_queue.bound(dict(rec, cq_state=state), thread, 'TQ', sessions)[0] is False
+    rec, thread, sessions = _bind(tmp_path, lambda rec: turn_rows('TE', 'queue', [('', rec['cq_text'].replace('DELIVERY', 'DELIVERY edited'))], 'OK', now + 50)
+                                  + turn_rows('TQ', 'queue', [('', rec['cq_text'])], 'OK', now + 100))
+    assert codex_queue.bound(rec, str(uuid.uuid4()), 'TQ', sessions)[0] is False          # other thread
+    assert codex_queue.bound(rec, thread, 'TE', sessions)[0] is False                     # text edited
+    assert codex_queue.bound(dict(rec, cq_turn='TX', cq_state='bound'), thread, 'TQ', sessions)[0] is False  # bound elsewhere
+    for state in ('abandoned', ''):
+        assert codex_queue.bound(dict(rec, cq_state=state), thread, 'TQ', sessions)[0] is False, state
+    assert codex_queue.bound(dict(rec, cq_token=''), thread, 'TQ', sessions)[0] is False
+    for state in ('queuing', 'uncertain', 'failed'):  # I3: the token in the rollout proves the item really ran
+        assert codex_queue.bound(dict(rec, cq_state=state), thread, 'TQ', sessions) == (True, ''), state
 
 
 # ================================================================ F. end to end: ids, duplicates, merge races
-def test_unreadable_client_id_still_settles_the_genuine_queue_turn(sup):
-    """Positive F1 case: the idle TUI consumed the row before the CLI returned, cq_client_id is ''.
-    The delivery's own queue turn still settles, exactly once."""
+def test_unreadable_client_id_still_settles_the_genuine_queue_turn_by_its_token(sup):
+    """Positive F1 case: the idle TUI consumed the row before the CLI returned and the rollout carries no
+    client_id. The delivery's own queue turn (its exact marked text) still settles, exactly once."""
     f = sup
     f.q.readable = False
     submit(f)
-    assert cq(f, 'cq_state') == 'queued' and cq(f, 'cq_client_id') == ''
+    token, text = cq(f, 'cq_token'), last(f)[1]
+    assert cq(f, 'cq_state') == 'queued' and token and text == cq(f, 'cq_text')
+    assert text.endswith('(fleet delivery ' + token + ')')
     turn = str(uuid.uuid4())
-    assert codex_turn(f, plan(['worker-1']), turn=turn)['status'] == 'committed'
-    assert cq(f, 'cq_state') == 'bound'
-    again = codex_turn(f, plan(['worker-2']), turn=turn, users=[last(f)])
+    assert codex_turn(f, plan(['worker-1']), turn=turn, users=[('', text)])['status'] == 'committed'
+    assert cq(f, 'cq_state') == 'bound' and cq(f, 'cq_turn') == turn
+    again = codex_turn(f, plan(['worker-2']), turn=turn, users=[('', text)])
     assert again is False or again['status'] == 'ignored', again
 
 
@@ -759,55 +754,85 @@ def test_runtime_turn_id_equal_to_queued_item_id_is_not_settled(sup):
     assert lease(f)['status'] == 'received'
 
 
-# ================================================================ G. withdraw vs consume, finish / retire / resume (I6)
-def test_withdraw_before_consume_the_item_never_settles(sup):
+# ================================================================ G. lifecycle as product behaviour (plan v3 I6)
+# `abandoned` only means "this token can never settle anything". It is NOT a cancellation: the item may still
+# sit in Codex's own queue and run there. The cases below therefore drive the item running afterwards.
+def test_abandoned_is_not_cancelled_the_item_still_runs_and_never_settles(sup):
     f = sup
-    f.q.sqlite = True
     submit(f)
-    thread = session(f, 'supervisor')
-    assert len(codex_queue.queued_rows(f.cfg, thread)) == 1
-    assert codex_queue.clear(f, 'supervisor', 'test withdraw') == 1
-    assert codex_queue.queued_rows(f.cfg, thread) == [] and cq(f, 'cq_state') == 'withdrawn'
-    out = codex_turn(f, plan(['worker-1']))
+    text = last(f)[1]
+    other = {'cq_delivery': 'other-d', 'cq_token': codex_queue.new_token(), 'cq_text': 'x', 'cq_thread': str(uuid.uuid4()),
+             'cq_queued_at': '1', 'cq_state': 'queued', 'cq_queued_id': 'q', 'cq_turn': ''}
+    f.r.hset(fleet.key('agent', 'codex-b'), mapping=other)  # another slot's live delivery
+    rec = codex_queue.clear(f, 'supervisor', 'test abandon')
+    assert rec['cq_text'] == text and cq(f, 'cq_state') == 'abandoned'
+    assert codex_queue.record(f.r.hgetall(fleet.key('agent', 'codex-b'))) == other  # only this slot's delivery
+    out = codex_turn(f, plan(['worker-1']), users=[('', text)])  # Codex runs the queued item anyway
     assert out is False or out['status'] == 'ignored', out
+    assert cq(f, 'cq_state') == 'abandoned' and lease(f)['status'] == 'received'
     assert typed(f, 'worker-1') == []
     assert_no_input_box(f)
 
 
-def test_consume_before_withdraw_running_turn_is_not_settled(sup):
+def test_clear_while_the_turn_runs_never_reports_success(sup):
+    """Consumption / cleanup race: the turn already started when the slot was cleared; its end must not be
+    reported as a settled delivery (no commit, no 'bound', nothing dispatched)."""
     f = sup
-    f.q.sqlite = True
     submit(f)
-    consume_all(f.cfg)
-    assert codex_queue.clear(f, 'supervisor', 'test withdraw') == 0
-    assert cq(f, 'cq_state') == 'withdrawn'
-    out = codex_turn(f, plan(['worker-1']))
+    text, turn = last(f)[1], str(uuid.uuid4())
+    write_rollout(f.test_sessions, session(f, 'supervisor'), fleet.agent_cwd(f.cfg, 'supervisor'),
+                  rows=turn_rows(turn, 'queue', [('', text)], '', complete=False))  # running
+    codex_queue.clear(f, 'supervisor', 'cleanup while running')
+    out = codex_turn(f, plan(['worker-1']), turn=turn, users=[('', text)])
     assert out is False or out['status'] == 'ignored', out
-    assert typed(f, 'worker-1') == []
-    assert_no_input_box(f)
+    assert cq(f, 'cq_state') == 'abandoned' and cq(f, 'cq_turn') == ''
+    assert lease(f)['status'] == 'received' and typed(f, 'worker-1') == []
 
 
-def test_finish_withdraws_a_pending_queued_item(sup):
+def test_clear_after_settlement_neither_unsettles_nor_settles_again(sup):
     f = sup
-    f.q.sqlite = True
     submit(f)
-    thread = session(f, 'supervisor')
-    assert [r['text'] for r in codex_queue.queued_rows(f.cfg, thread)] == [last(f)[1]]
+    turn = str(uuid.uuid4())
+    assert codex_turn(f, plan(['worker-1']), turn=turn)['status'] == 'committed'
+    assert codex_queue.clear(f, 'supervisor', 'late cleanup') == {}
+    assert cq(f, 'cq_state') == 'bound' and cq(f, 'cq_turn') == turn
+    again = codex_turn(f, plan(['worker-2']), turn=turn)
+    assert again is False or again['status'] == 'ignored', again
+
+
+def test_finish_old_item_running_later_is_not_taken_as_a_new_delivery(sup):
+    f = sup
+    submit(f)
+    old = codex_queue.record(f.r.hgetall(fleet.key('agent', 'supervisor')))
     f.v2.finish('stopped', 'operator stop')
-    assert codex_queue.queued_rows(f.cfg, thread) == [] and cq(f, 'cq_state') == 'withdrawn'
+    assert cq(f, 'cq_state') == 'abandoned'
+    out = codex_turn(f, plan(['worker-1']), users=[('', old['cq_text'])])
+    assert out is False or out['status'] in ('ignored', 'stale'), out
+    assert typed(f, 'worker-1') == [] and f.task()['status'] == 'stopped'
+    # a later delivery of the same body gets its own token; the old item's turn never binds it
+    new = codex_queue.deliver(f, 'supervisor', 'after-finish', _bare(old['cq_text']))
+    assert new['token'] != old['cq_token']
+    rec = codex_queue.record(f.r.hgetall(fleet.key('agent', 'supervisor')))
+    thread, turn = session(f, 'supervisor'), str(uuid.uuid4())
+    write_rollout(f.test_sessions, thread, fleet.agent_cwd(f.cfg, 'supervisor'),
+                  rows=turn_rows(turn, 'queue', [('', old['cq_text'])], 'x'))
+    assert codex_queue.bound(rec, thread, turn, f.test_sessions)[0] is False
     assert_no_input_box(f)
 
 
-def test_retire_withdraws_a_pending_queued_item(sup):
-    """Retiring the session (rotation / stop path, runtime_v2.retire) removes its pending item."""
+def test_retire_old_generation_item_is_isolated(sup):
+    """Rotation: the retired session's pane is killed; if its item ever runs (manual resume of that thread),
+    the notify carries the old generation and the abandoned token: it never settles."""
     f = sup
-    f.q.sqlite = True
     submit(f)
-    thread = session(f, 'supervisor')
-    assert len(codex_queue.queued_rows(f.cfg, thread)) == 1
-    f.v2.retire('supervisor', 'test retire')
-    assert codex_queue.queued_rows(f.cfg, thread) == [] and cq(f, 'cq_state') == 'withdrawn'
-    assert_no_input_box(f)
+    old = codex_queue.record(f.r.hgetall(fleet.key('agent', 'supervisor')))
+    pane = f.agent('supervisor')['pane']
+    assert f.v2.retire('supervisor', 'rotation') is True
+    assert cq(f, 'cq_state') == 'abandoned' and pane in f.mgr.killed
+    out = codex_turn(f, plan(['worker-1']), users=[('', old['cq_text'])], generation=0)
+    assert out is False or out['status'] in ('ignored', 'stale'), out
+    assert typed(f, 'worker-1') == []
+    assert_no_input_box(f, pane)
 
 
 def _report_in_flight(state, q):
@@ -821,8 +846,6 @@ def _report_in_flight(state, q):
     split = json.dumps({'status': 'RUNNING', 'completion': 10, 'reason': 'split', 'dispatch': [
         {'to': 'worker-1', 'instruction': 'Write worker-1/a.md with part A.'},
         {'to': 'worker-2', 'instruction': 'Write worker-2/b.md with part B.'}]})
-    if q.sqlite:
-        consume_all(f.cfg)  # the task item was consumed by its own turn
     assert codex_turn(f, split)['status'] == 'committed'
     f.pump()
     (f.workspace() / 'worker-1').mkdir(exist_ok=True)
@@ -850,21 +873,76 @@ def test_resume_new_generation_gets_the_brief_once_and_old_notify_is_stale(task_
     assert '[worker-1 report]' in queued_texts(f, thread=old_thread)[-1]  # nothing new for the old session
 
 
-def test_resume_withdraws_the_old_pending_item_and_delivers_once(task_run, monkeypatch):  # noqa: F811
-    """Crash while the report is queued but not started: --resume removes the old session's pending
-    item (it would otherwise run on its own) and the new generation gets the brief once."""
+def test_resume_replays_once_with_a_new_token_and_the_old_item_never_settles(task_run, monkeypatch):  # noqa: F811
+    """Crash while the report is queued (unsettled): --resume respawns the supervisor (new generation, new
+    thread), the brief is queued once with a new token, the old item running in the old session settles
+    nothing, and the new brief settles exactly once."""
     state = task_run
-    q = install_queue(monkeypatch, Queue(sqlite=True))
+    q = install_queue(monkeypatch)
     f = _report_in_flight(state, q)
-    old_thread = session(f, 'supervisor')
-    assert ['[worker-1 report]' in r['text'] for r in codex_queue.queued_rows(f.cfg, old_thread)] == [True]
+    old_thread, old_gen = session(f, 'supervisor'), int(f.agent('supervisor')['generation'])
+    old = codex_queue.record(f.r.hgetall(fleet.key('agent', 'supervisor')))
+    assert old['cq_state'] == 'queued' and '[worker-1 report]' in old['cq_text']
     f = crash_and_resume(state)
     f.q = q
-    assert codex_queue.queued_rows(f.cfg, old_thread) == [], 'the retired session would still run the old report'
+    assert int(f.agent('supervisor')['generation']) != old_gen and session(f, 'supervisor') != old_thread
     assert startup_ready(f)['status'] == 'ready'
     f.pump(); f.pump()
-    assert len([t for t in queued_texts(f) if '[Resumed task ' in t]) == 1
+    briefs = [t for t in queued_texts(f) if '[Resumed task ' in t]
+    assert len(briefs) == 1 and cq(f, 'cq_token') != old['cq_token']
+    assert queued_texts(f, thread=old_thread)[-1] == old['cq_text']  # nothing new was queued into the old thread
+    assert cq(f, 'cq_thread') == session(f, 'supervisor') != old_thread
+    late = codex_turn(f, WAIT, thread=old_thread, generation=old_gen, users=[('', old['cq_text'])])
+    assert late is False or late['status'] in ('ignored', 'stale'), late
+    turn = str(uuid.uuid4())
+    assert codex_turn(f, WAIT, turn=turn, users=[('', briefs[0])])['status'] == 'committed'
+    again = codex_turn(f, WAIT, turn=turn, users=[('', briefs[0])])
+    assert again is False or again['status'] in ('ignored', 'stale'), again
     assert input_box_use(f.agent('supervisor')['pane'], f.mgr.sent) == []
+
+
+def test_finish_then_resume_does_not_replay_the_abandoned_delivery(task_run, monkeypatch):  # noqa: F811
+    """abandoned is not cancelled: the stopped task's queued report may still run in Codex. A later --resume
+    must not queue it (or a brief containing it) again, or the same instruction runs twice."""
+    state = task_run
+    q = install_queue(monkeypatch)
+    f = _report_in_flight(state, q)
+    f.v2.finish('stopped', 'operator stop')
+    assert cq(f, 'cq_state') == 'abandoned'
+    before = len(q.items)
+    f = crash_and_resume(state)
+    f.q = q
+    startup_ready(f)
+    f.pump(); f.pump()
+    again = [i['text'] for i in q.items[before:] if '[worker-1 report]' in i['text'] or '[Resumed task ' in i['text']]
+    assert again == [], 'the abandoned delivery was queued again after resume: ' + repr([t[:80] for t in again])
+
+
+# ================================================================ G2. v1 Fleet.finish_rotation, driven directly
+@pytest.mark.parametrize('timed_out', [False, True])
+def test_v1_finish_rotation_abandons_the_old_delivery_and_its_late_turn_is_stale(fx, timed_out):  # noqa: F811
+    """v1 rotation (fleet.py finish_rotation): the retiring session's queued handoff delivery is abandoned
+    (logged), the old pane is killed, the successor's takeover prompt is argv (never queued into or typed into
+    any pane), and a late turn of the old generation answering the old delivery is stale."""
+    f = fx
+    old_pane = f.agent('supervisor')['pane']
+    f.start_rotation('supervisor', 90000, 100000)
+    rec = codex_queue.record(f.agent('supervisor'))
+    assert f.agent('supervisor')['state'] == 'handoff' and rec['cq_state'] == 'queued' and rec['cq_token']
+    f.finish_rotation('supervisor', timed_out=timed_out)
+    logs = [json.loads(x) for x in f.r.l['fx:log']]
+    assert [l for l in logs if l.get('kind') == 'queue.abandoned' and l.get('delivery') == rec['cq_delivery']
+            and l.get('token') == rec['cq_token']], 'the retiring delivery was not abandoned'
+    new = f.agent('supervisor')
+    assert new['generation'] == '1' and old_pane in f.mgr.killed and new['pane'] != old_pane
+    assert codex_queue.record(new)['cq_token'] != rec['cq_token']
+    f.handle(fleet_turn('supervisor', 'handoff written', generation=0))
+    assert json.loads(f.r.l['fx:log'][-1])['kind'] == 'turn.stale'
+    # fx uses the shared conftest queue fake, which logs *queued* text into FakeMgr.sent; real input-box use is
+    # the independent paste / Enter log of this module.
+    assert [p for p, _ in PASTE_CALLS if p in (old_pane, new['pane'])] == []
+    assert [k for p, k in KEY_CALLS if p in (old_pane, new['pane']) and k in ENTER_KEYS] == []
+    assert not [t for _, t in f.mgr.sent if '[Same-task takeover]' in str(t)]  # the takeover prompt is argv only
 
 
 # ================================================================ H. subfleet adoption / restore (Codex pane)
@@ -950,6 +1028,10 @@ def test_subfleet_refuses_a_codex_worker_pane_before_queueing_or_typing(ctree):
 
 
 def test_subfleet_adoption_and_restore_of_a_codex_pane_are_queued_never_typed(ctree, monkeypatch):
+    """UNREACHABLE-BRANCH DEFENSIVE COVERAGE. The product refuses to adopt a Codex pane
+    (`test_subfleet_refuses_a_codex_worker_pane_before_queueing_or_typing`, and that refusal stays).
+    This test lifts those guards on purpose, only so the Codex branch of adopt/restore cannot regress
+    into typing if it is ever enabled. It does not open, approve or document a new capability."""
     t, f = ctree, ctree.f
     lift_codex_adoption_guards(monkeypatch)
     sid = f.agent('worker-1')['pane']
@@ -986,6 +1068,10 @@ def test_subfleet_adoption_and_restore_of_a_codex_pane_are_queued_never_typed(ct
 
 
 def test_subfleet_adoption_queue_failure_blocks_without_typing(ctree, monkeypatch):
+    """UNREACHABLE-BRANCH DEFENSIVE COVERAGE. The product refuses to adopt a Codex pane
+    (`test_subfleet_refuses_a_codex_worker_pane_before_queueing_or_typing`, and that refusal stays).
+    This test lifts those guards on purpose, only so the Codex branch of adopt/restore cannot regress
+    into typing if it is ever enabled. It does not open, approve or document a new capability."""
     t, f = ctree, ctree.f
     lift_codex_adoption_guards(monkeypatch)
     sid = f.agent('worker-1')['pane']
@@ -994,3 +1080,161 @@ def test_subfleet_adoption_queue_failure_blocks_without_typing(ctree, monkeypatc
     cf = ts.child_daemon(t, rec)
     assert input_box_use(sid, t.world.sent) == []
     assert cf.agent('supervisor')['state'] == 'dead'
+
+
+# ================================================================ I. identity gap: a same-body queue turn that is not this delivery
+# Both turns are queue-triggered and each carries exactly one input with the same business body (not a manual
+# turn, not a merged turn). The older one starts after this delivery's record was written, and no client_id is
+# readable. The expectation is this delivery's identity, never "the first same-body queue turn after queueing".
+def _bare(text):
+    return text.rsplit('\n\n(fleet delivery ', 1)[0]
+
+
+def _queue_turn_notify(f, thread, rows, gen):
+    """`gen` is read before the hook thread: the test Redis client has one connection."""
+    turn = rows[0]['payload']['turn_id']
+    payload = json.dumps({'type': 'agent-turn-complete', 'thread-id': thread, 'turn-id': turn,
+                          'input-messages': ['startup prompt'], 'last-assistant-message': rows[-1]['payload']['last_agent_message']})
+    return fleet.notify(f.path, 'supervisor', gen, payload, f.test_sessions)
+
+
+@pytest.mark.parametrize('other', ['older-backlog-external', 'older-backlog-fleet-token', 'concurrent-external-enqueue'])
+def test_same_body_queue_turn_of_another_message_never_settles_this_delivery(sup, other):
+    f = sup
+    f.q.readable = False
+    box = {}
+
+    def inside_the_cli_call(item):
+        box['state'] = codex_queue._real(f.r).hget(fleet.key('agent', 'supervisor'), 'cq_state')  # read during the CLI call
+        text = _bare(item['text']) if other != 'older-backlog-fleet-token' else codex_queue.marked(_bare(item['text']), codex_queue.new_token())
+        box['rows'] = turn_rows(str(uuid.uuid4()), 'queue', [('', text)], plan(['worker-2']), int(time.time() * 1000))
+        box['other_text'] = text
+        if other != 'concurrent-external-enqueue':
+            # the older backlog item starts (after the record) and completes while the CLI still runs
+            write_rollout(f.test_sessions, item['thread'], fleet.agent_cwd(f.cfg, 'supervisor'), rows=box['rows'])
+        # (concurrent external enqueue: queued by someone else right now; its turn runs after the CLI returned)
+    f.q.hook = inside_the_cli_call
+    submit(f)
+    f.q.hook = None
+    thread = session(f, 'supervisor')
+    assert box['state'] == 'queuing'  # this delivery's record existed before `codex queue` ran
+    assert _bare(box['other_text']) == _bare(last(f)[1])  # identical business body; only each one's own envelope differs
+    assert int(cq(f, 'cq_queued_at')) <= int(datetime.datetime.fromisoformat(
+        box['rows'][0]['timestamp'].replace('Z', '+00:00')).timestamp() * 1000)  # it started after the record
+    write_rollout(f.test_sessions, thread, fleet.agent_cwd(f.cfg, 'supervisor'), rows=box['rows'])
+    gen = str(f.agent('supervisor')['generation'])
+    out = drive(f, lambda: _queue_turn_notify(f, thread, box['rows'], gen))
+    assert out is False or out['status'] in ('ignored', 'stale'), out
+    assert cq(f, 'cq_state') == 'queued' and lease(f)['status'] == 'received'
+    assert typed(f, 'worker-1') == [] and typed(f, 'worker-2') == []
+    # positive: this delivery's own queue turn (no client_id) then settles, exactly once
+    turn = str(uuid.uuid4())
+    out = codex_turn(f, plan(['worker-1']), turn=turn, users=[('', last(f)[1])], before=box['rows'])
+    assert out['status'] == 'committed', out
+    assert cq(f, 'cq_state') == 'bound' and cq(f, 'cq_turn') == turn
+    f.pump()
+    assert typed(f, 'worker-1') and typed(f, 'worker-2') == []
+    assert_no_input_box(f)
+
+
+# ================================================================ J. same-body redelivery, CLI timeout, awkward bodies (argv + binding)
+def test_same_body_redelivery_supersedes_only_the_older_token(sup):
+    """Same business body queued twice: the older delivery is abandoned, a turn carrying its token never
+    settles the newer one, and the newer delivery's own turn settles."""
+    f = sup
+    f.q.readable = False
+    submit(f)
+    old = codex_queue.record(f.r.hgetall(fleet.key('agent', 'supervisor')))
+    got = codex_queue.deliver(f, 'supervisor', old['cq_delivery'], _bare(old['cq_text']))
+    assert got['token'] != old['cq_token'] and _bare(got['text']) == _bare(old['cq_text'])
+    assert cq(f, 'cq_state') == 'queued' and cq(f, 'cq_token') == got['token']
+    out = codex_turn(f, plan(['worker-1']), users=[('', old['cq_text'])])
+    assert out is False or out['status'] == 'ignored', out
+    assert lease(f)['status'] == 'received'
+    assert codex_turn(f, plan(['worker-1']), users=[('', got['text'])])['status'] == 'committed'
+    assert cq(f, 'cq_state') == 'bound'
+
+
+class TimeoutQueue(Queue):
+    """`codex queue` timed out after the item had in fact been queued (the 'uncertain' case)."""
+
+    def enqueue(self, cfg, name, thread, text, **kw):
+        Queue.enqueue(self, cfg, name, thread, text, **kw)
+        raise codex_queue.QueueError('uncertain: codex queue gave no answer: timed out after 30 seconds')
+
+
+def test_cli_timeout_is_uncertain_held_and_after_clear_its_late_turn_never_settles(sup, monkeypatch):
+    f = sup
+    f.q = install_queue(monkeypatch, TimeoutQueue())
+    submit(f)
+    assert cq(f, 'cq_state') == 'uncertain'
+    text = f.q.items[-1]['text']
+    assert len(f.q.items) == 1  # never retried
+    f.v2.finish('stopped', 'operator stop')
+    assert cq(f, 'cq_state') == 'abandoned'
+    out = codex_turn(f, plan(['worker-1']), users=[('', text)])  # the item did run after all
+    assert out is False or out['status'] in ('ignored', 'stale'), out
+    assert typed(f, 'worker-1') == []
+    assert_no_input_box(f)
+
+
+AWKWARD = {
+    'hyphen': '- write worker-1/part.md with the findings',
+    'double-hyphen': '--help is not an option here; write the file',
+    'multiline': 'Write worker-1/part.md:\n  1. the totals\r\n  2. the gaps\n\n- and a bullet line',
+    'trailing-newlines': 'Write worker-1/part.md with the findings.\n\n\n',
+    'hyphen-multiline': '-n 3\nsecond line\n',
+}
+
+
+def message_value(argv):
+    """The --message value as a clap parser without allow_hyphen_values sees it: `--message=<v>` is always
+    the value; `--message <v>` is the value only if <v> does not look like a flag."""
+    glued = [a for a in argv if a.startswith('--message=')]
+    if glued:
+        assert len(glued) == 1 and '--message' not in argv
+        return glued[0][len('--message='):]
+    value = argv[argv.index('--message') + 1]
+    assert not value.startswith('-'), 'clap reads %r as a flag, not as the --message value' % value[:20]
+    return value
+
+
+@pytest.mark.parametrize('kind', sorted(AWKWARD))
+def test_enqueue_argv_carries_the_exact_marked_text_as_one_unambiguous_value(tmp_path, monkeypatch, kind):
+    thread, token = str(uuid.uuid4()), codex_queue.new_token()
+    text = codex_queue.marked(AWKWARD[kind], token)
+    seen = {}
+
+    def run(argv, **kw):
+        seen['argv'] = argv
+        return SimpleNamespace(returncode=0, stdout='Queued message q-1 for thread %s.\n' % thread, stderr='')
+    cfg = {'codex': str(tmp_path / 'codex'), 'codex_home': str(tmp_path / 'home'), 'run': str(tmp_path / 'run')}
+    monkeypatch.setattr(fleet, 'agent_cwd', lambda cfg, name: tmp_path)
+    assert ORIGINAL_ENQUEUE(cfg, 'supervisor', thread, text, run=run)['queued_id'] == 'q-1'
+    argv = seen['argv']
+    assert argv[:2] == [cfg['codex'], 'queue'] and argv[argv.index('--thread') + 1] == thread
+    assert message_value(argv) == text  # byte-exact: newlines, CR, indentation, leading '-' preserved
+    assert text.endswith('\n\n(fleet delivery ' + token + ')') and text.startswith(AWKWARD[kind].rstrip('\n'))
+
+
+@pytest.mark.parametrize('kind', sorted(AWKWARD))
+def test_awkward_body_delivery_binds_its_own_exact_text_only(sup, kind):
+    """The queue turn carrying exactly the queued text binds; the same body without its token, or with
+    whitespace normalised, does not (fails closed, never a wrong settle)."""
+    f = sup
+    got = codex_queue.deliver(f, 'supervisor', 'awkward-' + kind, AWKWARD[kind])
+    assert queued(f)[-1]['text'] == got['text'] == cq(f, 'cq_text')
+    rec = codex_queue.record(f.r.hgetall(fleet.key('agent', 'supervisor')))
+    thread, cwd = session(f, 'supervisor'), fleet.agent_cwd(f.cfg, 'supervisor')
+    t0 = int(time.time() * 1000)
+    variants = {'exact': got['text'], 'no-token': AWKWARD[kind],
+                'normalised': '\n'.join(l.strip() for l in got['text'].replace('\r\n', '\n').split('\n')).strip()}
+    rows = []
+    for i, (name, text) in enumerate(variants.items()):
+        rows += turn_rows('T-' + name, 'queue', [('', text)], 'a', t0 + 100 * i)
+    write_rollout(f.test_sessions, thread, cwd, rows=rows)
+    assert codex_queue.bound(rec, thread, 'T-exact', f.test_sessions) == (True, '')
+    assert codex_queue.bound(rec, thread, 'T-no-token', f.test_sessions)[0] is False
+    if variants['normalised'] != variants['exact']:
+        assert codex_queue.bound(rec, thread, 'T-normalised', f.test_sessions)[0] is False
+    assert_no_input_box(f)
