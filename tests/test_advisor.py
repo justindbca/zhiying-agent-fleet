@@ -533,3 +533,71 @@ def test_v2_domain_hotload_rewrites_the_bus_body(v2adv):
     assert 'option chain of NVDA' in text and f.agent('worker-1')['generation'] == '0'
     assert json.loads(f.agent('worker-1')['installed_domains']) == ['research_web', 'us_options']
     assert (fleet.agent_cwd(f.cfg, 'worker-1') / '.claude' / 'skills' / 'option-tier-screen').is_symlink()
+
+
+# ------------------------------------------------------------------ start --advisor
+def fake_start(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from cmux_fleet import cmux_manager
+    monkeypatch.setattr(cmux_manager, 'cmux_available', lambda: True)
+    monkeypatch.setattr(fleet.shutil, 'which', lambda name: '/bin/' + Path(str(name)).name)
+    mgr = SimpleNamespace(session_exists=lambda: False, meta_path=tmp_path / 'cmux' / 'meta.json',
+                          spawn_window=lambda *a, **k: SimpleNamespace(success=True, error=None))
+    monkeypatch.setattr(fleet, 'manager_for', lambda titles: mgr)
+    monkeypatch.setattr(fleet.redis_runtime, 'prepare', lambda root, token: {'redis_socket': str(tmp_path / 's.sock')})
+    monkeypatch.setattr(fleet, 'start_redis', lambda cfg: None)
+    monkeypatch.setattr(fleet, 'prepare_codex_home', lambda home, profiles: None)
+    monkeypatch.setattr(fleet, 'LATEST', tmp_path / 'latest.json')
+    return ['start', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--allow-development-v2',
+            '--runs-dir', str(tmp_path / 'runs'), '--codex-home', str(tmp_path / 'codex-home')]
+
+
+def test_start_advisor_flag_writes_config(monkeypatch, tmp_path):
+    argv = fake_start(monkeypatch, tmp_path)
+    kit = make_kit(tmp_path / 'kit')
+    fleet.main(argv + ['--advisor', '--worker-kit', str(kit)])
+    assert fleet.load(tmp_path / 'latest.json')['advisor'] is True
+    fleet.main(argv)
+    assert 'advisor' not in fleet.load(tmp_path / 'latest.json')  # not passed: config unchanged
+
+
+def test_start_advisor_refuses_bad_kit_before_provisioning(monkeypatch, tmp_path):
+    argv = fake_start(monkeypatch, tmp_path)
+    from cmux_fleet import cmux_manager
+    monkeypatch.setattr(cmux_manager, 'cmux_available', lambda: pytest.fail('bad kit must be refused first'))
+    kit = make_kit(tmp_path / 'kit')
+    (kit / 'domains' / 'fleet' / 'RULES.md').unlink()
+    with pytest.raises(SystemExit, match='--worker-kit rejected'):
+        fleet.main(argv + ['--advisor', '--worker-kit', str(kit)])
+
+
+# ------------------------------------------------------------------ contract task: held rows are advised on release
+def test_contract_row_held_by_depends_on_is_advised_when_released(tmp_path):
+    from test_contracts import WORKERS, THREADS as CT, item as citem, report as creport, sup, to_parallel, write
+    from test_fleet import write_rollout
+    run = tmp_path / 'run'
+    (run / 'workspace').mkdir(parents=True)
+    cfg = {'run': str(run), 'redis_socket': '/tmp/cmux-fleet-test.sock', 'python': sys.executable,
+           'workers': list(WORKERS), 'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 95000,
+           'codex_home': str(tmp_path / 'codex-home'), 'advisor': True, 'codex_model': 'gpt-6.1-sol'}
+    (run / 'config.json').write_text(json.dumps(cfg))
+    sessions = tmp_path / 'sessions'
+    f = fleet.Fleet(run / 'config.json', FakeRedis(), FakeMgr(), sessions=sessions)
+    f.advisor_runner = Runner({'model': 'gpt-6.1-sol', 'domains': []})
+    f.start_all()
+    for name in f.names:
+        write_rollout(sessions, CT[name], fleet.agent_cwd(cfg, name))
+        f.handle({'kind': 'turn', 'agent': name, 'generation': 0, 'thread': CT[name], 'text': 'READY'})
+    to_parallel(f)
+    sup(f, {'status': 'RUNNING', 'completion': 10, 'dispatch': [
+        citem('M0', 'worker-1', provides=['IF-M0-src']),
+        citem('M9', 'worker-3', depends_on=['M0'], serial_reason='integration')]})
+    assert f.contract_state()['tasks']['M9']['status'] == 'pending'
+    assert len(f.r.lrange(fleet.ADVICE_PENDING + 'worker-3', 0, -1)) == 1  # registered while held
+    write(f, 'worker-1/sources.md', '## Sources\n| url |\n| https://a |\n')
+    creport(f, 'worker-1', 'Interfaces: IF-M0-src@1 provided: ready')
+    assert f.contract_state()['tasks']['M9']['status'] == 'running'
+    f.pump()
+    asked = [c['instruction'] for c in f.advisor_runner.calls]
+    assert 'Do task M9 and write its output file' in asked
+    assert f.agent('worker-3')['advice_ticket'] and f.agent('worker-3')['state'] == 'busy'

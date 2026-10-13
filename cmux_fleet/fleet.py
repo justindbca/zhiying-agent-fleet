@@ -819,7 +819,6 @@ def actor(cfg_path, name, prompt, generation=None):
     # Every daemon launch pins this value in argv, never adopts a newer generation.
     generation = int(info.get('generation') or 0) if generation is None else generation
     deadline = time.monotonic() + 60
-    waited = False
     while True:
         if generation != int(info.get('generation', -1)) or info.get('state') == 'dead':
             raise RuntimeError('actor generation was retired or blocked before launch')
@@ -830,10 +829,8 @@ def actor(cfg_path, name, prompt, generation=None):
         if time.monotonic() >= deadline:
             raise RuntimeError('profile launch gate timed out; old runtime retirement unconfirmed')
         time.sleep(.1)
-        waited = True
         info = r.hgetall(key('agent', name))
-    if waited:
-        cfg = load(cfg_path)  # an advisor release may have rewritten this generation's snapshot
+    cfg = load(cfg_path)  # an advisor release may have rewritten this generation's snapshot
     os.chdir(agent_cwd(cfg, name))
     if is_pi(cfg, name):
         os.environ.update(pi_adapter.environment(cfg_path, cfg, name, generation))
@@ -1945,6 +1942,11 @@ class Fleet:
             # Metadata describes the next instruction, not the last appended one.
             # A busy worker records intent only; delivery re-evaluates at idle.
             advisory = profile_runtime.profile_advisory(slot, application)
+            if self.cfg.get('advisor') is True:
+                # Only supervisor dispatches are advised (never [contract] notices or report corrections).
+                # Registered before the depends_on hold: a held row is advised when the daemon releases it.
+                self.r.rpush(ADVICE_PENDING + slot, json.dumps({'instruction': instruction,
+                                                                'note': item.get('advise_note', '')}, ensure_ascii=False))
             if state is not None:
                 row = rows[item['id']]
                 row['message'] = advisory + self.contract_message(t.get('id', ''), row)
@@ -1954,10 +1956,6 @@ class Fleet:
                 row['attempts'] = row.get('attempts', 0) + 1
             if not self.inbox_depth(slot):
                 self.record_worker_profile(slot, application)
-            if self.cfg.get('advisor') is True:
-                # Only supervisor dispatches are advised (never [contract] notices or report corrections).
-                self.r.rpush(ADVICE_PENDING + slot, json.dumps({'instruction': instruction,
-                                                                'note': item.get('advise_note', '')}, ensure_ascii=False))
             if state is not None:
                 self.contract_queue(state, slot, row['message'], row['id'])
                 continue
