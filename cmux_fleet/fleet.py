@@ -1369,7 +1369,8 @@ class Fleet:
                                   claude_model(cfg, name) if is_claude(cfg, name) else agent_profile(cfg, name))},
             env_vars=dict({'PATH': os.environ.get('PATH', '')}, **(
                 pi_adapter.environment(cfg_path, cfg, name, generation) if is_pi(cfg, name)
-                else {'CODEX_HOME': str(codex_home(self.cfg))})))
+                else {'CODEX_HOME': str(codex_home(self.cfg))})),
+            **subfleet.tmux_spawn_args(self.cfg, name, generation))
         if not result.success:
             if result.pane_id:
                 self.setf(name, pane=result.pane_id)
@@ -4004,6 +4005,7 @@ def daemon(cfg_path, resume=False):
                     fleet.r.shutdown()
                 except Exception:
                     pass  # redis closes the socket while acknowledging shutdown
+                subfleet.stop_tmux(cfg)  # the fleet's own tmux server goes last (§19 dual display)
     if fleet is not None:
         lifecycle_close.after_daemon(fleet)  # lock released, Redis down: close this run's workspace
 

@@ -36,6 +36,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, unquote, urlsplit
 
 LIMITS = {'max_depth': 2, 'max_children': 3, 'max_agents_total': 12, 'child_workers_max': 3}
@@ -396,6 +397,69 @@ def process_requests(f):
         f.log('subfleet.request', request=path.stem, **answer)
 
 
+# ------------------------------------------------------------------ dual display (supervisor_slot in tmux)
+def tmux_slot(cfg, slot):
+    """A worker named as ``supervisor_slot`` of a ``subfleets:`` entry runs in the fleet's own tmux server,
+    so its one session can show in the parent's and the sub-fleet's workspace at once. Never in a sub-fleet."""
+    if cfg.get('adopt') or slot == 'supervisor':
+        return False
+    return any(isinstance(e, dict) and e.get('supervisor_slot') == slot for e in cfg.get('subfleets') or [])
+
+
+def tmux_socket(cfg):
+    return str(Path(cfg['run']) / 'tmux.sock')
+
+
+def tmux_spawn_args(cfg, slot, generation):
+    """Extra spawn_interactive_cli arguments for ``slot``'s generation ({} for a plain cmux pane)."""
+    from cmux_fleet import cmux_manager
+    if not tmux_slot(cfg, slot):
+        return {}
+    return {'tmux_socket': tmux_socket(cfg), 'tmux_session': cmux_manager.tmux_session_name(slot, generation)}
+
+
+def stop_tmux(cfg):
+    """Fleet exit: end the fleet's tmux server (every slot was retired before)."""
+    from cmux_fleet import cmux_manager
+    if Path(tmux_socket(cfg)).exists():
+        cmux_manager.tmux_kill_server(tmux_socket(cfg))
+
+
+def parent_view(f, slot, sid):
+    """Parent side of a delegation: the second-client info of a tmux slot's tab (None: plain cmux pane,
+    which is released and moved instead)."""
+    probe = getattr(f.mgr, 'tmux_view_info', None)
+    return probe(sid) if probe and tmux_slot(f.cfg, slot) else None
+
+
+def attach_child_view(f, sid, peer, info):
+    """Child side: show the delegated session just before ``peer``; returns the child's tab of it (None:
+    failed). tmux slot: a second client tab (the parent keeps its own); cmux pane: move the released tab."""
+    if info.get('tmux_session'):
+        return f.mgr.attach_view(info, peer)
+    return sid if f.mgr.adopt(sid, peer, info) else None
+
+
+def detach_child_view(f, sid):
+    """Child side of the return: disconnect its client tab of a tmux slot (session untouched), or release
+    the adopted cmux pane for the parent to move back. Returns the hand-back info (None: not ours)."""
+    if not sid:
+        return None
+    probe = getattr(f.mgr, 'tmux_view_info', None)
+    view = probe(sid) if probe else None
+    if view is not None:
+        return view if f.mgr.detach_view(sid) else None
+    return f.mgr.release(sid)
+
+
+def detach_child_views(child_mgr):
+    """Parent ``collect``: disconnect client tabs a crashed child left behind before its tabs are closed."""
+    meta = child_mgr._meta() if hasattr(child_mgr, '_meta') else {}
+    for sid, info in list(meta.get('surfaces', {}).items()):
+        if info.get('tmux_role') == 'view':
+            child_mgr.detach_view(sid)
+
+
 # ------------------------------------------------------------------ spawn
 def child_lifecycle(parent):
     """A sub-fleet runs the lifecycle its parent's mode names (child_mode), default dev_task, never the
@@ -511,20 +575,24 @@ def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, lau
         raise Refused('tabs of an earlier sub-fleet ' + task_id + ' are still open; close them first')
     info_now = f.agent(slot)
     sid = info_now['pane']
-    # 1. placeholder in the parent, in the worker's place
-    # spawn_window execs the command: keep the tab's process alive (an exited tab reads as a closed runtime)
-    show = 'printf "%s\\n" ' + shlex.quote(placeholder_label(slot, task_id, ws_title)) + '; exec sleep 2147483647'
-    ph = f.mgr.spawn_window('placeholder-' + slot, '/bin/bash -c ' + shlex.quote(show),
-                            metadata={'type': 'placeholder'}, start_directory=str(f.run_dir))
-    if not ph.success or not f.mgr.tab_into(ph.pane_id, sid):
-        if ph.pane_id:
-            f.mgr.kill_pane(ph.pane_id)
-        raise Refused('could not open the placeholder tab for ' + slot)
-    f.mgr.rename(ph.pane_id, placeholder_label(slot, task_id, ws_title))
+    view = parent_view(f, slot, sid)  # tmux slot: the parent keeps its own tab of the session
+    ph = SimpleNamespace(pane_id='')
+    if view is None:
+        # 1. placeholder in the parent, in the worker's place
+        # spawn_window execs the command: keep the tab's process alive (an exited tab reads as a closed runtime)
+        show = 'printf "%s\\n" ' + shlex.quote(placeholder_label(slot, task_id, ws_title)) + '; exec sleep 2147483647'
+        ph = f.mgr.spawn_window('placeholder-' + slot, '/bin/bash -c ' + shlex.quote(show),
+                                metadata={'type': 'placeholder'}, start_directory=str(f.run_dir))
+        if not ph.success or not f.mgr.tab_into(ph.pane_id, sid):
+            if ph.pane_id:
+                f.mgr.kill_pane(ph.pane_id)
+            raise Refused('could not open the placeholder tab for ' + slot)
+        f.mgr.rename(ph.pane_id, placeholder_label(slot, task_id, ws_title))
     deliver = deliverables(f.workspace(), slot, rec_dir / 'workspace', outputs or ([output] if output else []))
     rec = {'task_id': task_id, 'slot': slot, 'run': str(rec_dir), 'state': 'starting', 'attempt': attempt,
            'workers': workers, 'output': output, 'deliver': deliver, 'created': time.time(), 'title': ws_title,
-           'placeholder': ph.pane_id, 'pane': sid, 'generation': int(info_now.get('generation') or 0)}
+           'placeholder': ph.pane_id, 'pane': sid, 'generation': int(info_now.get('generation') or 0),
+           'view': int(view is not None)}
     cfg = released = None
     try:  # anything below fails -> rollback; SystemExit too (start_redis), never the parent daemon
         # 2. child run directory, config, private Redis, task
@@ -552,12 +620,13 @@ def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, lau
                               'subfleet-' + task_id)
         child_r.close(); child_r.connection_pool.disconnect()
         # 3. stop delivering to the slot and hand the surface over (hooks now route to the child)
-        f.setf(slot, state='delegated', pane=ph.pane_id, delegated_pane=sid, delegated_task=task_id,
+        f.setf(slot, state='delegated', pane=ph.pane_id or sid, delegated_pane=sid, delegated_task=task_id,
                delegate_cfg=str(rec_dir / 'config.json'), bridge_available=0)
-        released = f.mgr.release(sid) or {}
+        released = view if view is not None else (f.mgr.release(sid) or {})
         cfg['adopt']['info'] = released
         fleet.save(rec_dir / 'config.json', cfg)
-        child_mgr._save_meta({'workspace': None, 'control_workspace': None, 'surfaces': {sid: released}})
+        child_mgr._save_meta({'workspace': None, 'control_workspace': None,
+                              'surfaces': {} if view is not None else {sid: released}})
         result = (launch or default_launch)(rec_dir / 'config.json', cfg, child_mgr)
         if not result.success:
             raise RuntimeError('child daemon did not start: ' + str(result.error))
@@ -578,11 +647,12 @@ def rollback(f, rec_dir, rec, released, cfg):
         shutdown_redis(cfg)
     fleet.manager_for({'session': session_name(rec['task_id']), 'cmux_state_dir': f.cfg.get('cmux_state_dir')}
                       ).release(rec['pane'])
-    if released is not None:
+    if released is not None and not rec.get('view'):
         f.mgr._tag(rec['pane'], **{k: v for k, v in released.items() if isinstance(v, str)})
     f.setf(rec['slot'], state='idle', pane=rec['pane'], delegated_pane='', delegated_task='', delegate_cfg='')
     restore_role(f, rec)
-    f.mgr.kill_pane(rec['placeholder'])
+    if rec['placeholder']:
+        f.mgr.kill_pane(rec['placeholder'])
     rec['state'] = 'failed'
     rec['reason'] = 'start failed'
     if Path(rec_dir).is_dir():
@@ -626,10 +696,12 @@ def start_adopted(f):
            last_msg='', empty_tries=0, launch_ready=1, runtime_ready=0, current_profile='', idle_confirmed=0,
            pane=sid, bridge_available=0, startup_deadline=time.time() + float(f.cfg['profile_ready_timeout']))
     first = f.agent(f.workers[0])['pane']
-    if not f.mgr.adopt(sid, first, adopt.get('info') or {}):
+    sid = attach_child_view(f, sid, first, adopt.get('info') or {})
+    if not sid:
         f.setf('supervisor', state='dead', launch_ready=0)
         f.log('subfleet.adopt_failed', pane=sid)
         return f.finish('blocked', 'could not take over the delegated pane of ' + adopt['slot'])
+    f.setf('supervisor', pane=sid)
     f.mgr.rename(sid, 'fx-' + f.cfg.get('tab_prefix', '') + fleet.SUPERVISOR_LABEL)
     history.write_page(f.run_dir, f.history_slots(), f.history_links())
     f.history_pane = f.mgr.arrange(sid, [f.agent(w)['pane'] for w in f.workers], history.page_url(f.run_dir))
@@ -667,9 +739,11 @@ def sibling_anchor(cfg):
 def hand_back(f):
     """Child explicit stop: release the adopted pane (never kill it) for the parent to take back."""
     sid = f.agent('supervisor').get('pane')
-    info = f.mgr.release(sid) if sid else None
+    info = detach_child_view(f, sid)
     if info is None:
         return False
+    if info.get('tmux_session'):  # the parent never gave its own tab away
+        sid = f.cfg['adopt']['pane']
     _fleet().save(f.run_dir / 'handback.json', {'pane': sid, 'info': info, 'at': time.time()})
     f.log('subfleet.handed_back', pane=sid)
     return True
@@ -794,14 +868,19 @@ def collect(f, child_run, notify=True):
     child_mgr = fleet.manager_for(cfg)
     shutdown_redis(cfg)  # no orphan Redis even if the child crashed
     back = {}
-    try:
-        back = fleet.load(Path(child_run) / 'handback.json')
-    except (OSError, ValueError):
-        info = child_mgr.release(rec['pane'])  # crashed child: its registry still holds the pane
-        if info is not None:
-            back = {'pane': rec['pane'], 'info': info}
     ph = rec['placeholder']
-    returned = bool(back) and back.get('pane') == rec['pane'] and f.mgr.adopt(rec['pane'], ph, back.get('info') or {})
+    if rec.get('view'):
+        # tmux slot: the parent's tab never left; a crashed child may still show its client tab.
+        detach_child_views(child_mgr)
+        returned = f.mgr.get_pane_status(rec['pane']) is not None and f.mgr.has_cli_process(rec['pane'], fleet.RESUME_CLIS)
+    else:
+        try:
+            back = fleet.load(Path(child_run) / 'handback.json')
+        except (OSError, ValueError):
+            info = child_mgr.release(rec['pane'])  # crashed child: its registry still holds the pane
+            if info is not None:
+                back = {'pane': rec['pane'], 'info': info}
+        returned = bool(back) and back.get('pane') == rec['pane'] and f.mgr.adopt(rec['pane'], ph, back.get('info') or {})
     restore_role(f, rec)
     child_mgr.close_all()
     child_mgr.meta_path.unlink(missing_ok=True)
@@ -810,7 +889,8 @@ def collect(f, child_run, notify=True):
         # The adopted session may still be mid-turn (parent task ended, stop): abort that turn so its
         # late Stop cannot settle as the READY of the return. Second place Escape counts as accepted stop.
         f.mgr.send_key(rec['pane'], 'Escape')
-        f.mgr.kill_pane(ph)
+        if ph:
+            f.mgr.kill_pane(ph)
         f.mgr.rename(rec['pane'], 'fx-' + f.cfg.get('tab_prefix', '') + f.label(slot))
         f.setf(slot, pane=rec['pane'], state='starting', launch_ready=1, runtime_ready=0, bridge_available=0,
                startup_deadline=time.time() + float(f.cfg['profile_ready_timeout']), busy_since=time.time())
@@ -824,7 +904,7 @@ def collect(f, child_run, notify=True):
             f.log('subfleet.return_failed', task=rec['task_id'], slot=slot)
     else:
         # The original session is gone (or could not be moved back): next generation in the placeholder's place.
-        f.setf(slot, pane=ph, state='idle')
+        f.setf(slot, pane=ph or rec['pane'], state='idle')
         f.v2.respawn([slot], True)
         f.log('subfleet.slot_respawned', task=rec['task_id'], slot=slot)
     ok = rec.get('outcome') == 'completed'
