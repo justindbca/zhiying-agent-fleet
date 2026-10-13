@@ -90,7 +90,7 @@ def test_codex_routes_request_claude_answers_public_result(service):
     f = service
     assert serve(f, 'r1')['status'] == 'committed'
     assert json.loads(f.r.get(fleet.RESULT + 'r1'))['result'] == {'reply': 'fills ok'}
-    assert dict(f.mgr.bracketed)[f.agent('worker-1')['pane']] is True
+    assert f.agent('worker-1')['pane'] not in dict(getattr(f.mgr, 'bracketed', []))  # Stop-hook channel: never typed
     assert no_message_files(f)
 
 

@@ -1,0 +1,901 @@
+"""Claude worker deliveries through the Stop hook channel (feat/claude-hook-delivery).
+
+Black box on purpose: the hook is the exact command line the daemon wrote into this
+generation's Claude ``--settings`` file, run as a real subprocess with a Stop payload on
+stdin (real private Redis, fake cmux). After the launch prompt, a Claude worker must
+receive every delivery as ``{"decision": "block", "reason": <business text>}`` on the
+hook's stdout, and never through the input box (``send_prompt_to_idle``).
+
+Transcripts follow what Claude Code 2.1.280 was measured to write (worker-2/research.md §1):
+a hook delivery is NOT a normal user prompt but an ``isMeta`` user row
+``"Stop hook feedback:\\n<reason>\\n"`` followed by a ``hook_blocking_error`` attachment and a
+``stop_hook_summary`` system row. A row the operator typed is a plain user row.
+Escape / ctrl+x ctrl+s / a hook timeout SIGTERM the waiting hook (research §4); the fake
+manager below does the same on Escape.
+"""
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
+
+import pytest
+
+from test_fleet import FakeMgr, write_rollout
+from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
+from cmux_fleet import fleet, runtime_v2
+
+HOOK_CHANNEL = True  # tests/conftest.py keeps the channel on for this module
+
+WORKERS = ['worker-1', 'worker-2']
+REPORT = 'Done:\n- wrote {name}\nEvidence:\n- worker-1/{name} 8 bytes\nNot done: none\nBlocked: none'
+FEEDBACK = 'Stop hook feedback:\n'
+CAP = 'CLAUDE_CODE_STOP_HOOK_BLOCK_CAP'
+LONG_IDLE = 1800  # brief: >= 30 minutes without work must not break the channel
+
+
+# ------------------------------------------------------------------ fake cmux with real hook kills
+class HookMgr(FakeMgr):
+    """Escape in a Claude pane SIGTERMs the Stop hook waiting there (measured, research §4)."""
+
+    def __init__(self):
+        super().__init__()
+        self.hooks = []
+
+    def send_key(self, pane, k):
+        if k == 'Escape':
+            for hook in self.hooks:
+                if hook.pane == pane and hook.alive():
+                    hook.proc.send_signal(signal.SIGTERM)
+        return super().send_key(pane, k)
+
+    def has_cli_process(self, pane, clis):
+        return pane in self.alive
+
+    def dock_control(self, history_surface):
+        return True
+
+    def kill_pane(self, pane):
+        # kill_process_tree SIGTERMs Claude's children too, the waiting hook included
+        for hook in self.hooks:
+            if hook.pane == pane and hook.alive():
+                hook.proc.send_signal(signal.SIGTERM)
+        return super().kill_pane(pane)
+
+
+# ------------------------------------------------------------------ hook process
+class Hook:
+    """One run of the generation's real Stop hook command."""
+
+    def __init__(self, f, slot, generation, payload):
+        stop_hooks, = settings(f, slot, generation)['hooks']['Stop']
+        self.command = stop_hooks['hooks'][0]['command']
+        self.timeout = stop_hooks['hooks'][0].get('timeout')
+        self.slot, self.session, self.pane = slot, payload.get('session_id'), f.agent(slot)['pane']
+        self.transcript = payload.get('transcript_path')
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
+        self.proc = subprocess.Popen(shlex.split(self.command), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True, env=env, cwd=str(fleet.agent_cwd(f.cfg, slot)))
+        self.proc.stdin.write(json.dumps(payload))
+        self.proc.stdin.close()
+        self.out = self.err = None
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def finish(self):
+        if self.out is None:
+            self.out, self.err = self.proc.stdout.read(), self.proc.stderr.read()
+        return self.out
+
+    def decision(self):
+        """The parsed block decision, or None when the hook let Claude stop."""
+        out = (self.finish() or '').strip()
+        if not out:
+            return None
+        data = json.loads(out.splitlines()[-1])
+        return data if data.get('decision') == 'block' else None
+
+    def kill(self):
+        if self.alive():
+            self.proc.kill()
+            self.proc.wait(5)
+        self.finish()
+
+
+def settings(f, slot, generation=0):
+    """The generation's Claude --settings, written the way the pane launcher writes it."""
+    path = fleet.agent_cwd(f.cfg, slot) / ('.fleet-settings-g' + str(generation) + '.json')
+    if not path.exists():  # FakeMgr never execs the launcher, so build its argv here
+        argv = fleet.claude_argv(f.path, fleet.load(f.path), slot, generation, 'launch prompt')
+        path = Path(argv[argv.index('--settings') + 1])
+    return json.loads(path.read_text())
+
+
+def step(f, until, timeout=15.0):
+    """Step the daemon until ``until()`` holds; return whether it did."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        f.v2.step(20)
+        f.pump()
+        if until():
+            return True
+    return False
+
+
+def thread_of(f, slot, generation):
+    return f.test_threads[slot] if generation == 0 else f.test_threads[slot] + '-g' + str(generation)
+
+
+def transcript_of(f, slot, thread):
+    path = f.test_claude / slot / (thread + '.jsonl')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def append(path, rows):
+    with Path(path).open('a') as out:
+        out.write(''.join(json.dumps(x) + '\n' for x in rows))
+
+
+def feedback_rows(reason):
+    """What Claude Code 2.1.280 writes when a Stop hook blocks with ``reason``."""
+    return [{'type': 'user', 'isMeta': True, 'promptId': 'p-first',
+             'message': {'role': 'user', 'content': FEEDBACK + reason + '\n'}},
+            {'type': 'attachment', 'attachment': {'type': 'hook_blocking_error', 'hookEvent': 'Stop',
+                                                  'blockingError': {'blockingError': reason + '\n'}}},
+            {'type': 'system', 'subtype': 'stop_hook_summary'}]
+
+
+def payload(f, slot, thread, text, active):
+    return {'session_id': thread, 'transcript_path': str(transcript_of(f, slot, thread)),
+            'cwd': str(fleet.agent_cwd(f.cfg, slot)), 'hook_event_name': 'Stop', 'stop_hook_active': active,
+            'last_assistant_message': text, 'prompt_id': 'p-first', 'background_tasks': []}
+
+
+def stop(f, slot, text, *, generation=None, thread=None, active=True, user_prompt=None):
+    """Fire the slot's Stop hook for a finished turn.
+
+    ``user_prompt`` adds a plain user row (launch prompt, or text the operator typed); a hook
+    delivery's isMeta feedback rows are written by ``delivered`` when the hook hands it out."""
+    gen = int(f.agent(slot)['generation']) if generation is None else generation
+    thread = thread or thread_of(f, slot, gen)
+    rows = []
+    if user_prompt is not None:
+        rows.append({'type': 'user', 'promptId': 'p-' + uuid.uuid4().hex[:8],
+                     'message': {'role': 'user', 'content': user_prompt}})
+    rows.append({'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': text}]}})
+    append(transcript_of(f, slot, thread), rows)
+    hook = Hook(f, slot, gen, payload(f, slot, thread, text, active))
+    f.test_hooks.append(hook)
+    f.mgr.hooks.append(hook)
+    return hook
+
+
+def codex_turn(f, text):
+    """The Codex supervisor still answers through notify (it is typed, unchanged)."""
+    gen = int(f.agent('supervisor').get('generation') or 0)
+    # Codex rollout lookup needs a UUID per generation (as in test_resume)
+    thread = f.test_threads['supervisor'] if gen == 0 else f.test_threads.setdefault(('supervisor', gen), str(uuid.uuid4()))
+    turn_id = 't-' + uuid.uuid4().hex
+    write_rollout(f.test_sessions, thread, fleet.agent_cwd(f.cfg, 'supervisor'), rows=[
+        {'type': 'event_msg', 'payload': {'type': 'task_complete', 'turn_id': turn_id, 'last_agent_message': text}}])
+    prompt = typed(f, 'supervisor')[-1] if typed(f, 'supervisor') else 'startup prompt'
+    data = json.dumps({'type': 'agent-turn-complete', 'thread-id': thread, 'turn-id': turn_id,
+                       'input-messages': [prompt], 'last-assistant-message': text})
+    box = {}
+    worker = threading.Thread(target=lambda: box.setdefault('v', fleet.notify(f.path, 'supervisor', str(gen), data, f.test_sessions)))
+    worker.start()
+    deadline = time.time() + 15
+    while worker.is_alive() and time.time() < deadline:
+        f.v2.step(20)
+    worker.join(2)
+    assert not worker.is_alive()
+    return box['v']
+
+
+def typed(f, slot):
+    pane = f.agent(slot)['pane']
+    return [text for p, text in f.mgr.sent if p == pane]
+
+
+def panes(f, slot):
+    f.test_panes.setdefault(slot, set()).add(f.agent(slot)['pane'])
+    return f.test_panes[slot]
+
+
+def typed_any(f, slot):
+    """Everything typed into any pane this slot ever had (generations included)."""
+    mine = panes(f, slot)
+    return [text for p, text in f.mgr.sent if p in mine]
+
+
+def escapes(f, slot):
+    mine = panes(f, slot)
+    return [k for p, k in f.mgr.keys if p in mine and k == 'Escape']
+
+
+def decision_json(workers, what='part.md'):
+    return json.dumps({'status': 'RUNNING', 'completion': 10, 'reason': 'split the work',
+                       'dispatch': [{'to': w, 'instruction': 'Write ' + w + '/' + what + ' with the findings.'}
+                                    for w in workers]})
+
+
+def submit(f):
+    runtime_v2.post_event(f.v2.bus, dict(kind='task', request_id='new-task', spec={'goal': 'build MAYFLY M0 parts'}), 'new-task')
+    assert step(f, lambda: bool(typed(f, 'supervisor'))), 'the task never reached the supervisor'
+
+
+def received(f, slot):
+    return f.v2.bus.slot_state(slot).get('status') == 'received'
+
+
+def status_of(f, env):
+    return f.v2.bus.message(env['message_id']).get('status')
+
+
+def reports(f, slot='worker-1'):
+    """Reports the supervisor got (typed) or still has queued."""
+    label = re.compile(r'^\[' + re.escape(slot) + r'(\.\d+)? report')  # '[worker-1.1 report (took over ...)]'
+    return len([t for t in typed(f, 'supervisor') if label.match(t)]) \
+        + f.r.llen(f.v2.bus.pending_key('supervisor'))
+
+
+def audit(f, slot):
+    return [x for _, x in f.r.xrange(f.v2.bus.audit_key) if x.get('slot') == slot]
+
+
+@pytest.fixture
+def hooked(private_redis_v2, tmp_path):  # noqa: F811
+    """Codex supervisor + two Claude workers whose READY turns ended through the real Stop hook."""
+    r = private_redis_v2
+    r.flushdb()
+    run = tmp_path / ('run-' + uuid.uuid4().hex)
+    (run / 'workspace').mkdir(parents=True)
+    sessions = tmp_path / 'codex-home' / 'sessions'
+    cfg = dict(run=str(run), redis_socket=r.connection_pool.connection_kwargs['path'],
+               python=sys.executable, workers=list(WORKERS), mode='task', supervisor_cli='codex',
+               worker_cli='claude', codex_home=str(tmp_path / 'codex-home'), transport_version=2,
+               allow_development_v2=True, stall_timeout=0, v2_lease_ms=300000, max_busy=0)
+    path = run / 'config.json'
+    fleet.save(path, cfg)
+    f = fleet.Fleet(path, r, HookMgr(), sessions=sessions)
+    f.test_sessions, f.test_claude = sessions, tmp_path / 'claude-projects'
+    f.test_threads = {s: str(uuid.uuid4()) for s in ['supervisor'] + WORKERS}
+    f.test_hooks, f.test_panes, f.test_close = [], {}, [f]
+    import cmux_fleet.fleet as fleet_mod
+    real_trust = fleet_mod.trust_claude_dir
+    fleet_mod.trust_claude_dir = lambda cwd: None  # never touch the operator's ~/.claude.json
+    try:
+        f.start_all()
+        r.set(f.v2.prefix + ':boot', 'running')
+        for w in WORKERS:
+            panes(f, w)
+        assert codex_turn(f, 'READY')['status'] == 'ready'
+        f.test_ready = {}
+        for w in WORKERS:
+            # The launch prompt is the only typed input; its READY turn ends through the hook.
+            hook = stop(f, w, 'READY', active=False, user_prompt='startup prompt')
+            assert step(f, lambda: f.agent(w).get('runtime_ready') == '1'), 'READY was not bound through the hook'
+            f.test_ready[w] = hook
+        yield f
+    finally:
+        for hook in f.test_hooks:
+            hook.kill()
+        for proc in getattr(f, 'test_procs', []):
+            if proc.poll() is None:
+                proc.kill()
+        fleet_mod.trust_claude_dir = real_trust
+        for each in f.test_close:
+            each.v2.close()
+
+
+def dispatch(f, workers, what='part.md'):
+    if not typed(f, 'supervisor') or 'build MAYFLY' not in typed(f, 'supervisor')[0]:
+        submit(f)
+    assert codex_turn(f, decision_json(workers, what))['status'] == 'committed'
+    f.pump()
+
+
+def delivered(f, hook, timeout=15.0):
+    """Step until the blocking hook hands over a delivery; return its block decision.
+
+    Like Claude Code, record the hand-over in the session transcript as isMeta feedback rows."""
+    assert step(f, lambda: not hook.alive(), timeout), 'the hook never handed over the delivery'
+    got = hook.decision()
+    assert got is not None, 'hook exited without a block decision: ' + repr((hook.out, hook.err))
+    append(hook.transcript, feedback_rows(got['reason']))
+    return got
+
+
+def handed(f, slot='worker-1', what='part.md'):
+    """Dispatch one task to ``slot`` and let its waiting READY hook hand it over."""
+    dispatch(f, [slot], what)
+    got = delivered(f, f.test_ready[slot])
+    return got, f.v2.bus.slot_state(slot)
+
+
+# ------------------------------------------------------------------ settings / launch env measured on 2.1.280
+def launch_env(f, slot, monkeypatch, tmp_path):
+    """The environment the pane launcher execs Claude Code with (exec intercepted)."""
+    monkeypatch.setenv(CAP, 'unset-by-test')  # restored (removed) at teardown
+    monkeypatch.chdir(tmp_path)  # the launcher chdirs into the slot directory
+
+    class Exec(Exception):
+        pass
+
+    def fake_exec(prog, argv):
+        raise Exec(dict(os.environ))
+    monkeypatch.setattr(fleet.os, 'execvp', fake_exec)
+    with pytest.raises(Exec) as caught:
+        fleet.actor(f.path, slot, 'launch prompt')
+    return caught.value.args[0]
+
+
+def test_default_block_cap_is_off_and_hook_outlasts_long_idle(hooked, monkeypatch, tmp_path):
+    f = hooked
+    # Default cap 8: the 9th consecutive block is written to the transcript and never answered.
+    s = settings(f, 'worker-1')
+    in_settings = str((s.get('env') or {}).get(CAP))
+    in_launch = launch_env(f, 'worker-1', monkeypatch, tmp_path).get(CAP)
+    assert '0' in (in_settings, in_launch), CAP + ' must be 0 (settings env or launch env)'
+    for gen in (0, 1):
+        timeout = settings(f, 'worker-1', gen)['hooks']['Stop'][0]['hooks'][0].get('timeout')
+        # No timeout means 600 s: ten idle minutes would cut the channel.
+        assert timeout and timeout >= LONG_IDLE, 'Stop hook timeout must outlast a 30-minute idle wait'
+
+
+def test_codex_supervisor_keeps_the_typed_path_and_no_cap_change(hooked, monkeypatch, tmp_path):
+    f = hooked
+    assert typed(f, 'supervisor') == [] or all('Stop hook' not in t for t in typed(f, 'supervisor'))
+    dispatch(f, ['worker-1'])
+    assert typed(f, 'supervisor'), 'the Codex supervisor is still typed (unchanged)'
+
+
+# ------------------------------------------------------------------ input box is never used
+def test_ready_hook_waits_then_delivers_task_without_typing(hooked):
+    f = hooked
+    hook = f.test_ready['worker-1']
+    assert hook.alive(), 'after READY the hook must block for the next delivery, not let Claude stop'
+    got, lease = handed(f)
+    assert 'Write worker-1/part.md' in got['reason']
+    assert lease['status'] == 'received' and lease['session_id'] == f.test_threads['worker-1']
+    for transport_id in (lease['message_id'], lease['current_delivery'], '.inbox', 'fleet_result'):
+        assert transport_id not in got['reason']
+    assert typed_any(f, 'worker-1') == [], 'a Claude worker delivery reached the input box'
+    assert not [k for p, k in f.mgr.keys if p in panes(f, 'worker-1') and k == 'Enter']
+
+
+def test_idle_worker_hook_hands_out_nothing(hooked):
+    f = hooked
+    handed(f)
+    step(f, lambda: False, timeout=2)
+    assert f.test_ready['worker-2'].alive()
+    assert typed_any(f, 'worker-2') == []
+
+
+# ------------------------------------------------------------------ settle first, then wait
+def test_stop_settles_from_meta_feedback_before_blocking_again(hooked):
+    f = hooked
+    got, env = handed(f)
+    rows = [json.loads(x) for x in Path(f.test_ready['worker-1'].transcript).read_text().splitlines()]
+    assert not [x for x in rows if x['type'] == 'user' and not x.get('isMeta')
+                and 'Write worker-1/part.md' in str(x['message']['content'])], 'no plain user row for a hook delivery'
+    after = stop(f, 'worker-1', REPORT.format(name='part.md'))
+    # The report is committed while this same hook keeps waiting for more work.
+    assert step(f, lambda: status_of(f, env) == 'committed')
+    assert after.alive(), 'with nothing queued the hook keeps waiting instead of letting Claude stop'
+    msg = f.v2.bus.message(env['message_id'])
+    assert msg['outcome'] == 'completed' and msg['result']['done'] == ['wrote part.md']
+    assert f.agent('worker-1')['state'] == 'idle'
+    assert step(f, lambda: any(t.startswith('[worker-1 report]') for t in typed(f, 'supervisor')))
+
+
+def test_unrelated_meta_rows_do_not_hide_the_delivery(hooked):
+    f = hooked
+    got, env = handed(f)
+    # Claude also writes other isMeta user rows (reminders, attachments) inside a turn.
+    append(f.test_ready['worker-1'].transcript, [
+        {'type': 'user', 'isMeta': True, 'message': {'role': 'user', 'content': '<system-reminder>todo list empty</system-reminder>'}}])
+    stop(f, 'worker-1', REPORT.format(name='part.md'))
+    assert step(f, lambda: status_of(f, env) == 'committed')
+
+
+def test_ten_consecutive_deliveries_with_stop_hook_active(hooked):
+    f = hooked
+    hook, seen = f.test_ready['worker-1'], []
+    for i in range(10):  # past Claude Code's default cap of 8 consecutive blocks
+        dispatch(f, ['worker-1'], what='part-' + str(i) + '.md')
+        got = delivered(f, hook)
+        seen.append(got['reason'])
+        env = f.v2.bus.slot_state('worker-1')
+        hook = stop(f, 'worker-1', REPORT.format(name='part-' + str(i) + '.md'), active=True)
+        assert step(f, lambda: status_of(f, env) == 'committed'), \
+            'delivery ' + str(i) + ' did not settle with stop_hook_active=true'
+    assert all('part-' + str(i) + '.md' in seen[i] for i in range(10))
+    assert typed_any(f, 'worker-1') == []
+    assert step(f, lambda: reports(f) == 10)
+
+
+# ------------------------------------------------------------------ foreign / manual / old turns
+def test_old_generation_hook_never_settles_or_takes_a_delivery(hooked):
+    f = hooked
+    got, env = handed(f)
+    late = stop(f, 'worker-1', REPORT.format(name='part.md'), generation=5)
+    assert step(f, lambda: not late.alive(), timeout=15), 'a retired-generation hook must exit, not block'
+    assert late.decision() is None
+    assert received(f, 'worker-1') and status_of(f, env) != 'committed'
+
+
+def test_other_session_turn_does_not_settle_the_delivery(hooked):
+    f = hooked
+    got, env = handed(f)
+    other = stop(f, 'worker-1', REPORT.format(name='part.md'), thread=str(uuid.uuid4()))
+    step(f, lambda: not other.alive(), timeout=5)
+    assert status_of(f, env) != 'committed' and received(f, 'worker-1')
+    if not other.alive():
+        assert other.decision() is None or 'Write worker-1/part.md' not in other.decision()['reason']
+
+
+def test_manual_turn_without_a_handed_delivery_settles_nothing(hooked):
+    f = hooked
+    # The operator typed in the idle worker-2 pane: no delivery was handed to that session.
+    manual = stop(f, 'worker-2', REPORT.format(name='nothing.md'), user_prompt='just chatting')
+    step(f, lambda: False, timeout=2)
+    assert any(e.get('event') in ('turn.ignored', 'turn.unsolicited') for e in audit(f, 'worker-2'))
+    assert f.r.llen(f.v2.bus.pending_key('supervisor')) == 0
+    assert manual.alive() or manual.decision() is None
+
+
+def test_manual_turn_cannot_borrow_an_old_meta_row_to_settle(hooked):
+    f = hooked
+    # D1 is handed and settled: its feedback row stays in the transcript history.
+    got, env1 = handed(f)
+    waiting = stop(f, 'worker-1', REPORT.format(name='part.md'))
+    assert step(f, lambda: status_of(f, env1) == 'committed')
+    # D2 is handed through the hook and its feedback row is written ...
+    dispatch(f, ['worker-1'], what='second.md')
+    delivered(f, waiting)
+    env2 = f.v2.bus.slot_state('worker-1')
+    # ... then the operator presses ctrl+x ctrl+s: the turn is interrupted and their own text runs.
+    manual = stop(f, 'worker-1', REPORT.format(name='second.md'), active=False, user_prompt='HUMAN: what are you doing?')
+    step(f, lambda: False, timeout=3)
+    assert status_of(f, env2) != 'committed', 'a manual turn settled D2 through the earlier isMeta row'
+    assert step(f, lambda: reports(f) == 1) and reports(f) == 1, 'only D1 may have been reported'
+    assert typed_any(f, 'worker-1') == []
+    assert manual.alive() or manual.decision() is None or 'second.md' in manual.decision()['reason']
+
+
+def test_manual_turn_after_a_settled_delivery_reports_nothing_more(hooked):
+    f = hooked
+    got, env = handed(f)
+    stop(f, 'worker-1', REPORT.format(name='part.md'))
+    assert step(f, lambda: status_of(f, env) == 'committed')
+    # Only history meta rows remain; the operator then chats with the idle worker.
+    stop(f, 'worker-1', REPORT.format(name='part.md'), active=False, user_prompt='are you there?')
+    step(f, lambda: False, timeout=3)
+    assert step(f, lambda: reports(f) == 1) and reports(f) == 1
+
+
+def test_repeated_stop_after_settlement_reports_once(hooked):
+    f = hooked
+    got, env = handed(f)
+    stop(f, 'worker-1', REPORT.format(name='part.md'))
+    assert step(f, lambda: status_of(f, env) == 'committed')
+    again = stop(f, 'worker-1', REPORT.format(name='part.md'))
+    step(f, lambda: False, timeout=2)
+    assert reports(f) == 1, 'the same Stop fired twice produced two reports'
+    assert again.alive() or again.decision() is None
+
+
+# ------------------------------------------------------------------ fail closed: no input-box fallback
+def test_hook_without_redis_never_fabricates_a_delivery(hooked, tmp_path):
+    f = hooked
+    broken = dict(fleet.load(f.path), redis_socket=str(tmp_path / 'missing.sock'))
+    path = tmp_path / 'broken-config.json'
+    fleet.save(path, broken)
+    command = settings(f, 'worker-1')['hooks']['Stop'][0]['hooks'][0]['command']
+    argv = [str(path) if a == str(f.path) else a for a in shlex.split(command)]
+    assert str(path) in argv, 'the hook command must name the run config'
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        proc.stdin.write(json.dumps(payload(f, 'worker-1', f.test_threads['worker-1'], 'x', True)))
+        proc.stdin.close()
+        time.sleep(8)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        out = proc.stdout.read().strip()
+    assert not out or json.loads(out.splitlines()[-1]).get('decision') != 'block'
+    assert typed_any(f, 'worker-1') == []
+
+
+@pytest.mark.parametrize('how', ['sigterm', 'sigkill'])
+def test_lost_hook_never_falls_back_to_typing(hooked, how):
+    f = hooked
+    # Hook timeout / Esc / ctrl+x ctrl+s SIGTERM it; a crash takes it without a word.
+    hook = f.test_ready['worker-1']
+    hook.proc.send_signal(signal.SIGTERM if how == 'sigterm' else signal.SIGKILL)
+    hook.proc.wait(10)
+    dispatch(f, ['worker-1'])
+    step(f, lambda: False, timeout=3)
+    assert typed_any(f, 'worker-1') == [], 'a lost hook must not fall back to the input box'
+    assert not any(e.get('event') == 'tui.typed' for e in audit(f, 'worker-1'))
+    env = f.v2.bus.slot_state('worker-1')
+    assert env.get('message_id') and status_of(f, env) != 'committed'
+    # The delivery is not lost: the next turn end of this session (any typed line) picks it up.
+    revived = stop(f, 'worker-1', 'REVIVE', active=False, user_prompt='reply exactly REVIVE')
+    got = delivered(f, revived)
+    assert 'Write worker-1/part.md' in got['reason']
+    assert typed_any(f, 'worker-1') == []
+
+
+def test_escape_after_hand_over_does_not_lose_the_delivery(hooked):
+    f = hooked
+    got, env = handed(f)
+    waiting = stop(f, 'worker-1', 'partial work', active=True)  # Claude answered part of it; the hook waits
+    f.mgr.send_key(f.agent('worker-1')['pane'], 'Escape')
+    step(f, lambda: not waiting.alive(), timeout=5)
+    step(f, lambda: False, timeout=2)
+    assert status_of(f, env) != 'committed'
+    assert received(f, 'worker-1') or f.agent('worker-1')['state'] == 'held' or f.v2.depth('worker-1') >= 1
+    assert typed_any(f, 'worker-1') == []
+
+
+def test_orphaned_hook_does_not_steal_the_next_delivery(hooked):
+    f = hooked
+    # Claude SIGKILLed: its hook keeps waiting with ppid 1 (research §5). Model that with a parent
+    # shell that exits one second after starting the hook.
+    f.test_ready['worker-1'].kill()
+    command = settings(f, 'worker-1')['hooks']['Stop'][0]['hooks'][0]['command']
+    cwd = Path(fleet.agent_cwd(f.cfg, 'worker-1'))
+    stdin, out = cwd / '.orphan-stdin.json', cwd / '.orphan-stdout.txt'
+    stdin.write_text(json.dumps(payload(f, 'worker-1', f.test_threads['worker-1'], 'x', True)))
+    shell = subprocess.Popen(['sh', '-c', command + ' < ' + shlex.quote(str(stdin)) + ' > ' + shlex.quote(str(out))
+                              + ' 2>/dev/null & echo $!; sleep 1'], stdout=subprocess.PIPE, text=True)
+    pid = int(shell.stdout.readline())
+    shell.wait(10)
+    time.sleep(1)
+    try:
+        dispatch(f, ['worker-1'])
+        step(f, lambda: False, timeout=8)
+        assert 'decision' not in (out.read_text() if out.exists() else ''), \
+            'an orphaned hook (its Claude is gone) took the delivery'
+        live = stop(f, 'worker-1', 'REVIVE', active=False, user_prompt='reply exactly REVIVE')
+        assert 'Write worker-1/part.md' in delivered(f, live)['reason']
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_keepalive_turn_rearms_and_is_never_reported(hooked):
+    f = hooked
+    # Short hook timeout: the hook answers claude_hook.margin() seconds before Claude would kill it.
+    fleet.save(f.path, dict(fleet.load(f.path), claude_hook_timeout=20))
+    f.test_ready['worker-1'].kill()
+    hook = stop(f, 'worker-1', 'REVIVE', active=False, user_prompt='reply exactly REVIVE')
+    assert step(f, lambda: not hook.alive(), timeout=30), 'no keepalive before the hook timeout'
+    got = hook.decision()
+    assert got and 'IDLE' in got['reason'] and 'Write' not in got['reason']
+    append(hook.transcript, feedback_rows(got['reason']))
+    rearmed = stop(f, 'worker-1', 'IDLE')
+    step(f, lambda: False, timeout=3)
+    assert rearmed.alive(), 'after the keepalive turn the hook waits again'
+    assert reports(f) == 0
+    assert not any(e.get('event') == 'turn.unsolicited' for e in audit(f, 'worker-1'))
+    dispatch(f, ['worker-1'])
+    assert 'Write worker-1/part.md' in delivered(f, rearmed)['reason']
+
+
+# ------------------------------------------------------------------ watchdog
+def test_watchdog_leaves_an_idle_waiting_hook_alone(hooked):
+    f = hooked
+    f.cfg.update(stall_timeout=60, stall_grace=30, stall_escapes=3, watch_interval=0)
+    for later in (0, 3600, 7200):  # hours of idle wait inside the hook
+        f.v2.watchdog.tick(time.time() + later)
+    assert escapes(f, 'worker-1') == [] and escapes(f, 'worker-2') == []
+    assert f.test_ready['worker-1'].alive() and f.test_ready['worker-2'].alive()
+    assert f.agent('worker-1')['state'] == 'idle'
+
+
+def test_watchdog_still_acts_on_a_stalled_hook_delivery_without_typing(hooked):
+    f = hooked
+    got, env = handed(f)
+    f.cfg.update(stall_timeout=60, stall_grace=10 ** 6, stall_escapes=3, watch_interval=0)
+    f.v2.watchdog.tick(time.time() + 3600)
+    state = f.agent('worker-1')
+    assert escapes(f, 'worker-1') or state.get('watch_state') in ('stalled', 'frozen') or state['state'] == 'held', \
+        'an in-flight hook delivery with no activity is still a stall'
+    assert typed_any(f, 'worker-1') == []
+
+
+# ------------------------------------------------------------------ generation change and resume
+def rotate(f, slot, gen, what):
+    """One context generation change with business work queued behind the handoff.
+
+    Returns the business delivery's lease once the new generation's hook handed it over."""
+    waiting = f.test_hooks[-1] if f.test_hooks[-1].slot == slot and f.test_hooks[-1].alive() else None
+    f.setf(slot, ctx_used=990000, ctx_window=1000000, delivered=1)
+    dispatch(f, [slot], what=what)  # queued behind the handoff
+    got = delivered(f, waiting)
+    assert f.agent(slot)['state'] == 'handoff'
+    assert what not in got['reason'], 'the handoff note request comes before queued work'
+    retiring = stop(f, slot, 'handoff written')  # the old generation's hook after the handoff turn
+    assert step(f, lambda: f.agent(slot).get('generation') == str(gen + 1)), 'no new generation after the handoff turn'
+    # The retired generation's hook lets go and never takes the new generation's work.
+    assert step(f, lambda: not retiring.alive(), timeout=20), 'the old generation\'s hook kept waiting'
+    assert retiring.decision() is None, 'the old generation\'s hook took a delivery'
+    panes(f, slot)
+    ready = stop(f, slot, 'READY', active=False, user_prompt='startup prompt g' + str(gen + 1))
+    assert step(f, lambda: f.agent(slot).get('runtime_ready') == '1'), 'the new generation never became READY'
+    got = delivered(f, ready)
+    assert what in got['reason'], 'the queued business did not reach the new generation\'s hook'
+    lease = f.v2.bus.slot_state(slot)
+    assert lease['generation'] == str(gen + 1) and lease['session_id'] == thread_of(f, slot, gen + 1)
+    hooked_audit = [e for e in audit(f, slot) if e.get('event') == 'tui.hooked' and e.get('message_id') == lease['message_id']]
+    # e2e run1 (5fb0c91a) could not prove this: tui.hooked carried no generation.
+    assert hooked_audit and hooked_audit[-1].get('generation') == str(gen + 1)
+    return lease
+
+
+def test_handoff_goes_through_the_hook_and_next_generation_resumes_there(hooked):
+    f = hooked
+    got, env = handed(f)
+    stop(f, 'worker-1', REPORT.format(name='part.md'))
+    assert step(f, lambda: status_of(f, env) == 'committed')
+    f.usage = lambda name, _real=f.usage: (990000, 1000000) if name == 'worker-1' else _real(name)
+    lease = rotate(f, 'worker-1', 0, 'after-handoff.md')
+    # A late Stop of the retired generation cannot settle the new generation's delivery.
+    late = stop(f, 'worker-1', REPORT.format(name='after-handoff.md'), generation=0)
+    assert step(f, lambda: not late.alive(), timeout=15)
+    assert late.decision() is None and received(f, 'worker-1')
+    # The new generation's own Stop settles it and the supervisor gets the report.
+    before = reports(f)
+    stop(f, 'worker-1', REPORT.format(name='after-handoff.md'))
+    assert step(f, lambda: status_of(f, lease) == 'committed'), 'the new generation could not settle its delivery'
+    assert f.v2.bus.message(lease['message_id'])['outcome'] == 'completed'
+    assert step(f, lambda: reports(f) == before + 1)
+    assert typed_any(f, 'worker-1') == [], 'handoff / next-generation deliveries reached the input box'
+    assert not any(e.get('event') == 'tui.typed' for e in audit(f, 'worker-1'))
+
+
+def test_two_generation_changes_keep_delivering_through_the_newest_hook(hooked):
+    f = hooked
+    f.usage = lambda name, _real=f.usage: (990000, 1000000) if name == 'worker-1' else _real(name)
+    got, env = handed(f)
+    stop(f, 'worker-1', REPORT.format(name='part.md'))
+    assert step(f, lambda: status_of(f, env) == 'committed')
+    for gen in (0, 1):  # g0 -> g1 -> g2, like the real-cmux e2e (worker-1 reached g3)
+        what = 'rot-' + str(gen + 1) + '.md'
+        lease = rotate(f, 'worker-1', gen, what)
+        stop(f, 'worker-1', REPORT.format(name=what))
+        assert step(f, lambda: status_of(f, lease) == 'committed'), 'generation ' + str(gen + 1) + ' did not settle'
+    assert f.agent('worker-1')['generation'] == '2'
+    retired = [h for h in f.test_hooks if h.slot == 'worker-1' and h.session != thread_of(f, 'worker-1', 2)]
+    assert step(f, lambda: not any(h.alive() for h in retired), timeout=20), 'a retired generation still has a hook'
+    assert typed_any(f, 'worker-1') == []
+    assert not any(e.get('event') == 'tui.typed' for e in audit(f, 'worker-1'))
+
+
+def test_daemon_restart_with_resume_never_types_into_a_hook_worker(hooked):
+    f = hooked
+    got, env = handed(f)  # worker-1 is mid-delivery when the daemon dies
+    f.v2.close()
+    again = fleet.Fleet(f.path, f.r, f.mgr, sessions=f.test_sessions)
+    for name in ('test_sessions', 'test_claude', 'test_threads', 'test_hooks', 'test_panes', 'test_ready', 'test_close'):
+        setattr(again, name, getattr(f, name))
+    f.test_close.append(again)
+    again.resume_requested = True
+    again.v2.resume_run()
+    step(again, lambda: False, timeout=3)
+    assert typed_any(again, 'worker-1') == [], 'resume typed the lost delivery into a hook-channel pane'
+    lost = again.v2.bus.message(env['message_id'])
+    assert lost.get('outcome') != 'completed', 'a delivery the daemon lost was settled as done'
+    gen = int(again.agent('worker-1')['generation'])
+    if gen and again.agent('worker-1')['state'] == 'starting':
+        # Resume replaced the in-flight generation (its Escape would have killed the hook): READY it.
+        panes(again, 'worker-1')
+        hook = stop(again, 'worker-1', 'READY', active=False, user_prompt='startup prompt g' + str(gen))
+        assert step(again, lambda: again.agent('worker-1').get('runtime_ready') == '1')
+    else:
+        hook = stop(again, 'worker-1', 'REVIVE', active=False, user_prompt='reply exactly REVIVE')
+    if again.agent('worker-1')['state'] != 'held':
+        # The lost dispatch is redone through the hook channel, never typed.
+        assert 'Write worker-1/part.md' in delivered(again, hook)['reason']
+    assert typed_any(again, 'worker-1') == []
+
+
+# ------------------------------------------------------------------ worker-2 round-3 measurements
+LONG_BODY = '\n'.join(['## 第 %d 节：把下面的结果写进 worker-1/long.md，逐字保留' % i + '\n'
+                       + '这是很长的中文业务正文，含特殊字符 "引号" \\ 反斜杠 $HOME `反引号` <tag> & 和代码块：\n'
+                       + '```python\nprint("第 %d 行", {"k": [1, 2, 3]})\n```' % i for i in range(160)])
+
+
+def test_declaration_rides_the_launch_args_and_a_30kb_chinese_body_arrives_verbatim(hooked):
+    f = hooked
+    argv = fleet.claude_argv(f.path, fleet.load(f.path), 'worker-1', 0, 'launch prompt')
+    assert '--append-system-prompt' in argv, 'without the channel declaration models refuse long deliveries'
+    declaration = argv[argv.index('--append-system-prompt') + 1]
+    assert 'Stop hook feedback:' in declaration
+    assert argv[-2:] == ['--', 'launch prompt'], 'the launch prompt stays the last CLI argument'
+    assert len(LONG_BODY.encode()) > 30000
+    submit(f)
+    plan = json.dumps({'status': 'RUNNING', 'completion': 10, 'reason': 'long',
+                       'dispatch': [{'to': 'worker-1', 'instruction': LONG_BODY}]})
+    assert codex_turn(f, plan)['status'] == 'committed'
+    f.pump()
+    got = delivered(f, f.test_ready['worker-1'])
+    assert LONG_BODY in got['reason'], 'the long body was altered on its way through the hook'
+    assert typed_any(f, 'worker-1') == []
+
+
+def test_claude_supervisor_is_not_on_the_hook_channel(hooked):
+    f = hooked
+    cfg = dict(fleet.load(f.path), supervisor_cli='claude')
+    argv = fleet.claude_argv(f.path, cfg, 'supervisor', 0, 'launch prompt')
+    s = json.loads(Path(argv[argv.index('--settings') + 1]).read_text())
+    assert CAP not in (s.get('env') or {}) and 'StopFailure' not in s['hooks']
+    assert len(s['hooks']['Stop'][0]['hooks']) == 1 and not s['hooks']['Stop'][0]['hooks'][0].get('asyncRewake')
+    assert '--append-system-prompt' not in argv
+
+
+def test_api_error_turn_reports_through_stop_failure_and_settles_nothing(hooked):
+    f = hooked
+    got, env = handed(f)
+    s = settings(f, 'worker-1')
+    failure, = s['hooks']['StopFailure']
+    command = failure['hooks'][0]['command']
+    data = payload(f, 'worker-1', f.test_threads['worker-1'], 'API Error: 429 rate limited', False)
+    data.update(hook_event_name='StopFailure', error='rate_limit')
+    proc = subprocess.run(shlex.split(command), input=json.dumps(data), capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0 and proc.stdout.strip() == '', 'StopFailure output is ignored by Claude Code'
+    step(f, lambda: False, timeout=2)
+    events = [e for e in audit(f, 'worker-1') if e.get('event') == 'hook.stop_failure']
+    assert events and events[-1].get('error') == 'rate_limit'
+    assert status_of(f, env) != 'committed' and reports(f) == 0
+    assert typed_any(f, 'worker-1') == []
+
+
+def rewake(f, slot, text='partial', generation=None):
+    """The background asyncRewake entry of the same Stop event (settings Stop hooks[1])."""
+    gen = int(f.agent(slot)['generation']) if generation is None else generation
+    entry = settings(f, slot, gen)['hooks']['Stop'][0]['hooks'][1]
+    assert entry.get('asyncRewake') is True
+    proc = subprocess.Popen(shlex.split(entry['command']), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
+    proc.stdin.write(json.dumps(payload(f, slot, thread_of(f, slot, gen), text, True)))
+    proc.stdin.close()
+    f.test_procs = getattr(f, 'test_procs', []) + [proc]
+    return entry, proc
+
+
+def rewake_rows(text, prefix='Fleet delivery: '):
+    """Transcript row of an asyncRewake wake-up (a task-notification, not isMeta). ``prefix`` is the
+    configured rewakeMessage, or Claude Code's default when that internal setting is not honoured."""
+    return [{'type': 'user', 'origin': {'kind': 'task-notification'}, 'promptId': 'p-' + uuid.uuid4().hex[:8],
+             'message': {'role': 'user', 'content': '<task-notification>\n<summary>Stop hook feedback</summary>\n'
+                                                     '</task-notification>\n<system-reminder>\n'
+                                                     + prefix + text + '\n</system-reminder>'}}]
+
+
+@pytest.mark.parametrize('prefix', ['Fleet delivery: ', 'Stop hook blocking error from command "fleet.py claude-rewake": '])
+def test_rewake_fallback_hands_over_without_typing_when_no_hook_waits(hooked, prefix):
+    f = hooked
+    hook = f.test_ready['worker-1']
+    entry, proc = rewake(f, 'worker-1')
+    assert entry.get('rewakeMessage')
+    f.mgr.send_key(hook.pane, 'Escape')  # the waiting Stop hook is SIGTERMed: channel unarmed
+    hook.proc.wait(10)
+    try:
+        dispatch(f, ['worker-1'])
+        assert step(f, lambda: proc.poll() is not None, timeout=40), 'rewake never took over'
+        err = proc.stderr.read()
+        assert proc.returncode == 2 and 'Write worker-1/part.md' in err
+        assert typed_any(f, 'worker-1') == []
+        assert any(e.get('event') == 'hook.rewake' for e in audit(f, 'worker-1'))
+        env = f.v2.bus.slot_state('worker-1')
+        append(transcript_of(f, 'worker-1', f.test_threads['worker-1']), rewake_rows(err, prefix))
+        stop(f, 'worker-1', REPORT.format(name='part.md'), active=False)
+        assert step(f, lambda: status_of(f, env) == 'committed'), 'a rewake-delivered turn did not settle'
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_rewake_stays_quiet_while_a_stop_hook_waits(hooked):
+    f = hooked
+    entry, proc = rewake(f, 'worker-1')
+    try:
+        dispatch(f, ['worker-1'])
+        got = delivered(f, f.test_ready['worker-1'])
+        assert 'Write worker-1/part.md' in got['reason']
+        step(f, lambda: False, timeout=12)  # longer than claude_hook.GRACE
+        assert proc.poll() != 2, 'the rewake fallback took a delivery although the Stop hook was waiting'
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_task_notification_rows_do_not_start_a_new_turn(hooked):
+    f = hooked
+    got, env = handed(f)
+    # The delivery ran a background task; its completion wakes Claude with a task-notification row.
+    append(f.test_ready['worker-1'].transcript, [
+        {'type': 'user', 'origin': {'kind': 'task-notification'},
+         'message': {'role': 'user', 'content': '<task-notification>shell bg-1 completed</task-notification>'}}])
+    stop(f, 'worker-1', REPORT.format(name='part.md'), active=False)
+    assert step(f, lambda: status_of(f, env) == 'committed'), 'the background task continuation lost the delivery'
+
+
+def test_stop_with_background_tasks_returns_at_once_without_settling(hooked):
+    f = hooked
+    got, env = handed(f)
+    data = payload(f, 'worker-1', f.test_threads['worker-1'], REPORT.format(name='part.md'), True)
+    data['background_tasks'] = [{'id': 'bg-1', 'type': 'shell', 'status': 'running'}]
+    command = settings(f, 'worker-1')['hooks']['Stop'][0]['hooks'][0]['command']
+    started = time.time()
+    proc = subprocess.run(shlex.split(command), input=json.dumps(data), capture_output=True, text=True, timeout=60)
+    assert time.time() - started < 20 and proc.stdout.strip() == ''
+    assert status_of(f, env) != 'committed' and received(f, 'worker-1')
+
+
+# ------------------------------------------------------------------ watchdog frozen -> next generation
+def test_frozen_hook_worker_is_replaced_without_typing(hooked):
+    f = hooked
+    got, env = handed(f)
+    f.cfg.update(stall_timeout=60, stall_grace=60, stall_escapes=1, watch_interval=0)
+    now = time.time()
+    for i in range(1, 8):
+        f.v2.watchdog.tick(now + 3600 * i)
+        f.v2.step(20)
+        if f.agent('worker-1').get('generation') != '0':
+            break
+    assert f.agent('worker-1').get('generation') == '1', 'frozen worker was not replaced'
+    assert step(f, lambda: not f.test_ready['worker-1'].alive(), timeout=10), 'the frozen generation kept its hook'
+    panes(f, 'worker-1')
+    assert typed_any(f, 'worker-1') == [], 'frozen recovery typed into a hook-channel pane'
+    ready = stop(f, 'worker-1', 'READY', active=False, user_prompt='startup prompt g1')
+    assert step(f, lambda: f.agent('worker-1').get('runtime_ready') == '1')
+    assert ready.alive() or ready.decision() is not None
+    assert f.v2.bus.message(env['message_id']).get('outcome') != 'completed'
+    assert typed_any(f, 'worker-1') == []
+
+
+# ------------------------------------------------------------------ resume of an idle hook worker
+def test_resume_reattaches_an_idle_hook_worker_without_escape(hooked):
+    f = hooked
+    waiting = f.test_ready['worker-1']
+    f.v2.close()
+    again = fleet.Fleet(f.path, f.r, f.mgr, sessions=f.test_sessions)
+    for name in ('test_sessions', 'test_claude', 'test_threads', 'test_hooks', 'test_panes', 'test_ready', 'test_close'):
+        setattr(again, name, getattr(f, name))
+    f.test_close.append(again)
+    again.resume_requested = True
+    again.v2.resume_run()
+    step(again, lambda: False, timeout=2)
+    assert again.agent('worker-1')['generation'] == '0', 'an idle hook worker must be reattached, not replaced'
+    assert escapes(again, 'worker-1') == [], 'Escape kills the waiting hook (research §4)'
+    assert waiting.alive()
+    if again.agent('supervisor')['state'] == 'starting':  # the Codex supervisor is respawned on resume
+        assert codex_turn(again, 'READY')['status'] == 'ready'
+    dispatch(again, ['worker-1'])
+    assert 'Write worker-1/part.md' in delivered(again, waiting)['reason']
+    assert typed_any(again, 'worker-1') == []
+
+
+# ------------------------------------------------------------------ sub-fleet delegation
+def test_delegated_slot_hook_lets_go_and_takes_nothing(hooked):
+    f = hooked
+    hook = f.test_ready['worker-1']
+    # A sub-fleet adopts this pane and types its role change: the waiting hook must step aside.
+    f.setf('worker-1', state='delegated')
+    assert step(f, lambda: not hook.alive(), timeout=15), 'the hook kept the delegated pane busy'
+    assert hook.decision() is None

@@ -16,6 +16,7 @@ import uuid
 import pytest
 import yaml
 
+import hook_sim
 from test_fleet import FakeMgr
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
 from cmux_fleet import cli_pairs, cmux_manager, fleet, pi_adapter, runtime_v2
@@ -86,7 +87,10 @@ def test_claude_argv_supervisor_model_and_prompt_hook_only_on_supervisor(tmp_pat
     assert prompt_hook['timeout'] == fleet.PROMPT_HOOK_TIMEOUT > fleet.PROMPT_WAIT
     assert 'claude-stop' in hooks['Stop'][0]['hooks'][0]['command']
     worker = fleet.claude_argv(run / 'config.json', cfg, 'worker-1', 0, 'hi')
-    assert worker[worker.index('--model') + 1] == 'sonnet' and set(hooks_of(worker)) == {'Stop'}
+    # Claude workers are on the Stop-hook channel: waiting Stop hook + asyncRewake fallback + StopFailure.
+    assert worker[worker.index('--model') + 1] == 'sonnet' and set(hooks_of(worker)) == {'Stop', 'StopFailure'}
+    assert [bool(h.get('asyncRewake')) for h in hooks_of(worker)['Stop'][0]['hooks']] == [False, True]
+    assert '--append-system-prompt' in worker and '--append-system-prompt' not in sup
     # A §19 adopted pane keeps the parent's hooks; v1 runs have no operator queue.
     assert not fleet.prompt_hook_slot(dict(cfg, adopt={'pane': 'p'}), 'supervisor', 0)
     assert not fleet.prompt_hook_slot(dict(cfg, transport_version=1), 'supervisor', 0)
@@ -176,8 +180,9 @@ def drive(f, fn):
 
 
 def typed(f, slot):
+    """What the slot's current generation was given: typed into its pane, or handed over by its Stop hook."""
     pane = f.agent(slot)['pane']
-    return [text for p, text in f.mgr.sent if p == pane]
+    return [text for p, text in f.mgr.sent if p == pane] + hook_sim.handed_to(f, slot)
 
 
 def spawn_prompt(f, slot):
@@ -192,11 +197,11 @@ def stop_hook(f, slot, text, *, prompt=None, generation=None):
     thread = f.test_threads[slot]
     transcript = f.test_claude / slot / (thread + '.jsonl')
     transcript.parent.mkdir(parents=True, exist_ok=True)
-    rows = [{'type': 'user', 'message': {'role': 'user', 'content': prompt}},
+    rows = [hook_sim.user_row(prompt, hook_sim.was_handed(slot, prompt)),
             {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': text}]}}]
     transcript.write_text('\n'.join(json.dumps(x) for x in rows) + '\n')
     raw = json.dumps({'session_id': thread, 'transcript_path': str(transcript), 'last_assistant_message': text})
-    return drive(f, lambda: fleet.claude_stop(f.path, slot, str(gen), raw))
+    return drive(f, lambda: hook_sim.claude_stop(f.path, slot, str(gen), raw))
 
 
 def prompt_hook(f, text, *, generation=None, cli=False, wait=5, step=True):

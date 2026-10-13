@@ -8,7 +8,7 @@ from pathlib import Path
 
 from test_contracts import cf, inbox, item, p0_reply, report, write  # noqa: F401  (fixture + helpers)
 from test_escalate import escalate, ok_check, parallel_m0  # noqa: F401
-from test_subfleet import (child_daemon, hook, no_launch, parent_hook, step,  # noqa: F401
+from test_subfleet import (child_daemon, given, hook, no_launch, parent_hook, step,  # noqa: F401
                            stop_child_like_daemon, tree)
 from cmux_fleet import runtime_v2, subfleet
 
@@ -28,11 +28,12 @@ def test_startup_not_ready_gets_one_correction_then_blocks(tree):
     # a chatty but well-ended reply settles
     assert hook(t, cf, 'worker-1', "I've read AGENTS.md. No task has been sent yet.\n\nREADY",
                 prompt='startup')['status'] == 'ready'
-    # anything else: one correction typed into the pane, the slot keeps starting
+    # anything else: one correction (through the Stop hook on the hook channel), the slot keeps starting
     answer = hook(t, cf, 'worker-2', 'Ready to go', prompt='startup')
     assert answer['status'] == 'rejected' and 'asked once more' in answer['reason']
     pane = cf.agent('worker-2')['pane']
-    assert [x for p, x in t.world.sent if p == pane][-1] == runtime_v2.STARTUP_NUDGE
+    assert given(t, cf, 'worker-2')[-1] == runtime_v2.STARTUP_NUDGE
+    assert runtime_v2.STARTUP_NUDGE not in [x for p, x in t.world.sent if p == pane]  # never typed
     assert cf.agent('worker-2')['state'] == 'starting' and cf.task().get('status') != 'blocked'
     # the corrected turn settles normally
     assert hook(t, cf, 'worker-2', 'READY', prompt=runtime_v2.STARTUP_NUDGE)['status'] == 'ready'

@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import hook_sim
 from test_fleet import write_rollout
 from cmux_fleet import cmux_manager, fleet, redis_runtime, roster, runtime_v2, subfleet
 
@@ -243,12 +244,18 @@ def drive(t, fn):
     return box['value']
 
 
+def given(t, f, slot):
+    """What the slot's current generation was given: typed into its pane (Codex, a role change), or
+    handed over by its Stop hook (a Claude worker's deliveries)."""
+    return [x for p, x in t.world.sent if p == f.agent(slot)['pane']] + hook_sim.handed_to(f, slot)
+
+
 def hook(t, f, slot, text, *, prompt=None, thread=None, generation=None):
     """Fire the real turn hook the CLI in ``slot`` of fleet ``f`` was started with."""
     gen = int(f.agent(slot)['generation']) if generation is None else generation
     thread = thread or t.threads.setdefault((str(f.run_dir), slot, gen), str(uuid.uuid4()))
     if prompt is None:
-        prompt = [x for p, x in t.world.sent if p == f.agent(slot)['pane']][-1]
+        prompt = given(t, f, slot)[-1]
     if slot == 'supervisor' and fleet.agent_cli(f.cfg, slot) == 'codex':
         turn_id = 't-' + uuid.uuid4().hex
         write_rollout(t.sessions, thread, fleet.agent_cwd(f.cfg, slot), rows=[
@@ -262,12 +269,12 @@ def hook(t, f, slot, text, *, prompt=None, thread=None, generation=None):
 def claude_turn(t, cfg_path, slot, gen, thread, prompt, text):
     transcript = t.claude / (thread + '.jsonl')
     transcript.parent.mkdir(parents=True, exist_ok=True)
-    rows = [{'type': 'user', 'message': {'role': 'user', 'content': prompt}},
+    rows = [hook_sim.user_row(prompt, hook_sim.was_handed(slot, prompt)),
             {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': text}]}}]
     with transcript.open('a') as fh:
         fh.write('\n'.join(json.dumps(x) for x in rows) + '\n')
     raw = json.dumps({'session_id': thread, 'transcript_path': str(transcript), 'last_assistant_message': text})
-    return drive(t, lambda: fleet.claude_stop(cfg_path, slot, str(gen), raw))
+    return drive(t, lambda: hook_sim.claude_stop(cfg_path, slot, str(gen), raw))
 
 
 def no_launch(path, cfg, mgr):
@@ -367,8 +374,8 @@ def test_worker_pane_becomes_subfleet_supervisor_and_comes_back(tree):
     assert parent_hook(t, decision, task_msg)['status'] == 'committed'
     step(t)
     for w in cf.workers:
-        assert any('part.md' in x for p, x in t.world.sent if p == cf.agent(w)['pane'])
-    assert not any('part.md' in x for p, x in t.world.sent if p == f.agent('worker-2')['pane'])
+        assert any('part.md' in x for x in given(t, cf, w))
+    assert not any('part.md' in x for x in given(t, f, 'worker-2'))
     # the sub-fleet finishes: deliverable written, task completed, result.json written
     inside.parent.mkdir(parents=True, exist_ok=True)
     inside.write_text('merged findings')
@@ -396,6 +403,16 @@ def test_worker_pane_becomes_subfleet_supervisor_and_comes_back(tree):
                for m in f.v2.bus.pending('supervisor') + [f.v2.bus.slot_state('supervisor').get('message_id') or 'x']
                if f.v2.bus.message(m))
     assert 'cmux-fleet:M0' not in [p.stem for p in t.world.state_dir.glob('*.json')]
+    # Back in the parent fleet: the next delivery to worker-1 goes through its Stop hook again,
+    # never typed into the returned pane (only the role-change prompts above are typed).
+    typed_before = [x for p, x in t.world.sent if p == sid]
+    f.queue('worker-1', '[Supervisor instruction ' + f.task()['id'] + '] Write worker-1/after.md now')
+    step(t)
+    after = given(t, f, 'worker-1')[-1]
+    assert 'worker-1/after.md' in after and after in hook_sim.handed_to(f, 'worker-1')
+    assert [x for p, x in t.world.sent if p == sid] == typed_before
+    report = 'Done:\n- wrote after.md\nEvidence:\n- worker-1/after.md\nNot done: none\nBlocked: none'
+    assert parent_hook(t, report, after)['status'] == 'committed'
 
 
 def test_delegated_slot_is_not_delivered_held_or_timed_out(tree):

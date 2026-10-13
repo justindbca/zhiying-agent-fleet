@@ -10,7 +10,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from cmux_fleet import fleet, handoff  # noqa: E402
+from cmux_fleet import claude_hook, fleet, handoff  # noqa: E402
+import hook_sim  # noqa: E402
 
 THREADS = {'supervisor': '11111111-1111-1111-1111-111111111111',
            'worker-1': '22222222-2222-2222-2222-222222222222'}
@@ -72,6 +73,19 @@ class FakeRedis:
 
     def lrem(self, k, count, v):
         self.l[k] = [x for x in self.l.get(k, []) if x != v]
+
+    def expire(self, k, seconds):
+        return k in self.kv or k in self.h or k in self.l
+
+    def exists(self, k):
+        return int(k in self.kv or k in self.h or bool(self.l.get(k)))
+
+    def incr(self, k):
+        self.kv[k] = str(int(self.kv.get(k, 0)) + 1)
+        return int(self.kv[k])
+
+    def close(self):
+        pass
 
     def ltrim(self, k, a, b):
         items = self.l.get(k, [])
@@ -723,7 +737,11 @@ def test_claude_argv_pins_stop_hook_generation(cfx):
 def test_claude_multiline_message_goes_through_a_file(cfx):
     cfx.handle(turn('supervisor', decision()))
     cfx.pump()
-    sent = last_to(cfx, 'worker-1')
+    # Claude worker: the one-line pointer goes to its Stop-hook mailbox, never into the pane.
+    assert not [t for p, t in cfx.mgr.sent if p == cfx.agent('worker-1')['pane']]
+    entry = json.loads(cfx.r.l[claude_hook.keys('fx', 'worker-1', 0)['mailbox']][-1])
+    sent = entry['text']
+    assert entry['kind'] == 'pointer' and entry['msg_id'] == cfx.agent('worker-1')['msg_id']
     assert '\n' not in sent and '.inbox/msg-' in sent
     path = Path(sent.split('the full message is in ')[1].split(' . Read')[0])
     assert 'Write worker-1/report.md' in path.read_text()
@@ -737,8 +755,8 @@ def test_claude_stop_skips_background_work(tmp_path, monkeypatch):
                        'background_tasks': [{'id': 'a'}]})
     done = json.dumps({'session_id': 's1', 'transcript_path': '/x', 'last_assistant_message': 'Done: x',
                        'background_tasks': []})
-    assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', busy) is False
-    assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', done) is True
+    assert hook_sim.claude_stop(tmp_path / 'c.json', 'worker-1', '1', busy) is False
+    assert hook_sim.claude_stop(tmp_path / 'c.json', 'worker-1', '1', done) is True
     ev = json.loads(r.l['fx:events'][0])
     assert ev['text'] == 'Done: x' and ev['transcript'] == '/x' and ev['generation'] == 1
 
@@ -784,7 +802,7 @@ def test_claude_stop_reads_delivery_id_from_transcript(tmp_path, monkeypatch):
     rows += [{'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'z' * 32768}]}}] * 40
     tr.write_text('\n'.join(json.dumps(x) for x in rows) + '\n')  # pointer is > 1 MiB from the end
     payload = json.dumps({'session_id': 's', 'transcript_path': str(tr), 'last_assistant_message': 'Done', 'background_tasks': []})
-    assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '0', payload) is True
+    assert hook_sim.claude_stop(tmp_path / 'c.json', 'worker-1', '0', payload) is True
     assert json.loads(r.l['fx:events'][0])['msg_id'] == 'msg-20261008-090500-abc123'
 
 

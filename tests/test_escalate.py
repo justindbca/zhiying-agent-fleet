@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from test_contracts import cf, inbox, item, report, sup, to_parallel, write  # noqa: F401  (fixture + helpers)
-from test_subfleet import (child_daemon, hook, no_launch, parent_hook, step,  # noqa: F401
+from test_subfleet import (child_daemon, given, hook, no_launch, parent_hook, step,  # noqa: F401
                            stop_child_like_daemon, tree)
 from cmux_fleet import fleet, subfleet
 
@@ -224,7 +224,7 @@ def test_v2_escalate_approve_spawn_and_completion(tree, monkeypatch):
         {'id': 'M0', 'to': 'worker-1', 'instruction': 'Research five sources and write worker-1/m0.md'}]}
     assert hook(t, f, 'supervisor', json.dumps(decision))['status'] == 'committed'
     step(t)
-    work = [x for p, x in t.world.sent if p == f.agent('worker-1')['pane']][-1]
+    work = given(t, f, 'worker-1')[-1]
     assert '[M0] Research five sources' in work
     text = ('Done:\n- read the goal\nEvidence:\n- five sources listed in the instruction\nNot done: all of it\n'
             'Blocked: none\n' + escalate())
