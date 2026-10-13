@@ -1105,7 +1105,15 @@ class RuntimeV2:
         """Release the slot's lease and cancel its queue (re-queued afterwards). False: lease still held."""
         state = self.bus.r.hgetall(self.bus.lease_key(slot))
         released = True
-        codex_queue.clear(self.f, slot, 'start --resume')  # a not-yet-started queued item must never run
+        # A Codex delivery that was queued but never proven to run may still sit in this live session's
+        # queue (Codex's queue is not ours to edit) and would run next to the replay: do not reattach
+        # that session, respawn it (new thread; the old item can only run if that session is resumed).
+        keep_out = (reattached and codex_queue.is_codex(self.slot_cfg(slot), slot)
+                    and codex_queue.unsettled(self.f.agent(slot)))
+        codex_queue.clear(self.f, slot, 'start --resume')  # its token can never settle anything now
+        if keep_out:
+            self.audit('resume.codex_unsettled', slot=slot, level='warn',
+                       reason='queued delivery not proven to have run; session respawned, not reattached')
         if state.get('current_delivery'):
             pane = self.f.agent(slot).get('pane')
             if reattached and pane:
@@ -1122,7 +1130,7 @@ class RuntimeV2:
                 self.f.setf(slot, idle_confirmed=0)  # Escape is not proof the old turn stopped
         for mid in self.bus.pending(slot):
             self.cancel_queued(slot, {'message_id': mid}, 'start --resume: re-queued after reconcile')
-        return released
+        return released and not keep_out
 
     def respawn(self, slots, page):
         """Next generation of each slot in place; without a supervisor pane, rebuild the whole page."""

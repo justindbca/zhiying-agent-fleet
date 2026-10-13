@@ -20,17 +20,16 @@ def fake_codex_queue(monkeypatch):
 
     def fake_enqueue(cfg, name, thread, text, **kw):
         if not thread:
-            raise codex_queue.QueueError('no bound Codex session to queue into')
-        return {'queued_id': 'q-' + uuid.uuid4().hex, 'client_id': 'c-' + uuid.uuid4().hex, 'thread': thread}
+            raise codex_queue.QueueError('failed: no bound Codex session to queue into')
+        return {'queued_id': 'q-' + uuid.uuid4().hex, 'thread': thread}
 
     def deliver(f, slot, delivery, text, thread=None):
         got = real_deliver(f, slot, delivery, text, thread=thread)
         if codex_queue.enqueue is fake_enqueue:
             log = f.mgr.sent if hasattr(f.mgr, 'sent') else f.mgr.w.sent  # FakeMgr / test_subfleet WorldMgr
-            log.append((f.agent(slot).get('pane'), text))
-            test_fleet.CODEX_QUEUE[got['thread']] = {'turn': 't-' + uuid.uuid4().hex, 'client_id': got['client_id'],
-                                                     'text': text}
-            _, rows = test_fleet.codex_rows(got['thread'], text, pop=False)
+            log.append((f.agent(slot).get('pane'), text))  # what reached the agent (its token line is metadata)
+            test_fleet.CODEX_QUEUE[got['thread']] = {'turn': 't-' + uuid.uuid4().hex, 'text': got['text'], 'body': text}
+            _, rows = test_fleet.codex_rows(got['thread'], got['text'], pop=False)
             test_fleet.append_rollout(f.sessions, got['thread'], fleet.agent_cwd(f.runtime_cfg(slot), slot), rows)
         return got
 

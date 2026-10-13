@@ -146,7 +146,7 @@ def write_rollout(sessions, thread, cwd, used=1000, rows=(), window=95000):
 # ---- fake `codex queue` (installed for every test by tests/conftest.py)
 # Real Codex 0.162.1: a queued message starts its own turn whose rollout task_started has
 # turn_attribution.turn_trigger "queue" and whose one UserMessage carries the queued client_id.
-CODEX_QUEUE = {}  # thread -> {'turn', 'client_id', 'text'} of the queued delivery not answered yet
+CODEX_QUEUE = {}  # thread -> {'turn', 'text' (queued, with its token line), 'body'} of the delivery not answered yet
 
 
 def _stamp():
@@ -157,12 +157,13 @@ def codex_rows(thread, prompt, text=None, *, pop=True):
     """(turn_id, rollout rows) of a Codex turn whose input is `prompt`: the queued delivery's own
     turn when `prompt` is what was queued, else a turn the user typed. text=None: still running."""
     q = CODEX_QUEUE.get(thread)
-    if q and q['text'] == prompt:
+    if q and prompt in (q['text'], q.get('body')):
         if pop:
             CODEX_QUEUE.pop(thread)
-        turn, trigger, client = q['turn'], 'queue', q['client_id']
+        turn, trigger, client = q['turn'], 'queue', 'c-' + uuid.uuid4().hex
+        prompt = q['text']  # Codex records the queued text itself, token line included
     else:
-        turn, trigger, client = 't-' + uuid.uuid4().hex, 'user', ''
+        turn, trigger, client = 't-' + uuid.uuid4().hex, 'user', 'c-' + uuid.uuid4().hex
     rows = [{'timestamp': _stamp(), 'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_attribution': {
                 'turn_id': turn, 'turn_trigger': trigger, 'root_turn_id': turn}}},
             {'timestamp': _stamp(), 'type': 'event_msg', 'payload': {'type': 'item_completed', 'turn_id': turn, 'item': {

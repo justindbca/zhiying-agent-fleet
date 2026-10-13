@@ -878,7 +878,8 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
             """Did this delivery start the turn? Codex: exact rollout binding, never the cumulative inputs."""
             if not codex:
                 return runtime_v2.turn_answers(body_text, inputs)
-            rec = codex_queue.wait_queued(r, name)  # fast callback: the CLI may not have returned yet
+            # The record and its token are durable before the CLI runs, so a turn end faster than the CLI binds too.
+            rec = codex_queue.record(r.hgetall(key('agent', name)))
             if rec['cq_delivery'] != delivery:
                 why.append('queued delivery is ' + (rec['cq_delivery'] or 'none') + ', not ' + delivery)
                 return False
@@ -892,7 +893,7 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
             return skipped('stale', 'hook generation is not the current runtime')
         if info.get('state') == 'starting':
             pending = codex_queue.record(info) if codex else {}
-            if pending.get('cq_delivery') and pending.get('cq_state') in ('queuing', 'queued'):
+            if pending.get('cq_delivery') and codex_queue.unsettled(info):
                 # A queued startup message (READY nudge / sub-fleet role change) must be the one this turn answers.
                 if not answered(pending.get('cq_text', ''), pending['cq_delivery']):
                     return skipped('ignored', 'startup turn not bound to ' + pending['cq_delivery'] + ': ' + '; '.join(why))
@@ -2068,9 +2069,8 @@ class Fleet:
             self.setf(name, msg_done=ev.get('msg_id'))
         if codex_queue.is_codex(self.runtime_cfg(name), name) and info.get('state') in ('busy', 'handoff', 'starting'):
             # A queued delivery settles only on the turn the rollout binds to it (a manual or repeated turn does not).
-            rec = codex_queue.record(info)
-            if rec['cq_delivery'] and rec['cq_state'] in ('queuing', 'queued', 'bound'):
-                rec = codex_queue.wait_queued(self.r, name)
+            rec = codex_queue.record(self.agent(name))
+            if rec['cq_delivery'] and rec['cq_state'] not in ('', 'abandoned'):
                 ok, why = codex_queue.bound(rec, ev.get('thread') or '', ev.get('turn') or '', self.sessions)
                 if not ok or rec['cq_turn'] == (ev.get('turn') or ''):
                     self.log('turn.unbound', agent=name, delivery=rec['cq_delivery'], turn=ev.get('turn'),
