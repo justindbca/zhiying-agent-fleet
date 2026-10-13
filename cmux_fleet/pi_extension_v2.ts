@@ -116,11 +116,13 @@ export default function (pi: ExtensionAPI) {
   const artifact = Type.Object({ path: Type.String(), min_chars: Type.Optional(Type.Integer({ minimum: 1 })), contains: Type.Optional(Type.Array(Type.String())) });
   const dispatch = Type.Object({ to: Type.String(), instruction: Type.String({ minLength: 12 }),
     id: Type.Optional(Type.String()), advise_note: Type.Optional(Type.String()) });
+  const consult = Type.Object({ worker: Type.String(), task: Type.String(), finding: Type.String({ minLength: 1 }),
+    want: Type.Optional(Type.String()) });
   const decisionSchema = service ? Type.Object({ status: Type.Union([Type.Literal("RUNNING"), Type.Literal("BLOCKED")]),
     reason: Type.Optional(Type.String()), dispatch: Type.Array(dispatch), skip: Type.Optional(Type.Array(Type.Object({ reason: Type.String() }))) }) :
     Type.Object({ status: Type.Union([Type.Literal("RUNNING"), Type.Literal("COMPLETED"), Type.Literal("BLOCKED")]),
       completion: Type.Integer({ minimum: 0, maximum: 100 }), reason: Type.Optional(Type.String()),
-      dispatch: Type.Array(dispatch), artifacts: Type.Optional(Type.Array(artifact)),
+      dispatch: Type.Array(dispatch), consult: Type.Optional(Type.Array(consult)), artifacts: Type.Optional(Type.Array(artifact)),
       advisor: Type.Optional(Type.Union([Type.Literal("on"), Type.Literal("off")])) });
   pi.registerTool({
     name: supervisor ? "fleet_decision" : "fleet_result", label: supervisor ? "派工候选" : "结果候选",

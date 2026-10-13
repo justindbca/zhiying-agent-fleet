@@ -43,6 +43,12 @@ DUMP_PROMPT = (
 )
 
 
+# Mid-task rescue (advisor plan §3.2): same three sections, but the reason is a new configuration.
+RESCUE_PROMPT = DUMP_PROMPT.replace(
+    'Context is almost full ({used}/{window}). ',
+    'The supervisor is handing your current task to a successor session with a new configuration. ')
+
+
 def read_usage(path: str, window_fallback: int) -> Tuple[int, int]:
     """(tokens used, context window) from the newest token_count event in a rollout.
 
@@ -191,3 +197,18 @@ def build_skeleton(handoff_id: str, runtime: str, goal: str, done_lines: Optiona
     sect('Risks / reservations', '\n'.join('- ' + _sanitize(r) for r in (risks or []))
          or '- machine skeleton; the model did not fill its sections')
     return '\n'.join(parts).rstrip() + '\n'
+
+
+def add_next_step(text: str, line: str) -> str:
+    """Append one step to the end of 'Next steps' (after the model's merge, so it is never dropped)."""
+    out: List[str] = []
+    inside = False
+    for ln in text.splitlines():
+        if ln.startswith('## '):
+            if inside:
+                out.append('- ' + _sanitize(line))
+            inside = NEXT_KEY in ln[3:]
+        out.append(ln)
+    if inside:
+        out.append('- ' + _sanitize(line))
+    return '\n'.join(out).rstrip() + '\n'

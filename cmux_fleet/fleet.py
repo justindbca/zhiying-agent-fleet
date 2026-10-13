@@ -87,6 +87,9 @@ CMD_TIMEOUT, CMD_TIMEOUT_MAX = 120, 600  # artifact cmd_exit (contract tasks): s
 # Advisor online only (roster `advisor: on`): audit hash per consultation, its counter, dispatches awaiting
 # advice per worker (instruction -> advise_note), and notes appended to the supervisor's next message.
 ADVICE, ADVICE_SEQ, ADVICE_PENDING, ADVICE_NOTES = 'fx:advice:', 'fx:advice:seq', 'fx:advice:pending:', 'fx:advice:notes'
+# Mid-task rescue (advisor plan §3.2): supervisor consult items waiting for an idle slot, relays per task+slot.
+RESCUE, RESCUE_RELAYS = 'fx:advice:rescue', 'fx:advice:relays'
+RESCUE_FIELDS = ('rescue_note', 'rescue_launch', 'rescue_hint', 'rescue_relay', 'advice_preset')
 
 
 def load(path):
@@ -452,11 +455,30 @@ def parse_decision(text, workers, others_active):
         raise ValueError('escalations: one answer per task')
     if 'advisor' in decision and decision['advisor'] not in ('on', 'off'):
         raise ValueError('advisor must be "on" or "off"')
+    consult = decision.setdefault('consult', [])
+    validate_consult(consult, workers)
     if 'artifacts' in decision:
         validate_artifacts(decision['artifacts'])
-    if decision['status'] == 'RUNNING' and not dispatch and not escalations and not others_active:
+    if decision['status'] == 'RUNNING' and not dispatch and not escalations and not consult and not others_active:
         raise ValueError('no worker is busy: RUNNING must dispatch at least one instruction')
     return decision
+
+
+def validate_consult(consult, workers):
+    """Supervisor's mid-task consult items (advisor plan §3.2): {worker, task, finding, want?}."""
+    if not isinstance(consult, list):
+        raise ValueError('consult must be a list')
+    for item in consult:
+        if not isinstance(item, dict) or item.get('worker') not in workers:
+            raise ValueError('consult.worker must be one of ' + ', '.join(workers))
+        if not isinstance(item.get('task'), str) or not re.fullmatch(contracts.M_RE, item['task']):
+            raise ValueError('consult.task must be the dispatch id of the task (M<n>, e.g. M0)')
+        if not isinstance(item.get('finding'), str) or not item['finding'].strip():
+            raise ValueError('consult.finding must say in your own words what went wrong')
+        if not isinstance(item.get('want', ''), str):
+            raise ValueError('consult.want must be text')
+    if len({x['task'] for x in consult}) != len(consult):
+        raise ValueError('consult: one item per task')
 
 
 def validate_request(spec, workers):
@@ -1983,6 +2005,7 @@ class Fleet:
                 instruction = item['instruction'].strip()
                 prepared.append((slot, instruction, self.prepare_worker_profile(slot, instruction)))
             escalations = self.escalation_decision(decision, state) if decision['status'] == 'RUNNING' else []
+            consults = self.consult_decision(decision, state) if decision['status'] == 'RUNNING' else []
         except (ValueError, TypeError, KeyError) as exc:
             # P0 gap lists never count toward the three-strike limit (user 10/13): the supervisor
             # keeps fixing interfaces until all checks pass; the task `hours` budget is the bound.
@@ -2027,8 +2050,8 @@ class Fleet:
             if self.advisor_online():
                 # Only supervisor dispatches are advised (never [contract] notices or report corrections).
                 # Registered before the depends_on hold: a held row is advised when the daemon releases it.
-                self.r.rpush(ADVICE_PENDING + slot, json.dumps({'instruction': instruction,
-                                                                'note': item.get('advise_note', '')}, ensure_ascii=False))
+                self.r.rpush(ADVICE_PENDING + slot, json.dumps({'instruction': instruction, 'note': item.get('advise_note', ''),
+                                                                'task': item.get('id', '')}, ensure_ascii=False))
             if state is not None:
                 row = rows[item['id']]
                 row['message'] = advisory + self.contract_message(t.get('id', ''), row)
@@ -2055,6 +2078,7 @@ class Fleet:
             self.save_escalations({k: v for k, v in esc.items() if k not in redispatched})
         for task_id, rec, answer in escalations:
             self.escalation_apply(t, state, task_id, rec, answer)
+        self.consult_apply(consults)
         if state is not None:
             self.save_contract(state)
         self.log('dispatch', count=len(decision['dispatch']), completion=decision['completion'])
@@ -2151,6 +2175,13 @@ class Fleet:
         for w in self.workers:  # an earlier task's unadvised dispatches never match this one
             if self.r.llen(ADVICE_PENDING + w):
                 self.r.delete(ADVICE_PENDING + w)
+        if self.r.llen(RESCUE):  # an earlier task's consults and rescue leftovers never act in this one
+            self.r.delete(RESCUE)
+        for w in self.workers:
+            info = self.agent(w)
+            left = {k: '' for k in RESCUE_FIELDS if info.get(k)}
+            if left:
+                self.setf(w, **left)
         self.queue('supervisor', prompt + '\nReply with the JSON format from AGENTS.md.')
         (self.run_dir / 'result.json').unlink(missing_ok=True)  # a new task: this run is not finished
         self.log('task.submitted', task=task_id)
@@ -2298,6 +2329,8 @@ class Fleet:
     def pump(self):
         if (self.service or self.v2) and self.paused():
             return  # nothing is delivered and nothing rotates; requests keep queuing (and may time out)
+        if not self.service:
+            self.rescue_tick()  # advisor rescue (§3.2): outside any v2 transaction, like the pre-dispatch advice
         cap = int(self.cfg.get('max_busy') or 0)
         busy = sum(self.agent(w).get('state') in ('busy', 'handoff', 'held') for w in self.workers)
         for name in self.names:
@@ -2485,6 +2518,14 @@ class Fleet:
         whitelist = (cards[model].kit_domains if model in cards else None)
         info = self.agent(name)
         installed = json.loads(info.get('installed_domains') or '[]')
+        preset = json.loads(info.get('advice_preset') or '{}')
+        if (kind == 'dispatch' and entry.get('task') and preset.get('task') == entry['task']
+                and preset.get('run_task') == self.task().get('id')):
+            # The supervisor re-dispatches a task the advisor reassigned here: that sheet holds (no second consult).
+            self.setf(name, advice_preset='')
+            self.log('advice.preset', agent=name, ticket=preset['sheet']['ticket'], task=entry['task'])
+            sheet = {k: v for k, v in preset['sheet'].items() if k not in ('action', 'to', 'handoff_hint')}
+            return sheet, current, cards, registry
         matrix, matrix_error = advisor.load_matrix()
         catalog = self.kit.domains_catalog() if self.kit and cli == 'claude' else []
         payload = advisor.build_input(
@@ -2663,6 +2704,250 @@ class Fleet:
         self.setf(name, **fields)
         self.log('advice.released_default', agent=name)
 
+    # -- advisor mid-task rescue (advisor plan §3.2 / §4.2: consult -> respawn | reassign | give_up)
+    def rescue_enabled(self):
+        """The one gate of the rescue path (feat/advisor-hotload replaces this body with its roster switch)."""
+        return self.cfg.get('advisor') is True
+
+    def consult_decision(self, decision, state):
+        """Validate the supervisor's consult items against the task table (no side effects)."""
+        dispatched = {self.resolve(x['to']) for x in decision['dispatch']}
+        ids = {x.get('id') for x in decision['dispatch']}
+        waiting = {json.loads(x)['task'] for x in self.r.lrange(RESCUE, 0, -1)}
+        out = []
+        for item in decision['consult']:
+            slot, task_id = self.resolve(item['worker']), item['task']
+            owner, instruction, status = self.escalation_item(task_id, state)
+            if owner != slot or not instruction or status in ('escalated', 'delegated'):
+                raise ValueError('consult: ' + task_id + ' is not a task of ' + self.label(slot)
+                                 + ' (consult names the dispatch id that worker last ran)')
+            if slot in dispatched or task_id in ids:
+                raise ValueError('consult: ' + task_id + ' / ' + self.label(slot) + ' is also dispatched in this '
+                                 'reply; consult first, then act on the advisor\'s answer')
+            if task_id in waiting:
+                raise ValueError('consult: ' + task_id + ' is already with the advisor; wait for its answer')
+            out.append({'slot': slot, 'task': task_id, 'finding': ' '.join(item['finding'].split())[:2000],
+                        'want': ' '.join(item.get('want', '').split())[:1000]})
+        return out
+
+    def consult_apply(self, consults):
+        for c in consults:
+            if self.rescue_enabled():
+                self.r.rpush(RESCUE, json.dumps(dict(c, run_task=self.task().get('id', '')), ensure_ascii=False))
+                self.log('advice.consult', agent=c['slot'], task=c['task'])
+            else:
+                self.log('advice.consult_off', agent=c['slot'], task=c['task'])
+                self.queue('supervisor', self.consult_off_note(c))
+
+    def consult_off_note(self, c):
+        return ('[advisor off] consult ' + c['task'] + ' (' + self.label(c['slot']) + ') ignored: the advisor is '
+                'offline (先 advisor: on). Decide yourself: dispatch a correction to ' + self.label(c['slot'])
+                + ', or BLOCKED.\nReply with the JSON format from AGENTS.md.')
+
+    def rescue_tick(self):
+        """Ready notes of reassigned slots; then one consult request whose worker is idle."""
+        if not self.running():
+            return
+        for w in self.workers:
+            info = self.agent(w)
+            if info.get('rescue_note') and info.get('state') == 'idle':
+                self.setf(w, rescue_note='')
+                self.queue('supervisor', info['rescue_note'])
+        for raw in self.r.lrange(RESCUE, 0, -1):
+            req = json.loads(raw)
+            if req.get('run_task') != self.task().get('id'):
+                self.r.lrem(RESCUE, 1, raw)  # left over from an earlier task
+                continue
+            if self.agent(req['slot']).get('state') != 'idle' or self.inbox_depth(req['slot']):
+                continue  # judged at the worker's next idle boundary
+            self.r.lrem(RESCUE, 1, raw)
+            if not self.rescue_enabled():
+                self.queue('supervisor', self.consult_off_note(req))
+            else:
+                self.rescue(req)
+            return  # at most one consultation per pump
+
+    def advice_options(self, name, registry):
+        cfg = self.runtime_cfg(name)
+        cli = agent_cli(cfg, name)
+        cards = advisor.launch_cards(registry, cli)
+        model, effort = advisor.runtime_model(cfg, cli), advisor.runtime_effort(cfg, cli)
+        info = self.agent(name)
+        return {'name': name, 'cli': cli, 'cards': cards, 'model': model, 'effort': effort,
+                'current': advisor.fingerprint(cli, model, effort),
+                'models': list(dict.fromkeys(([model] if model else []) + list(cards))),
+                'generation': int(info.get('generation') or 0),
+                'installed_domains': json.loads(info.get('installed_domains') or '[]')}
+
+    def rescue_candidates(self, name):
+        """Idle slots a reassign may go to (a v2 Claude slot still held for its first sheet counts)."""
+        out = []
+        for w in self.active_workers():
+            info = self.agent(w)
+            held = (info.get('advice_hold') == '1' and info.get('state') == 'starting'
+                    and info.get('launch_ready') == '0')
+            if (w != name and (info.get('state') == 'idle' or held) and not self.inbox_depth(w)
+                    and not info.get('rescue_note') and not info.get('rescue_relay')):
+                out.append(w)
+        return out
+
+    def rescue(self, req):
+        """One rescue consultation. Unavailable advisor = no action, the supervisor is told (§8)."""
+        name, task_id, t = req['slot'], req['task'], self.task()
+        state = self.contract_state()
+        instruction = self.escalation_item(task_id, state)[1] or ''
+        relay_key = t.get('id', '') + '|' + task_id + '|' + name
+        relays = int(self.r.hget(RESCUE_RELAYS, relay_key) or 0)
+        try:
+            registry, registry_error = AgentRegistry(), None
+        except (OSError, ValueError) as exc:
+            registry, registry_error = (), 'agent registry unreadable: ' + str(exc)[:400]
+        candidates = self.rescue_candidates(name)
+        opts = {w: self.advice_options(w, registry) for w in [name] + candidates}
+        actions = advisor.rescue_actions(relays, candidates)
+        matrix, matrix_error = advisor.load_matrix()
+        catalog = self.kit.domains_catalog() if self.kit else []
+        names = [c['name'] for c in catalog]
+
+        def view(o, models=False):
+            out = {k: o[k] for k in ('name', 'cli', 'generation', 'model', 'effort', 'installed_domains')}
+            return dict(out, models=o['models']) if models else out
+        last = json.loads(self.agent(name).get('advice_last') or '{}')
+        payload = advisor.build_rescue_input(
+            goal=t.get('goal', ''), task=task_id, instruction=instruction, finding=req['finding'], want=req['want'],
+            slot=view(opts[name], True), previous_sheet=last.get('sheet') if last.get('task') == t.get('id') else None,
+            relays=relays, actions=actions, candidates=[view(opts[c], True) for c in candidates],
+            matrix=matrix, catalog=catalog)
+
+        def check_slot(target, raw):
+            o = opts[target or name]
+            wl = (o['cards'][raw.get('model')].kit_domains if raw.get('model') in o['cards']
+                  else o['cards'][o['model']].kit_domains if o['model'] in o['cards'] else None)
+            return advisor.validate(raw, cli=o['cli'], models=o['models'], current=o['current'],
+                                    catalog=names if o['cli'] == 'claude' else [], whitelist=wl, matrix=matrix,
+                                    cards=o['cards'])
+
+        def check(raw):
+            return advisor.validate_rescue(raw, actions=actions, check_slot=check_slot, candidates=candidates)
+        runner = self.advisor_runner or (lambda data: advisor.run_claude(data, cfg=self.cfg, run_dir=self.run_dir))
+        started = time.time()
+        if registry_error:
+            sheet, envelope, errors = None, None, [registry_error]
+        else:
+            sheet, envelope, errors = advisor.consult(payload, runner, check)
+        seq = self.r.hincrby(ADVICE_SEQ, 'n', 1)
+        ticket = 'adv-' + str(self.cfg.get('token') or self.run_dir.name[-8:]) + '-' + str(seq)
+        audit = {'slot': name, 'task': t.get('id', ''), 'kind': 'rescue', 'item': task_id,
+                 'input': json.dumps({k: payload[k] for k in ('goal', 'task', 'instruction', 'finding', 'want', 'slot',
+                                                              'relays', 'actions')}, ensure_ascii=False)[:4000],
+                 'output': json.dumps(sheet, ensure_ascii=False), 'errors': json.dumps(errors, ensure_ascii=False),
+                 'elapsed_s': round(time.time() - started, 3), 'status': 'unavailable' if sheet is None else 'ok',
+                 'action': (sheet or {}).get('action', 'none'), 'at': time.time()}
+        audit.update(advisor.usage_fields(envelope))
+        if matrix_error:
+            audit['matrix_error'] = matrix_error[:500]
+        self.r.hset(ADVICE + ticket, mapping=audit)
+        who = task_id + ' (' + self.label(name) + ')'
+        if sheet is None:
+            self.log('advice.unavailable', agent=name, ticket=ticket, path='rescue', errors=errors)
+            self.queue('supervisor', '[advisor unavailable] consult ' + who + '：顾问不可用，未做任何动作（'
+                       + (errors[-1] if errors else '')[:300] + '）。Decide yourself: dispatch a correction, or BLOCKED.'
+                       '\nReply with the JSON format from AGENTS.md.')
+            return
+        sheet['ticket'] = ticket
+        self.log('advice.rescue', agent=name, ticket=ticket, task=task_id, action=sheet['action'])
+        if sheet.get('capability_gap'):
+            self.log('capability.gap', agent=name, ticket=ticket, capability=sheet.get('capability'), model=sheet['model'])
+        if sheet['action'] == 'give_up':
+            self.queue('supervisor', '[advisor] give_up ' + task_id + ': ' + sheet['reason']
+                       + '\nNo configuration of ' + self.label(name) + ' or another slot is expected to finish '
+                       + task_id + ': reply BLOCKED with this reason.\nReply with the JSON format from AGENTS.md.')
+            return
+        target = sheet.get('to', name)
+        self.setf(target, advice_last=json.dumps({'task': t.get('id', ''), 'sheet': sheet}, ensure_ascii=False))
+        try:
+            if sheet['action'] == 'respawn':
+                self.r.hincrby(RESCUE_RELAYS, relay_key, 1)
+                self.rescue_respawn(name, task_id, sheet, opts[name], registry, state)
+            else:
+                self.rescue_reassign(name, task_id, sheet, opts[target], registry, state)
+        except (OSError, ValueError, RuntimeError, KeyError, SystemExit, subprocess.SubprocessError) as exc:
+            self.block_profile(target, 'advisor ' + sheet['action'] + ' failed: ' + str(exc))
+
+    def rescue_message(self, task_id, state, slot):
+        """The original instruction of a task, in the same envelope the supervisor's dispatch had."""
+        t = self.task()
+        if state is not None:
+            row = state['tasks'][task_id]
+            return row.get('message') or self.contract_message(t.get('id', ''), row)
+        instruction = self.escalation_item(task_id, None)[1]
+        return ('[Supervisor instruction ' + t.get('id', '') + '] [' + task_id + '] ' + instruction
+                + '\nShared output directory: ' + str(self.workspace()) + ' (write only inside your own '
+                'subdirectory ' + slot + '/). Reply in the AGENTS.md format when done.')
+
+    def rescue_respawn(self, name, task_id, sheet, opt, registry, state):
+        """Same slot, next generation: the old one writes the three-section handoff, the successor starts
+        with the new sheet (finish_rotation), reads the note, returns READY, then gets the task again."""
+        launch = None
+        if advisor.fingerprint(opt['cli'], sheet['model'], sheet.get('effort')) != opt['current']:
+            launch = self.advice_launch(opt['cli'], sheet, opt['cards'], registry)
+            self.preflight_profile(launch)  # Phase 5: dependencies first, never a fallback CLI
+        text = (self.rescue_message(task_id, state, name) + '\n[advisor] 上一代已做：见交接单；本代领域：'
+                + (', '.join(sheet['domains']) or '无') + '。')
+        if state is not None:
+            row = state['tasks'][task_id]
+            row.update(status='running', attempts=row.get('attempts', 0) + 1, reason='advisor respawn')
+            self.contract_queue(state, name, text, task_id)  # queued behind the handoff, delivered after READY
+            self.save_contract(state)
+        else:
+            self.queue(name, text)
+        self.setf(name, advice_domains=json.dumps(sheet['domains'], ensure_ascii=False),
+                  rescue_hint=sheet.get('handoff_hint', ''), rescue_relay=1,
+                  rescue_launch=profile_launch.encode_launch(launch) if launch else '')
+        self.record_advice(name, sheet, 'respawn')
+        used, window = self.usage(name)
+        self.start_rotation(name, used, window, prompt=handoff.RESCUE_PROMPT)
+
+    def rescue_reassign(self, name, task_id, sheet, opt, registry, state):
+        """Take the task back from the stuck worker and start the target slot per the sheet; the
+        supervisor re-dispatches (dispatch stays with the supervisor). The old worker gets no handoff."""
+        to, t = sheet['to'], self.task()
+        if state is not None:
+            row = state['tasks'][task_id]
+            row.update(status='running', attempts=row.get('attempts', 0) + 1,
+                       reason='reassigned by the advisor: ' + self.label(name) + ' -> ' + self.label(to)
+                       + '; waits for the supervisor to dispatch it again')
+            self.contract_log('task.reassigned', task=task_id, by='advisor', frm=name, to=to)
+            self.save_contract(state)
+        else:
+            items = json.loads(self.r.get(ITEMS) or '{}')
+            items.setdefault(task_id, {})['to'] = ''
+            self.r.set(ITEMS, json.dumps(items, ensure_ascii=False))
+        shown = sheet['model'] + ('/' + sheet['effort'] if sheet.get('effort') else '')
+
+        def note():  # after a switch the slot's label is the new generation's
+            return ('[advisor] ' + task_id + ' → ' + self.label(to) + ' (' + shown + ', domains: ['
+                    + ', '.join(sheet['domains']) + '])：reassign，' + self.label(name) + ' 不再负责 ' + task_id
+                    + '；请重新 dispatch ' + task_id + ' 给 ' + self.label(to) + '（' + sheet['reason'] + '）'
+                    + '\nReply with the JSON format from AGENTS.md.')
+        # The re-dispatch of this task to `to` uses this sheet instead of a second consultation.
+        self.setf(to, advice_preset=json.dumps({'task': task_id, 'run_task': t.get('id', ''), 'sheet': sheet},
+                                               ensure_ascii=False))
+        info = self.agent(to)
+        held = info.get('advice_hold') == '1' and info.get('state') == 'starting'
+        if not held and advisor.fingerprint(opt['cli'], sheet['model'], sheet.get('effort')) != opt['current']:
+            launch = self.advice_launch(opt['cli'], sheet, opt['cards'], registry)
+            self.setf(to, advice_domains=json.dumps(sheet['domains'], ensure_ascii=False))
+            self.record_advice(to, sheet, 'respawn')
+            self.switch_profile(to, launch)  # Phase 5 idle switch; the note goes out after its READY
+            if self.agent(to).get('state') == 'starting':
+                self.setf(to, rescue_note=note())
+            elif self.task().get('status') == 'running':  # switch deferred (codex subagents): tell the supervisor now
+                self.queue('supervisor', note())
+            return
+        self.r.hset(ADVICE + sheet['ticket'], mapping={'effect': 'reassign'})
+        self.queue('supervisor', note())  # held slot: released by the re-dispatch with this sheet
+
     def send(self, name, pane, text):
         """Codex accepts verbatim paste; Claude and Pi use a file pointer with a delivery id."""
         if self.v2:
@@ -2681,7 +2966,7 @@ class Fleet:
         return self.mgr.send_prompt_to_idle(pane, first + ' -- the full message is in ' + str(msg)
                                             + ' . Read that whole file first and follow it.')
 
-    def start_rotation(self, name, used, window):
+    def start_rotation(self, name, used, window, prompt=None):
         info = self.agent(name)
         hid = uuid.uuid4().hex[:10]
         draft = agent_cwd(self.cfg, name) / '.handoff' / ('draft-' + hid + '.md')
@@ -2691,7 +2976,7 @@ class Fleet:
                   handoff_mtime=draft.stat().st_mtime_ns,
                   handoff_deadline=time.time() + float(self.cfg['handoff_timeout']))
         self.log('rotate.start', agent=name, used=used, window=window, generation=info.get('generation'))
-        prompt = (handoff.DUMP_PROMPT.format(path=draft, used=used, window=window)
+        prompt = ((prompt or handoff.DUMP_PROMPT).format(path=draft, used=used, window=window)
                   + ' This is a same-task handoff: do not open windows, do not continue the task itself.')
         if self.v2:
             self.v2.offer_handoff(name, prompt)
@@ -2737,6 +3022,8 @@ class Fleet:
                 source = 'skeleton'
         if source == 'skeleton':
             out.write_text(base)  # never fail a rotation because the model did not write
+        if info.get('rescue_hint'):  # advisor rescue: its handoff_hint goes after the merge, never dropped
+            out.write_text(handoff.add_next_step(out.read_text(), info['rescue_hint']))
         old = info['pane']
         snapshot = out.with_suffix('.terminal.txt')
         self.mgr.capture_to(old, str(snapshot))
@@ -2749,6 +3036,8 @@ class Fleet:
             self.r.hset(NAMES, mapping={label: name})  # old names keep routing to this slot
         history.record(self.run_dir, slot=name, label=prev, generation=generation, handoff=str(out),
                        snapshot=str(snapshot), source=source, timed_out=timed_out)
+        if info.get('rescue_launch'):  # advisor rescue respawn: the successor starts with the new sheet's runtime
+            self.setf(name, runtime_launch=info['rescue_launch'], rescue_launch='')
         new = self.spawn(name, '[Same-task takeover] You are ' + label + ' (taking over from ' + prev
                          + '). Read the handoff note ' + str(out) + ' and continue from it. In this turn only read '
                          'the note, do no task work, and make your final reply exactly READY.',
@@ -2765,6 +3054,9 @@ class Fleet:
         self.refresh_history()
         self.log('rotate.done', agent=name, label=label, prev=prev, generation=generation + 1,
                  handoff=str(out), source=source, timed_out=timed_out)
+        if info.get('rescue_relay'):
+            self.setf(name, rescue_relay='', rescue_hint='')
+            self.r.rpush(ADVICE_NOTES, '[advisor] respawn ' + prev + ' → ' + label + ' done')
 
     def refresh_history(self):
         history.write_page(self.run_dir, self.history_slots())
