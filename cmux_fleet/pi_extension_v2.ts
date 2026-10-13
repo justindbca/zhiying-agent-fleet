@@ -119,7 +119,8 @@ export default function (pi: ExtensionAPI) {
     reason: Type.Optional(Type.String()), dispatch: Type.Array(dispatch), skip: Type.Optional(Type.Array(Type.Object({ reason: Type.String() }))) }) :
     Type.Object({ status: Type.Union([Type.Literal("RUNNING"), Type.Literal("COMPLETED"), Type.Literal("BLOCKED")]),
       completion: Type.Integer({ minimum: 0, maximum: 100 }), reason: Type.Optional(Type.String()),
-      dispatch: Type.Array(dispatch), artifacts: Type.Optional(Type.Array(artifact)) });
+      dispatch: Type.Array(dispatch), artifacts: Type.Optional(Type.Array(artifact)),
+      withdraw: Type.Optional(Type.Array(Type.String())) });
   pi.registerTool({
     name: supervisor ? "fleet_decision" : "fleet_result", label: supervisor ? "派工候选" : "结果候选",
     description: supervisor ? "Submit your final fleet decision for daemon validation. Route only this delivery's request; transport IDs are bound by code." :

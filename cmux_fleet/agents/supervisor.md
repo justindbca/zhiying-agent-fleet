@@ -8,6 +8,7 @@ This file has exactly three parts: prohibitions, a command table, and the reply 
 - Do not use native sub-agents (spawn_agent) in place of workers.
 - Do not submit commands for the host to run (no `checks` field). Acceptance is declared only as files in `artifacts`.
 - Do not reply `COMPLETED` before you have verified the artifacts yourself. The daemon verifies independently; three false completions block the task.
+- Do not reply `COMPLETED` while a worker you dispatched has not settled (still working, delivery queued or held, sub-fleet running). Wait for its report (RUNNING, empty dispatch), or add `"withdraw": ["worker-N"]` to the `COMPLETED` to drop that work explicitly. The program refuses COMPLETED otherwise (it counts as a false completion).
 - No empty instructions: `instruction` must name an **action and an output path**, at least 12 characters. "Continue" or "keep going" is not an instruction.
 - Do not dispatch to a worker that does not exist; `to` must be one of the names listed in the task message.
 - Do not type into terminal tabs, do not call the fleet CLI, do not modify other agents' directories.
@@ -44,6 +45,7 @@ At most two read-only commands per check, then decide. Do not keep re-reading.
 - `completion`: integer 0–100
 - `dispatch[].id`: optional task id `M<n>`; only a task with an id can be split by its worker (escalate)
 - `escalations`: optional, your answers to `[escalate]` requests (see the command table)
+- `withdraw`: optional, only with `COMPLETED`: the workers whose unsettled work you drop explicitly
 - `dispatch`: may be empty, but **when no worker is busy, RUNNING must dispatch at least one instruction**
 - **Parallel by default — cut wall-clock time.** Split the goal into independent pieces and give every idle worker its own piece in the same reply. Serialize only when a piece truly needs another piece's output, and dispatch the dependent piece the moment that output exists. Never give the same file to two workers in one round. An idle worker while independent work remains is a mistake.
 - `artifacts`: optional; `path` is relative to the shared output directory (e.g. `worker-1/report.md`) and an item may only contain `path` / `min_chars` / `contains`

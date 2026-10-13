@@ -809,6 +809,11 @@ def parse_decision(text, workers, others_active):
         raise ValueError('escalations: one answer per task')
     if 'artifacts' in decision:
         validate_artifacts(decision['artifacts'])
+    withdraw = decision.setdefault('withdraw', [])
+    if not isinstance(withdraw, list) or any(w not in workers for w in withdraw):
+        raise ValueError('withdraw must be a list of worker names: ' + ', '.join(workers))
+    if withdraw and decision['status'] != 'COMPLETED':
+        raise ValueError('withdraw is only for COMPLETED: it drops the unsettled work of the listed workers')
     if decision['status'] == 'RUNNING' and not dispatch and not escalations and not others_active:
         raise ValueError('no worker is busy: RUNNING must dispatch at least one instruction')
     return decision
@@ -2547,6 +2552,17 @@ class Fleet:
         return bool(self.inbox_depth('supervisor')) or any(
             self.agent(w).get('state') != 'idle' or self.inbox_depth(w) for w in self.workers)
 
+    def unsettled_reason(self, w):
+        """Why worker ``w`` still has dispatched work out, or '' when everything it got has settled."""
+        state = self.agent(w).get('state')
+        if state in ('busy', 'held', 'delegated'):
+            return {'busy': 'working on a delivery', 'held': 'delivery held, not settled',
+                    'delegated': 'sub-fleet running'}[state]
+        return 'delivery queued' if self.inbox_depth(w) else ''
+
+    def unsettled_workers(self):
+        return [w for w in self.workers if self.unsettled_reason(w)]
+
     def on_supervisor(self, text, invalid=None):
         """`invalid`: the v2 validator's own rejection; the correction must name it, not a parse error."""
         t = self.task()
@@ -2593,6 +2609,25 @@ class Fleet:
             self.finish('blocked', decision.get('reason', 'needs a human'))
             return
         if decision['status'] == 'COMPLETED':
+            withdrawn = {self.resolve(w) for w in decision['withdraw']}
+            pending = [w for w in self.unsettled_workers() if w not in withdrawn]
+            if pending:
+                # Never end a task over work still out: every dispatched delivery settles first, or the
+                # supervisor withdraws it explicitly (10/13: COMPLETED while workers still ran).
+                names = ', '.join(self.label(w) + ' (' + self.unsettled_reason(w) + ')' for w in pending)
+                self.log('complete.refused', workers=pending)
+                bounces = self.r.hincrby(TASK, 'bounces', 1)
+                if bounces >= 3:
+                    self.finish('blocked', 'supervisor claimed completion three times while workers had unsettled '
+                                'deliveries: ' + names)
+                else:
+                    self.queue('supervisor', 'COMPLETED refused: ' + names + ' still have unsettled deliveries. Wait '
+                               'for their reports (RUNNING with an empty dispatch), or reply COMPLETED again with '
+                               '"withdraw": [' + ', '.join('"' + self.label(w) + '"' for w in pending)
+                               + '] to drop that work explicitly.')
+                return
+            if withdrawn:
+                self.log('complete.withdrawn', workers=sorted(withdrawn))
             extended = state is not None or t.get('artifacts_frozen') == '1'
             failures = (check_artifacts(artifacts, self.workspace(), extended, extended, caller_commands(t))
                         if artifacts else ['no artifacts were declared, nothing to verify'])
