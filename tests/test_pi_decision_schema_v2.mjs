@@ -12,4 +12,10 @@ assert.ok(Value.Check(schema,{...base,dispatch:[{to:'worker-1',instruction:'Writ
   advise_note:'needs web research, no code'}]}),'dispatch[].id and advise_note must be accepted');
 assert.ok(!Value.Check(schema,{...base,dispatch:[{to:'worker-1',instruction:'Write worker-1/a.md please',advise_note:3}]}));
 assert.ok(!Value.Check(schema,{...base,dispatch:[{to:'worker-1',instruction:'Write worker-1/a.md please',id:5}]}),'id is typed text');
+const ask={worker:'worker-1',task:'M0',finding:'两轮都 403',want:'补抓取工具'};
+assert.ok(Value.Check(schema,{...base,dispatch:[],consult:[ask]}),'consult[] must be accepted (advisor plan §3.2)');
+assert.ok(Value.Check(schema,{...base,dispatch:[],consult:[{worker:'worker-1',task:'M0',finding:'x'}]}),'want is optional');
+assert.ok(!Value.Check(schema,{...base,dispatch:[],consult:[{...ask,worker:5}]}),'consult.worker is text');
+assert.ok(!Value.Check(schema,{...base,dispatch:[],consult:[{worker:'worker-1',task:'M0'}]}),'consult.finding is required');
+assert.ok(!Value.Check(schema,{...base,dispatch:[],consult:{...ask}}),'consult is a list');
 console.log('decision schema contract passed');
