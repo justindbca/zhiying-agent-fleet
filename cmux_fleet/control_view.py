@@ -508,7 +508,8 @@ def _snapshot(client, settings, cfg, redactor):
                    "heartbeat_age_s": max(0, now - heartbeat) if heartbeat is not None else None,
                    "paused": (service["paused"] == "1"
                               if service.get("paused") in ("0", "1") else None),
-                   "pause_reason": service.get("reason"), "service": service or None},
+                   "pause_reason": service.get("reason"), "service": service or None,
+                   "advisor": service.get("advisor") or "off"},  # roster advisor: on|off (advisor plan §2.1)
         "pending_requests": client.llen("fx:reqq"), "task": task or None, "slots": slots,
         "consistency": "current non-atomic read; None means unknown"})
 
@@ -557,9 +558,9 @@ def _render(record, width):
     if record.get("event") == "control.state":
         state = record["snapshot"]
         daemon = state["daemon"]
-        lines = ["STATE run=%s socket=%s pause=%s beat=%s" % (
+        lines = ["STATE run=%s socket=%s pause=%s beat=%s adv=%s" % (
             state["run_id"], state["socket"].get("available"), daemon.get("paused"),
-            daemon.get("heartbeat_at"))]
+            daemon.get("heartbeat_at"), daemon.get("advisor") or "off")]
         if state["socket"].get("error"):
             lines.append(state["socket"]["error"])
         for slot, item in state["slots"].items():

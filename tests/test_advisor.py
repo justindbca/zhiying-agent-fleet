@@ -168,6 +168,12 @@ def test_control_line_shows_advice():
 
 
 # ------------------------------------------------------------------ v1 daemon (fake Redis / cmux)
+def advisor_on(run, workers):
+    """The switch lives in the roster (advisor plan §2.1): <run>/roster.yaml with advisor: on."""
+    from cmux_fleet import roster
+    roster.write_advisor(Path(run) / 'roster.yaml', True, workers)
+
+
 class Runner:
     def __init__(self, *sheets):
         self.sheets, self.calls = list(sheets), []
@@ -189,9 +195,10 @@ def afx(tmp_path, monkeypatch):
     cfg = {'run': str(run), 'redis_socket': '/tmp/cmux-fleet-test.sock', 'python': sys.executable,
            'workers': ['worker-1', 'worker-2'], 'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 95000,
            'codex_home': str(tmp_path / 'codex-home'), 'worker_cli': 'claude', 'worker_kit': str(kit),
-           'claude': '/bin/claude', 'claude_window': 200000, 'advisor': True, 'worker_effort': 'medium',
+           'claude': '/bin/claude', 'claude_window': 200000, 'worker_effort': 'medium',
            'token': 'abcd1234'}
     (run / 'config.json').write_text(json.dumps(cfg))
+    advisor_on(run, cfg['workers'])
     f = fleet.Fleet(run / 'config.json', FakeRedis(), FakeMgr(), sessions=tmp_path / 'sessions')
     f.advisor_runner = Runner({'model': 'sonnet', 'effort': 'medium', 'domains': []})
     monkeypatch.setattr(f, 'preflight_profile', lambda launch: None)
@@ -382,7 +389,8 @@ def test_launch_drift_blocks_delivery(afx):
 
 def test_codex_slot_never_gets_domains(fx):
     f = fx
-    f.cfg.update(advisor=True, codex_model='gpt-6.1-sol')
+    f.cfg.update(codex_model='gpt-6.1-sol')
+    assert f.set_advisor(True, 'user') is None
     f.advisor_runner = Runner({'model': 'gpt-6.1-sol', 'domains': ['research_web']})
     f.on_supervisor(decision())
     f.pump()
@@ -410,12 +418,11 @@ def test_bad_kit_refuses_the_fleet(tmp_path):
     run = tmp_path / 'run'
     (run / 'workspace').mkdir(parents=True)
     cfg = {'run': str(run), 'redis_socket': '/tmp/x.sock', 'python': sys.executable, 'workers': ['worker-1'],
-           'worker_cli': 'claude', 'worker_kit': str(kit), 'advisor': True}
+           'worker_cli': 'claude', 'worker_kit': str(kit)}
     (run / 'config.json').write_text(json.dumps(cfg))
+    fleet.Fleet(run / 'config.json', FakeRedis(), FakeMgr())  # advisor off: the kit is not the advisor's business
+    advisor_on(run, cfg['workers'])
     with pytest.raises(kitmod.KitError, match='rules file missing'):
-        fleet.Fleet(run / 'config.json', FakeRedis(), FakeMgr())
-    fleet.save(run / 'config.json', dict(cfg, advisor='yes'))
-    with pytest.raises(ValueError, match='advisor must be a boolean'):
         fleet.Fleet(run / 'config.json', FakeRedis(), FakeMgr())
 
 
@@ -469,10 +476,11 @@ def v2_advised(r, tmp_path, monkeypatch, workers):
     cfg = dict(run=str(run), redis_socket=r.connection_pool.connection_kwargs['path'], python=sys.executable,
                workers=list(workers), mode='task', supervisor_cli='codex', worker_cli='claude',
                codex_home=str(tmp_path / 'codex-home'), transport_version=2, allow_development_v2=True,
-               stall_timeout=0, v2_lease_ms=300000, max_busy=0, advisor=True, worker_kit=str(kit),
+               stall_timeout=0, v2_lease_ms=300000, max_busy=0, worker_kit=str(kit),
                claude='/bin/claude', token='feedbeef')
     path = run / 'config.json'
     fleet.save(path, cfg)
+    advisor_on(run, workers)
     f = fleet.Fleet(path, r, FakeMgr(), sessions=sessions)
     f.test_sessions, f.test_claude = sessions, tmp_path / 'claude-projects'
     f.test_threads = {'supervisor': str(uuid.uuid4())}
@@ -544,7 +552,7 @@ def test_v2_domain_hotload_rewrites_the_bus_body(v2adv):
     assert (fleet.agent_cwd(f.cfg, 'worker-1') / '.claude' / 'skills' / 'option-tier-screen').is_symlink()
 
 
-# ------------------------------------------------------------------ start --advisor
+# ------------------------------------------------------------------ start --advisor (sugar: writes the roster)
 def fake_start(monkeypatch, tmp_path):
     from types import SimpleNamespace
     from cmux_fleet import cmux_manager
@@ -561,13 +569,21 @@ def fake_start(monkeypatch, tmp_path):
             '--runs-dir', str(tmp_path / 'runs'), '--codex-home', str(tmp_path / 'codex-home')]
 
 
-def test_start_advisor_flag_writes_config(monkeypatch, tmp_path):
+def test_start_advisor_flag_only_writes_the_roster(monkeypatch, tmp_path):
+    from cmux_fleet import roster
     argv = fake_start(monkeypatch, tmp_path)
     kit = make_kit(tmp_path / 'kit')
-    fleet.main(argv + ['--advisor', '--worker-kit', str(kit)])
-    assert fleet.load(tmp_path / 'latest.json')['advisor'] is True
+    fleet.main(argv + ['--advisor', '--worker-kit', str(kit), '--workers', '2'])
+    latest = fleet.load(tmp_path / 'latest.json')
+    assert 'advisor' not in latest and 'advisor' not in fleet.load(latest['config'])  # never in config.json
+    raw = (Path(latest['run']) / 'roster.yaml').read_bytes()
+    assert roster.advisor(raw) is True and roster.parse(raw, Path(latest['run']))[0] == ['worker-1', 'worker-2']
+    own = tmp_path / 'team.yaml'
+    own.write_text('# my team\nworkers:\n  - name: exit\n')
+    fleet.main(argv + ['--advisor', '--roster', str(own)])
+    assert own.read_text() == '# my team\nworkers:\n  - name: exit\nadvisor: on\n'  # edited in place, comment kept
     fleet.main(argv)
-    assert 'advisor' not in fleet.load(tmp_path / 'latest.json')  # not passed: config unchanged
+    assert not (Path(fleet.load(tmp_path / 'latest.json')['run']) / 'roster.yaml').exists()  # not passed: no roster
 
 
 def test_start_advisor_refuses_bad_kit_before_provisioning(monkeypatch, tmp_path):
@@ -588,8 +604,9 @@ def test_contract_row_held_by_depends_on_is_advised_when_released(tmp_path):
     (run / 'workspace').mkdir(parents=True)
     cfg = {'run': str(run), 'redis_socket': '/tmp/cmux-fleet-test.sock', 'python': sys.executable,
            'workers': list(WORKERS), 'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 95000,
-           'codex_home': str(tmp_path / 'codex-home'), 'advisor': True, 'codex_model': 'gpt-6.1-sol'}
+           'codex_home': str(tmp_path / 'codex-home'), 'codex_model': 'gpt-6.1-sol'}
     (run / 'config.json').write_text(json.dumps(cfg))
+    advisor_on(run, cfg['workers'])
     sessions = tmp_path / 'sessions'
     f = fleet.Fleet(run / 'config.json', FakeRedis(), FakeMgr(), sessions=sessions)
     f.advisor_runner = Runner({'model': 'gpt-6.1-sol', 'domains': []})
