@@ -1371,7 +1371,8 @@ class Fleet:
                                   claude_model(cfg, name) if is_claude(cfg, name) else agent_profile(cfg, name))},
             env_vars=dict({'PATH': os.environ.get('PATH', '')}, **(
                 pi_adapter.environment(cfg_path, cfg, name, generation) if is_pi(cfg, name)
-                else {'CODEX_HOME': str(codex_home(self.cfg))})))
+                else {'CODEX_HOME': str(codex_home(self.cfg))})),
+            **subfleet.tmux_spawn_args(self.cfg, name, generation))
         if not result.success:
             if result.pane_id:
                 self.setf(name, pane=result.pane_id)
@@ -3196,6 +3197,10 @@ class Fleet:
         for name in self.names:  # status shows the effective values without waiting for a delivery
             if self.agent(name):
                 self.handoff_limits(name)
+        if subfleets != (self.cfg.get('subfleets') or []):
+            # §28 + dual display: tmux_slot reads cfg['subfleets'] at every spawn (memory and config file)
+            self.cfg['subfleets'] = subfleets
+            self.persist_roster()
         if subfleets or named_subfleet.declared(self):
             named_subfleet.declare(self, subfleets)
 
@@ -3214,7 +3219,7 @@ class Fleet:
     def persist_roster(self):
         self.cfg['workers'][:] = self.workers  # in place: the control view holds this list
         fields = {'workers': list(self.workers), 'worker_roles': self.cfg.get('worker_roles') or {},
-                  'worker_profiles': self.cfg.get('worker_profiles') or {}}
+                  'worker_profiles': self.cfg.get('worker_profiles') or {}, 'subfleets': self.cfg.get('subfleets') or []}
         save(self.path, dict(load(self.path), **fields))
         try:
             latest = load(LATEST)
@@ -3938,6 +3943,7 @@ def resume(run, args):
         except (OSError, ValueError) as exc:
             raise SystemExit('--roster ' + str(roster_path) + ' rejected:\n' + str(exc)) from exc
         cfg['roster'] = str(roster_path)
+        cfg['subfleets'] = roster.load_subfleets(roster_path)  # respawned supervisor_slots start in tmux
     if getattr(args, 'advisor', False) and args.worker_kit:
         try:
             kitmod.Kit(args.worker_kit)  # refuse a bad kit before provisioning, like a bad roster
@@ -4013,6 +4019,7 @@ def daemon(cfg_path, resume=False):
                     fleet.r.shutdown()
                 except Exception:
                     pass  # redis closes the socket while acknowledging shutdown
+                subfleet.stop_tmux(cfg)  # the fleet's own tmux server goes last (§19 dual display)
     if fleet is not None:
         lifecycle_close.after_daemon(fleet)  # lock released, Redis down: close this run's workspace
 
@@ -4179,7 +4186,9 @@ def start(args):
     if getattr(args, 'name', None):
         cfg.update(name=args.name.strip(), **titles)
     if roster_path:
-        cfg.update(roster=str(roster_path), worker_roles=worker_roles, worker_profiles=worker_profiles)
+        # subfleets before the first spawn: a supervisor_slot starts in the fleet's tmux (§28 / dual display)
+        cfg.update(roster=str(roster_path), worker_roles=worker_roles, worker_profiles=worker_profiles,
+                   subfleets=roster.load_subfleets(roster_path))
     if night_path:
         cfg['roster_night'] = str(night_path)
     if 'pi' in clis:

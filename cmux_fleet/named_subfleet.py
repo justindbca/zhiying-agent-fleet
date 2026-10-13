@@ -276,6 +276,11 @@ def try_up(f, entry, goal=''):
         return 'wait', busy
     if not rotation_gate(f, slot):
         return 'wait', slot + ' is rotating to a fresh session first'
+    if subfleet.tmux_slot(f.cfg, slot) and subfleet.parent_view(f, slot, f.agent(slot).get('pane')) is None:
+        # Declared while the slot already ran as a plain cmux pane (hot roster): this delegation takes the
+        # §19 move-surface; the slot's next generation starts in the fleet's tmux (dual display from then on).
+        f.log('subfleet.view_fallback', name=name, slot=slot,
+              reason='slot not yet in fleet tmux; dual display from next generation')
     try:
         rec = subfleet.spawn_child(f, slot, name, goal or ('Named sub-fleet ' + name), workers, named=entry)
     except subfleet.Refused as exc:
