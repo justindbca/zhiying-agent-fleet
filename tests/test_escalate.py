@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from test_contracts import cf, inbox, item, report, sup, to_parallel, write  # noqa: F401  (fixture + helpers)
+from test_fleet import received  # noqa: E402
 from test_subfleet import (child_daemon, hook, no_launch, parent_hook, step,  # noqa: F401
                            stop_child_like_daemon, tree)
 from cmux_fleet import fleet, subfleet
@@ -224,13 +225,13 @@ def test_v2_escalate_approve_spawn_and_completion(tree, monkeypatch):
         {'id': 'M0', 'to': 'worker-1', 'instruction': 'Research five sources and write worker-1/m0.md'}]}
     assert hook(t, f, 'supervisor', json.dumps(decision))['status'] == 'committed'
     step(t)
-    work = [x for p, x in t.world.sent if p == f.agent('worker-1')['pane']][-1]
+    work = received(t.world, f.agent('worker-1')['pane'])[-1]
     assert '[M0] Research five sources' in work
     text = ('Done:\n- read the goal\nEvidence:\n- five sources listed in the instruction\nNot done: all of it\n'
             'Blocked: none\n' + escalate())
     assert hook(t, f, 'worker-1', text, prompt=work)['status'] == 'committed'
     step(t)
-    asked = [x for p, x in t.world.sent if p == f.agent('supervisor')['pane']][-1]
+    asked = received(t.world, f.agent('supervisor')['pane'])[-1]
     assert 'worker-1 asks to split M0 into 2 pieces' in asked
     approve = {'status': 'RUNNING', 'completion': 10, 'reason': 'split', 'dispatch': [],
                'escalations': [{'task': 'M0', 'decision': 'approve'}]}
@@ -245,7 +246,7 @@ def test_v2_escalate_approve_spawn_and_completion(tree, monkeypatch):
     cf = child_daemon(t, rec)
     for w in cf.workers:
         hook(t, cf, w, 'READY', prompt='startup')
-    role_change = [x for p, x in t.world.sent if p == rec['pane']][-1]
+    role_change = received(t.world, rec['pane'])[-1]
     assert parent_hook(t, 'READY', role_change)['status'] == 'ready'
     step(t)
     goal = cf.task()['goal']

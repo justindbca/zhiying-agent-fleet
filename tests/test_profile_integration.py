@@ -5,7 +5,7 @@ import json
 import pytest
 
 from cmux_fleet import fleet
-from test_fleet import FakeMgr, FakeRedis, decision, fx, last_to, turn, write_rollout, THREADS
+from test_fleet import FakeMgr, FakeRedis, decision, fx, last_to, traffic, turn, write_rollout, THREADS
 from test_pi import callback, operator_input, pfx, pi_turn
 
 
@@ -66,9 +66,9 @@ def test_queue_during_unsafe_boundary_waits_for_ready_or_idle(routed, monkeypatc
     info = f.agent('worker-1')
     assert info['profile_state'] == 'pending' and info['advisory_profile'] == ''
     assert info['desired_profile'] == 'flashnext-coder'
-    sent = list(f.mgr.sent)
+    sent = traffic(f.mgr)
     f.deliver('worker-1')
-    assert f.mgr.sent == sent and f.r.llen('fx:inbox:worker-1') == 1
+    assert traffic(f.mgr) == sent and f.r.llen('fx:inbox:worker-1') == 1
     assert f.agent('worker-1')['state'] == state
     # Simulate the existing completion/READY path reaching an idle boundary.
     f.setf('worker-1', state='idle')
@@ -135,10 +135,10 @@ def test_revalidate_before_delivery_and_before_context_rotation(routed, monkeypa
     f.setf('worker-1', delivered=1)
     write_rollout(f.sessions, THREADS['worker-1'], fleet.agent_cwd(f.cfg, 'worker-1'), used=90000)
     forbid_process_changes(monkeypatch, f)
-    sent = list(f.mgr.sent)
+    sent = traffic(f.mgr)
     f.deliver('worker-1')
     assert f.task()['status'] == 'blocked'
-    assert f.mgr.sent == sent
+    assert traffic(f.mgr) == sent
     assert f.agent('worker-1')['generation'] == '0'
 
 

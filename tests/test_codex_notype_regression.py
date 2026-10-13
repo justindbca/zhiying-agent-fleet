@@ -1178,6 +1178,63 @@ def test_cli_timeout_is_uncertain_held_and_after_clear_its_late_turn_never_settl
     assert_no_input_box(f)
 
 
+
+def test_cli_timeout_then_the_item_runs_releases_the_hold_without_committing_its_result(sup, monkeypatch):
+    """Timeout race: `codex queue` gave no answer (uncertain, slot held) but the item did run. Its token turn
+    proves that and lifts the hold (I3 hold exit); the result is never committed and nothing is dispatched."""
+    f = sup
+    f.q = install_queue(monkeypatch, TimeoutQueue())
+    submit(f)
+    assert cq(f, 'cq_state') == 'uncertain' and f.agent('supervisor')['state'] == 'held'
+    assert lease(f)['status'] == 'uncertain'
+    out = codex_turn(f, plan(['worker-1']), users=[('', f.q.items[-1]['text'])])
+    assert out is not False and out['status'] == 'released' and out.get('execution_stopped') is True, out
+    f.pump()
+    assert cq(f, 'cq_state') == 'bound' and lease(f)['status'] == 'idle'
+    assert typed(f, 'worker-1') == [] and len(f.q.items) == 1  # not committed, not dispatched, never retried
+    assert_no_input_box(f)
+
+
+def test_withdrawal_during_the_cli_call_is_not_revived_by_the_late_cli_answer(sup):
+    """Consumption/cleanup race inside `codex queue`: the TUI took the item and the slot was cleared before the
+    CLI returned. The CLI's late success must not turn 'abandoned' back into 'queued' (compare-and-set); the
+    item's turn settles nothing."""
+    f = sup
+    f.q.hook = lambda item: codex_queue.clear(f, 'supervisor', 'cleared while the CLI ran')
+    submit(f)
+    f.q.hook = None
+    assert cq(f, 'cq_state') == 'abandoned'
+    out = codex_turn(f, plan(['worker-1']))
+    assert out is False or out['status'] in ('ignored', 'stale'), out
+    assert typed(f, 'worker-1') == [] and lease(f)['status'] == 'received'
+    assert_no_input_box(f)
+
+
+@pytest.mark.parametrize('content', ['unknown-schema', 'not-a-database'])
+def test_codex_private_queue_db_is_never_read_or_written(sup, content):
+    """Plan v3 I6: Codex's queue_1.sqlite is not ours. Whatever it holds (another schema after an upgrade, or not
+    a database at all), delivery, settlement, clear and finish work the same and the file is byte-identical."""
+    import sqlite3
+    f = sup
+    path = fleet.codex_home(f.runtime_cfg('supervisor')) / 'queue_1.sqlite'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if content == 'unknown-schema':
+        con = sqlite3.connect(str(path))
+        con.execute('CREATE TABLE queued_items_v2 (uid BLOB PRIMARY KEY, data BLOB)')
+        con.execute("INSERT INTO queued_items_v2 VALUES (x'00', x'ff')")
+        con.commit()
+        con.close()
+    else:
+        path.write_bytes(b'not a sqlite database\x00\xff')
+    before, mtime = path.read_bytes(), path.stat().st_mtime_ns
+    submit(f)
+    assert codex_turn(f, plan(['worker-1']))['status'] == 'committed'
+    f.pump()
+    codex_queue.clear(f, 'supervisor', 'test')
+    f.v2.finish('stopped', 'operator stop')
+    assert path.read_bytes() == before and path.stat().st_mtime_ns == mtime
+    assert_no_input_box(f)
+
 AWKWARD = {
     'hyphen': '- write worker-1/part.md with the findings',
     'double-hyphen': '--help is not an option here; write the file',

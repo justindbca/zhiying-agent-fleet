@@ -10,7 +10,7 @@ import pytest
 
 from cmux_fleet import fleet, pi_adapter, profile_launch
 from cmux_fleet.agent_registry import AgentRegistry
-from test_fleet import fx, turn, decision
+from test_fleet import decision, fx, received, traffic, turn
 from test_profile_integration import dispatch
 from test_pi import pfx
 
@@ -39,7 +39,7 @@ def test_switch_waits_for_new_generation_ready_and_preserves_slot(live):
     dispatch(f)
     assert f.agent('worker-1')['current_profile'] == ''
     queued = f.r.lrange('fx:inbox:worker-1', 0, -1)
-    sent = list(f.mgr.sent)
+    sent = traffic(f.mgr)
     f.deliver('worker-1')
     info = f.agent('worker-1')
     assert info['state'] == 'starting' and info['profile_state'] == 'switching'
@@ -54,7 +54,7 @@ def test_switch_waits_for_new_generation_ready_and_preserves_slot(live):
     f.deliver('worker-1')
     f.handle(turn('worker-1', 'READY', 0))
     assert f.agent('worker-1') == info  # old READY cannot satisfy new startup
-    assert f.mgr.sent == sent and f.r.lrange('fx:inbox:worker-1', 0, -1) == queued
+    assert traffic(f.mgr) == sent and f.r.lrange('fx:inbox:worker-1', 0, -1) == queued
     ready(f)
     assert f.agent('worker-1')['profile_state'] == 'ready'
     assert f.agent('worker-1')['current_profile'] == 'flashnext-coder'
@@ -113,7 +113,7 @@ def test_failure_blocks_and_late_ready_cannot_resurrect(live, monkeypatch, failu
     assert f.task()['status'] == f.agent('worker-1')['profile_state'] == 'blocked'
     assert f.agent('worker-1')['state'] == 'dead'
     assert f.agent('worker-1')['launch_ready'] == '0'
-    assert not f.mgr.sent
+    assert not traffic(f.mgr)
     before = f.agent('worker-1')
     ready(f)
     assert f.agent('worker-1') == before
@@ -158,7 +158,7 @@ def test_ready_revalidates_queue_before_delivery(live, change, monkeypatch):
     else:
         live.r.hset(fleet.TASK, mapping={'id': 'different-task'})
     live.deliver('worker-1')
-    assert live.task()['status'] == 'blocked' and not live.mgr.sent
+    assert live.task()['status'] == 'blocked' and not traffic(live.mgr)
 
 
 def test_registry_model_drift_does_not_claim_applied(live, monkeypatch):
@@ -170,7 +170,7 @@ def test_registry_model_drift_does_not_claim_applied(live, monkeypatch):
     monkeypatch.setattr(fleet, 'AgentRegistry', lambda *args: registry)
     live.deliver('worker-1')
     assert live.task()['status'] == 'blocked'
-    assert 'changed since spawn' in live.task()['reason'] and not live.mgr.sent
+    assert 'changed since spawn' in live.task()['reason'] and not traffic(live.mgr)
 
 
 def test_fifo_switches_to_official_claude_and_reuses_ready_runtime(live, monkeypatch):
@@ -230,7 +230,7 @@ def test_preflight_failure_keeps_old_generation_and_never_falls_back(live, monke
     assert live.task()['status'] == 'blocked'
     assert live.agent('worker-1')['generation'] == before['generation']
     assert live.agent('worker-1')['pane'] == before['pane']
-    assert not live.mgr.killed and not live.mgr.sent
+    assert not live.mgr.killed and not traffic(live.mgr)
 
 
 def test_native_children_defer_switch(live, monkeypatch):
@@ -355,7 +355,7 @@ def test_codex_profile_switch_and_actor_override(live, monkeypatch):
     ready(live)
     live.deliver('worker-1')
     assert live.agent('worker-1')['profile_state'] == 'applied-live'
-    assert '.inbox/' not in live.mgr.sent[-1][1]  # correct per-slot Codex delivery adapter
+    assert '.inbox/' not in received(live.mgr, live.agent('worker-1')['pane'])[-1]  # correct per-slot Codex delivery adapter
 
 
 def test_created_surface_is_cleaned_when_command_delivery_fails(live, monkeypatch):

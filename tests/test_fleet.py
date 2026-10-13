@@ -83,6 +83,7 @@ class FakeRedis:
 class FakeMgr:
     def __init__(self):
         self.n, self.sent, self.killed, self.alive, self.keys = 0, [], [], set(), []
+        self.queued = []  # queued Codex deliveries (conftest); `sent` = real pastes only
 
     def spawn_interactive_cli(self, **kw):
         self.spawned = getattr(self, 'spawned', []) + [kw]
@@ -213,9 +214,21 @@ def decision(status='RUNNING', completion=30, dispatch=None, **extra):
     return json.dumps(dict(status=status, completion=completion, reason='r', dispatch=dispatch, **extra))
 
 
+def received(mgr, pane):
+    """What reached `pane`: its queued Codex deliveries (conftest), otherwise its real pastes. Never both:
+    the conftest guard fails a test in which a Codex pane also got a paste."""
+    box = mgr if hasattr(mgr, 'sent') else mgr.w
+    return [t for p, t in getattr(box, 'queued', []) if p == pane] or [t for p, t in box.sent if p == pane]
+
+
+def traffic(mgr):
+    """Everything that reached any pane: real pastes and queued Codex deliveries (for "nothing reached" checks)."""
+    box = mgr if hasattr(mgr, 'sent') else mgr.w
+    return list(box.sent) + list(getattr(box, 'queued', []))
+
+
 def last_to(f, name):
-    pane = f.agent(name)['pane']
-    return [t for p, t in f.mgr.sent if p == pane][-1]
+    return received(f.mgr, f.agent(name)['pane'])[-1]
 
 
 def seasoned(f, name):
@@ -798,7 +811,7 @@ def claude_turn(f, name, text):
 
 def sup_traffic(f):
     sup = f.agent('supervisor')['pane']
-    seen = [txt for p_, txt in f.mgr.sent if p_ == sup] + f.r.l.get('fx:inbox:supervisor', [])
+    seen = received(f.mgr, sup) + f.r.l.get('fx:inbox:supervisor', [])
     return ''.join(seen)
 
 

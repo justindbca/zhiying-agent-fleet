@@ -10,6 +10,8 @@ import threading
 import time
 import uuid
 
+import test_fleet
+
 import pytest
 
 from test_fleet import FakeMgr, codex_rows, write_rollout
@@ -138,8 +140,8 @@ def drive(f, fn):
 
 
 def typed(f, slot):
-    pane = f.agent(slot)['pane']
-    return [text for p, text in f.mgr.sent if p == pane]
+    """What reached the slot: queued for a Codex pane, pasted for a Claude pane (test_fleet.received)."""
+    return test_fleet.received(f.mgr, f.agent(slot)['pane'])
 
 
 def answer_turn(f, slot, text, *, startup=False, prompt=None, generation=None):

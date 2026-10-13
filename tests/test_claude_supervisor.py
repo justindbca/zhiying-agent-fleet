@@ -16,7 +16,7 @@ import uuid
 import pytest
 import yaml
 
-from test_fleet import FakeMgr
+from test_fleet import FakeMgr, traffic
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
 from cmux_fleet import cli_pairs, cmux_manager, fleet, pi_adapter, runtime_v2
 
@@ -342,7 +342,7 @@ def test_service_result_card_rendered_off_model_never_typed(service_fleet):
     assert stop_hook(f, 'supervisor', route)['status'] == 'committed'
     f.pump()
     env = f.v2.bus.receive('worker-1', 'bridge-worker-1-g0', generation=0, session_id=f.agent('worker-1')['thread'])
-    sent = len(f.mgr.sent)
+    sent = len(traffic(f.mgr))
     event(f, dict(pi_session(f, 'worker-1'), kind='settled', delivery=env, failed=False, aborted=False,
                   unfinished=False, candidates=[{'tool': 'fleet_result', 'value': {'reply': 'OK'}}]))
     assert json.loads(f.r.get(fleet.RESULT + 'r1'))['result'] == {'reply': 'OK'}
@@ -350,7 +350,7 @@ def test_service_result_card_rendered_off_model_never_typed(service_fleet):
     assert 'worker-1：OK' in (f.run_dir / 'cards' / 'supervisor.log').read_text()
     assert 'worker-1：OK' in (f.run_dir / 'history.html').read_text()   # history page "Cards" view
     assert not (f.run_dir / 'cards' / 'worker-1.log').exists()          # Pi shows its own cards
-    assert len(f.mgr.sent) == sent and not f.v2.depth('supervisor')     # never typed into Claude or queued
+    assert len(traffic(f.mgr)) == sent and not f.v2.depth('supervisor')     # never typed into Claude or queued
     assert not any('worker-1：OK' in text for text in typed(f, 'supervisor'))
 
 
