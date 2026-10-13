@@ -907,7 +907,7 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
             if rec['cq_delivery'] != delivery:
                 why.append('queued delivery is ' + (rec['cq_delivery'] or 'none') + ', not ' + delivery)
                 return False
-            ok, reason = codex_queue.bound(rec, thread, turn, sessions_dir(cfg))
+            ok, reason = codex_queue.bound(rec, thread, turn, sessions_dir(cfg), generation)
             if not ok:
                 why.append(reason)
                 return False
@@ -2095,7 +2095,8 @@ class Fleet:
             # A queued delivery settles only on the turn the rollout binds to it (a manual or repeated turn does not).
             rec = codex_queue.record(self.agent(name))
             if rec['cq_delivery'] and rec['cq_state'] not in ('', 'abandoned'):
-                ok, why = codex_queue.bound(rec, ev.get('thread') or '', ev.get('turn') or '', self.sessions)
+                ok, why = codex_queue.bound(rec, ev.get('thread') or '', ev.get('turn') or '', self.sessions,
+                                           ev.get('generation'))
                 if not ok or rec['cq_turn'] == (ev.get('turn') or ''):
                     self.log('turn.unbound', agent=name, delivery=rec['cq_delivery'], turn=ev.get('turn'),
                              reason=why or 'turn already settled')

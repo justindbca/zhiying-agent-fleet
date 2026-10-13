@@ -22,7 +22,8 @@ import subprocess
 import time
 import uuid
 
-FIELDS = ('cq_delivery', 'cq_token', 'cq_text', 'cq_thread', 'cq_queued_at', 'cq_state', 'cq_queued_id', 'cq_turn')
+FIELDS = ('cq_delivery', 'cq_token', 'cq_text', 'cq_thread', 'cq_generation', 'cq_queued_at', 'cq_state', 'cq_queued_id',
+          'cq_turn')
 # States: queuing -> queued (CLI confirmed) | failed (CLI said no) | uncertain (no answer) ; -> bound (turn proven);
 # abandoned (cleared on resume / rotation / retire / finish: a later turn carrying its token never settles).
 QUEUED = re.compile(r'Queued message (\S+) for thread (\S+?)\.?\s*$', re.M)
@@ -126,12 +127,16 @@ def record(info):
     return {k: info.get(k, '') for k in FIELDS}
 
 
-def bound(rec, thread, turn, sessions):
-    """(True, '') only if the rollout proves `turn` was started by the delivery in `rec`."""
+def bound(rec, thread, turn, sessions, generation=None):
+    """(True, '') only if the rollout proves `turn` was started by the delivery in `rec`: same thread,
+    same generation (when the caller knows it), a queue-triggered turn whose only input is this token's text."""
     if not rec.get('cq_delivery') or not rec.get('cq_token') or rec.get('cq_state') in ('', 'abandoned'):
         return False, 'no live queued delivery (state ' + (rec.get('cq_state') or 'none') + ')'
     if thread != rec.get('cq_thread'):
         return False, 'turn belongs to another thread'
+    if generation is not None and str(generation) != rec.get('cq_generation'):
+        return False, ('delivery was queued for generation ' + (rec.get('cq_generation') or 'none')
+                       + ', not ' + str(generation))
     if rec.get('cq_turn') and rec['cq_turn'] != turn:
         return False, 'delivery already bound to turn ' + rec['cq_turn']
     if not turn:
@@ -172,7 +177,8 @@ def deliver(f, slot, delivery, text, thread=None):
     token = new_token()
     queued = marked(text, token)
     r.hset(fleet.key('agent', slot), mapping={'cq_delivery': delivery, 'cq_token': token, 'cq_text': queued,
-                                              'cq_thread': thread, 'cq_queued_at': str(int(time.time() * 1000)),
+                                              'cq_thread': thread, 'cq_generation': str(info.get('generation', '')),
+                                              'cq_queued_at': str(int(time.time() * 1000)),
                                               'cq_state': 'queuing', 'cq_queued_id': '', 'cq_turn': ''})
     try:
         got = enqueue(f.runtime_cfg(slot), slot, thread, queued)

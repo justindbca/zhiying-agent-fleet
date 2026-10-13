@@ -762,7 +762,7 @@ def test_abandoned_is_not_cancelled_the_item_still_runs_and_never_settles(sup):
     submit(f)
     text = last(f)[1]
     other = {'cq_delivery': 'other-d', 'cq_token': codex_queue.new_token(), 'cq_text': 'x', 'cq_thread': str(uuid.uuid4()),
-             'cq_queued_at': '1', 'cq_state': 'queued', 'cq_queued_id': 'q', 'cq_turn': ''}
+             'cq_generation': '0', 'cq_queued_at': '1', 'cq_state': 'queued', 'cq_queued_id': 'q', 'cq_turn': ''}
     f.r.hset(fleet.key('agent', 'codex-b'), mapping=other)  # another slot's live delivery
     rec = codex_queue.clear(f, 'supervisor', 'test abandon')
     assert rec['cq_text'] == text and cq(f, 'cq_state') == 'abandoned'
@@ -1238,3 +1238,58 @@ def test_awkward_body_delivery_binds_its_own_exact_text_only(sup, kind):
     if variants['normalised'] != variants['exact']:
         assert codex_queue.bound(rec, thread, 'T-normalised', f.test_sessions)[0] is False
     assert_no_input_box(f)
+
+
+# ================================================================ K. generation binding (worker-1, moved verbatim from
+# tests/test_codex_generation_binding.py d975d35e): a queued delivery settles only on a turn of the generation it was
+# queued for; the record carries cq_thread, cq_generation and cq_token before `codex queue` runs.
+def test_record_is_durable_before_the_cli_and_names_the_generation_and_token(sup, monkeypatch):
+    f = sup
+    seen = {}
+    real = codex_queue.enqueue
+
+    def spy(cfg, name, thread, text, **kw):
+        seen.update(codex_queue.record(f.r.hgetall(fleet.key('agent', name))))  # what Redis holds while the CLI runs
+        return real(cfg, name, thread, text, **kw)
+    monkeypatch.setattr(codex_queue, 'enqueue', spy)
+    submit(f)
+    gen = f.agent('supervisor')['generation']
+    assert seen['cq_state'] == 'queuing' and seen['cq_generation'] == str(gen) and seen['cq_token'].startswith('fx-')
+    assert seen['cq_thread'] == f.agent('supervisor')['thread']
+    assert last(f)[1] == seen['cq_text'] and seen['cq_text'].endswith('(fleet delivery ' + seen['cq_token'] + ')')
+    out = codex_turn(f, plan(['worker-1']))
+    assert out['status'] == 'committed', out
+    assert cq(f, 'cq_state') == 'bound' and cq(f, 'cq_generation') == str(gen)
+    assert_no_input_box(f)
+
+
+def test_a_record_from_another_generation_never_settles_even_with_its_exact_token(sup):
+    f = sup
+    submit(f)
+    gen = int(f.agent('supervisor')['generation'])
+    f.r.hset(fleet.key('agent', 'supervisor'), 'cq_generation', str(gen + 1))  # queued for another runtime
+    out = codex_turn(f, plan(['worker-1']))  # the exact token, thread and a queue-triggered turn
+    assert out is False or out['status'] in ('ignored', 'stale'), out
+    assert cq(f, 'cq_state') != 'bound' and lease(f)['status'] == 'received'
+    assert typed(f, 'worker-1') == []
+    assert_no_input_box(f)
+
+
+def test_bound_checks_thread_generation_token_and_turn(tmp_path, monkeypatch):
+    thread, turn = str(uuid.uuid4()), str(uuid.uuid4())
+    token = codex_queue.new_token()
+    rec = {'cq_delivery': 'd-1', 'cq_token': token, 'cq_text': codex_queue.marked('do it', token), 'cq_thread': thread,
+           'cq_generation': '3', 'cq_queued_at': '1', 'cq_state': 'queued', 'cq_queued_id': 'q', 'cq_turn': ''}
+    facts = {'trigger': 'queue', 'users': [{'text': rec['cq_text']}]}
+    monkeypatch.setattr(codex_queue, 'turn_record', lambda th, tu, s: facts if (th, tu) == (thread, turn) else None)
+    assert codex_queue.bound(rec, thread, turn, tmp_path, 3) == (True, '')
+    assert codex_queue.bound(rec, thread, turn, tmp_path, '3') == (True, '')
+    assert not codex_queue.bound(rec, thread, turn, tmp_path, 4)[0]
+    assert not codex_queue.bound(dict(rec, cq_generation=''), thread, turn, tmp_path, 3)[0]  # unknown: fail closed
+    assert not codex_queue.bound(rec, str(uuid.uuid4()), turn, tmp_path, 3)[0]
+    assert not codex_queue.bound(rec, thread, str(uuid.uuid4()), tmp_path, 3)[0]
+    assert not codex_queue.bound(dict(rec, cq_turn='other'), thread, turn, tmp_path, 3)[0]
+    other = codex_queue.new_token()
+    assert not codex_queue.bound(dict(rec, cq_token=other), thread, turn, tmp_path, 3)[0]
+    facts['users'] = [{'text': 'do it'}]  # same body without this delivery's token
+    assert not codex_queue.bound(rec, thread, turn, tmp_path, 3)[0]
