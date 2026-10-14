@@ -1738,10 +1738,11 @@ class Fleet:
     advisor_online = advisor_enabled  # the earlier name of the switch
 
     def advisor_resident(self):
-        """Consultations go to the resident advisor tab: transport v2, task mode, a main fleet. Otherwise
-        (v1, service mode, a sub-fleet, or a test that injects advisor_runner) the one-shot `claude -p`
-        runner answers them at once, as before."""
-        return bool(self.v2) and not self.service and not self.cfg.get('adopt') and self.advisor_runner is None
+        """Consultations go to the resident advisor tab: transport v2, a main fleet (task or service mode,
+        10-14 Studio ops fleet). Otherwise (v1, a sub-fleet, or a test that injects advisor_runner) the
+        one-shot `claude -p` runner answers them at once, as before."""
+        return (bool(self.v2) and not self.cfg.get('adopt') and not self.cfg.get('parent_config')
+                and self.advisor_runner is None)
 
     def advisor_ready(self):
         if not self.advisor_enabled():

@@ -19,7 +19,7 @@ SHEET = {'model': 'opus', 'effort': 'high', 'domains': ['research_web'],
 SECRET_REPORT = 'Done:\n- notes WORKER-SECRET-TEXT\nEvidence:\n- worker-1/notes.md\nNot done: none\nBlocked: none'
 
 
-def resident(r, tmp_path, monkeypatch, workers, on=True, **extra):
+def resident(r, tmp_path, monkeypatch, workers, on=True, mode='task', **extra):
     from test_v2_codex_claude import answer_turn
     r.flushdb()
     kit = make_kit(tmp_path / 'kit')
@@ -27,7 +27,7 @@ def resident(r, tmp_path, monkeypatch, workers, on=True, **extra):
     (run / 'workspace').mkdir(parents=True)
     sessions = tmp_path / 'codex-home' / 'sessions'
     cfg = dict(run=str(run), redis_socket=r.connection_pool.connection_kwargs['path'], python=sys.executable,
-               workers=list(workers), mode='task', supervisor_cli='codex', worker_cli='claude',
+               workers=list(workers), mode=mode, supervisor_cli='codex', worker_cli='claude',
                codex_home=str(tmp_path / 'codex-home'), transport_version=2, allow_development_v2=True,
                stall_timeout=0, v2_lease_ms=300000, max_busy=0, worker_kit=str(kit),
                claude='/bin/claude', token='feedbeef', **extra)
@@ -423,11 +423,11 @@ def test_rescue_consult_goes_through_the_advisor_tab(res):
     assert any('[advisor] give_up M0' in t for t in typed(f, 'supervisor'))
 
 
-def test_service_mode_and_one_shot_runs_have_no_advisor_tab(res):
+def test_one_shot_runs_have_no_advisor_tab(res):
     f = res
     assert f.advisor_resident()
     f.service = True
-    assert not f.advisor_resident()
+    assert f.advisor_resident()  # a service main fleet has the tab too (tests/test_advisor_resident_service.py)
     f.service = False
     f.advisor_runner = lambda payload: {}
     assert not f.advisor_resident()  # an injected one-shot runner answers synchronously instead
