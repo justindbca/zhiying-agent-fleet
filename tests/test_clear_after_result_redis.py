@@ -227,14 +227,16 @@ def test_prepared_rebind_replays_atomically_once(clearing, monkeypatch):
     with pytest.raises(RuntimeError, match='injected'):
         cleared(f)
     assert f.agent(SLOT)['thread'] == f.r.hget(f.v2.bus.lease_key(SLOT), 'session_id') == old
+    assert f.r.xpending(f.v2.events, f.v2.group)['pending'] == 1
     monkeypatch.setattr(f.v2, 'apply', apply)
     assert f.v2.replay_intents()
+    assert f.r.xpending(f.v2.events, f.v2.group)['pending'] == 0
     new = f.agent(SLOT)['thread']
     assert new != old and f.r.hget(f.v2.bus.lease_key(SLOT), 'session_id') == new
     assert int(f.r.hget(f.v2.bus.lease_key(SLOT), 'fence')) == fence + 1
     assert f.v2.replay_intents()
     assert int(f.r.hget(f.v2.bus.lease_key(SLOT), 'fence')) == fence + 1
-    assert f.v2.step(10)  # duplicate event ACK, no second effect
+    assert not f.v2.step(10)  # replay already ACKed the original event; no duplicate was posted
 
 
 def test_rebind_apply_rechecks_pel_before_any_write(clearing, monkeypatch):
