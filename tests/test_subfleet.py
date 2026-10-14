@@ -1150,8 +1150,8 @@ def typed_return(t):
     ``typed_fallback`` parameter does). The §29 / §3.1 promise "the delegated session itself comes back
     as the worker" holds only there: on the hook channel (the default since the no-typing batch) a
     returned Claude worker is never typed into, it is retired and its next generation starts (R1-01;
-    covered by the ``*_on_the_hook_channel_*`` tests). Which of the two a named sub-fleet should get is an
-    open design decision (trial merge report, 2026-10-14)."""
+    covered by the ``*_on_the_hook_channel_*`` tests). The user chose the hook-channel behaviour for named
+    sub-fleets on 2026-10-14 (design §29: return = retire the session, next generation in the parent slot)."""
     f = t.f
     f.cfg['claude_hook_delivery'] = False
     fleet.save(f.path, dict(fleet.load(f.path), claude_hook_delivery=False))
