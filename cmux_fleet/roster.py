@@ -16,6 +16,9 @@
     advisor: off              # optional, default off: on = consult the advisor before every dispatch
     subfleets:                # optional named sub-fleets (docs/design.md §29); worker ``exit`` supervises one
       - {name: ops, supervisor_slot: exit, supervisor_role: roles/ops-sup.md, roster: ops.yaml, autostart: false}
+    tabs:                     # optional companion tabs (docs/design.md §31): terminal programs (no agents)
+      - {name: shell, command: python3 -m http.server 8895, cwd: ., env: {PORT: '8895'}}
+                              # opened with this fleet, as tabs after control
 
 The daemon re-reads the file while running (hot add / graceful remove; advisor on / off without
 a restart, also via `fleet advisor on|off` or the supervisor's decision key). A file with any
@@ -49,10 +52,10 @@ def parse_entries(raw, base):
     except yaml.YAMLError as exc:
         raise ValueError('invalid YAML: ' + ' '.join(str(exc).split())) from exc
     if (not isinstance(data, dict) or 'workers' not in data
-            or not set(data) <= {'workers', 'limits', 'handoff', 'advisor', 'subfleets'}
+            or not set(data) <= {'workers', 'limits', 'handoff', 'advisor', 'subfleets', 'tabs'}
             or not isinstance(data['workers'], list)):
         raise ValueError('the roster must be a mapping with only a "workers" list '
-                         '(and optional "limits", "handoff", "advisor", "subfleets")')
+                         '(and optional "limits", "handoff", "advisor", "subfleets", "tabs")')
     parse_limits(data.get('limits'))
     advisor_value(data)
     if not data['workers']:
@@ -87,6 +90,7 @@ def parse_entries(raw, base):
                 continue
             roles[name] = str(path.resolve())
     errors += subfleet_errors(data.get('subfleets'), base, workers)
+    errors += tab_entries(data.get('tabs'), base)[1]
     if errors:
         raise ValueError('\n'.join(errors))
     return workers, roles, profiles
@@ -371,3 +375,54 @@ def subfleets(raw, base):
 def load_subfleets(path):
     path = Path(path).expanduser().resolve()
     return subfleets(path.read_bytes(), path.parent)
+
+
+# ------------------------------------------------------------------ companion tabs (docs/design.md §31)
+TAB_KEYS = {'name', 'command', 'cwd', 'env'}
+TAB_NAME_RE = r'[a-z][a-z0-9-]*'
+ENV_NAME_RE = r'[A-Za-z_][A-Za-z0-9_]*'
+
+
+def tab_entries(value, base):
+    """(entries, errors) of the optional ``tabs:`` list: each entry {name, command, cwd (absolute), env}.
+    ``cwd`` is relative to the roster's directory (``~`` expanded), default that directory, and must exist
+    (the tab runs ``cd <cwd> && exec ...``)."""
+    if value is None:
+        return [], []
+    if not isinstance(value, list):
+        return [], ['tabs must be a list of mappings']
+    entries, errors, names = [], [], set()
+    for i, item in enumerate(value):
+        where = 'tabs[' + str(i) + ']'
+        if not isinstance(item, dict) or not set(item) <= TAB_KEYS:
+            errors.append(where + ': must be a mapping with keys ' + ', '.join(sorted(TAB_KEYS)) + ' only')
+            continue
+        name = item.get('name')
+        if not isinstance(name, str) or not re.fullmatch(TAB_NAME_RE, name):
+            errors.append(where + ': name must match ' + TAB_NAME_RE)
+            continue
+        where += ' (' + name + ')'
+        bad = ['duplicate tab name'] if name in names else []
+        names.add(name)
+        command = item.get('command')
+        if not isinstance(command, str) or not command.strip():
+            bad.append('command must be a non-empty string')
+        cwd = item.get('cwd', '.')
+        path = (Path(base) / Path(cwd).expanduser()) if isinstance(cwd, str) and cwd.strip() else None
+        if path is None or not path.is_dir():
+            bad.append('cwd directory not found: ' + str(cwd))
+        env = item.get('env') or {}
+        if not isinstance(env, dict) or not all(isinstance(k, str) and re.fullmatch(ENV_NAME_RE, k)
+                                                and isinstance(v, str) for k, v in env.items()):
+            bad.append('env must map variable names to strings (quote numbers: PORT: "8895")')
+        if bad:
+            errors += [where + ': ' + b for b in bad]
+        else:
+            entries.append({'name': name, 'command': command, 'cwd': str(path.resolve()), 'env': dict(env)})
+    return entries, errors
+
+
+def tabs(raw, base):
+    """Validated ``tabs:`` entries of an already validated roster (empty list without the section)."""
+    import yaml
+    return tab_entries(yaml.safe_load(raw).get('tabs'), base)[0]

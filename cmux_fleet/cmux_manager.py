@@ -416,13 +416,37 @@ class CmuxSessionManager:
         sid, ran = self._new_surface(control=control, command=full)
         if not sid:
             return SpawnResult(success=False, error='cmux surface creation failed (' + self._spawn_error() + ')')
-        self._tag(sid, type=(metadata or {}).get('type', ''), label=window_name)
+        self._tag(sid, **dict({k: v for k, v in (metadata or {}).items() if isinstance(v, str)},
+                              type=(metadata or {}).get('type', ''), label=window_name))
         if not _wait_until(lambda: self._where(sid)):
             return SpawnResult(success=False, pane_id=sid, error='cmux surface did not become visible')
         if not ran and not self._type_command(sid, full):
             return SpawnResult(success=False, error='cmux command delivery failed')
         self.rename(sid, window_name)
         return SpawnResult(success=True, pane_id=sid, window_name=window_name)
+
+    # -- companion tabs (roster ``tabs:``, docs/design.md §31) -------------------
+    def tab_panes(self) -> Dict[str, str]:
+        """{surface id: tab name} of the companion tabs this registry owns that cmux still shows."""
+        return {sid: info['tab'] for sid, info in self._meta()['surfaces'].items()
+                if info.get('type') == 'tab' and info.get('tab') and self._where(sid)}
+
+    def dock_tab(self, sid: str, history_surface: str, after: Optional[str] = None) -> bool:
+        """Move a companion tab into the history / control pane: right after ``after`` (the tab opened before it)
+        when that is there, else after the control tab, else after history. ``--focus false``."""
+        ws = self._where(history_surface)
+        if not ws or self._where(sid) != ws:
+            return False
+        live = self._surfaces(ws)
+        pane = live[history_surface]['pane_id']
+        controls = [s for s, info in self._meta()['surfaces'].items()
+                    if info.get('type') == 'daemon' and live.get(s, {}).get('pane_id') == pane]
+        anchor = after if after and live.get(after, {}).get('pane_id') == pane else (
+            controls[0] if controls else history_surface)
+        if _run('move-surface', '--workspace', ws, '--surface', sid, '--pane', pane, '--after', anchor,
+                '--focus', 'false').returncode:
+            return False
+        return _wait_until(lambda: self._surfaces(ws).get(sid, {}).get('pane_id') == pane)
 
     def spawn_interactive_cli(self, window_name: str, cli_command: str, prompt_file: Optional[str] = None,
                               output_file: Optional[str] = None, metadata: Optional[Dict[str, str]] = None,

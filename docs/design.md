@@ -719,3 +719,16 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - **已知边界**：kit 升级不会进在跑或续跑的 run（要新版就新起 run）；副本与 kit 的差异只能拿 `roster_md5` 对 kit 版本的名单，子名单 / 角色文件不记哈希。
 
 **验证**：`tests/test_kit_fleet.py`（只读 kit 新起复制 + 副本可写 + 与 `--roster <副本>` 的 config 一致；子名单相对路径在副本里解析；缺 kit / 缺 `fleets/NAME` / 名字非法 / 与 `--roster`、`--workers`、`--worker-names` 同给 → provisioning 前拒；改副本、删 kit 后 `--resume` 不重复制、热改保留；`Kit` 接受 `fleets/`）。**未做**：真机 cmux 起一次、独立复核、合进在役分支、部署。
+
+## 31. 附带标签：名单 `tabs:`（2026-10-15 用户新要求，最小版）
+
+用户定：Studio 上 EverMemOS 抽记忆的 HTTP 外壳（`evermem_fleet_shell.py`，:8895，转给 memx 子 fleet）原来手工跑在单独的 cmux 工作区；改成由 kit 名单声明、作为 memx 子 fleet 工作区里 control 后面的一个标签开出来，不在代码里写死。只加名单一个顶层键；不写 `tabs:` 本节不生效。
+
+- **声明**（`roster.py`）：顶层 `tabs:` 列表，每项 `{name, command, cwd?, env?}`。`name` 匹配 `^[a-z][a-z0-9-]*$`、名单内唯一；`command` 非空字符串；`cwd` 相对名单目录（`~` 展开），缺省名单目录，须是已存在的目录；`env` 变量名 → 字符串（`8895` 要加引号）；其它键或任一项不合法 → 整份拒收（§16 `roster.rejected`）。谁加载这份名单（主 fleet 或具名子 fleet），标签就开在谁的工作区。
+- **何时开**（`tabs.open_all`，`Fleet.tick` 的 `tabs` 段）：每次起该 fleet 的 daemon（`start`、`start --resume`、具名子 fleet 被父 fleet revive 的 `daemon --resume`）后，名单第一次被接受的那一拍开一次；之后不再管：**daemon 活着时标签被关 / 程序退出不会自动重开**，等下次起 fleet；热改 `tabs:` 也要等下次起 fleet 才生效。
+- **开之前先清同一程序**：先关掉本登记里上一个 daemon 留下、cmux 还显示的标签；再对每个标签用 `ps -axww -o pid=,command=` 找命令行与它精确相等的进程，全部 SIGTERM，最多等 5 s，还在就 SIGKILL（再等 2 s），确认都没了才开；`ps` 失败或杀不掉 → 不开，记 `tab.start_failed`。**匹配规则**：标签 argv = `shlex.split(command)`；进程的 `ps` 命令行必须等于 argv 用空格连起来，唯一放宽是第一个词还可以是 argv[0] 经 `which` 后的路径或其 `realpath`，或（macOS 框架 Python）同一个 `Python.framework/Versions/X.Y` 下的 `Resources/Python.app/Contents/MacOS/Python`（框架 Python 会 re-exec 成它，`ps` 里 argv[0] 被改写）；其余每个词逐字相同。参数多一个、少一个、换解释器都不算。所以 `command` 要写成一个直接 exec 的程序（不用管道 / `&&`）；`env` 不参与匹配。
+- **位置与归属**：`spawn_window` 跑 `cd <cwd> && exec [env K=V …] <command>`（程序就是 surface 里的进程，命令行与名单一致），开在本 fleet 工作区，再 `move-surface --after` 挪进 history / control 所在 pane：排在上一个标签后，否则 control 后，否则 history 后；`--focus false`，标题 = `name`。surface 登记为本 fleet 所有（`type: tab`、`tab: <name>`），所以 lifecycle close / 子 fleet 收回的 `close_all` 一并关；显式 `stop` 收尾也 `tabs.stop_all` 关掉、计入「全部停稳」。不是 agent：不进 worker 名单、不投递、不进提示词、不算配额。
+- **审计**：`tab.cleared`（杀了哪些 pid）/ `tab.started` / `tab.start_failed` / `tab.dock_failed` / `tab.stopped`。
+- **安全**：标签程序以 fleet 用户身份运行，**名单即授权**——能改名单（kit 或 run 副本）的人就能让 fleet 跑任意命令、杀掉同命令行的进程。
+
+**验证**：`tests/test_roster_tabs.py`（名单解析与坏值拒收；匹配规则含框架 Python 存根；真进程：SIGTERM 清掉、忽略 SIGTERM 的被 SIGKILL、同程序不同参数不碰；只开一次、按序挂在 control 后、先关旧标签；清不掉不开；stop 关标签；`dock_tab` / `spawn_window` 登记）。**未做**：全套测试、真机 cmux、复核、合进在役分支、部署。

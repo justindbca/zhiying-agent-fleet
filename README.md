@@ -216,6 +216,7 @@ whole directory is copied to `<run>/fleet-config/` and the run follows that copy
   when the first dispatch's sheet arrives. Turned off: workers still waiting for a sheet start with the
   defaults; running workers keep their generation. Logged as `advisor.on` / `advisor.off` (`who`), and the
   control `STATE` line shows `adv=on|off`.
+- **Companion tabs** (docs/design.md §31): optional top-level `tabs: [{name, command, cwd?, env?}]` (name `^[a-z][a-z0-9-]*$`, unique; cwd relative to the roster, `~` ok; env strings) - terminal programs (not agents) opened as tabs after the control tab of the loading fleet's workspace, `--focus false`. On every fleet start (`start`, `--resume`, a sub-fleet's `daemon --resume`) each running process whose command line exactly equals the tab's program is SIGTERMed (SIGKILL after ~5 s) before the tab opens; matching rule in §31. Closed by `stop` / `close_all`; a tab closed while the daemon runs is not reopened until the next start. Programs run as the fleet's user: the roster is the authorization.
 - Needs PyYAML in the Python that runs the daemon.
 
 ## Handoff window and ratio per model

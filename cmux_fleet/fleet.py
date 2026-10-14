@@ -50,7 +50,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import advisor, brake, claude_hook, cli_pairs, codex_queue, contracts, handoff, history, kit as kitmod, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, named_subfleet, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, watchdog  # noqa: E402
+from cmux_fleet import advisor, brake, claude_hook, cli_pairs, codex_queue, contracts, handoff, history, kit as kitmod, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, named_subfleet, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, tabs, watchdog  # noqa: E402
 from cmux_fleet import clear_after_result
 from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
@@ -1698,6 +1698,7 @@ class Fleet:
         self.roster_stamp = self.roster_digest = None
         self.handoff_table, self.worker_handoff = {}, {}  # roster `handoff:` / per-worker overrides (§22)
         self.roster_followed = None  # day or night roster file (night.json picks it)
+        self.tab_specs, self.tabs_opened = None, False  # roster `tabs:` (§31): opened once per daemon start
         self.service = self.cfg.get('mode') == 'service'
         self.stopping = False
         self.next_liveness = 0
@@ -5045,6 +5046,7 @@ class Fleet:
             self.names = self.slot_names()
         # §29: a hot-added supervisor_slot must be known before it spawns (tmux slot + no advisor hold read
         # cfg['subfleets']); written after the adds, it started as a plain held tab and its sub-fleet waited (10-14).
+        self.tab_specs = roster.tabs(raw, Path(path).parent)  # opened once by tabs.open_all (§31)
         subs_changed = subfleets != (self.cfg.get('subfleets') or [])
         if subs_changed:
             self.cfg['subfleets'] = subfleets
@@ -5666,6 +5668,7 @@ class Fleet:
                           ('lifecycle', lambda: lifecycle_close.tick(self)),  # mode policy (done gate, hold, timeouts, idle); before result.json
                           ('result', self.write_result), ('contracts', self.sync_contract_files),
                           ('subfleet', lambda: subfleet.tick(self)),  # side effects, outside any v2 transaction
+                          ('tabs', lambda: tabs.open_all(self)),  # companion tabs (§31): once per daemon start
                           ('escalations', self.escalation_tick), ('notices', self.relay_notices),
                           ('vetoes', self.apply_vetoes)):
             try:

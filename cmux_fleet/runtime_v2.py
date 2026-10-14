@@ -16,7 +16,7 @@ from pathlib import Path
 
 import redis
 
-from cmux_fleet import advisor, claude_hook, clear_after_result, cli_pairs, contracts
+from cmux_fleet import advisor, claude_hook, clear_after_result, cli_pairs, contracts, tabs
 from cmux_fleet.message_bus import BusError, MessageBus, LUA_REBIND_CHECK, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
 from cmux_fleet import codex_queue, lifecycle_close, named_subfleet, subfleet, tui_cards
@@ -2075,6 +2075,7 @@ class RuntimeV2:
             if self.f.explicit_stop:
                 children_stopped = subfleet.stop_children(self.f)  # descendants first, panes taken back
                 all_stopped = all([self.retire(slot, 'explicit fleet stop') for slot in self.f.names]) and children_stopped
+                all_stopped = tabs.stop_all(self.f) and all_stopped  # companion tabs close with the fleet (§31)
                 if all_stopped:
                     self.bus.r.set(marker, 'stopped')
                     # An explicit stop finishes the run: start --resume refuses it, auto starts anew.
