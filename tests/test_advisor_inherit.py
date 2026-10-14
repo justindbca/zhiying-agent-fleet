@@ -181,7 +181,9 @@ def test_v1_never_advised_slot_hands_off_plain_while_online(cfx, roster_card):
     before = record(f)
     assert f.set_advisor(True, 'user') is None and f.advisor_online()
     assert record(f) == before
-    if not roster_card:  # (a profile-card slot takes no plain dispatch in this fixture: handoff alone)
+    # roster_card: handoff alone. A dispatch here is blocked by the pre-existing extras drift check (frozen
+    # card launch has no extras, the same-fingerprint sheet's advice_launch carries effort) -- not this fix.
+    if not roster_card:
         send_decision(f, [item()])  # advised: sheet = the slot's own runtime, no domains -> effect none
         f.pump()
         assert f.r.hgetall(fleet.ADVICE + f.agent('worker-1')['advice_ticket'])['effect'] == 'none'
