@@ -1565,6 +1565,8 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
             argv += ['--effort', cfg['worker_effort']]
     if hooked:
         argv += ['--append-system-prompt', claude_hook.DECLARATION]
+    elif name != 'supervisor':  # typed / pasted delivery: the same promise for the pasted text
+        argv += ['--append-system-prompt', claude_hook.TYPED_DECLARATION]
     if (cwd / 'mcp.json').exists():
         argv += ['--mcp-config', str(cwd / 'mcp.json')]
     return argv + ['--', prompt]  # --add-dir / --mcp-config are variadic: end options first
