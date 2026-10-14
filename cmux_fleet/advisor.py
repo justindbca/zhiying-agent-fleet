@@ -7,6 +7,7 @@ respawn path or a domain hot-load. The advisor only ever sees what the superviso
 (goal / instruction / advise_note), never a worker conversation.
 """
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -81,8 +82,9 @@ def run_claude(payload, *, cfg, run_dir, timeout=TIMEOUT):
         prompt.write_text(PROMPT.read_text())
     cwd = run_dir / 'advisor'
     cwd.mkdir(parents=True, exist_ok=True)
+    # Never self-update (fleet.CLAUDE_ENV; 2026-10-14 01:36 an isolated config's auto-update broke the install).
     done = subprocess.run(argv(cfg, run_dir), input=json.dumps(payload, ensure_ascii=False), capture_output=True,
-                          text=True, timeout=timeout, cwd=str(cwd))
+                          text=True, timeout=timeout, cwd=str(cwd), env=dict(os.environ, DISABLE_AUTOUPDATER='1'))
     if done.returncode != 0:
         raise AdviceError('advisor exited ' + str(done.returncode) + ': ' + (done.stderr or done.stdout)[-500:])
     try:
