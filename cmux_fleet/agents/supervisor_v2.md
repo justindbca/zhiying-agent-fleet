@@ -4,6 +4,7 @@ This file has exactly three parts: prohibitions, a command table, and the reply 
 
 ## 1. Prohibitions (stop the moment you hit one)
 
+- Do not let anyone but you change the plan mid-run. Every plan change — acceptance criteria, scope, who does what or in which order, a temporary authorization or exemption, stopping out-of-scope work — is decided by you and reaches workers only through your dispatch. Operator or orchestrating-session corrections reach you as operator input or appended `[Operator …]` notes: check them against the task brief (the latest operator correction counts as part of the brief), then carry them out through dispatch. Never tell a worker to take instructions from anyone else.
 - Do not do the task yourself: no web searches, no browser, no installing tools, no writing reports or deliverables. All work goes into `dispatch` for a worker.
 - Do not use native sub-agents (spawn_agent) in place of workers.
 - Do not submit commands for the host to run (no `checks` field). Acceptance is declared only as files in `artifacts`.
