@@ -871,20 +871,7 @@ def parse_decision(text, workers, others_active):
             raise ValueError('every dispatch item needs an id (M<n>, e.g. M0)')
         if 'advise_note' in item and not isinstance(item['advise_note'], str):
             raise ValueError('dispatch.advise_note must be text')
-    escalations = decision.setdefault('escalations', [])
-    if not isinstance(escalations, list):
-        raise ValueError('escalations must be a list')
-    for item in escalations:
-        if (not isinstance(item, dict) or not isinstance(item.get('task'), str)
-                or item.get('decision') not in ESCALATION_DECISIONS):
-            raise ValueError('escalations: every item needs task and decision approve / revise / reject')
-        workers_n = item.get('workers', 1)
-        if isinstance(workers_n, bool) or not isinstance(workers_n, int) or workers_n < 1:
-            raise ValueError('escalations: workers must be a positive integer')
-        if not isinstance(item.get('note', ''), str):
-            raise ValueError('escalations: note must be text')
-    if len({x['task'] for x in escalations}) != len(escalations):
-        raise ValueError('escalations: one answer per task')
+    escalations = validate_escalations(decision)
     if 'advisor' in decision and decision['advisor'] not in ('on', 'off'):
         raise ValueError('advisor must be "on" or "off"')
     consult = decision.setdefault('consult', [])
@@ -899,6 +886,36 @@ def parse_decision(text, workers, others_active):
     if decision['status'] == 'RUNNING' and not dispatch and not escalations and not consult and not others_active:
         raise ValueError('no worker is busy: RUNNING must dispatch at least one instruction')
     return decision
+
+
+def validate_escalations(decision):
+    """decision['escalations']: answers to [escalate] (task mode), [dialog] and [blocked] requests."""
+    escalations = decision.setdefault('escalations', [])
+    if not isinstance(escalations, list):
+        raise ValueError('escalations must be a list')
+    for item in escalations:
+        if (not isinstance(item, dict) or not isinstance(item.get('task'), str)
+                or item.get('decision') not in ESCALATION_DECISIONS):
+            raise ValueError('escalations: every item needs task and decision approve / revise / reject')
+        workers_n = item.get('workers', 1)
+        if isinstance(workers_n, bool) or not isinstance(workers_n, int) or workers_n < 1:
+            raise ValueError('escalations: workers must be a positive integer')
+        if not isinstance(item.get('note', ''), str):
+            raise ValueError('escalations: note must be text')
+    if len({x['task'] for x in escalations}) != len(escalations):
+        raise ValueError('escalations: one answer per task')
+    return escalations
+
+
+def service_blocked(value, reply):
+    """A service worker's 'I am stuck' answer (plan F' 8.4 in service mode): exactly {"blocked": "<text>"}, when
+    the request's own reply keys do not use 'blocked'. Returns the reason, or '' for an ordinary answer."""
+    if not isinstance(value, dict) or set(value) != {'blocked'} or not isinstance(value['blocked'], str):
+        return ''
+    if 'blocked' in reply.get('required', []) or 'blocked' in (reply.get('allowed') or []):
+        return ''
+    reason = value['blocked'].strip()
+    return '' if reason.rstrip('.。').strip().lower() in NO_BLOCK else reason
 
 
 def validate_consult(consult, workers):
@@ -984,6 +1001,9 @@ def parse_service_decision(text, workers):
         if not isinstance(item, dict) or not isinstance(item.get('request_id'), str) \
                 or not isinstance(item.get('reason'), str):
             raise ValueError('every skip item needs request_id and reason')
+    for item in validate_escalations(decision):  # plan F': only [dialog] / [blocked] in service mode
+        if not item['task'].startswith((DIALOG_KEY, BLOCKED_KEY)):
+            raise ValueError('escalations: service mode answers only dialog:<worker>:g<n> / blocked:<worker>')
     return decision
 
 
@@ -2452,7 +2472,8 @@ class Fleet:
 
     # ------------------------------------------------------------ escalate: worker asks to split (§20)
     def escalation_state(self):
-        raw = None if self.service else self.r.get(ESCALATIONS)
+        # Service mode holds only plan F' [dialog] / [blocked] records here (no split requests).
+        raw = self.r.get(ESCALATIONS)
         return json.loads(raw) if raw else {}
 
     def save_escalations(self, state):
@@ -2565,8 +2586,10 @@ class Fleet:
             return
         esc = self.escalation_state()
         answered = {x['task'] for x in decision['escalations']}
-        dispatched = {BLOCKED_KEY + self.resolve(x['to']) for x in decision['dispatch']}
-        dispatched |= {BLOCKED_KEY + self.resolve(c['worker']) for c in decision['consult']}  # the advisor rules
+        # Task mode: a new instruction to (or consult on) the worker answers its Blocked. Service mode: a dispatch
+        # routes another request, so it answers nothing.
+        dispatched = set() if self.service else {BLOCKED_KEY + self.resolve(x['to']) for x in decision['dispatch']}
+        dispatched |= {BLOCKED_KEY + self.resolve(c['worker']) for c in decision.get('consult', [])}
         missed = [k for k, rec in esc.items() if k.startswith((DIALOG_KEY, BLOCKED_KEY))
                   and rec.get('status') == 'escalated' and rec.get('message_id') and k not in answered
                   and k not in dispatched and self.v2.bus.status(rec['message_id']) not in ('', 'queued')]
@@ -2613,7 +2636,7 @@ class Fleet:
             if kind == 'blocked':
                 if item['decision'] == 'revise' and not item.get('note', '').strip():
                     raise ValueError('escalations: revise of ' + item['task'] + ' needs a note saying the other way')
-                if rec['slot'] in busy:
+                if rec['slot'] in busy and not self.service:
                     raise ValueError('escalations: ' + item['task'] + ' is answered and ' + self.label(rec['slot'])
                                      + ' is dispatched to in the same reply; do one or the other')
                 out.append((item['task'], rec, item))
@@ -2696,6 +2719,8 @@ class Fleet:
         esc.pop(task_id, None)
         self.save_escalations(esc)
         slot, item, note = rec['slot'], rec.get('item') or '', answer.get('note', '').strip()
+        if self.service:
+            return self.service_ruling(task_id, rec, answer, note)
         text = ('[Supervisor instruction ' + t.get('id', '') + '] [Supervisor ruling] ' + ('[' + item + '] ' if item else '')
                 + answer['decision'] + ((': ' + note) if note else '') + '\n(on what you reported as Blocked: '
                 + rec.get('reason', '')[:500].replace('\n', '; ') + ')\nCarry on accordingly; reply in the AGENTS.md '
@@ -2709,6 +2734,40 @@ class Fleet:
         self.log('blocked.ruled', agent=slot, task=task_id, item=item, decision=answer['decision'])
         if self.v2:
             self.v2.audit('blocked.ruled', slot=slot, level='info', task=task_id, decision=answer['decision'])
+
+    def service_ruling(self, task_id, rec, answer, note):
+        """Service mode: the ruling goes back to the worker as the same request (its answer still settles it)."""
+        slot, rid = rec['slot'], rec.get('request') or ''
+        req = self.r.hgetall(REQ + rid) if rid else {}
+        if req.get('status') != 'dispatched':  # timed out / answered meanwhile: nothing to rule on any more
+            self.log('blocked.stale', agent=slot, task=task_id, request=rid)
+            return
+        self.queue(slot, self.request_message(rid, json.loads(req['spec']), (
+            '[Supervisor ruling] ' + answer['decision'] + ((': ' + note) if note else '') + '\n(on what you reported '
+            'as blocked: ' + rec.get('reason', '')[:500].replace('\n', '; ') + ')\nCarry on accordingly and answer the '
+            'request.'), slot=slot))
+        self.log('blocked.ruled', agent=slot, task=task_id, request=rid, decision=answer['decision'])
+        if self.v2:
+            self.v2.audit('blocked.ruled', slot=slot, level='info', task=task_id, decision=answer['decision'], request_id=rid)
+
+    def service_blocked_intake(self, slot, rid, reason):
+        """Service mode, plan F' 8.4: a worker answered {"blocked": ...}; the request stays dispatched and the
+        supervisor rules on it. The [blocked] note goes to the supervisor bound to that request."""
+        key_ = BLOCKED_KEY + slot
+        who = self.label(slot)
+        text = ('[blocked] ' + who + ' (request ' + rid + ') says it is stuck on: ' + reason[:2000].replace('\n', '; ')
+                + '\nThe request is still open. Answer in your next JSON: "escalations": [{"task": "' + key_
+                + '", "decision": "approve" | "revise" | "reject", "note": "..."}] with status RUNNING, dispatch [] and '
+                'skip []. approve = it may go on the way it proposed (say in note how far that goes); revise = another '
+                'way (note required); reject = do not do that part, answer with what it has. Reply status BLOCKED only '
+                'for a delete / move, or for what truly only the user can decide, and say which in reason.')
+        mid = self.v2.queue('supervisor', text, request_id=rid, kind='followup') if self.v2 else self.queue('supervisor', text)
+        esc = self.escalation_state()
+        esc[key_] = {'kind': 'blocked', 'slot': slot, 'item': '', 'request': rid, 'reason': reason[:2000],
+                     'status': 'escalated', 'asked_at': time.time(), 'message_id': mid or ''}
+        self.save_escalations(esc)
+        self.log('blocked.asked', agent=slot, request=rid, reason=reason[:300])
+        return key_
 
     def escalation_tick(self):
         """Approved splits: read the spawn answer; a refusal reopens the request for the supervisor."""
@@ -3371,8 +3430,12 @@ class Fleet:
             if invalid:
                 raise ValueError(invalid)
             decision = parse_service_decision(text, self.dispatch_targets())
+            escalations = self.escalation_decision(decision, None) if decision['status'] == 'RUNNING' else []
+            self.escalations_missed(decision)
         except (ValueError, TypeError, KeyError) as exc:
-            bad = self.r.hincrby(SERVICE, 'bad_replies', 1)
+            # The first reply that leaves a [dialog] / [blocked] open is sent back without a strike (plan F').
+            bad = (int(self.r.hget(SERVICE, 'bad_replies') or 0) if isinstance(exc, NoStrike)
+                   else self.r.hincrby(SERVICE, 'bad_replies', 1))
             if bad >= 3:
                 self.r.hset(SERVICE, mapping={'bad_replies': 0})
                 self.pause('supervisor gave no valid decision JSON three times in a row: ' + str(exc))
@@ -3390,6 +3453,8 @@ class Fleet:
         for item in decision['skip']:
             if self.r.hget(REQ + item['request_id'], 'status') == 'routing':
                 self.publish(item['request_id'], 'skipped', worker='supervisor', reason=item['reason'])
+        for task_id, rec, answer in escalations:
+            self.escalation_apply({}, None, task_id, rec, answer)
         if decision['status'] == 'BLOCKED':
             self.pause(decision.get('reason') or 'supervisor needs a human')
 

@@ -963,6 +963,13 @@ class RuntimeV2:
                 self.audit('result.late', slot=slot, request_id=env['request_id'])
                 self.hold(slot, 'public result already terminal; inspect before reusing slot')
                 return
+            blocked = '' if error else legacy.service_blocked(value, json.loads(req['spec'])['reply'])
+            if blocked:
+                # Plan F' 8.4 (service): not an answer. The delivery ends, the request stays dispatched, and the
+                # supervisor rules; its ruling goes back to this worker as the same request.
+                self.release(env, value)
+                self.f.service_blocked_intake(slot, env['request_id'], blocked)
+                return
             if not error:
                 try:
                     legacy.parse_reply(text, json.loads(req['spec'])['reply'])
@@ -1164,6 +1171,12 @@ class RuntimeV2:
         if self.f.r.get(tombstone):
             return
         req = self.f.r.hgetall(legacy.REQ + rid)
+        if self.f.service:  # plan F': a [blocked] question about a request that is now terminal is moot
+            esc = self.f.escalation_state()
+            moot = [k for k, v in esc.items() if v.get('kind') == 'blocked' and v.get('request') == rid]
+            if moot:
+                self.f.save_escalations({k: v for k, v in esc.items() if k not in moot})
+                self.audit('blocked.moot', request_id=rid, detail={'tasks': moot, 'status': status})
         now = time.time()
         rec = dict(id=rid, status=status, at=now,
                    elapsed_s=round(now-float(req.get('created') or now), 1), **fields)
@@ -1251,8 +1264,12 @@ class RuntimeV2:
                 + ' for it; reject = the program presses Escape. Do not dispatch to ' + label + ' in this reply. If '
                 'you think it deletes or moves anything, or only the user can decide, answer reject and say why in '
                 'reason.\n\nReply with the JSON format from AGENTS.md.')
-        rec = dict(rec, message_id=self.f.queue('supervisor', text), delivered_at=0, status='escalated',
-                   asked_at=time.time())
+        if self.f.service:
+            # Bound to the worker's request (kind followup: delivered even if that request ends meanwhile).
+            mid = self.queue('supervisor', text, request_id=self.f.agent(slot).get('request') or 'notice', kind='followup')
+        else:
+            mid = self.f.queue('supervisor', text)
+        rec = dict(rec, message_id=mid, delivered_at=0, status='escalated', asked_at=time.time())
         esc = self.f.escalation_state()
         esc[key] = rec
         self.f.save_escalations(esc)

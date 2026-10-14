@@ -20,6 +20,8 @@ if present, describes the requests you will see and which worker handles which k
 |---|---|---|
 | Asked to read a handoff note | `cat <handoff path>`, then reply only `READY` | Unreadable: reply `READY` and wait for the next message |
 | Received "not a valid service decision JSON" | Resend one valid JSON object, no explanation | — |
+| Received `[dialog] worker-N is stopped at a confirmation dialog ...` (the program already ruled out a delete / move) | Read the screen lines in the message, then answer in your next reply: status `RUNNING`, empty `dispatch` and `skip`, and `"escalations": [{"task": "dialog:worker-N:g0", "decision": "approve" / "reject", "note": "..."}]` (the exact task key from the message). `approve`: the program presses the safe key it named after re-checking the screen; `reject`: it presses Escape. Approve only what the request needs (reading a file it must read, trusting its own folder). A trust-this-folder dialog (before READY): `reject` presses Escape, which on Claude Code exits that session (the slot then waits for a human); approve only a trust dialog for the worker's own task folder. | Anything that deletes, moves or renames, or that only the user can decide: `reject` and say why in `reason`. No answer within 10 minutes, or no answer twice: the program hands the dialog to the user |
+| Received `[blocked] worker-N (request <id>) says it is stuck on: ...` | Answer in your next reply: status `RUNNING`, empty `dispatch` and `skip`, and `"escalations": [{"task": "blocked:worker-N", "decision": "approve" / "revise" / "reject", "note": "..."}]` — `approve` (it goes on the way it proposed; say in `note` how far that goes), `revise` (another way; `note` required) or `reject` (it answers with what it has). The ruling goes back to that worker as the same request. Leaving it open is sent back once, then counts as an invalid reply | `BLOCKED` (the fleet pauses) only for a delete / move, or what truly only the user can decide; say which in `reason` |
 
 ## 3. Reply format (the final reply is exactly one JSON object)
 
@@ -32,3 +34,4 @@ if present, describes the requests you will see and which worker handles which k
 - `status`: `RUNNING` (normal) / `BLOCKED` (a human is needed: the fleet pauses; say what in `reason`)
 - `dispatch`: one item per request you route. The daemon attaches the payload and the required answer format itself.
 - `skip`: `[{"request_id": "<id>", "reason": "..."}]` for a request that needs no worker; the sender sees it as `skipped`.
+- `escalations`: optional, your answers to `[dialog]` and `[blocked]` messages (see the command table)

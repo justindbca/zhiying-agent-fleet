@@ -123,7 +123,8 @@ export default function (pi: ExtensionAPI) {
     decision: Type.Union([Type.Literal("approve"), Type.Literal("revise"), Type.Literal("reject")]),
     workers: Type.Optional(Type.Integer({ minimum: 1 })), note: Type.Optional(Type.String()) });
   const decisionSchema = service ? Type.Object({ status: Type.Union([Type.Literal("RUNNING"), Type.Literal("BLOCKED")]),
-    reason: Type.Optional(Type.String()), dispatch: Type.Array(dispatch), skip: Type.Optional(Type.Array(Type.Object({ reason: Type.String() }))) }) :
+    reason: Type.Optional(Type.String()), dispatch: Type.Array(dispatch), skip: Type.Optional(Type.Array(Type.Object({ reason: Type.String() }))),
+    escalations: Type.Optional(Type.Array(escalation)) }) :
     Type.Object({ status: Type.Union([Type.Literal("RUNNING"), Type.Literal("COMPLETED"), Type.Literal("BLOCKED")]),
       completion: Type.Integer({ minimum: 0, maximum: 100 }), reason: Type.Optional(Type.String()),
       dispatch: Type.Array(dispatch), consult: Type.Optional(Type.Array(consult)), artifacts: Type.Optional(Type.Array(artifact)),
@@ -142,7 +143,9 @@ export default function (pi: ExtensionAPI) {
       if (!active || phase !== "delivery" || active.body.purpose === "handoff" || signal?.aborted || unhealthy) throw new Error("No active fleet delivery for this tool");
       const value = supervisor ? params as Record<string, unknown> : (params as { result: Record<string, unknown> }).result;
       if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Candidate must be a business object");
-      if (!supervisor && active.body.reply) {
+      // Plan F' (service): exactly {"blocked": "<text>"} asks the supervisor to rule; the daemon checks it.
+      const blockedOnly = Object.keys(value).length === 1 && typeof (value as Record<string, unknown>).blocked === "string";
+      if (!supervisor && active.body.reply && !blockedOnly) {
         const spec = active.body.reply;
         if (spec.required.some((key) => !(key in value)) || spec.allowed?.some(() => Object.keys(value).some((key) => !spec.allowed!.includes(key)))) {
           throw new Error("Business result violates required/allowed reply keys");

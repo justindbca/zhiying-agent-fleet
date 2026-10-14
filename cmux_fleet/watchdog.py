@@ -399,8 +399,8 @@ class Watchdog:
 
     def supervisor_away(self):
         """Why the supervisor cannot rule on a worker's dialog now ('' when it can)."""
-        if self.f.service or not self.f.running():
-            return 'no running task (service mode has no supervisor escalations)' if self.f.service else 'no running task'
+        if not self.f.running():  # task mode between tasks (service mode always runs)
+            return 'no running task'
         if self.f.paused():
             return 'dispatch is paused'
         sup = self.f.agent('supervisor')
