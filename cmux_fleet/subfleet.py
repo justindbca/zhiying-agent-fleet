@@ -508,7 +508,8 @@ def child_config(f, slot, task_id, workers, rec_dir, sid, info, redis_cfg, name,
     parent = child_worker_cfg(f.cfg, named) if named else f.cfg
     root_path = parent.get('root_config') or str(f.path)
     path = list(parent.get('title_path') or [name]) + [slot, task_id]
-    # `advisor` is the parent's in-memory switch (its roster): a sub-fleet starts with the advisor off.
+    # `advisor` is the parent's in-memory switch (its roster): never inherited. A sub-fleet's advisor is off
+    # unless its own roster says `advisor: on` (named sub-fleets, §29; read by the child daemon at start).
     cfg = {k: v for k, v in parent.items() if k not in ('roster', 'worker_roles', 'roles', 'adopt',
                                                           'redis_socket', 'redis_runtime_dir', 'advisor',
                                                           'subfleets')}

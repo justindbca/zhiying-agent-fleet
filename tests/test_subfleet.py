@@ -1254,6 +1254,40 @@ def test_named_child_with_clear_and_typed_delivery_runs_with_its_own_switches(sv
         clear_after_result.validate(loose)
 
 
+@pytest.mark.parametrize('switch', ['', 'advisor: off\n', 'advisor: on\n'])
+def test_named_child_roster_has_its_own_advisor_switch_default_off(svc, switch):
+    """§29 c) (user 10-14): a sub-fleet roster may say advisor: on | off; not written = off. The parent's
+    switch never reaches the child (child_config drops it)."""
+    t, f = svc, svc.f
+    f.cfg['advisor'] = True  # the parent's own (in-memory) switch is on
+    path = write_roster(t)
+    (t.tmp / 'child.yaml').write_text('workers:\n  - name: ops-w1\n' + switch)
+    f.cfg['roster'] = str(path)
+    f.roster_tick()
+    rid, answer = ask(t, 'up')
+    assert answer['status'] == 'accepted', answer
+    supervisor_answers(t, rid)
+    subfleet.tick(f)
+    rec = subfleet.record(f.run_dir / 'sub' / 'ops')
+    assert 'advisor' not in fleet.load(Path(rec['run']) / 'config.json')
+    cf = child_daemon(t, rec)  # the child daemon's first boot reads its own roster
+    on = switch == 'advisor: on\n'
+    assert cf.advisor_online() is on
+    assert (cf.r.hget(fleet.SERVICE, 'advisor') == 'on') is on
+    # advisor on: the child's Claude worker starts held for its first configuration sheet (§27)
+    assert (cf.agent('ops-w1').get('launch_ready') == '0') is on
+
+
+def test_named_child_roster_advisor_value_is_checked_with_the_parent_roster(tmp_path):
+    (tmp_path / 'sup.md').write_text('x')
+    (tmp_path / 'child.yaml').write_text('workers:\n  - name: a\nadvisor: maybe\n')
+    bad = tmp_path / 'bad.yaml'
+    bad.write_text('workers:\n  - name: worker-1\nsubfleets:\n'
+                   '  - {name: ops, supervisor_slot: worker-1, supervisor_role: sup.md, roster: child.yaml}\n')
+    with pytest.raises(ValueError, match='advisor must be on or off'):
+        roster.load_entries(bad)
+
+
 # §5.1 + §5.2
 def test_external_up_is_gated_approved_and_answered_with_the_child_address(svc):
     t, f = svc, svc.f
