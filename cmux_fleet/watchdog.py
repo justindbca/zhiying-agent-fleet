@@ -2,8 +2,10 @@
 
   idle       no delivery in flight and not starting: never acted on, however long (E1).
   working    a delivery is in flight and the transcript / rollout moved within stall_timeout.
-  prompting  the screen shows a confirmation dialog. Whitelisted (prompt table) -> save the
-             screen and press its keys; unknown -> save the screen and hold, press nothing.
+  prompting  the screen shows a confirmation dialog. Whitelisted (prompt table) and verified -> save
+             the screen and press its keys; anything else -> save the screen, mark the slot
+             prompt_wait, pause dispatch, press nothing (the lease stays received: once a human
+             answers in the pane the turn settles normally). Deletes / moves are never pressed.
   stalled    in flight, no activity for stall_timeout: Escape, at most stall_escapes times
              spread over stall_grace. Activity after that -> working again.
   frozen     stalled for stall_grace, or every Escape left the screen unchanged, or `ps` shows
@@ -31,7 +33,11 @@ VERIFY = {
     'own_cwd': 'every path on the dialog is the slot\'s own working directory (trusted at spawn)',
     'paths_in_run': 'every path on the dialog is inside the slot directory or the run workspace (--add-dir)',
 }
-DEFAULTS = {'stall_grace': 300, 'stall_escapes': 3, 'watch_interval': 5, 'capture_fail_alarm': 3}
+DEFAULTS = {'stall_grace': 300, 'stall_escapes': 3, 'watch_interval': 5, 'capture_fail_alarm': 3,
+            'dialog_escalation_timeout': 600}  # seconds the supervisor has to rule on a dialog it received
+# The supervisor cannot rule on a worker's dialog now (plan F' 8.3 step 5): the user gets it.
+SUPERVISOR_AWAY = ('held', 'dead', 'starting', 'retired', 'delegated', 'handoff', 'clearing', 'walled', 'reclaimed')
+YES_CURSOR = re.compile(r'❯\s*(?:1\.\s*)?yes\b')
 # Slot states the watchdog never touches: someone else owns the next step.
 HANDS_OFF = ('held', 'dead', 'retired', 'delegated', 'handoff', 'clearing')
 
@@ -41,6 +47,46 @@ def setting(cfg, name):
     if type(value) not in (int, float) or value < 0:
         raise ValueError(name + ' must be a non-negative number')
     return value
+
+
+# ---------------------------------------------------------------- delete classifier (plan F' 8.1)
+# A dialog that may lose data is the user's call, always: never answered by the program or the supervisor.
+# Strict on purpose: a non-delete dialog misread as a delete only asks the user once more; the reverse is
+# not allowed. So this list only grows (watchdog_prompts.yaml `delete_markers:` adds, nothing removes), and
+# a move / rename (mv) counts as a delete (user, 2026-10-14).
+DELETE_MARKERS = [
+    'rm', 'rmdir', 'unlink', 'del', 'delete', 'remove', 'rimraf', 'shred', 'trash', 'purge', 'wipe', 'erase',
+    'truncate', 'drop table', 'drop database', 'drop schema', 'git clean', 'git reset --hard', 'git push --force',
+    'git push -f', 'git branch -d', 'git checkout --', 'git restore', 'dd if=', '> /dev/null', '>/dev/null',
+    'mv', 'move', 'rename', 'move-item', 'rename-item', 'remove-item',
+    '删除', '清空', '移除', '清理', '移动', '改名', '重命名',
+]
+
+
+def _marker_re(phrase):
+    """Case-insensitive, word-bounded at ASCII word edges (CJK phrases match as substrings); a single English
+    word also matches its inflections (delete -> deleted / deleting, rm -> rms)."""
+    word = phrase.lower()
+    if re.fullmatch(r'[a-z]+', word):
+        body = (re.escape(word[:-1]) + '(?:e|es|ed|ing)' if word.endswith('e') and len(word) > 2
+                else re.escape(word) + '(?:s|es|ed|ing|d)?')
+    else:
+        body = re.escape(word)
+    head = r'(?<![a-z0-9_])' if re.match(r'[a-z0-9_]', word) else ''
+    tail = r'(?![a-z0-9_])' if re.search(r'[a-z0-9_]$', word) else ''
+    return re.compile(head + body + tail)
+
+
+def dialog_class(table, prompt, screen):
+    """'delete' | 'other' for the dialog at the bottom of `screen`; None when the screen is empty (unreadable:
+    the caller hands it to the user). Any delete word anywhere in the last tail_lines rows makes it a delete."""
+    if (prompt or {}).get('name') == 'dangerous_rm' or (prompt or {}).get('verify') == 'rm_in_cwd':
+        return 'delete'
+    text = screen_tail(screen, table['tail_lines']).lower()
+    if not text.strip():
+        return None
+    patterns = table.get('delete_markers') or [_marker_re(x) for x in DELETE_MARKERS]
+    return 'delete' if any(p.search(text) for p in patterns) else 'other'
 
 
 # ---------------------------------------------------------------- prompt table
@@ -56,7 +102,7 @@ def parse_table(raw):
         data = raw
     if not isinstance(data, dict):
         raise ValueError('prompt table must be a mapping')
-    unknown = set(data) - {'tail_lines', 'max_hits', 'prompts', 'unknown_markers'}
+    unknown = set(data) - {'tail_lines', 'max_hits', 'prompts', 'unknown_markers', 'delete_markers'}
     if unknown:
         raise ValueError('unknown prompt table keys: ' + ', '.join(sorted(unknown)))
     tail, hits = data.get('tail_lines', 25), data.get('max_hits', 3)
@@ -90,8 +136,13 @@ def parse_table(raw):
     markers = data.get('unknown_markers') or []
     if not isinstance(markers, list) or not all(isinstance(x, str) and x.strip() for x in markers):
         raise ValueError('unknown_markers must be a list of non-empty strings')
+    extra = data.get('delete_markers') or []
+    if not isinstance(extra, list) or not all(isinstance(x, str) and x.strip() for x in extra):
+        raise ValueError('delete_markers must be a list of non-empty strings')
+    # The built-in delete words are always in force: the table can only add to them, never remove one.
     return {'tail_lines': tail, 'max_hits': hits, 'prompts': prompts,
-            'unknown_markers': [x.lower() for x in markers]}
+            'unknown_markers': [x.lower() for x in markers],
+            'delete_markers': [_marker_re(x) for x in DELETE_MARKERS + [x.strip() for x in extra]]}
 
 
 class TableCache:
@@ -307,11 +358,16 @@ class Watchdog:
             info = self.f.agent(slot)
             state, pane = info.get('state'), info.get('pane')
             if state in HANDS_OFF or info.get('handoff_id') or not pane:
+                if info.get('prompt_wait'):  # held / retired / handed off: the dialog wait is someone else's now
+                    self.clear_prompt_wait(slot, 'hands_off')
                 continue
             lease = self.f.r.hgetall(self.rt.bus.lease_key(slot))
             in_flight = bool(lease.get('current_delivery')) and lease.get('status') == 'received'
             active = in_flight or state == 'starting'
+            scope = lease.get('current_delivery') or ('startup-g' + str(info.get('generation', '0')))
             if not active:
+                if info.get('prompt_wait'):  # the delivery settled / the startup READY came
+                    self.clear_prompt_wait(slot, 'inactive')
                 if info.get('watch_state', 'idle') != 'idle' or info.get('stall_escapes', '0') != '0':
                     self.set_state(slot, info, 'idle')
                     self.f.setf(slot, stall_escapes=0, watch_since=0, proc_frozen=0, prompt_hits=0)
@@ -319,7 +375,180 @@ class Watchdog:
             if now < self.next_check.get(slot, 0):
                 continue
             self.next_check[slot] = now + interval
+            if info.get('prompt_wait'):
+                if info['prompt_wait'] != scope:  # that delivery settled, a new one / generation came
+                    self.drop_dialog(slot, info, 'identity')
+                    self.clear_prompt_wait(slot, 'scope_changed')
+                elif info.get('prompt_route') == 'supervisor':
+                    if self.supervised(slot, info, lease, scope, table, now):
+                        continue
+                elif self.f.last_activity(info) <= float(info.get('prompt_wait_at') or 0):
+                    # A human answers this dialog (B-2): no screen read, no stall ladder, not a single key,
+                    # whether or not the dialog is still in the captured tail.
+                    continue
+                else:  # the transcript moved: the human answered and the agent went on
+                    self.clear_prompt_wait(slot, 'activity')
+                    self.set_state(slot, info, 'working')
+                info = self.f.agent(slot)
             self.check(slot, info, lease, in_flight, table, now)
+
+    # ------------------------------------------------------------ plan F' 8.3: non-delete dialog -> supervisor
+    def dialog_key(self, slot, info):
+        from cmux_fleet.fleet import DIALOG_KEY
+        return DIALOG_KEY + slot + ':g' + str(info.get('generation', '0'))
+
+    def supervisor_away(self):
+        """Why the supervisor cannot rule on a worker's dialog now ('' when it can)."""
+        if not self.f.running():  # task mode between tasks (service mode always runs)
+            return 'no running task'
+        if self.f.paused():
+            return 'dispatch is paused'
+        sup = self.f.agent('supervisor')
+        if sup.get('state') in SUPERVISOR_AWAY or sup.get('handoff_id') or sup.get('prompt_wait'):
+            return 'supervisor is ' + (sup.get('state') or 'missing') + (' at a dialog' if sup.get('prompt_wait') else '')
+        return ''
+
+    def escalate(self, slot, info, lease, scope, prompt, unknown, screen, path, table):
+        """Hand a non-delete dialog to the supervisor (plan F' 8.3). False: it goes to the user instead."""
+        from cmux_fleet import subfleet
+        owns = getattr(self.f.mgr, 'owns', None)
+        if slot == 'supervisor':
+            return False  # nobody can rule on the supervisor's own dialog but the user
+        if (owns is not None and not owns(info['pane'])) or subfleet.adopted(self.f.cfg, slot, info.get('generation')):
+            return False  # keys are never pressed on a pane this fleet does not own
+        away = self.supervisor_away()
+        if away:
+            self.audit('dialog.to_human', slot=slot, level='warn', reason='supervisor_unavailable', detail=away)
+            return False
+        tail = screen_tail(screen, table['tail_lines'])
+        if prompt is not None:
+            keys = list(prompt['keys'])
+        else:  # an unknown dialog: Enter only when the cursor visibly sits on Yes
+            keys = ['Enter'] if YES_CURSOR.search(tail.lower()) else None
+        rec = {'kind': 'dialog', 'slot': slot, 'generation': str(info.get('generation', '0')),
+               'session_id': info.get('thread', ''), 'scope': scope, 'delivery_id': lease.get('current_delivery', ''),
+               'prompt': prompt['name'] if prompt is not None else 'unknown:' + unknown,
+               'screen': path, 'digest': hashlib.sha256(tail.encode()).hexdigest()[:16],
+               'keys_approve': keys, 'keys_reject': ['Escape']}
+        self.rt.transaction('watch-dialog-' + uuid.uuid4().hex, lambda: self.rt.prompt_escalate(slot, rec, tail))
+        return True
+
+    def drop_dialog(self, slot, info, reason):
+        """Pop this slot's dialog escalation (if any) and audit why it is stale."""
+        from cmux_fleet.fleet import DIALOG_KEY
+        prefix = DIALOG_KEY + slot + ':g'  # any generation of this slot
+        esc = self.f.escalation_state()
+        stale = [k for k in esc if k.startswith(prefix)]
+        if stale:
+            self.rt.transaction('watch-dialog-' + uuid.uuid4().hex, lambda: self.f.save_escalations(
+                {k: v for k, v in esc.items() if k not in stale}))
+            self.audit('dialog.stale', slot=slot, level='info', reason=reason, task=', '.join(stale))
+
+    def to_user(self, slot, info, scope, rec, why, reason):
+        """A supervisor-routed dialog falls back to the user (plan F' 8.3 step 4 / 5)."""
+        def act():
+            esc = self.f.escalation_state()
+            esc.pop(self.dialog_key(slot, info), None)
+            self.f.save_escalations(esc)
+            self.audit('dialog.' + ('reclassified_delete' if why == 'reclassified_delete' else 'to_human'), slot=slot,
+                       level='warn', reason=why, task=self.dialog_key(slot, info))
+            self.rt.prompt_wait(slot, scope, reason, (rec or {}).get('screen', ''),
+                                kind='delete' if why == 'reclassified_delete' else 'other')
+        self.rt.transaction('watch-dialog-' + uuid.uuid4().hex, act)
+
+    def supervised(self, slot, info, lease, scope, table, now):
+        """One tick of a dialog waiting for the supervisor. True: done with this slot this tick."""
+        key = self.dialog_key(slot, info)
+        esc = self.f.escalation_state()
+        rec = esc.get(key)
+        if rec is None or rec.get('scope') != scope:  # e.g. a new task cleared fx:escalations
+            self.to_user(slot, info, scope, rec, 'record_gone', 'dialog escalation record gone; handed to the user')
+            return True
+        if self.f.last_activity(info) > float(info.get('prompt_wait_at') or 0):
+            # A human answered in the pane meanwhile: nothing to press any more.
+            self.drop_dialog(slot, info, 'activity')
+            self.clear_prompt_wait(slot, 'activity')
+            self.set_state(slot, info, 'working')
+            return False
+        if rec.get('status') == 'answered':
+            return self.answer_dialog(slot, info, scope, key, rec, table)
+        away = self.supervisor_away()
+        if away and away != 'dispatch is paused':
+            self.to_user(slot, info, scope, rec, 'supervisor_unavailable', 'supervisor unavailable (' + away
+                         + '); dialog handed to the user')
+            return True
+        if not float(rec.get('delivered_at') or 0):
+            # The clock starts when the supervisor receives the [dialog] message, not while it is queued.
+            if self.rt.bus.status(rec.get('message_id') or '') not in ('', 'queued'):
+                rec['delivered_at'] = now
+                esc[key] = rec
+                self.rt.transaction('watch-dialog-' + uuid.uuid4().hex, lambda: self.f.save_escalations(esc))
+            return True
+        limit = float(setting(self.f.cfg, 'dialog_escalation_timeout'))
+        if now - float(rec['delivered_at']) >= limit:
+            minutes = str(int(limit // 60))
+            self.to_user(slot, info, scope, rec, 'supervisor_timeout', 'supervisor did not rule on the dialog within '
+                         + minutes + ' min; handed to the user')
+        return True
+
+    def answer_dialog(self, slot, info, scope, key, rec, table):
+        """Press the supervisor's answer, only after every check passes on a fresh screen (plan F' 8.3 step 4)."""
+        from cmux_fleet import subfleet
+        pane = info['pane']
+        screen = self.capture(slot, info, pane)
+        if not screen or self.f.wall_gate(slot, screen) is not None:
+            return True  # nothing readable / a wall is the brake's: try again next tick
+        owns = getattr(self.f.mgr, 'owns', None)
+        if (str(info.get('generation', '0')) != rec['generation'] or info.get('thread', '') != rec['session_id']
+                or scope != rec['scope'] or (owns is not None and not owns(pane))
+                or subfleet.adopted(self.f.cfg, slot, info.get('generation'))):
+            self.drop_dialog(slot, info, 'identity')
+            self.clear_prompt_wait(slot, 'identity')
+            return True
+        tail = screen_tail(screen, table['tail_lines'])
+        prompt, unknown = match_prompt(table, screen)
+        if prompt is None and unknown is None:  # the dialog is gone (answered in the pane, or the agent moved on)
+            self.drop_dialog(slot, info, 'dialog_gone')
+            self.clear_prompt_wait(slot, 'dialog_gone')
+            self.set_state(slot, info, 'working')
+            return False
+        same = (prompt['name'] if prompt is not None else 'unknown:' + unknown) == rec['prompt']
+        if not same or hashlib.sha256(tail.encode()).hexdigest()[:16] != rec['digest']:
+            # Another dialog (or this one changed): never press the old answer; classify and route it afresh.
+            self.drop_dialog(slot, info, 'dialog_changed')
+            self.clear_prompt_wait(slot, 'dialog_changed')
+            return False
+        if dialog_class(table, prompt, screen) != 'other':
+            self.to_user(slot, info, scope, rec, 'reclassified_delete', 'dialog ' + rec['prompt'] + ' now reads as a '
+                         'delete / move; handed to the user, nothing pressed')
+            return True
+        if rec['decision'] == 'approve' and not rec.get('keys_approve'):
+            self.to_user(slot, info, scope, rec, 'no_safe_key', 'the supervisor approved dialog ' + rec['prompt']
+                         + ' but no safe key is known; handed to the user')
+            self.rt.queue('supervisor', '[dialog] ' + key + ': no safe key to press for approve; handed to the user.')
+            return True
+        keys = rec['keys_approve'] if rec['decision'] == 'approve' else rec.get('keys_reject') or ['Escape']
+        sent = [k for k in keys if k in KEYS and self.f.mgr.send_key(pane, k)]
+        if prompt is not None:
+            hits = int(info.get('prompt_hits') or 0) if info.get('prompt_scope') == scope else 0
+            self.f.setf(slot, prompt_scope=scope, prompt_hits=hits + 1)
+        self.audit('watch.prompt_answered', slot=slot, level='warn', prompt=rec['prompt'], keys=sent, screen=rec['screen'],
+                   authorized='supervisor:' + rec['decision'], task=key, delivery_id=rec.get('delivery_id', ''))
+        self.drop_dialog(slot, info, 'answered')
+        self.clear_prompt_wait(slot, 'answered')
+        self.set_state(slot, info, 'working')
+        return True
+
+    def clear_prompt_wait(self, slot, reason):
+        info = self.f.agent(slot)
+        self.f.setf(slot, prompt_wait='', prompt_wait_at=0, prompt_route='')
+        self.audit('watch.prompt_cleared', slot=slot, level='info', reason=reason, scope=info.get('prompt_wait', ''))
+
+    def wait_for_user(self, slot, scope, reason, path, kind):
+        """Hand a dialog to the user (plan F B-1 / F' 8.2): mark the slot, pause dispatch, press nothing.
+        The lease is untouched: once the human answers, the turn ends and settles normally."""
+        self.rt.transaction('watch-prompt-' + uuid.uuid4().hex, lambda: self.rt.prompt_wait(
+            slot, scope, reason + '; nothing pressed, screen saved to ' + path, path, kind=kind))
 
     def check(self, slot, info, lease, in_flight, table, now):
         pane = info['pane']
@@ -349,13 +578,18 @@ class Watchdog:
         if state == 'prompting' and prompt is not None:
             path = self.save_screen(slot, info, screen, 'prompt-' + prompt['name'])
             allowed, reason = self.authorized(slot, info, prompt, screen, table)
+            kind = dialog_class(table, prompt, screen)
+            if allowed and kind != 'other':
+                # Never press keys on anything that may delete / move data, even on a whitelisted dialog.
+                allowed, reason = False, 'the screen shows a delete / move: the user decides'
             if not allowed:
-                # Keep the scene: nothing pressed, slot held, a human reads the saved screen and decides.
+                # Keep the scene: nothing pressed, a human reads the saved screen and answers in the pane.
                 self.set_state(slot, info, state, prompt=prompt['name'], authorized=False)
                 self.audit('watch.prompt_unverified', slot=slot, level='error', prompt=prompt['name'], reason=reason,
-                           screen=path, delivery_id=lease.get('current_delivery', ''))
-                self.rt.transaction('watch-prompt-' + uuid.uuid4().hex, lambda: self.rt.hold(
-                    slot, 'dialog ' + prompt['name'] + ' not answered: ' + reason + '; nothing pressed, screen saved to ' + path))
+                           screen=path, delivery_id=lease.get('current_delivery', ''), dialog_class=kind or 'unread')
+                if kind == 'other' and self.escalate(slot, info, lease, scope, prompt, None, screen, path, table):
+                    return
+                self.wait_for_user(slot, scope, 'dialog ' + prompt['name'] + ' not answered: ' + reason, path, kind)
                 return
             sent = [k for k in prompt['keys'] if self.f.mgr.send_key(pane, k)]
             self.f.setf(slot, prompt_scope=scope, prompt_hits=hits + 1)
@@ -364,10 +598,13 @@ class Watchdog:
                        hits=hits + 1, screen=path, authorized=reason, delivery_id=lease.get('current_delivery', ''))
         elif state == 'prompting':
             path = self.save_screen(slot, info, screen, 'prompt-unknown')
+            kind = dialog_class(table, None, screen)
             self.set_state(slot, info, state, marker=unknown)
-            self.audit('watch.prompt_unknown', slot=slot, level='error', marker=unknown, screen=path)
-            self.rt.transaction('watch-prompt-' + uuid.uuid4().hex, lambda: self.rt.hold(
-                slot, 'unknown confirmation dialog on screen (' + unknown + '); nothing pressed, screen saved to ' + path))
+            self.audit('watch.prompt_unknown', slot=slot, level='error', marker=unknown, screen=path,
+                       dialog_class=kind or 'unread')
+            if kind == 'other' and self.escalate(slot, info, lease, scope, None, unknown, screen, path, table):
+                return
+            self.wait_for_user(slot, scope, 'unknown confirmation dialog on screen (' + unknown + ')', path, kind)
         elif state == 'working':
             if prev != 'working' or escapes:
                 self.f.setf(slot, stall_escapes=0, watch_since=0, esc_digest='')

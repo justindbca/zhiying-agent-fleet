@@ -18,6 +18,7 @@ Section 4 is your role: what you judge and which keys you may propose.
 | To do this | Run this | If it fails |
 |---|---|---|
 | Keep notes across requests | Write to `./notes.md` in your directory | Answer anyway; mention the failure in the JSON |
+| Stuck on something you must not decide yourself (an authorisation, a scope question, a missing input you cannot get) | Call fleet_result with `{ "result": {"blocked": "..."} }` instead of the answer: one sentence on what blocks you and the way you propose. The supervisor rules and sends the request back to you | Never for a deletion / move: those are confirmed by the user in your pane |
 | Asked to read a handoff note | `cat <handoff path>`, then reply only `READY` | Unreadable: reply `READY` and wait for the next message |
 | Asked to write a handoff | Write only to the file path given in the message, using its three headings, then reply "handoff written" | — |
 | Told "Your last reply was rejected" | Call fleet_result with corrected business keys | — |

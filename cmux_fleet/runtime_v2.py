@@ -44,6 +44,8 @@ def validate_config(cfg):
             raise ValueError('transport v2 requires --allow-development-v2; real SDK/TUI acceptance is pending')
         for name in watchdog.DEFAULTS:
             watchdog.setting(cfg, name)
+        if watchdog.setting(cfg, 'dialog_escalation_timeout') < 60:
+            raise ValueError('dialog_escalation_timeout must be at least 60 seconds')
         if cfg.get('prompt_table'):
             try:
                 watchdog.parse_table(Path(cfg['prompt_table']).read_text(encoding='utf-8'))
@@ -835,6 +837,9 @@ class RuntimeV2:
             return
         self.f.setf(slot, state='idle', idle_confirmed=1, bridge_available=0, request='', watch_state='idle',
                     stall_escapes=0, watch_since=0)
+        if codex_queue.is_codex(self.slot_cfg(slot), slot):
+            # The rollout proved the held item ran to completion; an unsettled record would refuse the next deliver.
+            codex_queue.clear(self.f, slot, 'held delivery released')
         if self.clear_enabled(slot):
             self.begin_clear(slot, hook_pid=ev.get('hook_pid'))
         self.audit('hold.released', slot=slot, level='warn', message_id=env['message_id'],
@@ -957,6 +962,13 @@ class RuntimeV2:
             if req.get('status') != 'dispatched':
                 self.audit('result.late', slot=slot, request_id=env['request_id'])
                 self.hold(slot, 'public result already terminal; inspect before reusing slot')
+                return
+            blocked = '' if error else legacy.service_blocked(value, json.loads(req['spec'])['reply'])
+            if blocked:
+                # Plan F' 8.4 (service): not an answer. The delivery ends, the request stays dispatched, and the
+                # supervisor rules; its ruling goes back to this worker as the same request.
+                self.release(env, value)
+                self.f.service_blocked_intake(slot, env['request_id'], blocked)
                 return
             if not error:
                 try:
@@ -1159,6 +1171,12 @@ class RuntimeV2:
         if self.f.r.get(tombstone):
             return
         req = self.f.r.hgetall(legacy.REQ + rid)
+        if self.f.service:  # plan F': a [blocked] question about a request that is now terminal is moot
+            esc = self.f.escalation_state()
+            moot = [k for k, v in esc.items() if v.get('kind') == 'blocked' and v.get('request') == rid]
+            if moot:
+                self.f.save_escalations({k: v for k, v in esc.items() if k not in moot})
+                self.audit('blocked.moot', request_id=rid, detail={'tasks': moot, 'status': status})
         now = time.time()
         rec = dict(id=rid, status=status, at=now,
                    elapsed_s=round(now-float(req.get('created') or now), 1), **fields)
@@ -1213,6 +1231,56 @@ class RuntimeV2:
             if slot != 'supervisor':
                 self.ui('supervisor', card)
         self.f.pause(slot + ': ' + reason)
+
+    def prompt_wait(self, slot, scope, reason, screen, kind=None):
+        """A dialog waits for the user (plan F B-1 / F' 8.2): mark the slot, pause dispatch, tell the user.
+
+        Not a hold: the lease, the message and the slot state stay as they are (busy / received, or
+        starting), so once a human answers in the pane the turn ends and settles normally."""
+        self.f.setf(slot, prompt_wait=scope, prompt_wait_at=time.time(), prompt_route='user', watch_state='prompting')
+        self.audit('execution.prompt_wait', slot=slot, level='error', error=reason,
+                   detail={'scope': scope, 'screen': screen, 'route': 'user', 'dialog_class': kind or 'unread'})
+        card = routing_card(self.f.label(slot) + ' 停在确认框等人答，已暂停派工；屏幕见 ' + screen + '。',
+                            kind='notice', slot=self.f.label(slot), severity='warn')
+        card['metadata']['event_id'] = 'ui-prompt-' + digest(slot + ':' + scope)[:32]
+        self.ui(slot, card)
+        if slot != 'supervisor':
+            self.ui('supervisor', card)
+        self.f.pause(slot + ': ' + reason)
+
+    def prompt_escalate(self, slot, rec, tail):
+        """A non-delete dialog goes to the supervisor to rule on (plan F' 8.3): mark the slot, record the
+        escalation, queue the [dialog] question. No pause, no key; the lease stays received."""
+        from cmux_fleet.fleet import DIALOG_KEY
+        key = DIALOG_KEY + slot + ':g' + str(rec['generation'])
+        label = self.f.label(slot)
+        self.f.setf(slot, prompt_wait=rec['scope'], prompt_wait_at=time.time(), prompt_route='supervisor',
+                    prompt_digest=rec['digest'], watch_state='prompting')
+        keys = ', '.join(rec['keys_approve']) if rec['keys_approve'] else 'no key (it will go to the user)'
+        text = ('[dialog] ' + label + ' is stopped at a confirmation dialog (' + rec['prompt'] + '); the program '
+                'classified it as not a delete / move. Last ' + str(len(tail.splitlines())) + ' screen lines:\n'
+                + tail + '\n[end of screen]\nAnswer in your next JSON: "escalations": [{"task": "' + key + '", '
+                '"decision": "approve" | "reject", "note": "<optional>"}]. approve = the program presses ' + keys
+                + ' for it; reject = the program presses Escape. Do not dispatch to ' + label + ' in this reply. If '
+                'you think it deletes or moves anything, or only the user can decide, answer reject and say why in '
+                'reason.\n\nReply with the JSON format from AGENTS.md.')
+        if self.f.service:
+            # Bound to the worker's request (kind followup: delivered even if that request ends meanwhile).
+            mid = self.queue('supervisor', text, request_id=self.f.agent(slot).get('request') or 'notice', kind='followup')
+        else:
+            mid = self.f.queue('supervisor', text)
+        rec = dict(rec, message_id=mid, delivered_at=0, status='escalated', asked_at=time.time())
+        esc = self.f.escalation_state()
+        esc[key] = rec
+        self.f.save_escalations(esc)
+        self.audit('watch.prompt_escalated', slot=slot, level='warn', task=key, prompt=rec['prompt'],
+                   screen=rec['screen'], digest=rec['digest'], message_id=rec['message_id'])
+        card = routing_card(label + ' 停在确认框（非删除类），等监工裁定；屏幕见 ' + rec['screen'] + '。',
+                            kind='notice', slot=label, severity='warn')
+        card['metadata']['event_id'] = 'ui-dialog-' + digest(key + ':' + rec['scope'])[:32]
+        self.ui(slot, card)
+        self.ui('supervisor', card)
+        return key
 
     def replay_intents(self):
         # Replay prepared effects only; applied plans never run validators again.
@@ -1761,6 +1829,8 @@ class RuntimeV2:
                 info = self.f.agent(slot)
                 state = self.f.r.hgetall(self.bus.lease_key(slot))
                 if (info.get('state') == 'starting' and info.get('advice_hold') != '1'  # held for its first advisor sheet
+                        # a dialog before READY waits for a human (plan F B-2b): not a dead start
+                        and info.get('prompt_wait') != 'startup-g' + str(info.get('generation', '0'))
                         and now >= float(info.get('startup_deadline') or 0)):
                     self.f.setf(slot, state='dead', bridge_available=0, runtime_ready=0)
                     self.finish('blocked', slot + ' startup timed out before READY')

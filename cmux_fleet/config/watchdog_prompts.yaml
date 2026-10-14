@@ -11,12 +11,17 @@
 #   dialog's concrete operation / path lies inside a grant the run already has:
 #     own_cwd       every path shown is the slot's own directory (trusted at spawn)
 #     paths_in_run  every path shown is inside the slot directory or <run>/workspace (--add-dir)
-#   If the scope cannot be read off the screen, nothing is pressed: screen saved, slot held.
+#   If the scope cannot be read off the screen, nothing is pressed: screen saved, the slot is marked
+#   prompt_wait and dispatch pauses (not a hold: once a human answers in the pane the turn settles).
 # unknown_markers: a screen that shows one of these but matches no whitelist entry is an UNKNOWN
-#   dialog: the screen is saved, the slot is held, and nothing is pressed (an Enter could approve
-#   something the task never authorised).
+#   dialog: the screen is saved, the slot is marked prompt_wait, and nothing is pressed (an Enter
+#   could approve something the task never authorised).
 #   Deletions are always the user's call (2026-10-14): "dangerous rm" is an unknown marker, never a
 #   whitelist entry, and nothing in the fleet answers a delete confirmation (no PermissionRequest hook).
+# delete_markers (optional): extra words / phrases that make a dialog a delete (moves / renames count).
+#   The built-in list (cmux_fleet/watchdog.py DELETE_MARKERS: rm, unlink, delete, remove, mv, rename,
+#   git clean, DROP TABLE, 删除, 移动 ...) is always in force; this list can only add to it. Any of them
+#   in the last tail_lines rows means no key is ever pressed by the program, even on a whitelisted dialog.
 tail_lines: 25
 max_hits: 3
 prompts:
@@ -41,9 +46,10 @@ prompts:
     verify: own_cwd
 unknown_markers:
   # Claude Code asks for `rm` on a possibly-empty variable even under --dangerously-skip-permissions
-  # (10/12 E16). Every delete is confirmed by the user: screen saved, slot held, no key pressed.
+  # (10/12 E16). Every delete is confirmed by the user: screen saved, slot marked, no key pressed.
   - "Dangerous rm"
   - "Do you want to proceed?"
   - "Do you want to make this edit"
   - "Do you want to create"
   - "❯ 1. Yes"
+delete_markers: []

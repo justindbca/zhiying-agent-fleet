@@ -29,4 +29,12 @@ assert.ok(!Value.Check(schema,{...done,withdraw:'worker-1'})&&!Value.Check(schem
 assert.ok(Value.Check(schema,{...done,withdraw:['worker-1'],advisor:'off'}),'withdraw and advisor in one reply');
 assert.ok(Value.Check(schema,{...base,dispatch:[{to:'worker-1',instruction:'Write worker-1/a.md please',id:'M1',advise_note:'n'}],
   consult:[ask],advisor:'on'}),'every advisor key together');
+// plan F' 8.3 / 8.4: escalations[] answers [escalate], [dialog] and [blocked]
+const run={...base,dispatch:[]};
+assert.ok(Value.Check(schema,{...run,escalations:[{task:'dialog:worker-1:g0',decision:'approve'}]}),'dialog approve');
+assert.ok(Value.Check(schema,{...run,escalations:[{task:'blocked:worker-1',decision:'revise',note:'other way'}]}),'blocked revise');
+assert.ok(Value.Check(schema,{...run,escalations:[{task:'M0',decision:'approve',workers:2,note:'n'}]}),'split approve');
+assert.ok(!Value.Check(schema,{...run,escalations:[{task:'dialog:worker-1:g0',decision:'yes'}]}),'decision is an enum');
+assert.ok(!Value.Check(schema,{...run,escalations:[{decision:'approve'}]}),'task is required');
+assert.ok(!Value.Check(schema,{...run,escalations:{task:'M0',decision:'approve'}}),'escalations is a list');
 console.log('decision schema contract passed');

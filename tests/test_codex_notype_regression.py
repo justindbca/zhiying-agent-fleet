@@ -812,7 +812,9 @@ def test_finish_old_item_running_later_is_not_taken_as_a_new_delivery(sup):
     f.v2.finish('stopped', 'operator stop')
     assert cq(f, 'cq_state') == 'abandoned'
     out = codex_turn(f, plan(['worker-1']), users=[('', old['cq_text'])])
-    assert out is False or out['status'] in ('ignored', 'stale'), out
+    # Plan E-3: the held item's token turn completed: released, not settled (record stays abandoned).
+    assert out is not False and out['status'] == 'released', out
+    assert cq(f, 'cq_state') == 'abandoned'
     assert typed(f, 'worker-1') == [] and f.task()['status'] == 'stopped'
     # a later delivery of the same body gets its own token; the old item's turn never binds it
     new = codex_queue.deliver(f, 'supervisor', 'after-finish', _bare(old['cq_text']))
@@ -1265,7 +1267,9 @@ def test_cli_timeout_is_uncertain_held_and_after_clear_its_late_turn_never_settl
     f.v2.finish('stopped', 'operator stop')
     assert cq(f, 'cq_state') == 'abandoned'
     out = codex_turn(f, plan(['worker-1']), users=[('', text)])  # the item did run after all
-    assert out is False or out['status'] in ('ignored', 'stale'), out
+    # Plan E-3: its token turn completed, so the held slot is released (result NOT applied, record stays abandoned).
+    assert out is not False and out['status'] == 'released', out
+    assert cq(f, 'cq_state') == 'abandoned' and lease(f)['status'] == 'idle'
     assert typed(f, 'worker-1') == []
     assert_no_input_box(f)
 
@@ -1284,6 +1288,31 @@ def test_cli_timeout_then_the_item_runs_releases_the_hold_without_committing_its
     f.pump()
     assert cq(f, 'cq_state') == 'bound' and lease(f)['status'] == 'idle'
     assert typed(f, 'worker-1') == [] and len(f.q.items) == 1  # not committed, not dispatched, never retried
+    assert_no_input_box(f)
+
+
+def test_held_codex_delivery_is_released_only_when_its_token_turn_completes(sup, monkeypatch):
+    """Plan E-3: Codex has no withdraw, so another turn ending proves nothing while the held item may still run
+    from its queue. Only the rollout's task_complete of the token's own turn releases; afterwards the record
+    no longer blocks the next deliver."""
+    f = sup
+    f.q = install_queue(monkeypatch, TimeoutQueue())
+    submit(f)
+    rec = codex_queue.record(f.agent('supervisor'))
+    assert f.agent('supervisor')['state'] == 'held' and rec['cq_state'] == 'uncertain'
+    out = codex_turn(f, 'just chatting', trigger='user', users=[('', 'operator line')], inputs=['operator line'])
+    assert out['status'] == 'ignored' and 'has not started' in out['reason'], out
+    token_turn = str(uuid.uuid4())
+    running = turn_rows(token_turn, 'queue', [('', rec['cq_text'])], '', complete=False)
+    out = codex_turn(f, 'still chatting', trigger='user', users=[('', 'operator line 2')], inputs=['x'], before=running)
+    assert out['status'] == 'ignored' and 'still running' in out['reason'], out
+    assert f.agent('supervisor')['state'] == 'held' and lease(f)['status'] == 'uncertain'
+    out = codex_turn(f, plan(['worker-1']), turn=token_turn, users=[('', rec['cq_text'])])
+    assert out['status'] == 'released', out
+    assert f.agent('supervisor')['state'] == 'idle' and lease(f)['status'] == 'idle'
+    assert not codex_queue.unsettled(f.agent('supervisor')) and typed(f, 'worker-1') == []
+    f.q = install_queue(monkeypatch)
+    assert codex_queue.deliver(f, 'supervisor', 'after-release', 'next message')['token'] != rec['cq_token']
     assert_no_input_box(f)
 
 
@@ -1514,7 +1543,9 @@ def test_cli_timeout_withdraws_no_pending_item_and_its_late_turn_never_settles(s
     assert cq(f, 'cq_state') == 'abandoned'
     assert rows() == snap  # clear withdraws nothing from Codex's queue
     late = codex_turn(f, plan(['worker-1']), users=[('', rec['cq_text'])])  # the item runs after all
-    assert late is False or late['status'] in ('ignored', 'stale'), late
+    # Plan E-3: its token turn completed: the hold is released, nothing settled (record stays abandoned).
+    assert late is not False and late['status'] == 'released', late
+    assert cq(f, 'cq_state') == 'abandoned'
     assert typed(f, 'worker-1') == []
     f.v2.finish('stopped', 'operator stop')
     assert rows() == snap
