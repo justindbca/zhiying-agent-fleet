@@ -48,7 +48,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import advisor, brake, claude_hook, cli_pairs, codex_queue, contracts, handoff, history, kit as kitmod, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, watchdog  # noqa: E402
+from cmux_fleet import advisor, brake, claude_hook, cli_pairs, codex_queue, contracts, handoff, history, kit as kitmod, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, named_subfleet, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, watchdog  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -931,6 +931,8 @@ def parse_service_decision(text, workers):
         if not isinstance(item, dict) or not isinstance(item.get('request_id'), str) \
                 or not isinstance(item.get('reason'), str):
             raise ValueError('every skip item needs request_id and reason')
+    if decision.get('subfleet') is not None:  # §28: approve / reject one external sub-fleet up / down
+        named_subfleet.validate_decision(decision['subfleet'])
     return decision
 
 
@@ -1925,7 +1927,8 @@ class Fleet:
                                   claude_model(cfg, name) if is_claude(cfg, name) else agent_profile(cfg, name))},
             env_vars=dict({'PATH': os.environ.get('PATH', '')}, **(
                 pi_adapter.environment(cfg_path, cfg, name, generation) if is_pi(cfg, name)
-                else dict({'CODEX_HOME': str(codex_home(self.cfg))}, **(CLAUDE_ENV if is_claude(cfg, name) else {})))))
+                else dict({'CODEX_HOME': str(codex_home(self.cfg))}, **(CLAUDE_ENV if is_claude(cfg, name) else {})))),
+            **subfleet.tmux_spawn_args(self.cfg, name, generation))
         if not result.success:
             if result.pane_id:
                 self.setf(name, pane=result.pane_id)
@@ -3039,6 +3042,8 @@ class Fleet:
     def request(self, spec):
         if not self.service:
             raise ValueError('requests need a fleet started with --mode service')
+        if named_subfleet.is_op(spec):  # §28: own branch, never REQQ / validate_request / request_timeout
+            return named_subfleet.request(self, spec)
         validate_request(spec, self.dispatch_targets())
         rid = spec['id']
         if (self.r.hgetall(REQ + rid) or self.r.get(RESULT + rid)
@@ -3148,6 +3153,8 @@ class Fleet:
         for item in decision['skip']:
             if self.r.hget(REQ + item['request_id'], 'status') == 'routing':
                 self.publish(item['request_id'], 'skipped', worker='supervisor', reason=item['reason'])
+        if decision.get('subfleet'):
+            named_subfleet.decide(self, decision['subfleet'])
         if decision['status'] == 'BLOCKED':
             self.pause(decision.get('reason') or 'supervisor needs a human')
 
@@ -4117,6 +4124,7 @@ class Fleet:
                 raise ValueError(problem)
             workers, roles, profiles = roster.parse_entries(raw, Path(path).parent)
             table, per_worker = roster.handoff(raw)
+            subfleets = roster.subfleets(raw, Path(path).parent)  # §28 (exempt from the used-name rule)
             # A slot name used earlier in this run still has Redis state and a workspace.
             used = [n + ': name was already used in this run (agent state or workspace exists); pick a new name'
                     for n in workers if n not in self.workers
@@ -4193,6 +4201,12 @@ class Fleet:
         for name in self.names:  # status shows the effective values without waiting for a delivery
             if self.agent(name):
                 self.handoff_limits(name)
+        if subfleets != (self.cfg.get('subfleets') or []):
+            # §28 + dual display: tmux_slot reads cfg['subfleets'] at every spawn (memory and config file)
+            self.cfg['subfleets'] = subfleets
+            self.persist_roster()
+        if subfleets or named_subfleet.declared(self):
+            named_subfleet.declare(self, subfleets)
 
     def default_capacity_problem(self, adds, cfg=None):
         """None if new default slots ``adds`` fit the default model's card next to the live slots
@@ -4213,7 +4227,8 @@ class Fleet:
         self.cfg['workers'][:] = self.workers  # in place: the control view holds this list
         fields = {'workers': list(self.workers), 'worker_roles': self.cfg.get('worker_roles') or {},
                   'worker_profiles': self.cfg.get('worker_profiles') or {},
-                  'pi_models': self.cfg.get('pi_models') or {}, 'pi_thinkings': self.cfg.get('pi_thinkings') or {}}
+                  'pi_models': self.cfg.get('pi_models') or {}, 'pi_thinkings': self.cfg.get('pi_thinkings') or {},
+                  'subfleets': self.cfg.get('subfleets') or []}
         save(self.path, dict(load(self.path), **fields))
         try:
             latest = load(LATEST)
@@ -4962,6 +4977,7 @@ def resume(run, args):
         except (OSError, ValueError) as exc:
             raise SystemExit('--roster ' + str(roster_path) + ' rejected:\n' + str(exc)) from exc
         cfg['roster'] = str(roster_path)
+        cfg['subfleets'] = roster.load_subfleets(roster_path)  # respawned supervisor_slots start in tmux
     if getattr(args, 'advisor', False):  # sugar: writes `advisor: on` into this run's roster (§2.1)
         if cfg.get('worker_kit'):
             try:
@@ -5043,6 +5059,7 @@ def daemon(cfg_path, resume=False):
                     fleet.r.shutdown()
                 except Exception:
                     pass  # redis closes the socket while acknowledging shutdown
+                subfleet.stop_tmux(cfg)  # the fleet's own tmux server goes last (§19 dual display)
     if fleet is not None:
         lifecycle_close.after_daemon(fleet)  # lock released, Redis down: close this run's workspace
 
@@ -5282,7 +5299,9 @@ def start(args):
     if getattr(args, 'name', None):
         cfg.update(name=args.name.strip(), **titles)
     if roster_path:
-        cfg.update(roster=str(roster_path), worker_roles=worker_roles, worker_profiles=worker_profiles)
+        # subfleets before the first spawn: a supervisor_slot starts in the fleet's tmux (§28 / dual display)
+        cfg.update(roster=str(roster_path), worker_roles=worker_roles, worker_profiles=worker_profiles,
+                   subfleets=roster.load_subfleets(roster_path))
     if night_path:
         cfg['roster_night'] = str(night_path)
     if 'pi' in clis:

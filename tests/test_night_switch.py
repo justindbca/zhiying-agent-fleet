@@ -351,13 +351,15 @@ def test_pair_check_unverified_needs_smoke(pairs):
     assert night.resolve_launches(v2cfg(), {'worker-1': 'flashnext-coder'})['worker-1']['overrides']['worker_cli'] == 'pi'
 
 
-def test_pair_check_adopt_exception_is_claude_claude_task_only(pairs):
-    """Sub-fleet (design §19): an adopted Claude supervisor passes before the row is consulted."""
+def test_pair_check_adopt_exception_is_claude_claude_task_or_service(pairs):
+    """Sub-fleet (design §19, service: §28): an adopted Claude supervisor passes before the row is consulted."""
     pairs(('claude', 'claude', 'task', 'unverified', ('claude_supervisor',)))
     sub = v2cfg(supervisor_cli='claude', adopt=True)
     assert night.resolve_launches(sub, {'worker-1': 'claude-coder'})['worker-1']['overrides']['worker_cli'] == 'claude'
     assert '[adapter_missing]' in refusal(dict(sub, adopt=False), 'claude-coder')
-    assert '[unlisted]' in refusal(dict(sub, mode='service'), 'claude-coder')   # service: no exception
+    service = night.resolve_launches(dict(sub, mode='service'), {'worker-1': 'claude-coder'})  # §28: allowed
+    assert service['worker-1']['overrides']['worker_cli'] == 'claude'
+    assert '[unlisted]' in refusal(dict(sub, mode='service', adopt=False), 'claude-coder')  # without adopt: no
     assert 'claude+pi/task [unlisted]' in refusal(sub)                          # other worker CLI: no exception
 
 

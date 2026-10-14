@@ -296,17 +296,19 @@ def tree_agents(run):
 
 
 # ------------------------------------------------------------------ limits / refusal reasons
-def check(f, slot, task_id, workers, ready=True):
+def check(f, slot, task_id, workers, ready=True, named=None):
     """None when this sub-fleet may start now, else the reason (refusals are enforced by program).
 
     ``ready=False`` (escalate / approve time): limits and slot kind only; the worker is still
-    settling its report, so idle / in-flight are checked again when the spawn runs."""
+    settling its report, so idle / in-flight are checked again when the spawn runs.
+    ``named``: a roster ``subfleets:`` entry (§28): ``task_id`` is its name; the M<n> id, depth and
+    max_attempts rules (made for split tasks) do not apply, its workers run the entry's model."""
     fleet = _fleet()
     lim = limits(f.cfg)
-    if not valid_child_id(f.cfg.get('task_id'), task_id):
+    if not named and not valid_child_id(f.cfg.get('task_id'), task_id):
         want = (f.cfg['task_id'] + '.<n>') if f.cfg.get('task_id') else 'M<n>'
         return 'task id ' + repr(task_id) + ' must be ' + want + ' in this fleet'
-    if task_level(task_id) > lim['max_depth']:
+    if not named and task_level(task_id) > lim['max_depth']:
         return ('max_depth ' + str(lim['max_depth']) + ': ' + task_id + ' would be level '
                 + str(task_level(task_id)) + ' (main fleet is level 1)')
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
@@ -317,7 +319,7 @@ def check(f, slot, task_id, workers, ready=True):
     if any(record(d).get('task_id') == task_id for d in live):
         return 'sub-fleet ' + task_id + ' is already running'
     cap = int(f.cfg.get('max_attempts') or fleet.DEFAULTS['max_attempts'])
-    used = attempts_used(f.run_dir, task_id)
+    used = 0 if named else attempts_used(f.run_dir, task_id)
     if used >= cap:  # acceptance 10/13 P1-4: escalate -> approve must not retry a sub-fleet forever
         return (EXHAUSTED + ' ' + str(cap) + ': sub-fleet ' + task_id + ' already started ' + str(used)
                 + ' time(s); no new sub-fleet for it')
@@ -331,12 +333,13 @@ def check(f, slot, task_id, workers, ready=True):
                 + ' agents, ' + str(workers) + ' more would exceed it')
     if slot not in f.active_workers():
         return slot + ' is not an active worker of this fleet'
-    # The child's workers run this fleet's default worker runtime: its model card caps them (per fleet).
+    # The child's workers run this fleet's default worker runtime (a named entry: its own worker_model):
+    # that model card caps them (per fleet).
     try:
         from cmux_fleet import model_usage
         from cmux_fleet.agent_registry import AgentRegistry
-        problem = model_usage.default_problem(f.cfg, ['worker-' + str(i + 1) for i in range(workers)],
-                                              AgentRegistry())
+        problem = model_usage.default_problem(child_worker_cfg(f.cfg, named) if named else f.cfg,
+                                              ['worker-' + str(i + 1) for i in range(workers)], AgentRegistry())
     except Exception as exc:  # unreadable cards: refuse rather than start uncapped
         problem = 'cannot read agent cards: ' + str(exc)
     if problem:
@@ -398,6 +401,69 @@ def process_requests(f):
         f.log('subfleet.request', request=path.stem, **answer)
 
 
+# ------------------------------------------------------------------ dual display (supervisor_slot in tmux)
+def tmux_slot(cfg, slot):
+    """A worker named as ``supervisor_slot`` of a ``subfleets:`` entry runs in the fleet's own tmux server,
+    so its one session can show in the parent's and the sub-fleet's workspace at once. Never in a sub-fleet."""
+    if cfg.get('adopt') or slot == 'supervisor':
+        return False
+    return any(isinstance(e, dict) and e.get('supervisor_slot') == slot for e in cfg.get('subfleets') or [])
+
+
+def tmux_socket(cfg):
+    return str(Path(cfg['run']) / 'tmux.sock')
+
+
+def tmux_spawn_args(cfg, slot, generation):
+    """Extra spawn_interactive_cli arguments for ``slot``'s generation ({} for a plain cmux pane)."""
+    from cmux_fleet import cmux_manager
+    if not tmux_slot(cfg, slot):
+        return {}
+    return {'tmux_socket': tmux_socket(cfg), 'tmux_session': cmux_manager.tmux_session_name(slot, generation)}
+
+
+def stop_tmux(cfg):
+    """Fleet exit: end the fleet's tmux server (every slot was retired before)."""
+    from cmux_fleet import cmux_manager
+    if Path(tmux_socket(cfg)).exists():
+        cmux_manager.tmux_kill_server(tmux_socket(cfg))
+
+
+def parent_view(f, slot, sid):
+    """Parent side of a delegation: the second-client info of a tmux slot's tab (None: plain cmux pane,
+    which is released and moved instead)."""
+    probe = getattr(f.mgr, 'tmux_view_info', None)
+    return probe(sid) if probe and tmux_slot(f.cfg, slot) else None
+
+
+def attach_child_view(f, sid, peer, info):
+    """Child side: show the delegated session just before ``peer``; returns the child's tab of it (None:
+    failed). tmux slot: a second client tab (the parent keeps its own); cmux pane: move the released tab."""
+    if info.get('tmux_session'):
+        return f.mgr.attach_view(info, peer)
+    return sid if f.mgr.adopt(sid, peer, info) else None
+
+
+def detach_child_view(f, sid):
+    """Child side of the return: disconnect its client tab of a tmux slot (session untouched), or release
+    the adopted cmux pane for the parent to move back. Returns the hand-back info (None: not ours)."""
+    if not sid:
+        return None
+    probe = getattr(f.mgr, 'tmux_view_info', None)
+    view = probe(sid) if probe else None
+    if view is not None:
+        return view if f.mgr.detach_view(sid) else None
+    return f.mgr.release(sid)
+
+
+def detach_child_views(child_mgr):
+    """Parent ``collect``: disconnect client tabs a crashed child left behind before its tabs are closed."""
+    meta = child_mgr._meta() if hasattr(child_mgr, '_meta') else {}
+    for sid, info in list(meta.get('surfaces', {}).items()):
+        if info.get('tmux_role') == 'view':
+            child_mgr.detach_view(sid)
+
+
 # ------------------------------------------------------------------ spawn
 def child_lifecycle(parent):
     """A sub-fleet runs the lifecycle its parent's mode names (child_mode), default dev_task, never the
@@ -412,17 +478,45 @@ def child_lifecycle(parent):
     return child
 
 
-def child_config(f, slot, task_id, workers, rec_dir, sid, info, redis_cfg, name):
+NAMED_OVERRIDES = ('claude', 'worker_model', 'stall_timeout', 'request_timeout', 'max_busy')
+
+
+def child_worker_cfg(parent, named):
+    """The worker runtime keys of a named sub-fleet (§28): the entry's value, else the built-in default,
+    never the parent's (a read-only parent ``claude`` wrapper must not leak into the child)."""
     fleet = _fleet()
-    parent = f.cfg
+    cfg = {k: v for k, v in parent.items() if k not in NAMED_OVERRIDES}
+    for k in NAMED_OVERRIDES:
+        if k in named:
+            cfg[k] = named[k]
+        elif k in fleet.DEFAULTS:
+            cfg[k] = fleet.DEFAULTS[k]
+    cfg['worker_cli'] = 'claude'  # §19: only official Claude workers in a sub-fleet
+    return cfg
+
+
+def child_config(f, slot, task_id, workers, rec_dir, sid, info, redis_cfg, name, named=None):
+    fleet = _fleet()
+    parent = child_worker_cfg(f.cfg, named) if named else f.cfg
     root_path = parent.get('root_config') or str(f.path)
     path = list(parent.get('title_path') or [name]) + [slot, task_id]
     # `advisor` is the parent's in-memory switch (its roster): a sub-fleet starts with the advisor off.
     cfg = {k: v for k, v in parent.items() if k not in ('roster', 'worker_roles', 'roles', 'adopt',
-                                                          'redis_socket', 'redis_runtime_dir', 'advisor')}
+                                                          'redis_socket', 'redis_runtime_dir', 'advisor',
+                                                          'subfleets')}
     cfg.update(redis_cfg)
-    life = child_lifecycle(parent)
-    cfg.update(run=str(rec_dir), workers=['worker-' + str(i + 1) for i in range(workers)], mode='task',
+    mode = named['mode'] if named else 'task'
+    life = None if mode == 'service' else child_lifecycle(parent)
+    if named:  # its own roster (hot inside the child, §16), not numbered workers
+        from cmux_fleet import roster
+        names, roles, profiles = roster.load_entries(named['roster'])
+        cfg.update(roster=named['roster'], worker_roles=roles, worker_profiles=profiles,
+                   supervisor_role=named['supervisor_role'],
+                   named={'name': named['name'], 'autostart': named['autostart']})
+        cfg.pop('roster_night', None)
+    else:
+        names = ['worker-' + str(i + 1) for i in range(workers)]
+    cfg.update(run=str(rec_dir), workers=names, mode=mode,
                lifecycle=life, initiator={'kind': 'fleet', 'id': str(f.path)},
                session=session_name(task_id), task_id=task_id, parent_config=str(f.path),
                root_config=root_path, root_token=token(parent), name=name, title_path=path,
@@ -490,32 +584,17 @@ def default_launch(child_cfg_path, child_cfg, mgr):
                             start_directory=str(child_cfg['run']))
 
 
-def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, launch=None, contracts=False,
-                outputs=None):
-    """Start sub-fleet ``task_id`` with ``slot``'s live pane as its supervisor. Outside transactions only."""
-    fleet = _fleet()
-    from cmux_fleet import redis_runtime, runtime_v2
-    if not isinstance(goal, str) or not goal.strip():
-        raise Refused('a sub-fleet needs a goal')
-    reason = check(f, slot, task_id, workers)
-    if reason:
-        raise Refused(reason)
-    base = f.run_dir / 'sub'
-    rec_dir = base / task_id
-    attempt = 1
-    while rec_dir.exists():
-        attempt += 1
-        rec_dir = base / (task_id + '-attempt-' + str(attempt))
-    name = root_name(f.cfg, '' if f.cfg.get('adopt') else f.task().get('goal', ''))
-    path = list(f.cfg.get('title_path') or [name]) + [slot, task_id]
-    ws_title = title(path)
-    child_mgr = fleet.manager_for({'session': session_name(task_id), 'cmux_state_dir': f.cfg.get('cmux_state_dir'),
-                                   'agents_title': ws_title, 'control_title': 'Fleet control · ' + task_id})
-    if child_mgr.session_exists():
-        raise Refused('tabs of an earlier sub-fleet ' + task_id + ' are still open; close them first')
-    info_now = f.agent(slot)
-    sid = info_now['pane']
-    # 1. placeholder in the parent, in the worker's place
+# ------------------------------------------------------------------ parent-side view hooks (§28 / §3.1)
+# Where the parent shows or takes back the delegated session's tab. A tmux slot (dual display) keeps its
+# own parent tab and the child opens a second client (child side: attach_child_view / detach_child_view);
+# a plain cmux pane takes the §19 move-surface (placeholder in the parent, surface released / adopted back).
+def parent_attach_view(f, slot, sid, task_id, ws_title):
+    """Parent side, at delegation: (placeholder tab or None, released / second-client info).
+
+    Raises Refused when nothing was changed (the spawn rolls back)."""
+    view = parent_view(f, slot, sid)
+    if view is not None:  # tmux slot: the parent keeps its own tab of the session, nothing is released
+        return '', view
     # spawn_window execs the command: keep the tab's process alive (an exited tab reads as a closed runtime)
     show = 'printf "%s\\n" ' + shlex.quote(placeholder_label(slot, task_id, ws_title)) + '; exec sleep 2147483647'
     ph = f.mgr.spawn_window('placeholder-' + slot, '/bin/bash -c ' + shlex.quote(show),
@@ -525,13 +604,77 @@ def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, lau
             f.mgr.kill_pane(ph.pane_id)
         raise Refused('could not open the placeholder tab for ' + slot)
     f.mgr.rename(ph.pane_id, placeholder_label(slot, task_id, ws_title))
+    return ph.pane_id, (f.mgr.release(sid) or {})
+
+
+def parent_detach_view(f, rec, child_mgr, child_run):
+    """Parent side, on collect (the child daemon is gone): True when the delegated session is back in
+    ``rec['pane']`` as the slot's tab (placeholder closed, tab renamed); False when it is lost."""
+    if rec.get('view'):
+        # tmux slot: the parent's tab never left; a crashed child may still show its client tab.
+        detach_child_views(child_mgr)
+        returned = (f.mgr.get_pane_status(rec['pane']) is not None
+                    and f.mgr.has_cli_process(rec['pane'], _fleet().RESUME_CLIS))
+        if returned:
+            f.mgr.rename(rec['pane'], 'fx-' + f.cfg.get('tab_prefix', '') + f.label(rec['slot']))
+        return returned
+    back = {}
+    try:
+        back = _fleet().load(Path(child_run) / 'handback.json')
+    except (OSError, ValueError):
+        info = child_mgr.release(rec['pane'])  # crashed child: its registry still holds the pane
+        if info is not None:
+            back = {'pane': rec['pane'], 'info': info}
+    ph = rec['placeholder']
+    returned = bool(back) and back.get('pane') == rec['pane'] and f.mgr.adopt(rec['pane'], ph, back.get('info') or {})
+    if returned:
+        f.mgr.kill_pane(ph)
+        f.mgr.rename(rec['pane'], 'fx-' + f.cfg.get('tab_prefix', '') + f.label(rec['slot']))
+    return returned
+
+
+def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, launch=None, contracts=False,
+                outputs=None, named=None):
+    """Start sub-fleet ``task_id`` with ``slot``'s live pane as its supervisor. Outside transactions only.
+
+    ``named``: a roster ``subfleets:`` entry (§28; ``task_id`` is its name): its own roster and worker
+    runtime, its mode (service: no task, no deadline), and the run directory ``sub/<name>`` reused."""
+    fleet = _fleet()
+    from cmux_fleet import redis_runtime, runtime_v2
+    service = bool(named) and named['mode'] == 'service'
+    if not service and (not isinstance(goal, str) or not goal.strip()):
+        raise Refused('a sub-fleet needs a goal')
+    reason = check(f, slot, task_id, workers, named=named)
+    if reason:
+        raise Refused(reason)
+    base = f.run_dir / 'sub'
+    rec_dir = base / task_id
+    attempt = 1
+    if named:
+        attempt = int(record(rec_dir).get('attempt') or 0) + 1
+    while rec_dir.exists() and not named:
+        attempt += 1
+        rec_dir = base / (task_id + '-attempt-' + str(attempt))
+    name = root_name(f.cfg, '' if f.cfg.get('adopt') or f.service else f.task().get('goal', ''))
+    path = list(f.cfg.get('title_path') or [name]) + [slot, task_id]
+    ws_title = title(path)
+    child_mgr = fleet.manager_for({'session': session_name(task_id), 'cmux_state_dir': f.cfg.get('cmux_state_dir'),
+                                   'agents_title': ws_title, 'control_title': 'Fleet control · ' + task_id})
+    if child_mgr.session_exists():
+        raise Refused('tabs of an earlier sub-fleet ' + task_id + ' are still open; close them first')
+    if named and rec_dir.exists():
+        archive_run(rec_dir)  # §28: one directory per name; the last run's files move to archive/
+    info_now = f.agent(slot)
+    sid = info_now['pane']
     deliver = deliverables(f.workspace(), slot, rec_dir / 'workspace', outputs or ([output] if output else []))
     rec = {'task_id': task_id, 'slot': slot, 'run': str(rec_dir), 'state': 'starting', 'attempt': attempt,
            'workers': workers, 'output': output, 'deliver': deliver, 'created': time.time(), 'title': ws_title,
-           'placeholder': ph.pane_id, 'pane': sid, 'generation': int(info_now.get('generation') or 0)}
+           'placeholder': None, 'pane': sid, 'generation': int(info_now.get('generation') or 0)}
+    if named:
+        rec.update(name=task_id, named=True, mode=named['mode'], autostart=named['autostart'])
     cfg = released = None
     try:  # anything below fails -> rollback; SystemExit too (start_redis), never the parent daemon
-        # 2. child run directory, config, private Redis, task
+        # 1. child run directory, config, private Redis, task
         (rec_dir / 'workspace').mkdir(parents=True)
         backup = rec_dir / 'handover'
         backup.mkdir()
@@ -542,26 +685,29 @@ def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, lau
         save_record(rec_dir, rec)
         redis_cfg = redis_runtime.prepare(f.cfg.get('redis_runtime_root') or redis_runtime.DEFAULT_ROOT,
                                           uuid.uuid4().hex[:8])
-        cfg = child_config(f, slot, task_id, workers, rec_dir, sid, None, redis_cfg, name)
+        cfg = child_config(f, slot, task_id, workers, rec_dir, sid, None, redis_cfg, name, named=named)
         child_r = fleet.start_redis(cfg)
-        hours = 16
-        deadline = float(f.task().get('deadline') or 0)
-        if deadline:
-            hours = max((deadline - time.time()) / 3600, 0.05)
-        bus = runtime_v2.bus_for(cfg, child_r)
-        spec = {'goal': goal_text(goal, task_id, deliver, proposal, f.label(slot)), 'hours': hours}
-        if contracts:  # spec §3.0: a sub-fleet of a contract task runs P0 / P1 first as well
-            spec['contracts'] = True
-        runtime_v2.post_event(bus, {'kind': 'task', 'request_id': 'subfleet-' + task_id, 'spec': spec},
-                              'subfleet-' + task_id)
+        if not service:  # a service sub-fleet has no task: it answers requests until it is taken down
+            hours = 16
+            deadline = float(f.task().get('deadline') or 0)
+            if deadline:
+                hours = max((deadline - time.time()) / 3600, 0.05)
+            bus = runtime_v2.bus_for(cfg, child_r)
+            spec = {'goal': goal_text(goal, task_id, deliver, proposal, f.label(slot)), 'hours': hours}
+            if contracts:  # spec §3.0: a sub-fleet of a contract task runs P0 / P1 first as well
+                spec['contracts'] = True
+            runtime_v2.post_event(bus, {'kind': 'task', 'request_id': 'subfleet-' + task_id, 'spec': spec},
+                                  'subfleet-' + task_id)
         child_r.close(); child_r.connection_pool.disconnect()
-        # 3. stop delivering to the slot and hand the surface over (hooks now route to the child)
-        f.setf(slot, state='delegated', pane=ph.pane_id, delegated_pane=sid, delegated_task=task_id,
+        # 2. the parent's tab for the slot, then stop delivering to it (hooks now route to the child)
+        rec['placeholder'], released = parent_attach_view(f, slot, sid, task_id, ws_title)
+        rec['view'] = int(bool(released.get('tmux_session')))
+        f.setf(slot, state='delegated', pane=rec['placeholder'] or sid, delegated_pane=sid, delegated_task=task_id,
                delegate_cfg=str(rec_dir / 'config.json'), bridge_available=0)
-        released = f.mgr.release(sid) or {}
         cfg['adopt']['info'] = released
         fleet.save(rec_dir / 'config.json', cfg)
-        child_mgr._save_meta({'workspace': None, 'control_workspace': None, 'surfaces': {sid: released}})
+        child_mgr._save_meta({'workspace': None, 'control_workspace': None,
+                              'surfaces': {} if rec['view'] else {sid: released}})
         result = (launch or default_launch)(rec_dir / 'config.json', cfg, child_mgr)
         if not result.success:
             raise RuntimeError('child daemon did not start: ' + str(result.error))
@@ -582,15 +728,30 @@ def rollback(f, rec_dir, rec, released, cfg):
         shutdown_redis(cfg)
     fleet.manager_for({'session': session_name(rec['task_id']), 'cmux_state_dir': f.cfg.get('cmux_state_dir')}
                       ).release(rec['pane'])
-    if released is not None:
+    if released is not None and not rec.get('view'):
         f.mgr._tag(rec['pane'], **{k: v for k, v in released.items() if isinstance(v, str)})
     f.setf(rec['slot'], state='idle', pane=rec['pane'], delegated_pane='', delegated_task='', delegate_cfg='')
     restore_role(f, rec)
-    f.mgr.kill_pane(rec['placeholder'])
+    if rec.get('placeholder'):
+        f.mgr.kill_pane(rec['placeholder'])
     rec['state'] = 'failed'
     rec['reason'] = 'start failed'
     if Path(rec_dir).is_dir():
         save_record(rec_dir, rec)
+
+
+def archive_run(rec_dir):
+    """Move everything of a named sub-fleet's last run into ``archive/<date>/<time>/`` (§28 N6)."""
+    stamp = time.strftime('%Y-%m-%d/%H%M%S')
+    dest = Path(rec_dir) / 'archive' / stamp
+    n = 1
+    while dest.exists():
+        n += 1
+        dest = Path(rec_dir) / 'archive' / (stamp + '-' + str(n))
+    dest.mkdir(parents=True)
+    for item in Path(rec_dir).iterdir():
+        if item.name != 'archive':
+            shutil.move(str(item), str(dest / item.name))
 
 
 def restore_role(f, rec):
@@ -622,6 +783,8 @@ def start_adopted(f):
         f.spawn_ready(name)
     cwd = fleet.agent_cwd(f.cfg, 'supervisor')
     scope = f.role_scope('supervisor', f.runtime_cfg('supervisor'), {})
+    if f.cfg.get('supervisor_role'):  # a named sub-fleet (§28): the entry's supervisor role file
+        scope += '\n## 4. Your role (supervisor)\n\n' + Path(f.cfg['supervisor_role']).read_text()
     (cwd / 'AGENTS.md').write_text(scope)
     if fleet.is_claude(f.cfg, 'supervisor'):
         (cwd / 'CLAUDE.md').write_text(scope)
@@ -630,10 +793,12 @@ def start_adopted(f):
            last_msg='', empty_tries=0, launch_ready=1, runtime_ready=0, current_profile='', idle_confirmed=0,
            pane=sid, bridge_available=0, startup_deadline=time.time() + float(f.cfg['profile_ready_timeout']))
     first = f.agent(f.workers[0])['pane']
-    if not f.mgr.adopt(sid, first, adopt.get('info') or {}):
+    sid = attach_child_view(f, sid, first, adopt.get('info') or {})
+    if not sid:
         f.setf('supervisor', state='dead', launch_ready=0)
         f.log('subfleet.adopt_failed', pane=sid)
         return f.finish('blocked', 'could not take over the delegated pane of ' + adopt['slot'])
+    f.setf('supervisor', pane=sid)
     f.mgr.rename(sid, 'fx-' + f.cfg.get('tab_prefix', '') + fleet.SUPERVISOR_LABEL)
     history.write_page(f.run_dir, f.history_slots(), f.history_links())
     f.history_pane = f.mgr.arrange(sid, [f.agent(w)['pane'] for w in f.workers], history.page_url(f.run_dir))
@@ -643,8 +808,9 @@ def start_adopted(f):
     prompt = ('Your role changed. You are now ' + fleet.SUPERVISOR_LABEL + ' of sub-fleet ' + f.cfg['task_id']
               + ' (workers: ' + ', '.join(f.workers) + '). The files AGENTS.md / CLAUDE.md in your current '
               'directory were replaced with the supervisor rules: read AGENTS.md now and follow it from now on; '
-              'your earlier worker rules no longer apply. The daemon sends the task next. In this turn do no task '
-              'work: your final reply must be exactly READY.')
+              'your earlier worker rules no longer apply. '
+              + ('Requests are delivered to you next. ' if f.service else 'The daemon sends the task next. ')
+              + 'In this turn do no task work: your final reply must be exactly READY.')
     if codex_queue.is_codex(f.cfg, 'supervisor'):
         try:  # no typing: the adopted Codex session takes the role change from its queue
             codex_queue.deliver(f, 'supervisor', 'adopt', prompt, thread=adopt.get('thread') or '')
@@ -677,9 +843,11 @@ def sibling_anchor(cfg):
 def hand_back(f):
     """Child explicit stop: release the adopted pane (never kill it) for the parent to take back."""
     sid = f.agent('supervisor').get('pane')
-    info = f.mgr.release(sid) if sid else None
+    info = detach_child_view(f, sid)
     if info is None:
         return False
+    if info.get('tmux_session'):  # the parent never gave its own tab away
+        sid = f.cfg['adopt']['pane']
     _fleet().save(f.run_dir / 'handback.json', {'pane': sid, 'info': info, 'at': time.time()})
     f.log('subfleet.handed_back', pane=sid)
     return True
@@ -758,6 +926,8 @@ def tick(f):
     if not f.v2:
         return
     process_requests(f)
+    from cmux_fleet import named_subfleet
+    named_subfleet.tick(f)  # §28: external up/down, autostart, drains, paused mirror
     fleet = _fleet()
     running = f.running()
     for d in active_children(f.run_dir):
@@ -770,7 +940,9 @@ def tick(f):
             alive = fleet.daemon_running(d) or time.time() - float(rec.get('launched') or rec.get('created') or 0) < LAUNCH_GRACE
             if res is None and running and alive:
                 continue
-            rec['outcome'] = (res or {}).get('status') or 'cancelled'
+            if res is None and running and rec.get('named') and named_subfleet.revive(f, d, rec, cfg):
+                continue  # §28: an autostart sub-fleet's daemon died: relaunched (crashloop: collected below)
+            rec['outcome'] = (res or {}).get('status') or rec.get('outcome') or 'cancelled'  # §28: crashloop kept
             rec['reason'] = (res or {}).get('reason') or (
                 'main task ended while the sub-fleet was running' if not running
                 else 'the sub-fleet daemon exited without writing result.json')
@@ -803,15 +975,8 @@ def collect(f, child_run, notify=True):
     slot = rec['slot']
     child_mgr = fleet.manager_for(cfg)
     shutdown_redis(cfg)  # no orphan Redis even if the child crashed
-    back = {}
-    try:
-        back = fleet.load(Path(child_run) / 'handback.json')
-    except (OSError, ValueError):
-        info = child_mgr.release(rec['pane'])  # crashed child: its registry still holds the pane
-        if info is not None:
-            back = {'pane': rec['pane'], 'info': info}
     ph = rec['placeholder']
-    returned = bool(back) and back.get('pane') == rec['pane'] and f.mgr.adopt(rec['pane'], ph, back.get('info') or {})
+    returned = parent_detach_view(f, rec, child_mgr, child_run)
     restore_role(f, rec)
     child_mgr.close_all()
     child_mgr.meta_path.unlink(missing_ok=True)
@@ -828,8 +993,6 @@ def collect(f, child_run, notify=True):
         # The adopted session may still be mid-turn (parent task ended, stop): abort that turn so its
         # late Stop cannot settle as the READY of the return. Second place Escape counts as accepted stop.
         f.mgr.send_key(rec['pane'], 'Escape')
-        f.mgr.kill_pane(ph)
-        f.mgr.rename(rec['pane'], 'fx-' + f.cfg.get('tab_prefix', '') + f.label(slot))
         f.setf(slot, pane=rec['pane'], state='starting', launch_ready=1, runtime_ready=0, bridge_available=0,
                startup_deadline=time.time() + float(f.cfg['profile_ready_timeout']), busy_since=time.time())
         # Always told (also on a stop): the session still believes it is a supervisor until then.
@@ -848,7 +1011,7 @@ def collect(f, child_run, notify=True):
             f.log('subfleet.return_failed', task=rec['task_id'], slot=slot)
     else:
         # The original session is gone (or could not be moved back): next generation in the placeholder's place.
-        f.setf(slot, pane=ph, state='idle')
+        f.setf(slot, pane=ph or rec['pane'], state='idle')
         f.v2.respawn([slot], True)
         f.log('subfleet.slot_respawned', task=rec['task_id'], slot=slot)
     ok = rec.get('outcome') == 'completed'
@@ -861,11 +1024,17 @@ def collect(f, child_run, notify=True):
     if ok and missing:
         ok, rec['reason'] = False, 'completed but the deliverable ' + rec['output'] + ' is missing or empty'
     rec['state'] = 'returned' if ok else 'failed'
+    if rec.get('named'):  # §28: taken down on purpose is not a failure; the parent hash says down
+        from cmux_fleet import named_subfleet
+        rec['state'] = 'down' if rec.get('outcome') in named_subfleet.DOWN_OUTCOMES else 'failed'
     rec['finished'] = time.time()
     save_record(child_run, rec)
     f.refresh_history()
     f.log('subfleet.' + rec['state'], task=rec['task_id'], slot=slot, outcome=rec.get('outcome'),
           reason=rec.get('reason', ''), attempt=rec.get('attempt'))
+    if rec.get('named'):
+        named_subfleet.collected(f, rec, returned)
+        return rec  # never a "[Sub-fleet … failed]" notice: the parent supervisor does not own it
     if notify and f.running():
         extra = f.escalation_finished(rec, ok)
         f.queue('supervisor', '[Sub-fleet ' + rec['task_id'] + ' ' + ('completed' if ok else 'failed') + '] '
@@ -888,7 +1057,8 @@ def stop_children(f, wait=STOP_WAIT):
         if cfg is None:
             continue
         if rec['state'] != 'stopping':
-            rec.update(state='stopping', outcome=rec.get('outcome') or 'stopped', reason='main fleet stopped')
+            rec.update(state='stopping', outcome=rec.get('outcome') or ('down' if rec.get('named') else 'stopped'),
+                       reason='main fleet stopped')
             save_record(d, rec)
             post_stop(cfg)
         deadline = time.monotonic() + wait
@@ -915,6 +1085,12 @@ def resume_children(f, launch=None):
         if rec['state'] == 'stopping':
             collect(f, d)
             continue
+        if rec.get('named') and not rec.get('autostart'):
+            # §28 N5: an externally started sub-fleet waits for the next external up, never a stale "up"
+            rec.update(state='stopping', outcome='down', reason='parent fleet resumed')
+            save_record(d, rec)
+            collect(f, d, notify=False)
+            continue
         if not redis_up(cfg):
             fleet.start_redis(cfg, tries=300)  # reloads its AOF from the same directory
         mgr = fleet.manager_for(cfg)
@@ -939,6 +1115,8 @@ def tree(cfg):
         except (OSError, ValueError):
             child = None
         item = {k: rec.get(k) for k in ('state', 'slot', 'outcome', 'reason', 'attempt', 'title', 'workers')}
+        if rec.get('named'):
+            item.update(name=rec.get('name'), mode=rec.get('mode'), autostart=rec.get('autostart'))
         item.update(run=str(d), daemon_alive=fleet.daemon_running(d), result=child_result(d))
         if child:
             item['subfleets'] = tree(child)
