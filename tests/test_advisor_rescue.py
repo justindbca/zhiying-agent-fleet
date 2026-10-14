@@ -9,7 +9,7 @@ import pytest
 from test_advisor import Runner, advisor_on, afx, item, report, send_decision, supervisor_texts, v2adv2, worker_text  # noqa: F401
 from test_fleet import decision, fx, turn  # noqa: F401
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
-from cmux_fleet import advisor, fleet, handoff
+from cmux_fleet import advisor, claude_hook, fleet, handoff
 
 FINDING = '两轮都把 Reddit 抓成 403；产出只有标题没有正文'
 
@@ -220,7 +220,9 @@ def run_respawn(f, gen=0):
     f.pump()
     info = f.agent('worker-1')
     assert info['state'] == 'handoff'
-    prompt = [t for p, t in f.mgr.sent if p == info['pane']][-1]
+    # Claude workers take deliveries from their Stop-hook mailbox (claude_hook), never the pane.
+    box = claude_hook.keys('fx', 'worker-1', int(info['generation']))['mailbox']
+    prompt = json.loads(f.r.l[box][-1])['text']
     assert 'new configuration' in prompt and 'Context is almost full' not in prompt
     Path(info['handoff_draft']).write_text('## Done (facts)\n- 7 links in worker-1/notes.md\n## In progress\nnone\n'
                                            '## Next steps (in order)\n1. fetch the bodies\n')

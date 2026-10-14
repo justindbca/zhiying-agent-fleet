@@ -1,8 +1,10 @@
 """Fleet daemon tests: in-memory Redis, fake cmux manager, fake Codex rollouts.
 No live model, no cmux, no redis-server."""
+import datetime
 import json
 import os
 import sys
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +12,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from cmux_fleet import fleet, handoff  # noqa: E402
+from cmux_fleet import claude_hook, fleet, handoff  # noqa: E402
+import hook_sim  # noqa: E402
 
 THREADS = {'supervisor': '11111111-1111-1111-1111-111111111111',
            'worker-1': '22222222-2222-2222-2222-222222222222'}
@@ -73,6 +76,19 @@ class FakeRedis:
     def lrem(self, k, count, v):
         self.l[k] = [x for x in self.l.get(k, []) if x != v]
 
+    def expire(self, k, seconds):
+        return k in self.kv or k in self.h or k in self.l
+
+    def exists(self, k):
+        return int(k in self.kv or k in self.h or bool(self.l.get(k)))
+
+    def incr(self, k):
+        self.kv[k] = str(int(self.kv.get(k, 0)) + 1)
+        return int(self.kv[k])
+
+    def close(self):
+        pass
+
     def ltrim(self, k, a, b):
         items = self.l.get(k, [])
         self.l[k] = items[a:] if b == -1 else items[a:b + 1]
@@ -81,6 +97,7 @@ class FakeRedis:
 class FakeMgr:
     def __init__(self):
         self.n, self.sent, self.killed, self.alive, self.keys = 0, [], [], set(), []
+        self.queued = []  # queued Codex deliveries (conftest); `sent` = real pastes only
 
     def spawn_interactive_cli(self, **kw):
         self.spawned = getattr(self, 'spawned', []) + [kw]
@@ -141,6 +158,46 @@ def write_rollout(sessions, thread, cwd, used=1000, rows=(), window=95000):
     return path
 
 
+# ---- fake `codex queue` (installed for every test by tests/conftest.py)
+# Real Codex 0.162.1: a queued message starts its own turn whose rollout task_started has
+# turn_attribution.turn_trigger "queue" and whose one UserMessage carries the queued client_id.
+CODEX_QUEUE = {}  # thread -> {'turn', 'text' (queued, with its token line), 'body'} of the delivery not answered yet
+
+
+def _stamp():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+
+
+def codex_rows(thread, prompt, text=None, *, pop=True):
+    """(turn_id, rollout rows) of a Codex turn whose input is `prompt`: the queued delivery's own
+    turn when `prompt` is what was queued, else a turn the user typed. text=None: still running."""
+    q = CODEX_QUEUE.get(thread)
+    if q and prompt in (q['text'], q.get('body')):
+        if pop:
+            CODEX_QUEUE.pop(thread)
+        turn, trigger, client = q['turn'], 'queue', 'c-' + uuid.uuid4().hex
+        prompt = q['text']  # Codex records the queued text itself, token line included
+    else:
+        turn, trigger, client = 't-' + uuid.uuid4().hex, 'user', 'c-' + uuid.uuid4().hex
+    rows = [{'timestamp': _stamp(), 'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_attribution': {
+                'turn_id': turn, 'turn_trigger': trigger, 'root_turn_id': turn}}},
+            {'timestamp': _stamp(), 'type': 'event_msg', 'payload': {'type': 'item_completed', 'turn_id': turn, 'item': {
+                'type': 'UserMessage', 'client_id': client, 'content': [{'type': 'text', 'text': prompt}]}}}]
+    if text is not None:
+        rows.append({'timestamp': _stamp(), 'type': 'event_msg', 'payload': {
+            'type': 'task_complete', 'turn_id': turn, 'last_agent_message': text}})
+    return turn, rows
+
+
+def append_rollout(sessions, thread, cwd, rows):
+    path = Path(sessions) / '2026/09/25' / ('rollout-' + thread + '.jsonl')
+    if not path.exists():
+        return write_rollout(Path(sessions), thread, cwd, rows=rows)
+    with path.open('a') as fh:
+        fh.write('\n'.join(json.dumps(x) for x in rows) + '\n')
+    return path
+
+
 @pytest.fixture
 def fx(tmp_path):
     run = tmp_path / 'run'
@@ -160,7 +217,9 @@ def fx(tmp_path):
 
 
 def turn(name, text, generation=0):
-    return {'kind': 'turn', 'agent': name, 'generation': generation, 'thread': THREADS.get(name), 'text': text}
+    q = CODEX_QUEUE.pop(THREADS.get(name), None)  # the queued delivery this turn answers (its rows are in the rollout)
+    return {'kind': 'turn', 'agent': name, 'generation': generation, 'thread': THREADS.get(name), 'text': text,
+            **({'turn': q['turn']} if q else {})}
 
 
 def decision(status='RUNNING', completion=30, dispatch=None, **extra):
@@ -169,9 +228,21 @@ def decision(status='RUNNING', completion=30, dispatch=None, **extra):
     return json.dumps(dict(status=status, completion=completion, reason='r', dispatch=dispatch, **extra))
 
 
+def received(mgr, pane):
+    """What reached `pane`: its queued Codex deliveries (conftest), otherwise its real pastes. Never both:
+    the conftest guard fails a test in which a Codex pane also got a paste."""
+    box = mgr if hasattr(mgr, 'sent') else mgr.w
+    return [t for p, t in getattr(box, 'queued', []) if p == pane] or [t for p, t in box.sent if p == pane]
+
+
+def traffic(mgr):
+    """Everything that reached any pane: real pastes and queued Codex deliveries (for "nothing reached" checks)."""
+    box = mgr if hasattr(mgr, 'sent') else mgr.w
+    return list(box.sent) + list(getattr(box, 'queued', []))
+
+
 def last_to(f, name):
-    pane = f.agent(name)['pane']
-    return [t for p, t in f.mgr.sent if p == pane][-1]
+    return received(f.mgr, f.agent(name)['pane'])[-1]
 
 
 def seasoned(f, name):
@@ -486,7 +557,11 @@ def test_rotated_worker_gets_next_name_and_old_name_still_routes(fx):
     fx.pump()
     assert 'worker-1/map.md' in last_to(fx, 'worker-1')  # same slot dir, artifacts still valid
     write_rollout(fx.sessions, new_thread, fleet.agent_cwd(fx.cfg, 'worker-1'))
-    fx.handle({'kind': 'turn', 'agent': 'worker-1', 'generation': 1, 'thread': new_thread, 'text': 'Done: step two'})
+    append_rollout(fx.sessions, new_thread, fleet.agent_cwd(fx.cfg, 'worker-1'),  # rewritten: put its queued turn back
+                   codex_rows(new_thread, CODEX_QUEUE[new_thread]['text'], pop=False)[1])
+    q = CODEX_QUEUE.pop(new_thread, None)  # the queued delivery this turn answers
+    fx.handle({'kind': 'turn', 'agent': 'worker-1', 'generation': 1, 'thread': new_thread, 'text': 'Done: step two',
+               **({'turn': q['turn']} if q else {})})
     fx.pump()
     assert '[worker-1.1 report (took over from worker-1)]' in last_to(fx, 'supervisor')
     fx.handle(turn('supervisor', decision(dispatch=[
@@ -577,13 +652,24 @@ def test_stalled_worker_is_aborted_and_reported_to_supervisor(fx):
     assert fx.agent('worker-1')['stalls'] == '0'
 
 
+def _started_turn(fx, text):
+    """The rollout of a Codex turn that took `text` from the queue and then went silent (no task_complete)."""
+    t = str(uuid.uuid4())
+    return [{'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': t,
+                                              'turn_attribution': {'turn_id': t, 'turn_trigger': 'queue'}}},
+            {'type': 'event_msg', 'payload': {'type': 'item_completed', 'turn_id': t, 'item': {
+                'type': 'UserMessage', 'content': [{'type': 'text', 'text': text}]}}}]
+
+
 def test_stalled_supervisor_gets_one_retry_then_blocks(fx):
+    """The stalled turn had taken the message from Codex's queue (Escape aborts it), so one retry is safe."""
     import time as _t
     fx.cfg['stall_timeout'] = 600
     fx.pump()
     first = last_to(fx, 'supervisor')
     stale = _t.time() - 1000
-    path = write_rollout(fx.sessions, THREADS['supervisor'], fleet.agent_cwd(fx.cfg, 'supervisor'))
+    path = write_rollout(fx.sessions, THREADS['supervisor'], fleet.agent_cwd(fx.cfg, 'supervisor'),
+                         rows=_started_turn(fx, fx.agent('supervisor')['cq_text']))
     os.utime(path, (stale, stale))
     fx.setf('supervisor', busy_since=stale)
     fx.tick()
@@ -593,6 +679,25 @@ def test_stalled_supervisor_gets_one_retry_then_blocks(fx):
     fx.setf('supervisor', busy_since=stale); os.utime(path, (stale, stale))
     fx.tick()
     assert fx.task()['status'] == 'blocked' and 'stalled twice' in fx.task()['reason']
+
+
+def test_stalled_supervisor_whose_queued_item_never_started_is_not_queued_twice(fx):
+    """No turn carries the delivery's token: the item still sits in Codex's queue (abandoning cannot withdraw
+    it) and runs once the TUI is free. No second copy is queued; its own turn still settles it."""
+    import time as _t
+    fx.cfg['stall_timeout'] = 600
+    fx.pump()
+    first, rec = last_to(fx, 'supervisor'), dict(fx.agent('supervisor'))
+    stale = _t.time() - 1000
+    path = write_rollout(fx.sessions, THREADS['supervisor'], fleet.agent_cwd(fx.cfg, 'supervisor'))
+    os.utime(path, (stale, stale))
+    fx.setf('supervisor', busy_since=stale)
+    fx.tick()
+    assert fx.r.llen('fx:inbox:supervisor') == 0 and fx.agent('supervisor')['state'] == 'busy'
+    assert fx.agent('supervisor')['cq_token'] == rec['cq_token'] and fx.agent('supervisor')['cq_state'] == 'queued'
+    fx.pump()
+    assert last_to(fx, 'supervisor') == first and fx.task()['status'] == 'running'
+    assert any(json.loads(x)['kind'] == 'queue.kept' for x in fx.r.l['fx:log'])
 
 
 def test_rollout_activity_keeps_a_busy_agent_alive(fx):
@@ -723,7 +828,11 @@ def test_claude_argv_pins_stop_hook_generation(cfx):
 def test_claude_multiline_message_goes_through_a_file(cfx):
     cfx.handle(turn('supervisor', decision()))
     cfx.pump()
-    sent = last_to(cfx, 'worker-1')
+    # Claude worker: the one-line pointer goes to its Stop-hook mailbox, never into the pane.
+    assert not [t for p, t in cfx.mgr.sent if p == cfx.agent('worker-1')['pane']]
+    entry = json.loads(cfx.r.l[claude_hook.keys('fx', 'worker-1', 0)['mailbox']][-1])
+    sent = entry['text']
+    assert entry['kind'] == 'pointer' and entry['msg_id'] == cfx.agent('worker-1')['msg_id']
     assert '\n' not in sent and '.inbox/msg-' in sent
     path = Path(sent.split('the full message is in ')[1].split(' . Read')[0])
     assert 'Write worker-1/report.md' in path.read_text()
@@ -737,8 +846,8 @@ def test_claude_stop_skips_background_work(tmp_path, monkeypatch):
                        'background_tasks': [{'id': 'a'}]})
     done = json.dumps({'session_id': 's1', 'transcript_path': '/x', 'last_assistant_message': 'Done: x',
                        'background_tasks': []})
-    assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', busy) is False
-    assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '1', done) is True
+    assert hook_sim.claude_stop(tmp_path / 'c.json', 'worker-1', '1', busy) is False
+    assert hook_sim.claude_stop(tmp_path / 'c.json', 'worker-1', '1', done) is True
     ev = json.loads(r.l['fx:events'][0])
     assert ev['text'] == 'Done: x' and ev['transcript'] == '/x' and ev['generation'] == 1
 
@@ -750,7 +859,7 @@ def claude_turn(f, name, text):
 
 def sup_traffic(f):
     sup = f.agent('supervisor')['pane']
-    seen = [txt for p_, txt in f.mgr.sent if p_ == sup] + f.r.l.get('fx:inbox:supervisor', [])
+    seen = received(f.mgr, sup) + f.r.l.get('fx:inbox:supervisor', [])
     return ''.join(seen)
 
 
@@ -784,7 +893,7 @@ def test_claude_stop_reads_delivery_id_from_transcript(tmp_path, monkeypatch):
     rows += [{'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'z' * 32768}]}}] * 40
     tr.write_text('\n'.join(json.dumps(x) for x in rows) + '\n')  # pointer is > 1 MiB from the end
     payload = json.dumps({'session_id': 's', 'transcript_path': str(tr), 'last_assistant_message': 'Done', 'background_tasks': []})
-    assert fleet.claude_stop(tmp_path / 'c.json', 'worker-1', '0', payload) is True
+    assert hook_sim.claude_stop(tmp_path / 'c.json', 'worker-1', '0', payload) is True
     assert json.loads(r.l['fx:events'][0])['msg_id'] == 'msg-20261008-090500-abc123'
 
 
@@ -872,8 +981,9 @@ def submit(f, spec):
 
 
 def answer(f, name, text):
+    q = CODEX_QUEUE.pop(SVC_THREADS[name], None)  # the queued delivery this turn answers
     f.handle({'kind': 'turn', 'agent': name, 'generation': int(f.agent(name)['generation']),
-              'thread': SVC_THREADS[name], 'text': text})
+              'thread': SVC_THREADS[name], 'text': text, **({'turn': q['turn']} if q else {})})
 
 
 def results(f):

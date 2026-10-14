@@ -16,10 +16,10 @@ from pathlib import Path
 
 import redis
 
-from cmux_fleet import cli_pairs, contracts
+from cmux_fleet import claude_hook, cli_pairs, contracts
 from cmux_fleet.message_bus import BusError, MessageBus, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
-from cmux_fleet import lifecycle_close, subfleet, tui_cards
+from cmux_fleet import codex_queue, lifecycle_close, subfleet, tui_cards
 from cmux_fleet import watchdog
 
 
@@ -53,8 +53,9 @@ def validate_config(cfg):
 
 def tui_slot(cfg, slot):
     """Official interactive CLIs (Codex/Claude) have no in-process bridge: the daemon
-    receives their delivery and types the business text into the TUI; the CLI's own
-    turn-end hook (Codex notify / Claude Stop) settles it."""
+    receives their delivery and hands the business text to the TUI (typed for Codex and a
+    Claude supervisor; through the Stop-hook mailbox for Claude workers, see claude_hook);
+    the CLI's own turn-end hook (Codex notify / Claude Stop) settles it."""
     return cfg.get('transport_version') == 2 and (
         cfg.get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') or 'codex') != 'pi'
 
@@ -535,10 +536,21 @@ class RuntimeV2:
             for slot in list(self.rotation_pending):
                 self.rotation_pending.remove(slot)
                 self.f.finish_rotation(slot)
-            for slot in list(self.startup_nudges):  # pane typing is not a Redis effect either
+            for slot in list(self.startup_nudges):  # pane typing / queueing is not a Redis effect either
                 self.startup_nudges.remove(slot)
                 pane = self.f.agent(slot).get('pane')
-                if pane:
+                if codex_queue.is_codex(self.slot_cfg(slot), slot):
+                    try:
+                        codex_queue.deliver(self.f, slot, 'startup-nudge-g' + str(self.f.agent(slot).get('generation')),
+                                            STARTUP_NUDGE)
+                    except codex_queue.QueueError as exc:
+                        # No typing fallback: the startup deadline then blocks the slot as for no READY.
+                        self.audit('startup.nudge_failed', slot=slot, level='error', error=str(exc)[:300])
+                elif self.hooked(slot):
+                    generation = int(self.f.agent(slot).get('generation') or 0)
+                    claude_hook.post(self.bus.r, self.hook_keys(slot, generation),
+                                     {'kind': 'nudge', 'generation': generation, 'text': STARTUP_NUDGE})
+                elif pane:
                     from cmux_fleet.fleet import is_claude
                     self.f.mgr.send_prompt_to_idle(pane, STARTUP_NUDGE, bracketed=is_claude(self.f.runtime_cfg(slot), slot))
             return True
@@ -886,9 +898,9 @@ class RuntimeV2:
                 self.audit('candidate.invalid', slot=slot, error=error, detail=candidates)
             self.release(env, value, 'failed' if error else 'completed')
             if self.f.service:
-                self.f.on_service_supervisor('invalid candidate' if error else text)
+                self.f.on_service_supervisor(text, invalid=error)
             else:
-                self.f.on_supervisor('invalid candidate' if error else text)
+                self.f.on_supervisor(text, invalid=error)
             invalid = error or int(self.f.r.hget(legacy.SERVICE if self.f.service else legacy.TASK, 'bad_replies') or 0)
             if invalid:
                 self.f.r.hset(self.bus.msg_key(env['message_id']), mapping={'outcome': 'failed'})
@@ -1046,6 +1058,7 @@ class RuntimeV2:
             self.audit('resume.refused', level='error', error='ambiguous effect intent; held like a plain restart')
             return self.recover()
         previous = self.bus.r.hget(SERVICE, 'reason') if self.f.paused() else ''
+        unsettled = self.codex_unsettled()  # read before clear_slot abandons them and releases their leases
         lost = self.lost_dispatches()
         sup = self.f.agent('supervisor').get('pane')
         page = bool(sup) and self.f.mgr.get_pane_status(sup) is not None
@@ -1062,13 +1075,47 @@ class RuntimeV2:
         # A delegated slot's pane is run by its sub-fleet (resumed below): never replace it here.
         delegated = [s for s in self.f.workers if self.f.agent(s).get('state') == 'delegated']
         self.respawn([s for s in self.f.names if s not in reattach and s not in delegated], page)
+        ran = self.codex_ran(unsettled)  # only now: respawn closed those sessions (never reattached)
+        lost = [m for m in lost if m['message_id'] not in ran]
         self.f.resume()
         if self.f.service:
-            self.transaction('resume-requests-' + uuid.uuid4().hex, self.requeue_requests)
+            self.transaction('resume-requests-' + uuid.uuid4().hex, lambda: self.requeue_requests(ran))
         elif self.f.task().get('status') == 'running':
-            self.transaction('resume-task-' + uuid.uuid4().hex, lambda: self.brief(lost))
+            self.transaction('resume-task-' + uuid.uuid4().hex, lambda: self.brief(lost, ran))
         self.audit('daemon.resumed', level='warn', reattached=reattach, lost=len(lost), previous_pause=previous or '')
         subfleet.resume_children(self.f)  # children whose daemon is gone run again (--resume)
+
+    def codex_unsettled(self):
+        """Codex slots with a queued delivery never settled: [(slot, record, pane, lease message id or '')].
+        Abandoning does not withdraw such an item (Codex has no official way to), so a live TUI would still
+        run it next to the replay: clear_slot never reattaches these slots and respawn closes their session."""
+        out = []
+        for slot in self.f.names:
+            info = self.f.agent(slot)
+            if codex_queue.is_codex(self.slot_cfg(slot), slot) and codex_queue.unsettled(info):
+                rec = codex_queue.record(info)
+                lease = self.bus.r.hgetall(self.bus.lease_key(slot))
+                current = lease.get('message_id') if lease.get('current_delivery') == rec['cq_delivery'] else ''
+                out.append((slot, rec, info.get('pane') or '', current or ''))
+        return out
+
+    def codex_ran(self, unsettled):
+        """After the old sessions are closed, the old rollout decides by the delivery's token: no turn -> it
+        never ran (replayed); started -> interrupted by the close (replayed, like an aborted typed turn);
+        completed -> it ran while the daemon was down: never replayed. A session still open (respawn could
+        not close it; the task is blocked) is never replayed either. Returns {message_id: (slot, record, turn)}."""
+        ran = {}
+        for slot, rec, pane, current in unsettled:
+            open_ = bool(pane) and self.f.mgr.get_pane_status(pane) is not None
+            hit = codex_queue.token_turn(rec['cq_thread'], rec['cq_token'], self.f.sessions)
+            if current and (open_ or (hit and hit['complete'])):
+                ran[current] = (slot, rec, (hit or {}).get('turn', ''))
+            event = 'resume.codex_open' if open_ else 'resume.codex_ran' if hit and hit['complete'] else (
+                'resume.codex_interrupted' if hit else 'resume.codex_not_started')
+            self.audit(event, slot=slot, level='warn', delivery_id=rec['cq_delivery'],
+                       turn=(hit or {}).get('turn', ''), message_id=current,
+                       replay='no' if current in ran else 'yes')
+        return ran
 
     def lost_dispatches(self):
         """Task-mode worker instructions of the running task that were queued or in flight."""
@@ -1090,6 +1137,10 @@ class RuntimeV2:
         from cmux_fleet.fleet import RESUME_CLIS
         info = self.f.agent(slot)
         pane = info.get('pane')
+        if self.hooked(slot) and self.bus.r.hget(self.bus.lease_key(slot), 'current_delivery'):
+            # The Escape that aborts its in-flight turn would also kill the waiting Stop hook and
+            # leave the session with no delivery channel: start the next generation instead.
+            return False
         return (tui_slot(self.slot_cfg(slot), slot) and info.get('runtime_ready') == '1' and not info.get('handoff_id')
                 and info.get('state') in ('idle', 'busy', 'held') and bool(pane)
                 and self.f.mgr.get_pane_status(pane) is not None and self.f.mgr.has_cli_process(pane, RESUME_CLIS))
@@ -1098,6 +1149,15 @@ class RuntimeV2:
         """Release the slot's lease and cancel its queue (re-queued afterwards). False: lease still held."""
         state = self.bus.r.hgetall(self.bus.lease_key(slot))
         released = True
+        # A Codex delivery that was queued but never proven to run may still sit in this live session's
+        # queue (Codex's queue is not ours to edit) and would run next to the replay: do not reattach
+        # that session, respawn it (new thread; the old item can only run if that session is resumed).
+        keep_out = (reattached and codex_queue.is_codex(self.slot_cfg(slot), slot)
+                    and codex_queue.unsettled(self.f.agent(slot)))
+        codex_queue.clear(self.f, slot, 'start --resume')  # its token can never settle anything now
+        if keep_out:
+            self.audit('resume.codex_unsettled', slot=slot, level='warn',
+                       reason='queued delivery not proven to have run; session respawned, not reattached')
         if state.get('current_delivery'):
             pane = self.f.agent(slot).get('pane')
             if reattached and pane:
@@ -1114,7 +1174,7 @@ class RuntimeV2:
                 self.f.setf(slot, idle_confirmed=0)  # Escape is not proof the old turn stopped
         for mid in self.bus.pending(slot):
             self.cancel_queued(slot, {'message_id': mid}, 'start --resume: re-queued after reconcile')
-        return released
+        return released and not keep_out
 
     def respawn(self, slots, page):
         """Next generation of each slot in place; without a supervisor pane, rebuild the whole page."""
@@ -1214,8 +1274,9 @@ class RuntimeV2:
                 + '\nCompleted dispatches (their reports were accepted; do not redo them):\n'
                 + ('\n'.join(x for _, x in sorted(done)) or '- none'))
 
-    def brief(self, lost):
-        """Re-queue lost dispatches (attempt-capped) and brief the new supervisor generation."""
+    def brief(self, lost, ran=None):
+        """Re-queue lost dispatches (attempt-capped) and brief the new supervisor generation. `ran`: worker
+        instructions that ran to completion before the interruption (never re-queued, reported instead)."""
         task = self.f.task()
         cap = int(self.f.cfg['max_attempts'])
         head = lambda text: ' '.join(text.split())[:200]
@@ -1231,6 +1292,8 @@ class RuntimeV2:
             self.effects.hset(self.bus.msg_key(mid), {'replay': attempt})
             requeued.append('- ' + self.f.label(msg['slot']) + ' (attempt ' + str(attempt) + ' of ' + str(cap)
                             + '): ' + head(msg['body']['text']))
+        done = ['- ' + self.f.label(slot) + ': ' + head(self.bus.message(mid).get('body', {}).get('text', ''))
+                for mid, (slot, _rec, _turn) in (ran or {}).items() if slot != 'supervisor']
         progress = self.progress(task)
         state = self.f.contract_state()
         self.f.queue('supervisor', '[Resumed task ' + task['id'] + '] This run was interrupted and resumed with '
@@ -1242,15 +1305,20 @@ class RuntimeV2:
                      + progress
                      + '\nLost dispatches the daemon already re-queued (do NOT dispatch them again):\n'
                      + ('\n'.join(requeued) or '- none')
+                     + (('\nInstructions that already ran to completion before the interruption; their reports were '
+                         'not received (check their files; do NOT dispatch them again):\n' + '\n'.join(done))
+                        if done else '')
                      + (('\nInterface contracts are on: read CONTRACTS.md in your directory and '
                          + str(self.f.workspace() / 'contracts.json') + '. ' + contracts.table_line(state))
                         if state else '')
                      + '\nDispatch only work that is still missing. Reply with the JSON format from AGENTS.md.')
 
-    def requeue_requests(self):
-        """Service: accepted requests without a public result run once more (unless replay is false)."""
+    def requeue_requests(self, ran=None):
+        """Service: accepted requests without a public result run once more (unless replay is false, or a
+        Codex item of theirs already ran to completion before the interruption)."""
         from cmux_fleet.fleet import REQ, REQQ
         cap = int(self.f.cfg['max_attempts'])
+        done = {self.bus.message(mid).get('request_id') for mid in (ran or {})}
         for rid in self.f.r.lrange(REQQ, 0, -1):
             req = self.f.r.hgetall(REQ + rid)
             if not req:
@@ -1258,7 +1326,10 @@ class RuntimeV2:
             spec = json.loads(req['spec'])
             attempt = int(req.get('replay') or 1) + 1
             worker = req.get('worker') or 'supervisor'
-            if spec.get('replay') is False:
+            if rid in done:
+                self.publish(rid, 'timeout', worker=worker, error='not replayed on resume: it already ran to '
+                             'completion before the interruption and its result was not received')
+            elif spec.get('replay') is False:
                 self.publish(rid, 'timeout', worker=worker, error='not replayed on resume (request has replay: false)')
             elif attempt > cap:
                 self.publish(rid, 'timeout', worker=worker, error='not replayed on resume: ' + str(cap)
@@ -1295,11 +1366,22 @@ class RuntimeV2:
             if tui_slot(self.slot_cfg(slot), slot):
                 self.type_into(slot, env)
 
-    def type_into(self, slot, env):
-        """Receive an offered delivery for an official CLI and type only its business text.
+    def hooked(self, slot):
+        """A Claude worker: deliveries go through its Stop-hook mailbox, never its input box."""
+        return tui_slot(self.slot_cfg(slot), slot) and claude_hook.enabled(self.slot_cfg(slot), slot)
 
-        No message file and no transport IDs reach the model. The CLI's own turn-end hook
-        settles against this delivery in Redis. Any failure holds the slot (fail closed).
+    def hook_keys(self, slot, generation):
+        return claude_hook.keys(self.bus.prefix, slot, generation)
+
+    def type_into(self, slot, env):
+        """Receive an offered delivery for an official CLI and hand over only its business text.
+
+        No message file and no transport IDs reach the model (a Codex delivery carries only its
+        opaque delivery-token line). An official Codex agent gets the text through `codex queue`
+        (codex_queue); a Claude worker from its Stop hook (mailbox, claude_hook); any other official
+        CLI slot (a Claude supervisor) gets it typed into the TUI. The
+        CLI's own turn-end hook settles against this delivery in Redis. Any failure holds the slot
+        (fail closed).
         """
         consumer = 'tui-' + slot + '-g' + str(env['generation'])
         reason = 'TUI input not confirmed; prompt state unknown'
@@ -1309,12 +1391,29 @@ class RuntimeV2:
             if not got or got['delivery_id'] != env['delivery_id'] or not got['execution_allowed']:
                 raise BusError('offered delivery was not received by this generation')
             self.renewed[slot] = time.monotonic()
+            if codex_queue.is_codex(self.slot_cfg(slot), slot):
+                # Codex: the TUI takes the message from its own queue; nothing is typed (codex_queue).
+                got_q = codex_queue.deliver(self.f, slot, env['delivery_id'], got['body']['text'])
+                self.audit('tui.queued', slot=slot, message_id=env['message_id'], delivery_id=env['delivery_id'],
+                           queued_id=got_q['queued_id'])
+                return True
             pane = self.f.agent(slot).get('pane')
+            if self.hooked(slot):
+                k = self.hook_keys(slot, env['generation'])
+                waiting = claude_hook.post(self.bus.r, k, {
+                    'kind': 'delivery', 'generation': env['generation'], 'message_id': env['message_id'],
+                    'delivery_id': env['delivery_id'], 'text': got['body']['text']})
+                # armed=False is normal right after a settle (the hook is still reporting the turn). If
+                # Escape / a hook timeout left the session idle, the next turn end of this session (any
+                # typed line) picks it up; otherwise the watchdog's stall path applies.
+                self.audit('tui.hooked', slot=slot, message_id=env['message_id'], delivery_id=env['delivery_id'],
+                           generation=env['generation'], armed=waiting)
+                return True
             claude = self.slot_cfg(slot).get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') == 'claude'
             if pane and self.f.mgr.send_prompt_to_idle(pane, got['body']['text'], bracketed=claude):
                 self.audit('tui.typed', slot=slot, message_id=env['message_id'], delivery_id=env['delivery_id'])
                 return True
-        except (BusError, ValueError, KeyError, OSError) as exc:
+        except (BusError, ValueError, KeyError, OSError, codex_queue.QueueError) as exc:
             reason += ': ' + str(exc)[:500]
         self.transaction('tui-input-' + env['delivery_id'], lambda: self.hold(slot, reason, public_status='failed'))
         return False
@@ -1358,6 +1457,7 @@ class RuntimeV2:
             return
         self.f.r.hset(TASK, mapping={'status': status, 'reason': reason})
         for slot in self.f.names:
+            codex_queue.clear(self.f, slot, 'task ' + status)  # its token can never settle (Codex's queue is not edited)
             for mid in self.f.r.lrange(self.bus.pending_key(slot), 0, -1):
                 msg = dict(message_id=mid)
                 self.cancel_queued(slot, msg, reason)
@@ -1399,6 +1499,7 @@ class RuntimeV2:
         self.audit('runtime.retired', slot=slot, execution_stopped=True)
 
     def retire(self, slot, reason):
+        codex_queue.clear(self.f, slot, 'retire: ' + reason)
         info = self.f.agent(slot)
         pane = info.get('pane')
         if info.get('state') == 'reclaimed' and not pane:  # already retired by the idle reclaim

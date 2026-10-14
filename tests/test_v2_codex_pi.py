@@ -170,7 +170,7 @@ def test_service_request_routed_by_codex_result_card_rendered_off_model(codex_pi
     assert answer_turn(f, 'supervisor', route)['status'] == 'committed'
     f.pump()
     env = receive(f, 'worker-1')
-    sent_before = len(f.mgr.sent)
+    sent_before = len(f.mgr.sent) + len(f.mgr.queued)  # neither pasted nor queued
     settle(f, 'worker-1', env, {'reply': 'OK'})
     assert json.loads(f.r.get(fleet.RESULT + 'r1'))['result'] == {'reply': 'OK'}
     f.v2.render_cards()
@@ -178,5 +178,5 @@ def test_service_request_routed_by_codex_result_card_rendered_off_model(codex_pi
     assert 'worker-1：OK' in log
     assert 'worker-1：OK' in (f.run_dir / 'history.html').read_text()   # history page "Cards" view
     assert not (f.run_dir / 'cards' / 'worker-1.log').exists()          # Pi shows its own cards
-    assert len(f.mgr.sent) == sent_before                       # card never typed into Codex
+    assert len(f.mgr.sent) + len(f.mgr.queued) == sent_before   # card never typed or queued into Codex
     assert not f.v2.depth('supervisor')                          # and never queued for the model

@@ -7,8 +7,8 @@ run is done, stuck or out of time, per the mode table (config/fleet_modes.yaml, 
   - ``blocked`` / ``budget_exhausted``: hold the run as it is for ``hold_hours`` (default 12), then
     ``stop_keep_resumable`` (``closed_by: timeout``, result.json ``resumable: true``: start --resume
     reopens it). scheduled (``on_fail``) and smoke (``on_any_end``) close at once instead.
-  - a review_loop that reaches ``max_rounds`` FAIL verdicts is ended blocked and closed with an
-    outstanding-issues list (``on_cap: stop_and_report``); scheduled past ``hard_timeout_min`` is ended
+  - a review_loop that reaches ``max_rounds`` FAIL verdicts (dev_task: ``review_step.max_rounds`` with
+    ``on_cap: stop_and_report``) is ended blocked and closed with an outstanding-issues list; scheduled past ``hard_timeout_min`` is ended
     ``budget_exhausted`` and closed (``closed_by: timeout``).
 * service: idle workers are reclaimed and respawned on demand; optional ``idle_stop_hours``
   (lifecycle_hold).
@@ -191,24 +191,34 @@ def running_checks(f, policy, task, now):
         return
     spec = task_spec(task)
     if policy['name'] == 'review_loop' and spec.get('review_file'):
-        verdict, _ = lifecycle_deliver.read_verdict(f.workspace() / spec['review_file'])
-        cap = int(policy.get('max_rounds') or 3)
-        if verdict and verdict['verdict'] == 'FAIL' and verdict['round'] >= cap:
-            report = write_outstanding(f, verdict, cap)
-            _hset(f, **{'cap:' + tid: str(report)})
-            left = len(lifecycle_deliver.outstanding(verdict))
-            f.finish('blocked', 'review_loop: round ' + str(verdict['round']) + ' of max_rounds ' + str(cap)
-                     + ' still FAIL; ' + str(left) + ' open issue(s) handed to the user: ' + str(report))
+        review_cap(f, tid, spec['review_file'], int(policy.get('max_rounds') or 3), 'review_loop')
+    review = policy.get('review_step') or {}
+    if (policy['name'] == 'dev_task' and review.get('max_rounds') and review.get('on_cap') == 'stop_and_report'
+            and (spec.get('deliver') or {}).get('review_file')):
+        # dev_task review rounds are capped too (10/13 codex-notype ran to r16): at the cap no new round
+        # starts; the open P0/P1 go to the user in the result instead.
+        review_cap(f, tid, spec['deliver']['review_file'], int(review['max_rounds']), 'dev_task review')
 
 
-def write_outstanding(f, verdict, cap):
+def review_cap(f, tid, review_file, cap, label):
+    """A FAIL verdict at round >= cap ends the task blocked with the outstanding-issues list."""
+    verdict, _ = lifecycle_deliver.read_verdict(f.workspace() / review_file)
+    if verdict and verdict['verdict'] == 'FAIL' and verdict['round'] >= cap:
+        report = write_outstanding(f, verdict, cap, label)
+        _hset(f, **{'cap:' + tid: str(report)})
+        left = len(lifecycle_deliver.outstanding(verdict))
+        f.finish('blocked', label + ': round ' + str(verdict['round']) + ' of max_rounds ' + str(cap)
+                 + ' still FAIL; ' + str(left) + ' open issue(s) handed to the user: ' + str(report))
+
+
+def write_outstanding(f, verdict, cap, label='review_loop'):
     """The outstanding-issues list (挂账清单) of a capped review loop: JSON + a readable Markdown."""
     items = lifecycle_deliver.outstanding(verdict)
     data = {'task_id': f.task().get('id', ''), 'round': verdict['round'], 'max_rounds': cap,
             'reviewer': verdict.get('reviewer'), 'issues': items, 'at': time.time()}
     out = f.run_dir / 'outstanding.json'
     out.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding='utf-8')
-    lines = ['# 挂账清单：review_loop 第 ' + str(verdict['round']) + ' 轮仍 FAIL（max_rounds ' + str(cap) + '）', '']
+    lines = ['# 挂账清单：' + label + ' 第 ' + str(verdict['round']) + ' 轮仍 FAIL（max_rounds ' + str(cap) + '）', '']
     lines += ['- [' + str(i.get('severity', '?')) + '] ' + str(i.get('id', '')) + ' ' + str(i.get('title', ''))
               for i in items] or ['- （verdict 未列出具体问题）']
     (f.run_dir / 'outstanding.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')

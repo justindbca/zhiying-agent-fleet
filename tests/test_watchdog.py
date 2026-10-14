@@ -5,6 +5,7 @@ fake cmux screens / ps. Time is passed explicitly to Watchdog.tick, never slept.
 """
 import json
 import os
+from pathlib import Path
 import time
 
 import pytest
@@ -105,8 +106,11 @@ def test_classify_five_states(change, state):
 
 def test_default_prompt_table_matches_the_three_known_dialogs_only():
     table = watchdog.parse_table(watchdog.DEFAULT_TABLE.read_text())
-    assert [p['name'] for p in table['prompts']] == ['dangerous_rm', 'read_outside', 'trust_folder', 'trust_folder_legacy']
-    assert watchdog.match_prompt(table, DIALOG_RM)[0]['name'] == 'dangerous_rm'
+    assert [p['name'] for p in table['prompts']] == ['read_outside', 'trust_folder', 'trust_folder_legacy']
+    # Deletes are the user's call (2026-10-14): a dangerous-rm dialog is never whitelisted, only an unknown marker.
+    assert watchdog.match_prompt(table, DIALOG_RM) == (None, 'dangerous rm')
+    assert watchdog.match_prompt(table, DIALOG_RM_LITERAL) == (None, 'dangerous rm')
+    assert 'rm_in_cwd' not in watchdog.VERIFY
     assert watchdog.match_prompt(table, 'Read file\n\nRead outside the working directories?\n❯ 1. Yes')[0]['name'] == 'read_outside'
     assert watchdog.match_prompt(table, DIALOG_TRUST)[0]['name'] == 'trust_folder_legacy'
     assert watchdog.match_prompt(table, 'Trust this folder?\n› 1. Yes')[0]['name'] == 'trust_folder_legacy'
@@ -164,19 +168,24 @@ def test_busy_worker_with_fresh_transcript_is_working(wd):
 
 
 # ------------------------------------------------------------------ prompting
+def read_in_run(f, slot='worker-1'):
+    """A whitelisted dialog whose scope is inside the run (worker-2's notes in the shared workspace)."""
+    return READ.format(cwd(f, slot).parent / 'worker-2' / 'notes.md')
+
+
 def test_whitelisted_dialog_is_answered_with_screen_saved(wd):
     f = wd
     dispatch_one(f)
-    f.mgr.screens[f.agent('worker-1')['pane']] = DIALOG_RM_LITERAL
+    f.mgr.screens[f.agent('worker-1')['pane']] = read_in_run(f)
     f.v2.watchdog.tick(time.time())
     assert keys(f, 'worker-1') == ['Enter']
     assert f.agent('worker-1')['watch_state'] == 'prompting' and f.agent('worker-1')['state'] == 'busy'
     saved, = screens(f)
-    assert saved.startswith('worker-1-g0-') and saved.endswith('prompt-dangerous_rm.txt')
-    assert 'Dangerous rm' in (f.run_dir / 'watchdog' / saved).read_text()
+    assert saved.startswith('worker-1-g0-') and saved.endswith('prompt-read_outside.txt')
+    assert 'Read outside the working directories?' in (f.run_dir / 'watchdog' / saved).read_text()
     answered, = audits(f, 'watch.prompt_answered')
-    assert answered['prompt'] == 'dangerous_rm' and json.loads(answered['keys']) == ['Enter']
-    assert answered['authorized'] == 'rm build/tmp'
+    assert answered['prompt'] == 'read_outside' and json.loads(answered['keys']) == ['Enter']
+    assert answered['authorized'].endswith('/worker-2/notes.md')
     assert not f.paused() and f.v2.bus.slot_state('worker-1')['status'] == 'received'
     f.mgr.screens[f.agent('worker-1')['pane']] = WORKING  # the dialog went away: back to work
     f.v2.watchdog.tick(time.time())
@@ -186,7 +195,7 @@ def test_whitelisted_dialog_is_answered_with_screen_saved(wd):
 def test_same_dialog_three_times_becomes_stalled(wd):
     f = wd
     dispatch_one(f)
-    f.mgr.screens[f.agent('worker-1')['pane']] = DIALOG_RM_LITERAL
+    f.mgr.screens[f.agent('worker-1')['pane']] = read_in_run(f)
     now = time.time()
     for i in range(3):
         f.v2.watchdog.tick(now + i)
@@ -420,24 +429,50 @@ def held_unpressed(f, slot, prompt, reason):
     assert audits(f, 'watch.prompt_answered') == []
 
 
+def held_for_the_user(f, slot, marker):
+    """An unknown dialog: screen saved, slot held (fleet paused), not a single key pressed."""
+    assert keys(f, slot) == [] and f.agent(slot)['state'] == 'held' and f.paused()
+    assert audits(f, 'watch.prompt_unknown')[0]['marker'] == marker
+    assert any(n.endswith('prompt-unknown.txt') for n in screens(f))
+    assert audits(f, 'watch.prompt_answered') == [] and audits(f, 'watch.prompt_unverified') == []
+
+
 def test_dangerous_rm_on_a_variable_is_held_for_a_human(wd):
     f = wd
     dispatch_one(f)
     f.mgr.screens[f.agent('worker-1')['pane']] = DIALOG_RM   # rm -rf "$OUT/"*: OUT may be empty
     f.v2.watchdog.tick(time.time())
-    held_unpressed(f, 'worker-1', 'dangerous_rm', 'shell variable')
+    held_for_the_user(f, 'worker-1', 'dangerous rm')
     assert f.v2.bus.slot_state('worker-1')['status'] == 'uncertain'
     f.v2.watchdog.tick(time.time() + 1)                         # held: the next tick presses nothing either
     assert keys(f, 'worker-1') == []
 
 
-@pytest.mark.parametrize('target', ['../worker-2/out', '/Users', '~/Documents'])
-def test_dangerous_rm_outside_the_slot_directory_is_held(wd, target):
+@pytest.mark.parametrize('target', ['build/tmp', '../worker-2/out', '/Users', '~/Documents'])
+def test_dangerous_rm_is_held_for_the_user_wherever_its_target_is(wd, target):
+    # build/tmp (a literal target inside the slot directory) used to be answered; deletes are now always
+    # confirmed by the user (2026-10-14).
     f = wd
     dispatch_one(f)
     f.mgr.screens[f.agent('worker-1')['pane']] = DIALOG_RM_LITERAL.replace('build/tmp', target)
     f.v2.watchdog.tick(time.time())
-    held_unpressed(f, 'worker-1', 'dangerous_rm', 'outside the slot directory')
+    held_for_the_user(f, 'worker-1', 'dangerous rm')
+    assert f.v2.bus.slot_state('worker-1')['status'] == 'uncertain'
+    f.v2.watchdog.tick(time.time() + 1)                         # held: the next tick presses nothing either
+    assert keys(f, 'worker-1') == []
+
+
+def test_no_permission_hook_answers_delete_dialogs(tmp_path):
+    """Nothing in the fleet auto-answers a delete confirmation: no PermissionRequest hook is installed."""
+    from cmux_fleet import fleet
+    for hook in (True, False):
+        cfg = dict(run=str(tmp_path / ('run-' + str(hook))), workers=['worker-1'], supervisor_cli='claude',
+                   worker_cli='claude', python='python3', claude_hook_delivery=hook)
+        for slot in ('supervisor', 'worker-1'):
+            fleet.agent_cwd(cfg, slot).mkdir(parents=True)
+            argv = fleet.claude_argv(tmp_path / 'config.json', cfg, slot, 0, 'prompt')
+            settings = json.loads(Path(argv[argv.index('--settings') + 1]).read_text())
+            assert 'PermissionRequest' not in settings['hooks'] and 'PreToolUse' not in settings['hooks']
 
 
 def test_read_outside_inside_the_run_workspace_is_answered(wd):
@@ -480,10 +515,10 @@ def test_dialog_on_a_pane_outside_this_fleet_registry_is_not_answered(wd):
     f = wd
     dispatch_one(f)
     pane = f.agent('worker-1')['pane']
-    f.mgr.screens[pane] = DIALOG_RM_LITERAL
+    f.mgr.screens[pane] = read_in_run(f)
     f.mgr.owns = lambda p: False
     f.v2.watchdog.tick(time.time())
-    held_unpressed(f, 'worker-1', 'dangerous_rm', 'registry')
+    held_unpressed(f, 'worker-1', 'read_outside', 'registry')
 
 
 def test_live_claude_trust_dialog_wrapped_path_is_read_whole():

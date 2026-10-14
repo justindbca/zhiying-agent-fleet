@@ -2,11 +2,16 @@
 # Real-TUI smoke of one transport-v2 CLI pair: 1 supervisor + 2 workers, lifecycle smoke.
 #
 #   scripts/smoke_pair.sh <supervisor_cli> <worker_cli> <task|service>
-#   e.g. scripts/smoke_pair.sh codex pi task      (night pair: Codex supervisor + Pi workers)
+#   e.g. scripts/smoke_pair.sh pi claude task     (default pair: pi Astra supervisor + official Claude workers)
+#        SUPERVISOR_PI_MODEL=openai-codex/gpt-6-astra PI_MODEL=flashnext/... scripts/smoke_pair.sh pi pi task  (night pair)
 #        scripts/smoke_pair.sh codex claude service
 #
 # Run it inside a cmux terminal with the CLIs logged in. Environment (optional):
-#   PI_MODEL=provider/model  required when a Pi agent is involved
+#   PI_MODEL=provider/model  run-wide pi model (--pi-model): required for pi workers, and for a pi
+#                            supervisor unless SUPERVISOR_PI_MODEL is set
+#   SUPERVISOR_PI_MODEL=provider/model, SUPERVISOR_PI_THINKING=level  pi supervisor's own model/thinking
+#   PI_THINKING=level        run-wide pi thinking (--pi-thinking)
+#   CLAUDE=/path/to/claude   official Claude Code binary (--claude; a shell function/shim is not a binary)
 #   SMOKE_PROFILE=<codex profile>  supervisor/worker Codex profile (default: fleet's own default)
 #   SMOKE_TIMEOUT=900        seconds for READY + work
 #   SMOKE_KEEP=1             keep the temp dir for inspection (processes are still stopped)
@@ -20,9 +25,14 @@
 #   2 zero-model cards      results reach the supervisor as UI-only cards (no mechanical relay turn)
 #   3 stale callback        a retired-generation callback is rejected (turn.stale / settle rejected)
 #   4 human input           a manual line typed into worker-1 is not settled as a delivery
+# Evidence lines (not checks): each agent's cmux tab title, the model/thinking a pi agent actually ran
+# (its session file; pi renames its process so ps shows no argv) and the screen line naming the model
+# (pi status line). The title is the slot label (design.md §3); session/status line only prove the
+# model, they do not replace a title acceptance.
 # Exit 0 only if the run finished and all four PASS. A PASS does not flip the pair table to
 # verified: a human edits cmux_fleet/config/cli_pairs.yaml (status + verified_by).
 set -u
+export DISABLE_AUTOUPDATER=1  # every Claude Code this smoke starts never self-updates (10/14 01:36 broken shared install)
 SUP=${1:?supervisor cli}; WRK=${2:?worker cli}; MODE=${3:?task|service}
 case "$MODE" in task|service) ;; *) echo "mode must be task or service" >&2; exit 2;; esac
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -68,9 +78,18 @@ args=(start --lifecycle smoke --supervisor-cli "$SUP" --worker-cli "$WRK" --work
       --allow-development-v2 --redis-runtime-dir "$TMP/r" --name "smoke-$SUP-$WRK-$MODE")
 [ "$MODE" = service ] && args+=(--mode service)
 if [ "$SUP" = pi ] || [ "$WRK" = pi ]; then
-  : "${PI_MODEL:?PI_MODEL=provider/model is required for pi agents}"
-  args+=(--allow-unsandboxed-pi --pi-model "$PI_MODEL")
+  if [ "$WRK" = pi ] || [ -z "${SUPERVISOR_PI_MODEL:-}" ]; then
+    : "${PI_MODEL:?PI_MODEL=provider/model is required for pi workers (and a pi supervisor without SUPERVISOR_PI_MODEL)}"
+  fi
+  args+=(--allow-unsandboxed-pi)
+  [ -n "${PI_MODEL:-}" ] && args+=(--pi-model "$PI_MODEL")
+  [ -n "${PI_THINKING:-}" ] && args+=(--pi-thinking "$PI_THINKING")
 fi
+if [ "$SUP" = pi ]; then
+  [ -n "${SUPERVISOR_PI_MODEL:-}" ] && args+=(--supervisor-pi-model "$SUPERVISOR_PI_MODEL")
+  [ -n "${SUPERVISOR_PI_THINKING:-}" ] && args+=(--supervisor-pi-thinking "$SUPERVISOR_PI_THINKING")
+fi
+[ -n "${CLAUDE:-}" ] && args+=(--claude "$CLAUDE")
 [ -n "${SMOKE_PROFILE:-}" ] && args+=(--profile "$SMOKE_PROFILE")
 echo "smoke: $SUP+$WRK/$MODE in $TMP"
 if ! (cd "$TMP" && "$PY" "$FLEET" "${args[@]}"); then
@@ -78,11 +97,12 @@ if ! (cd "$TMP" && "$PY" "$FLEET" "${args[@]}"); then
   exit 4
 fi
 
-"$PY" - "$CFG" "$MODE" "${SMOKE_TIMEOUT:-900}" "$ROOT" <<'EOF'
-import json, sys, time, uuid
-cfg_path, mode, timeout, root = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4]
+"$PY" - "$CFG" "$MODE" "${SMOKE_TIMEOUT:-900}" "$ROOT" "$TMP" <<'EOF'
+import json, shutil, subprocess, sys, time, uuid
+cfg_path, mode, timeout, root, tmp = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4], sys.argv[5]
 sys.path.insert(0, root)
 from pathlib import Path
+import redis
 from cmux_fleet import fleet, runtime_v2
 
 cfg = fleet.load(cfg_path)
@@ -92,20 +112,89 @@ run = Path(cfg['run'])
 names = ['supervisor'] + cfg['workers']
 deadline = time.time() + timeout
 checks = {}
+mgr = fleet.manager_for(cfg)
+# --lifecycle smoke closes the run (fleet stop, Redis down) as soon as the work ends. While it is
+# alive, keep a live view of the audit / UI stream / agents / results; once it is closed, the checks
+# read the final state from Redis's own persisted data (final_from_disk), never a stale live view.
+snap = {'audit': [], 'ui': 0, 'agents': {}, 'results': {}, 'alive': True, 'source': 'live'}
 
 
-def audit():
-    return [f for _, f in r.xrange(bus.audit_key)]
+def read_into(client, rids=()):
+    snap['audit'] = [f for _, f in client.xrange(bus.audit_key)]
+    snap['ui'] = client.xlen(bus.prefix + ':ui:supervisor')
+    snap['agents'] = {n: client.hgetall(fleet.key('agent', n)) for n in names}
+    snap['task'] = client.hgetall(fleet.TASK)
+    for x in rids:
+        raw = client.get(fleet.RESULT + x)
+        if raw:
+            snap['results'][x] = json.loads(raw)
+
+
+def refresh(rids=()):
+    if not snap['alive']:
+        return False
+    try:
+        read_into(r, rids)
+        return True
+    except (redis.exceptions.ConnectionError, OSError):
+        snap['alive'] = False
+        print('   run closed (Redis gone): the checks read its final persisted state (Redis AOF/RDB) + result.json')
+        return False
+
+
+def final_from_disk(rids=(), wait_s=60):
+    """The run's Redis shut down (AOF fsync + final RDB, then pid file and socket removed). Open a
+    copy of its data dir on a throwaway socket inside the temp dir and read the final state: a
+    result card written in the same instant as COMPLETED, after the last live view, is not lost."""
+    src = Path(cfg['redis_runtime_dir'])
+    gone = lambda: not (src / 'redis.pid').exists() and not Path(cfg['redis_socket']).exists()
+    end = time.time() + wait_s
+    while not gone() and time.time() < end:
+        time.sleep(1)
+    if not gone():
+        print('   final state: the run Redis did not finish shutting down within %ds' % wait_s)
+        return False
+    dst = Path(tmp) / 'final'
+    shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst, ignore=shutil.ignore_patterns('redis.log', 'redis.pid', '*.sock'))
+    sock = dst / 'f.sock'
+    subprocess.run([cfg['redis_server'], '--port', '0', '--unixsocket', str(sock), '--unixsocketperm', '700',
+                    '--dir', str(dst), '--dbfilename', 'fleet.rdb',
+                    '--appendonly', 'yes' if (dst / 'appendonlydir').is_dir() else 'no',
+                    '--save', '', '--daemonize', 'yes', '--pidfile', str(dst / 'redis.pid'),
+                    '--logfile', str(dst / 'redis.log')], check=True)
+    client = redis.Redis(unix_socket_path=str(sock), decode_responses=True, socket_connect_timeout=3, socket_timeout=10)
+    try:
+        for _ in range(100):
+            try:
+                if client.ping():
+                    break
+            except (redis.exceptions.ConnectionError, redis.exceptions.BusyLoadingError, OSError):
+                time.sleep(.1)
+        read_into(client, rids)
+        snap['source'] = 'final (persisted data of the closed run)'
+        return True
+    except (redis.exceptions.RedisError, OSError) as e:
+        print('   final state: read failed: %r' % e)
+        return False
+    finally:
+        try:
+            client.shutdown(nosave=True)
+        except (redis.exceptions.RedisError, OSError):
+            pass
 
 
 def agent(n):
-    return r.hgetall(fleet.key('agent', n))
+    refresh()
+    return snap['agents'].get(n, {})
 
 
 def wait(pred, what):
     while time.time() < deadline:
         if pred():
             return True
+        if not snap['alive']:
+            break
         time.sleep(3)
     print('FAIL timeout waiting for ' + what)
     return False
@@ -116,19 +205,71 @@ if not wait(lambda: all(agent(n).get('runtime_ready') == '1' and agent(n).get('s
     sys.exit(1)
 print('ok READY: ' + ', '.join(n + '=' + agent(n).get('state', '?') for n in names))
 
+# Evidence (not a check): tab title, pi session model/thinking, screen line naming the model.
+for n in names:
+    a = agent(n)
+    ws = mgr._where(a.get('pane', ''))
+    info = mgr._surfaces(ws).get(a.get('pane', ''), {}) if ws else {}
+    print('   evidence title %s label=%s tab=%r' % (n, a.get('label'), info.get('title')))
+    cli = fleet.agent_cli(cfg, n)
+    if cli == 'pi':
+        # pi renames its process to "pi" (ps shows no argv); its session file records the model it ran.
+        seen = {}
+        for path in sorted((run / 'pi-sessions' / n).glob('g*/*.jsonl')):
+            for line in path.read_text().splitlines():
+                row = json.loads(line)
+                if row.get('type') == 'model_change':
+                    seen['model'] = row.get('provider', '') + '/' + row.get('modelId', '')
+                elif row.get('type') == 'thinking_level_change':
+                    seen['thinking'] = row.get('thinkingLevel')
+        print('   evidence session %s model=%s thinking=%s' % (n, seen.get('model'), seen.get('thinking')))
+    screen = mgr.capture_output(a.get('pane', ''), 60) if a.get('pane') else ''
+    model = (fleet.agent_cfg(cfg, n).get('pi_model') if cli == 'pi' else cfg.get('worker_model')) or ''
+    key = model.split('/')[-1][:24]  # the status line may truncate a long model id
+    tail = [l.strip() for l in screen.splitlines() if key and key in l]
+    print('   evidence screen %s model=%s line=%r' % (n, model, tail[-1][:160] if tail else None))
+
 # 4 human input: a manual line in worker-1's tab before any delivery must not settle anything.
 w1 = agent('worker-1')
-mgr = fleet.manager_for(cfg)
 claude = cfg.get('worker_cli') == 'claude'
 typed = mgr.send_prompt_to_idle(w1['pane'], 'Manual operator note: reply with the word noted.', bracketed=claude)
 time.sleep(45)
-before = audit()
-manual_settled = [a for a in before if a.get('slot') == 'worker-1' and a.get('event') == 'committed']
-manual_seen = [a for a in before if a.get('slot') == 'worker-1' and a.get('event') in ('turn.ignored',)]
+refresh()
+manual_settled = [a for a in snap['audit'] if a.get('slot') == 'worker-1' and a.get('event') == 'committed']
+manual_seen = [a for a in snap['audit'] if a.get('slot') == 'worker-1' and a.get('event') in ('turn.ignored',)]
 checks['4 human input'] = bool(typed) and not manual_settled
 print('   manual line typed=%s ignored-audit=%d committed=%d' % (typed, len(manual_seen), len(manual_settled)))
 
+# 3 stale callback: a retired generation's turn end is refused by the daemon (before the work: the
+# smoke lifecycle stops the run when the work ends).
+if runtime_v2.tui_slot(cfg, 'supervisor'):
+    late = fleet.tui_turn(cfg, 'supervisor', int(agent('supervisor').get('generation', 0)) + 7,
+                          thread=agent('supervisor').get('thread') or str(uuid.uuid4()), transcript='',
+                          text='{"status":"RUNNING","dispatch":[]}', inputs=[], wait=5)
+    ok3 = late.get('status') == 'stale'
+elif runtime_v2.tui_slot(cfg, 'worker-1'):
+    # Official-CLI worker: its turn-end hook path (Claude Stop -> tui_turn) with a retired generation.
+    late = fleet.tui_turn(cfg, 'worker-1', int(agent('worker-1').get('generation', 0)) + 7,
+                          thread=agent('worker-1').get('thread') or str(uuid.uuid4()), transcript='',
+                          text='Done: none', inputs=[], wait=5)
+    ok3 = late.get('status') == 'stale'
+    print('   stale worker-1 turn -> %s' % late.get('status'))
+else:
+    n0 = len(snap['audit'])
+    gen = int(agent('worker-1').get('generation', 0)) + 7
+    runtime_v2.post_event(bus, dict(kind='settled', agent='worker-1', generation=gen, run_id=bus.run_id,
+                                    thread='stale-' + uuid.uuid4().hex, transcript='', delivery={},
+                                    candidates=[], failed=False, aborted=False, unfinished=False),
+                          'stale-' + uuid.uuid4().hex)
+    time.sleep(5)
+    refresh()
+    tail = snap['audit'][n0:]
+    ok3 = any(a.get('event', '').startswith(('settle.', 'turn.stale', 'event.rejected', 'event.stale')) for a in tail) \
+        and not any(a.get('event') == 'committed' for a in tail)
+checks['3 stale callback'] = ok3
+
 # The work: two files (task) or two requests (service), one per worker.
+rids = []
 if mode == 'task':
     spec = {'goal': 'Smoke: worker-1 writes worker-1/ok1.txt containing OK; worker-2 writes worker-2/ok2.txt '
                     'containing OK. Dispatch both in one decision, declare both files as artifacts '
@@ -137,11 +278,16 @@ if mode == 'task':
                           {'path': 'worker-2/ok2.txt', 'contains': ['OK']}]}
     rid = 'smoke-task'
     runtime_v2.post_event(bus, dict(kind='task', request_id=rid, spec=spec), rid)
-    done = wait(lambda: r.hget(fleet.TASK, 'status') in ('completed', 'blocked', 'budget_exhausted'), 'task end')
-    status = r.hget(fleet.TASK, 'status')
-    print('   task status=%s reason=%s' % (status, r.hget(fleet.TASK, 'reason')))
-    work_ok = done and status == 'completed'
-    rids = []
+    ended = lambda: (refresh() and snap['task'].get('status') in ('completed', 'blocked', 'budget_exhausted')) \
+        or (run / 'result.json').is_file()
+    wait(ended, 'task end')
+    result = json.loads((run / 'result.json').read_text()) if (run / 'result.json').is_file() else {}
+    status = snap.get('task', {}).get('status') if snap['alive'] else result.get('status')
+    status = status or result.get('status')
+    print('   task status=%s reason=%s result.json=%s' % (status, (snap.get('task') or {}).get('reason') or result.get('reason'),
+                                                         result.get('status')))
+    work_ok = status == 'completed' and result.get('status') in (None, 'completed') \
+        and all(not a.get('problems') for a in result.get('artifacts', []))
 else:
     rids = ['smoke-r1', 'smoke-r2']
     for rid, w in zip(rids, cfg['workers']):
@@ -149,13 +295,21 @@ else:
         spec = {'id': rid, 'payload': {'message': 'Smoke: route this to ' + w + '; it replies with reply = "OK from ' + w + '".'},
                 'reply': {'required': ['reply'], 'allowed': ['reply']}, 'timeout_s': 600}
         runtime_v2.post_event(bus, dict(kind='request', request_id='cmd-' + rid, spec=spec), 'cmd-' + rid)
-    done = wait(lambda: all(r.get(fleet.RESULT + x) for x in rids), 'both public results')
-    results = {x: json.loads(r.get(fleet.RESULT + x) or '{}') for x in rids}
-    for x, v in results.items():
+    wait(lambda: refresh(rids) and all(x in snap['results'] for x in rids), 'both public results')
+    for x in rids:
+        v = snap['results'].get(x, {})
         print('   %s status=%s result=%s' % (x, v.get('status'), v.get('result')))
-    work_ok = done and all(v.get('status') == 'ok' for v in results.values())
-time.sleep(15)  # let cards render (tui_cards refresh) and late hooks land
-events = audit()
+    work_ok = all(snap['results'].get(x, {}).get('status') == 'ok' for x in rids)
+for _ in range(5):  # let cards render (tui_cards refresh) and late hooks land, while the run is alive
+    time.sleep(3)
+    refresh(rids)
+final_ok = True
+if not snap['alive']:
+    final_ok = final_from_disk(rids)
+    if mode == 'task' and final_ok:
+        status = snap['task'].get('status') or result.get('status')
+        work_ok = work_ok and status == 'completed'
+events = snap['audit']
 
 # 1 no message files
 files = [str(p) for p in run.rglob('.inbox')] + [str(p) for p in run.rglob('msg-*.md')]
@@ -166,43 +320,26 @@ checks['1 no message files'] = not files
 sup_delivers = [json.loads(a.get('detail') or '{}') for a in events
                 if a.get('event') == 'deliver' and a.get('slot') == 'supervisor']
 relays = [d for d in sup_delivers if str(d.get('text', '')).startswith('[Operator result')]
-cards = r.xlen(bus.prefix + ':ui:supervisor')
 rendered = [a for a in events if a.get('event') == 'ui.rendered' and a.get('slot') == 'supervisor']
-ok2 = cards > 0 and not relays
+ok2 = snap['ui'] > 0 and not relays
 if runtime_v2.tui_slot(cfg, 'supervisor'):
     ok2 = ok2 and bool(rendered) and (run / 'cards' / 'supervisor.log').is_file()
 if mode == 'service':
     ok2 = ok2 and len(sup_delivers) == len(rids)
 checks['2 zero-model cards'] = ok2
-print('   supervisor deliveries=%d relays=%d ui cards=%d rendered=%d' % (len(sup_delivers), len(relays), cards, len(rendered)))
-
-# 3 stale callback: a retired generation's turn end is refused by the daemon.
-if runtime_v2.tui_slot(cfg, 'supervisor'):
-    late = fleet.tui_turn(cfg, 'supervisor', int(agent('supervisor').get('generation', 0)) + 7,
-                          thread=agent('supervisor').get('thread') or str(uuid.uuid4()), transcript='',
-                          text='{"status":"RUNNING","dispatch":[]}', inputs=[], wait=5)
-    ok3 = late.get('status') == 'stale'
-else:
-    n0 = len(events)
-    gen = int(agent('worker-1').get('generation', 0)) + 7
-    runtime_v2.post_event(bus, dict(kind='settled', agent='worker-1', generation=gen, run_id=bus.run_id,
-                                    thread='stale-' + uuid.uuid4().hex, transcript='', delivery={},
-                                    candidates=[], failed=False, aborted=False, unfinished=False),
-                          'stale-' + uuid.uuid4().hex)
-    time.sleep(5)
-    tail = audit()[n0:]
-    ok3 = any(a.get('event', '').startswith(('settle.', 'turn.stale', 'event.rejected')) for a in tail) \
-        and not any(a.get('event') == 'committed' for a in tail)
-checks['3 stale callback'] = ok3
+print('   supervisor deliveries=%d relays=%d ui cards=%d rendered=%d (%s, run alive=%s)'
+      % (len(sup_delivers), len(relays), snap['ui'], len(rendered), snap['source'], snap['alive']))
 
 errors = [a for a in events if a.get('level') == 'error']
 print('   audit errors=%d' % len(errors))
 for a in errors[:5]:
     print('     ' + json.dumps({k: a.get(k) for k in ('event', 'slot', 'error')}, ensure_ascii=False))
 print(('PASS' if work_ok else 'FAIL') + ' work finished')
+if not final_ok:
+    print('FAIL final state read (the run closed and its persisted data could not be read)')
 for name in sorted(checks):
     print(('PASS ' if checks[name] else 'FAIL ') + name)
-sys.exit(0 if work_ok and all(checks.values()) else 1)
+sys.exit(0 if work_ok and final_ok and all(checks.values()) else 1)
 EOF
 RESULT=$?
 echo "smoke $SUP+$WRK/$MODE: $([ $RESULT = 0 ] && echo PASS || echo FAIL)"

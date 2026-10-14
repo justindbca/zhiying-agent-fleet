@@ -22,8 +22,9 @@ def row(sup, wrk, mode, status='verified', missing=(), **extra):
 
 def test_shipped_table_rows_and_default():
     table = cli_pairs.load_pairs()
-    assert table.default == {'supervisor_cli': 'codex', 'worker_cli': 'claude', 'mode': 'task',
-                             'supervisor_profile': 'fleet-astra'}
+    # 2026-10-13 user decision: pi supervisor on Astra/high + official Claude workers (tests/test_codex_via_pi.py)
+    assert table.default == {'supervisor_cli': 'pi', 'worker_cli': 'claude', 'mode': 'task',
+                             'supervisor_pi_model': 'openai-codex/gpt-6-astra', 'supervisor_pi_thinking': 'high'}
     assert table.lookup('codex', 'claude', 'task')['status'] == 'verified'
     # Real smokes (scripts/smoke_pair.sh, 2026-10-12 @8a31c3c7) flipped these rows; each names its run.
     smoked = [('codex', 'pi', 'task'), ('codex', 'pi', 'service'), ('codex', 'claude', 'service'),

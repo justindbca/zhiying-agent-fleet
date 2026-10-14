@@ -8,7 +8,8 @@ from pathlib import Path
 
 from test_contracts import cf, inbox, item, p0_reply, report, write  # noqa: F401  (fixture + helpers)
 from test_escalate import escalate, ok_check, parallel_m0  # noqa: F401
-from test_subfleet import (child_daemon, hook, no_launch, parent_hook, step,  # noqa: F401
+from test_fleet import received  # noqa: E402
+from test_subfleet import (child_daemon, given, hook, no_launch, parent_hook, step,  # noqa: F401
                            stop_child_like_daemon, tree)
 from cmux_fleet import runtime_v2, subfleet
 
@@ -28,11 +29,12 @@ def test_startup_not_ready_gets_one_correction_then_blocks(tree):
     # a chatty but well-ended reply settles
     assert hook(t, cf, 'worker-1', "I've read AGENTS.md. No task has been sent yet.\n\nREADY",
                 prompt='startup')['status'] == 'ready'
-    # anything else: one correction typed into the pane, the slot keeps starting
+    # anything else: one correction (through the Stop hook on the hook channel), the slot keeps starting
     answer = hook(t, cf, 'worker-2', 'Ready to go', prompt='startup')
     assert answer['status'] == 'rejected' and 'asked once more' in answer['reason']
     pane = cf.agent('worker-2')['pane']
-    assert [x for p, x in t.world.sent if p == pane][-1] == runtime_v2.STARTUP_NUDGE
+    assert given(t, cf, 'worker-2')[-1] == runtime_v2.STARTUP_NUDGE
+    assert runtime_v2.STARTUP_NUDGE not in [x for p, x in t.world.sent if p == pane]  # never typed
     assert cf.agent('worker-2')['state'] == 'starting' and cf.task().get('status') != 'blocked'
     # the corrected turn settles normally
     assert hook(t, cf, 'worker-2', 'READY', prompt=runtime_v2.STARTUP_NUDGE)['status'] == 'ready'
@@ -124,7 +126,7 @@ def test_contract_subfleet_writes_its_own_dir_and_the_parent_check_passes(tree):
     cf = child_daemon(t, rec)
     for w in cf.workers:
         assert hook(t, cf, w, 'READY', prompt='startup')['status'] == 'ready'
-    assert parent_hook(t, 'READY', [x for p, x in t.world.sent if p == rec['pane']][-1])['status'] == 'ready'
+    assert parent_hook(t, 'READY', received(t.world, rec['pane'])[-1])['status'] == 'ready'
     step(t)
     goal = cf.task()['goal']
     assert str(inside) in goal and str(parent_path) not in goal and 'IF-M0-src@1' in goal
@@ -211,4 +213,6 @@ def test_a_failing_copy_still_returns_the_pane_and_fails_the_subfleet(tree):
     f.tick()
     rec = subfleet.record(rec['run'])
     assert rec['state'] == 'failed' and 'missing or empty' in rec['reason']
-    assert f.agent('worker-1')['state'] == 'starting' and f.agent('worker-1')['pane'] == rec['pane']
+    # the pane still comes back (hook-channel worker: as its next generation, never typed into)
+    assert f.agent('worker-1')['state'] == 'starting' and f.agent('worker-1')['generation'] == '1'
+    assert f.agent('worker-1')['pane'] != rec['pane'] and rec['pane'] not in t.world.alive

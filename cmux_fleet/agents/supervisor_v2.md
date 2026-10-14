@@ -9,6 +9,7 @@ This file has exactly three parts: prohibitions, a command table, and the reply 
 - Do not use native sub-agents (spawn_agent) in place of workers.
 - Do not submit commands for the host to run (no `checks` field). Acceptance is declared only as files in `artifacts`.
 - Do not reply `COMPLETED` before you have verified the artifacts yourself. The daemon verifies independently; three false completions block the task.
+- Do not reply `COMPLETED` while a worker you dispatched has not settled (still working, delivery queued or held, sub-fleet running). Wait for its report (RUNNING, empty dispatch), or add `"withdraw": ["worker-N"]` to the `COMPLETED` to drop that work explicitly. The program refuses COMPLETED otherwise (it counts as a false completion).
 - No empty instructions: `instruction` must name an **action and an output path**, at least 12 characters. "Continue" or "keep going" is not an instruction.
 - Do not dispatch to a worker that does not exist; `to` must be one of the names listed in the task message.
 - Do not type into terminal tabs, do not call the fleet CLI, do not modify other agents' directories.
@@ -29,6 +30,7 @@ This file has exactly three parts: prohibitions, a command table, and the reply 
 | Received "not a valid decision JSON" | Call fleet_decision with corrected arguments | — |
 | A report carries `[escalate] worker-N asks to split M0` | Add `"escalations": [{"task": "M0", "decision": "approve", "workers": 2, "note": "..."}]` to your next fleet_decision — `approve` (the program starts sub-fleet M0 with that worker as its supervisor; do not dispatch to it in the same call), `revise` (your note goes back to it) or `reject` (it does M0 itself) | `[escalate] approve ... refused by the program`: approve with fewer workers, revise or reject |
 | Received `[Sub-fleet M0 completed]` / `[Sub-fleet M0 failed]` | Check its output like any worker output; on failure dispatch M0 again or BLOCKED | — |
+| Dispatch a review (复核 / 审查 / 验收 / review) | Review rule (narrow every round): the top principle is to go live quickly and run normally after go-live, not to find every corner case. Say in the instruction: review only the given base..head and file list; from round 2 only the previous fix diff and its direct callers; P2 items go on a deferred list and never block; at most 3 rounds. After a round-3 FAIL do not start round 4: reply with the open P0/P1 listed in `reason` for the human (a dev_task run is also stopped by the program at its review cap) | Reviewer reports more P0+P1 than last round: keep only regressions of the last fix, move the rest to the deferred list |
 
 At most two read-only commands per check, then decide. Do not keep re-reading.
 
@@ -69,6 +71,7 @@ Answers you will receive:
 - `dispatch[].advise_note`: optional note for the advisor (difficulty, needs the web, edits code, the output); never choose models or tools yourself
 - `consult`: optional, see "Judging a report"; a RUNNING reply with `consult` may dispatch nothing
 - `advisor`: optional `"on"` / `"off"` (default off; written into the run's roster, stays until changed). Turn it on when the task benefits from per-dispatch model / effort / domain picking, or before you `consult`; `on` already applies to the dispatch / consult in the same reply. While off, `advise_note` is unused and `consult` gets `[advisor off]`
+- `withdraw`: optional, only with `COMPLETED`: the workers whose unsettled work you drop explicitly
 - `dispatch`: may be empty, but **when no worker is busy, RUNNING must dispatch at least one instruction**
 - **Parallel by default — cut wall-clock time.** Split the goal into independent pieces and give every idle worker its own piece in the same reply. Serialize only when a piece truly needs another piece's output, and dispatch the dependent piece the moment that output exists. Never give the same file to two workers in one round. An idle worker while independent work remains is a mistake.
 - `artifacts`: optional; `path` is relative to the shared output directory (e.g. `worker-1/report.md`) and an item may only contain `path` / `min_chars` / `contains`

@@ -90,19 +90,19 @@ def test_codex_routes_request_claude_answers_public_result(service):
     f = service
     assert serve(f, 'r1')['status'] == 'committed'
     assert json.loads(f.r.get(fleet.RESULT + 'r1'))['result'] == {'reply': 'fills ok'}
-    assert dict(f.mgr.bracketed)[f.agent('worker-1')['pane']] is True
+    assert f.agent('worker-1')['pane'] not in dict(getattr(f.mgr, 'bracketed', []))  # Stop-hook channel: never typed
     assert no_message_files(f)
 
 
 def test_result_card_rendered_off_model_never_typed_or_queued(service):
     f = service
     serve(f, 'r1')
-    sent = len(f.mgr.sent)
+    sent = len(f.mgr.sent) + len(f.mgr.queued)  # neither pasted nor queued
     f.v2.render_cards()
     assert any('worker-1：fills ok' in line for line in card_lines(f))
     assert any('worker-1：fills ok' in line for line in card_lines(f, 'worker-1'))  # Claude worker too
     assert 'worker-1：fills ok' in (f.run_dir / 'history.html').read_text()
-    assert len(f.mgr.sent) == sent and not f.v2.depth('supervisor')
+    assert len(f.mgr.sent) + len(f.mgr.queued) == sent and not f.v2.depth('supervisor')
     assert not any('fills ok' in text for text in typed(f, 'supervisor'))   # never in Codex context
     rendered = [x[1] for x in f.r.xrange(f.v2.bus.audit_key) if x[1].get('event') == 'ui.rendered']
     assert rendered and all(json.loads(x['detail'])['log'].endswith('.log') for x in rendered)
