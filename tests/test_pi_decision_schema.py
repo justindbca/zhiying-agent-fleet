@@ -1,4 +1,4 @@
-"""Pi supervisor (task mode) fleet_decision schema accepts dispatch[].id, advise_note, advisor on/off and consult[]."""
+"""Pi supervisor (task mode) fleet_decision schema accepts dispatch[].id, advise_note, advisor on/off, consult[] and withdraw[]."""
 import os
 from pathlib import Path
 import shutil
@@ -33,3 +33,4 @@ def test_schema_source_declares_optional_keys():
     assert 'advisor: Type.Optional(Type.Union([Type.Literal("on"), Type.Literal("off")]))' in src
     assert 'consult: Type.Optional(Type.Array(consult))' in src
     assert 'finding: Type.String({ minLength: 1 })' in src
+    assert 'withdraw: Type.Optional(Type.Array(Type.String()))' in src

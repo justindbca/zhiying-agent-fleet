@@ -22,4 +22,11 @@ assert.ok(!Value.Check(schema,{...base,dispatch:[],consult:[{...ask,worker:5}]})
 assert.ok(!Value.Check(schema,{...base,dispatch:[],consult:[{worker:'worker-1',task:'M0'}]}),'consult.finding is required');
 assert.ok(!Value.Check(schema,{...base,dispatch:[],consult:{...ask}}),'consult is a list');
 assert.ok(Value.Check(schema,{...base,dispatch:[],advisor:'on',consult:[ask]}),'advisor on and consult in one reply');
+// no-typing batch (7b14068f): withdraw[] of worker names, next to the advisor keys
+const done={status:'COMPLETED',completion:100,reason:'r',dispatch:[]};
+assert.ok(Value.Check(schema,{...done,withdraw:['worker-1']}),'withdraw[] must be accepted');
+assert.ok(!Value.Check(schema,{...done,withdraw:'worker-1'})&&!Value.Check(schema,{...done,withdraw:[1]}),'withdraw is a list of names');
+assert.ok(Value.Check(schema,{...done,withdraw:['worker-1'],advisor:'off'}),'withdraw and advisor in one reply');
+assert.ok(Value.Check(schema,{...base,dispatch:[{to:'worker-1',instruction:'Write worker-1/a.md please',id:'M1',advise_note:'n'}],
+  consult:[ask],advisor:'on'}),'every advisor key together');
 console.log('decision schema contract passed');
