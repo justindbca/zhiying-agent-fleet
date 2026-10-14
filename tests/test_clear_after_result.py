@@ -143,6 +143,23 @@ def test_ambiguous_tui_never_authorizes_clear(screen):
     assert not clear.idle_prompt(screen)
 
 
+# Real Studio screen (Claude Code + fleet --name, 2026-10-14): the session name sits in the upper rule.
+NAMED_IDLE = """⏺ {"answer": {"ok": true}}
+
+✻ Churned for 2s · done 9:38
+
+────────────────────────────────────────────────────────────── feeea440e-worker-1 ─
+❯
+───────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+"""
+
+
+def test_idle_prompt_accepts_session_name_in_rule():
+    assert clear.idle_prompt(NAMED_IDLE)
+    assert not clear.idle_prompt(NAMED_IDLE.replace('❯\n', '❯ /clear\n'))  # text already in the box
+
+
 def test_idle_tui_and_process_exit_guards(monkeypatch):
     assert clear.idle_prompt(IDLE)
     assert not clear.hook_exited(os.getpid())

@@ -49,7 +49,8 @@ def idle_prompt(screen):
     tail = '\n'.join(rows).lower()
     if re.search(r'esc to (?:interrupt|cancel)|running.{0,30}hooks?|thinking[…\.]|\d+ background tasks?', tail):
         return False
-    rule = lambda row: bool(re.fullmatch(r'[─━\-]{8,}', row))
+    # Claude Code prints the session name (--name) inside the upper rule: "──── f1a2b3c4-worker-1 ─".
+    rule = lambda row: bool(re.fullmatch(r'[─━\-]{8,}(?: \S+ [─━\-]+)?', row))
     for i in range(1, len(rows) - 2):
         if rows[i] != '❯' or not rule(rows[i-1]) or not rule(rows[i+1]):
             continue
