@@ -232,7 +232,8 @@ def test_advisor_hands_off_with_a_skeleton_of_sheets_only(res, monkeypatch):
     f.pump()  # the next delivery to the advisor finds it over the §22 ratio: next generation first
     info = f.agent('advisor')
     assert info['generation'] == '1' and info['label'] == 'advisor-1.1' and info['state'] == 'starting'
-    assert old in f.mgr.killed and (info['pane'], old) in f.mgr.tabbed  # the successor took the old tab's place
+    # old tab retired first (never two advisor sessions), successor in the supervisor's pane (astra r1 P0-01)
+    assert old in f.mgr.killed and (info['pane'], f.agent('supervisor')['pane']) in f.mgr.tabbed
     assert not logs(f, 'rotate.impossible')
     note = next((f.run_dir / 'handoffs').glob('advisor-g0-*.md')).read_text()
     first_ticket = json.loads(f.r.hget(fleet.ADVICE + f.r.lrange(fleet.ADVICE_RECENT, 0, -1)[0], 'output'))['ticket']
@@ -471,9 +472,113 @@ def test_resume_respawns_the_advisor_tab_in_its_place(res):
         again.v2.resume_run()
         info = again.agent('advisor')
         assert info['label'] == 'advisor-1.1' and info['state'] == 'starting' and info['launch_ready'] == '1'
-        assert old in f.mgr.killed and (info['pane'], old) in f.mgr.tabbed
+        # one advisor fault branch for resume too (review astra r1 P0-01): old tab retired, new one by the supervisor
+        assert old in f.mgr.killed and (info['pane'], again.agent('supervisor')['pane']) in f.mgr.tabbed
         prompt = (again.run_dir / 'prompts' / 'advisor-g1.md').read_text()
         assert 'AGENTS.md' not in prompt and 'READY' in prompt
         assert 'advisor-1.1' not in again.r.hgetall(fleet.NAMES)
     finally:
         again.v2.close()
+
+
+
+# ------------------------------------------------------------------ review astra r1: P0-01 / P2-02 / P2-01
+def over_threshold_handoff(f, monkeypatch):
+    """worker-1 ran one sheet; the advisor is over its §22 ratio; worker-1's next dispatch is queued."""
+    from test_v2_codex_claude import answer_turn
+    first_generation_through_the_advisor(f)
+    answer_turn(f, 'worker-1', SECRET_REPORT)
+    f.pump()
+    real = fleet.Fleet.usage
+    monkeypatch.setattr(f, 'usage', lambda name: (700000, 1000000) if name == 'advisor' else real(f, name))
+    dispatch(f, ('worker-1', 'Summarize worker-1/notes.md into worker-1/summary.md'))
+
+
+def no_fleet_damage(f):
+    assert f.task()['status'] == 'running' and not f.paused()
+    assert all(f.agent(w)['state'] != 'held' for w in f.workers)
+
+
+def test_handoff_spawn_failure_is_an_advisor_fault_not_a_daemon_exit(res, monkeypatch):
+    from types import SimpleNamespace
+    from test_v2_codex_claude import typed
+    f = res
+    over_threshold_handoff(f, monkeypatch)
+    real = f.mgr.spawn_interactive_cli
+
+    def spawn(**kw):
+        if kw['metadata']['type'] == 'advisor':
+            return SimpleNamespace(success=False, pane_id=None, error='cmux spawn failed')
+        return real(**kw)
+    monkeypatch.setattr(f.mgr, 'spawn_interactive_cli', spawn)
+    old = f.agent('advisor')['pane']
+    f.pump()  # worker-1's consultation is queued, then the advisor's handoff fails: nothing raises
+    info = f.agent('advisor')
+    assert info['state'] == 'dead' and info['spawn_failed'] == '1' and old in f.mgr.killed
+    assert 'cmux spawn failed' in info['advisor_fault'] and f.v2.depth('advisor') == 0
+    no_fleet_damage(f)
+    f.pump()  # the withdrawn consultation falls back: worker-1 gets its dispatch on its running runtime
+    assert f.agent('worker-1')['state'] == 'busy' and 'Summarize' in typed(f, 'worker-1')[-1]
+    assert any(n.startswith('[advisor unavailable]') for n in f.r.lrange(fleet.ADVICE_NOTES, 0, -1))
+    no_fleet_damage(f)
+    f.advisor_tick()
+    assert f.agent('advisor')['state'] == 'dead'  # not before the 60 s gap
+    monkeypatch.setattr(f.mgr, 'spawn_interactive_cli', real)
+    f.setf('advisor', restart_at=0)
+    f.advisor_tick()
+    info = f.agent('advisor')
+    assert info['state'] == 'starting' and info['spawn_failed'] == '0' and info['label'] == 'advisor-1.2'
+
+
+def test_handoff_retire_and_placement_failures_never_block(res, monkeypatch):
+    from test_v2_codex_claude import typed
+    f = res
+    over_threshold_handoff(f, monkeypatch)
+    old = f.agent('advisor')['pane']
+    monkeypatch.setattr(f.mgr, 'kill_pane', lambda pane: False)  # the old advisor tab will not close
+    f.pump()
+    info = f.agent('advisor')
+    assert info['state'] == 'held' and info['pane'] == old and info['generation'] == '0'  # never two sessions
+    assert 'did not close' in info['advisor_fault'] and f.v2.depth('advisor') == 0
+    no_fleet_damage(f)
+    f.pump()
+    assert f.agent('worker-1')['state'] == 'busy' and 'Summarize' in typed(f, 'worker-1')[-1]
+    monkeypatch.undo()  # the tab closes now; placing the new one fails
+    monkeypatch.setattr(f.mgr, 'tab_into', lambda pane, peer, before=True: False)
+    f.setf('advisor', restart_at=0)
+    f.advisor_tick()
+    info = f.agent('advisor')
+    assert info['state'] == 'starting' and info['label'] == 'advisor-1.1' and old in f.mgr.killed
+    assert logs(f, 'advisor.placement_failed')
+    no_fleet_damage(f)
+
+
+def test_rescue_correction_carries_the_current_idle_slots(res2):
+    from test_v2_codex_claude import answer_turn, submit
+    f = res2
+    ready_advisor(f)
+    submit(f)
+    dispatch(f, ('worker-1', 'M0: research the semis rotation into worker-1/notes.md'))
+    f.pump()
+    advisor_answers(f, json.dumps(SHEET))
+    f.pump()
+    answer_turn(f, 'worker-1', 'READY', startup=True)
+    f.pump()
+    answer_turn(f, 'worker-1', SECRET_REPORT)
+    f.pump()
+    f.r.set(fleet.ITEMS, json.dumps({'M0': {'to': 'worker-1', 'instruction': 'research the semis rotation'}}))
+    answer_turn(f, 'supervisor', json.dumps({'status': 'RUNNING', 'completion': 30, 'reason': 'consult', 'dispatch': [],
+        'consult': [{'worker': 'worker-1', 'task': 'M0', 'finding': 'Reddit 403', 'want': 'a browser'}]}))
+    f.pump()
+    f.pump()
+    asked = json.loads(consultations(f)[-1].split('\n', 1)[1])
+    assert [c['name'] for c in asked['reassign_candidates']] == ['worker-2']
+    f.setf('worker-2', state='busy')  # took other work while the advisor thought
+    advisor_answers(f, json.dumps({'action': 'reassign', 'to': 'worker-2', 'model': 'sonnet', 'effort': 'high',
+                                   'domains': [], 'reason': '能力表：sonnet=enough'}))
+    f.pump()
+    correction = consultations(f)[-1]
+    assert correction.startswith('[Advisor correction ')
+    again = json.loads(correction.split('\n', 2)[2])
+    assert again['reassign_candidates'] == [] and 'reassign' not in again['actions']
+    no_fleet_damage(f)

@@ -3736,9 +3736,10 @@ class Fleet:
                          + '；最多等 ' + str(ADVICE_WAIT) + ' 秒，超时按缺省')
         return True
 
-    def advisor_poll(self, ticket, check):
+    def advisor_poll(self, ticket, check, request=None):
         """('wait' | 'ok' | 'unavailable', sheet or None, errors) of a resident consultation. An unusable answer
-        gets one correction; a second one, the time limit, or a failed / cancelled advisor turn: unavailable."""
+        gets one correction; a second one, the time limit, or a failed / cancelled advisor turn: unavailable.
+        ``request``: the input as it is now (rescue: idle slots may have changed), sent with the correction."""
         t = self.r.hgetall(ADVICE + ticket)
         errors = json.loads(t.get('errors') or '[]')
         now = time.time()
@@ -3750,8 +3751,9 @@ class Fleet:
             attempt = int(t.get('attempt') or 1)
             if attempt >= advisor.ATTEMPTS or not self.advisor_enabled():
                 return 'unavailable', None, errors
-            mid = self.advisor_send(ticket, t.get('request') or '', error=errors[-1])
-            self.r.hset(ADVICE + ticket, mapping={'status': 'pending', 'mid': mid, 'attempt': attempt + 1,
+            request = request or t.get('request') or ''
+            mid = self.advisor_send(ticket, request, error=errors[-1])
+            self.r.hset(ADVICE + ticket, mapping={'status': 'pending', 'mid': mid, 'attempt': attempt + 1, 'request': request,
                                                   'phase': 'queued', 'deadline': now + ADVICE_WAIT, 'raw': '',
                                                   'errors': json.dumps(errors, ensure_ascii=False)})
             self.log('advice.correction', ticket=ticket, attempt=attempt + 1, error=errors[-1])
@@ -3891,40 +3893,58 @@ class Fleet:
         self.refresh_history()
         self.log('advisor.retired')
 
-    def advisor_restart(self, reason):
-        """Next generation of the failed advisor tab in its place (or next to the supervisor). Its in-flight
-        consultation, if any, is cancelled (the waiting slot falls back); queued ones go to the successor."""
+    def advisor_restart(self, reason, source='advisor-restart'):
+        """Next generation of the advisor tab next to the supervisor: after a fault, for a §22 handoff
+        (``source='handoff'``) and on start --resume. Every failure here is an advisor fault (design §27 §2c-6):
+        nothing raises into the daemon, nothing blocks the task, pauses the fleet or holds another slot. On
+        failure the queued consultations are withdrawn (their slots fall back to the default on their next
+        pump) and advisor_tick tries the next generation again after ADVISOR_RESTART_GAP."""
         info = self.agent(ADVISOR)
         generation, old, prev = int(info.get('generation') or 0), info.get('pane'), self.label(ADVISOR)
-        self.setf(ADVISOR, restart_at=time.time() + ADVISOR_RESTART_GAP, advisor_fault='')
-        alive = bool(old) and self.mgr.get_pane_status(old) is not None
-        hid = 'restart-' + uuid.uuid4().hex[:8]
-        note = self.run_dir / 'handoffs' / (ADVISOR + '-g' + str(generation) + '-' + hid + '.md')
-        note.parent.mkdir(parents=True, exist_ok=True)
-        note.write_text(self.skeleton(ADVISOR, dict(info, handoff_id=hid)))
-        snapshot = ''
-        if alive:
-            snapshot = str(note.with_suffix('.terminal.txt'))
-            self.mgr.capture_to(old, snapshot)
-            if not self.mgr.kill_pane(old) or self.mgr.get_pane_status(old) is not None:
-                self.log('advisor.restart_failed', level='error', reason=reason, error='old tab did not close')
-                return
-        self.v2.confirm_retired(ADVISOR)  # its in-flight consultation is cancelled: that slot falls back (§8)
-        history.record(self.run_dir, slot=ADVISOR, label=prev, generation=generation, handoff=str(note),
-                       snapshot=snapshot, source='advisor-restart', timed_out=True)
-        label = slot_base(ADVISOR) + '.' + str(generation + 1)
-        self.setf(ADVISOR, generation=generation + 1, label=label, handoff_id='')
+        self.setf(ADVISOR, restart_at=time.time() + ADVISOR_RESTART_GAP, advisor_fault='', handoff_id='')
         try:
-            pane = self.spawn(ADVISOR, '[Advisor takeover] You are ' + label + ' (the advisor tab ' + prev + ' failed: '
-                              + ' '.join(reason.split())[:200] + '). Read the handoff note ' + str(note) + '. In this '
-                              'turn only read the note and make your final reply exactly READY.')
+            alive = bool(old) and self.mgr.get_pane_status(old) is not None
+            hid = ('handoff-' if source == 'handoff' else 'restart-') + uuid.uuid4().hex[:8]
+            note = self.run_dir / 'handoffs' / (ADVISOR + '-g' + str(generation) + '-' + hid + '.md')
+            note.parent.mkdir(parents=True, exist_ok=True)
+            note.write_text(self.skeleton(ADVISOR, dict(info, handoff_id=hid)))
+            snapshot = ''
+            if alive:  # retire first: two advisor sessions never run at once
+                snapshot = str(note.with_suffix('.terminal.txt'))
+                self.mgr.capture_to(old, snapshot)
+                if not self.mgr.kill_pane(old) or self.mgr.get_pane_status(old) is not None:
+                    return self.advisor_failed('held', reason, 'old advisor tab ' + prev + ' did not close')
+            self.v2.confirm_retired(ADVISOR)  # its in-flight consultation is cancelled: that slot falls back (§8)
+            history.record(self.run_dir, slot=ADVISOR, label=prev, generation=generation, handoff=str(note),
+                           snapshot=snapshot, source=source, timed_out=source != 'handoff')
+            label = slot_base(ADVISOR) + '.' + str(generation + 1)
+            self.setf(ADVISOR, generation=generation + 1, label=label)
+            why = ('took over at its context threshold' if source == 'handoff' else
+                   'the advisor tab ' + prev + ' failed: ' + ' '.join(reason.split())[:200])
+            pane = self.spawn(ADVISOR, '[Advisor takeover] You are ' + label + ' (' + why + '). Read the handoff note '
+                              + str(note) + '. In this turn only read the note and make your final reply exactly READY.')
         except (Exception, SystemExit) as exc:
-            self.setf(ADVISOR, state='dead', spawn_failed=1, launch_ready=0)
-            self.log('advisor.spawn_failed', level='error', error=str(exc)[:500])
-            return
+            return self.advisor_failed('dead', reason, str(exc))
         self.place_advisor(pane)
-        self.refresh_history()
-        self.log('advisor.restarted', prev=prev, label=label, reason=reason)
+        try:
+            self.refresh_history()
+        except Exception as exc:  # the page is cosmetic: never an advisor failure
+            self.log('advisor.history_failed', level='warning', error=str(exc)[:300])
+        self.log('advisor.restarted', prev=prev, label=label, reason=reason, source=source)
+
+    def advisor_failed(self, state, reason, error):
+        """The next advisor generation could not be started: dead (no tab) or held (old tab still there).
+        Queued consultations fall back now; advisor_tick retries after the gap."""
+        fields = dict(state=state, launch_ready=0, runtime_ready=0, advisor_fault=('restart failed: ' + error)[:300])
+        if state == 'dead':
+            fields['spawn_failed'] = 1
+        self.setf(ADVISOR, **fields)
+        try:
+            for mid in self.v2.bus.pending(ADVISOR):
+                self.v2.cancel_queued(ADVISOR, {'message_id': mid}, 'advisor restart failed')
+        except Exception as exc:
+            self.log('advisor.cancel_failed', level='error', error=str(exc)[:300])
+        self.log('advisor.restart_failed', level='error', reason=reason, error=error[:500])
 
     def advice_launch(self, cli, sheet, cards, registry):
         card = cards[sheet['model']]
@@ -4285,7 +4305,9 @@ class Fleet:
             if (self.r.hget(ADVICE + pending['ticket'], 'status') == 'answered'
                     and (self.agent(name).get('state') != 'idle' or self.inbox_depth(name))):
                 return  # answered: acted on at the worker's next idle boundary
-            state_, sheet, errors = self.advisor_poll(pending['ticket'], check)
+            # The correction carries the input as it is now: a reassign target that went busy meanwhile is
+            # refused against the current idle slots and the advisor sees those (review astra r1 P2-01).
+            state_, sheet, errors = self.advisor_poll(pending['ticket'], check, json.dumps(payload, ensure_ascii=False))
             if state_ == 'wait':
                 return
             self.r.delete(RESCUE_PENDING)
@@ -4474,6 +4496,11 @@ class Fleet:
         info = self.agent(name)
         if info.get('state') == 'clearing' or info.get('clear_required') == '1':
             return
+        if name == ADVISOR:
+            # §22 handoff of the advisor (§27): it has only Read and cannot write a draft, so no handoff turn;
+            # the daemon's skeleton (recent sheets) is its note. Failures stay advisor faults (advisor_restart).
+            self.log('rotate.start', agent=name, used=used, window=window, generation=info.get('generation'))
+            return self.advisor_restart('context ' + str(used) + '/' + str(window), source='handoff')
         hid = uuid.uuid4().hex[:10]
         draft = agent_cwd(self.cfg, name) / '.handoff' / ('draft-' + hid + '.md')
         draft.parent.mkdir(parents=True, exist_ok=True)
@@ -4482,9 +4509,6 @@ class Fleet:
                   handoff_mtime=draft.stat().st_mtime_ns,
                   handoff_deadline=time.time() + float(self.cfg['handoff_timeout']))
         self.log('rotate.start', agent=name, used=used, window=window, generation=info.get('generation'))
-        if name == ADVISOR:
-            # Only the Read tool: it cannot write a draft. The daemon's skeleton (recent sheets) is its note (§27).
-            return self.finish_rotation(name)
         prompt = ((prompt or handoff.DUMP_PROMPT).format(path=draft, used=used, window=window)
                   + ' This is a same-task handoff: do not open windows, do not continue the task itself.')
         if self.v2:

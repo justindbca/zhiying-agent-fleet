@@ -396,7 +396,7 @@ class Watchdog:
     def rotate(self, slot, why, screen):
         """Kill this fleet's own frozen session and start the next generation in its place."""
         from cmux_fleet import history, subfleet
-        from cmux_fleet.fleet import NAMES, slot_base
+        from cmux_fleet.fleet import NAMES, SUPERVISOR_LABEL
         f, rt = self.f, self.rt
         info = f.agent(slot)
         pane, generation = info['pane'], int(info.get('generation') or 0)
@@ -417,6 +417,12 @@ class Watchdog:
             rt.transaction('watch-frozen-' + uuid.uuid4().hex, lambda: rt.hold(
                 slot, 'frozen (' + why + '); pane ' + pane + ' is not in this fleet\'s registry, not killed'))
             return False
+        if slot == advisor.SLOT:
+            # §27: one advisor fault branch (retire, next generation by the supervisor, queued consultations fall
+            # back on failure); its in-flight consultation is cancelled and that slot falls back. Never raises.
+            f.advisor_restart('frozen: ' + why)
+            self.next_check.pop(slot, None)
+            return f.agent(slot).get('state') == 'starting'
         lease = f.r.hgetall(rt.bus.lease_key(slot))
         msg = rt.bus.message(lease['message_id']) if lease.get('message_id') else {}
         hid = 'frozen-' + uuid.uuid4().hex[:8]
@@ -426,7 +432,7 @@ class Watchdog:
         snapshot = note.with_suffix('.terminal.txt')
         f.mgr.capture_to(pane, str(snapshot))
         prev = f.label(slot)
-        label = slot_base(slot) + '.' + str(generation + 1)
+        label = (SUPERVISOR_LABEL if slot == 'supervisor' else slot) + '.' + str(generation + 1)
         # Order (same as respawn / handoff, keeps the layout): start the successor launch-held, put it in
         # the old tab's place, kill the old process tree, confirm retirement, only then open the launch
         # gate. Until then the successor cannot run work: it is 'starting' (pump delivers to 'idle'
@@ -435,8 +441,8 @@ class Watchdog:
         # the successor again, so at most one session of this slot is ever left.
         f.setf(slot, generation=generation + 1, label=label, handoff_id='', watch_state='frozen',
                stall_escapes=0, watch_since=0, esc_digest='', proc_frozen=0, prompt_hits=0,
-               prev_label=prev if slot in f.workers else '')
-        if slot in f.workers:
+               prev_label='' if slot == 'supervisor' else prev)
+        if slot != 'supervisor':
             f.r.hset(NAMES, mapping={label: slot})
         try:
             new = f.spawn(slot, '[Same-task takeover] You are ' + label + ' (taking over from ' + prev + ', which '
@@ -478,12 +484,11 @@ class Watchdog:
                     'successor ' + str(new) + '; two sessions may hold slot ' + slot + '. Close one by hand.')
             f.setf(slot, launch_ready=0, retired_pane=old.get('pane', ''))
             rt.transaction('watch-frozen-' + uuid.uuid4().hex, lambda: rt.hold(slot, text))
-            if slot != advisor.SLOT:  # the advisor never blocks the task (design §27); its hold is enough
-                rt.finish('blocked', text)
+            rt.finish('blocked', text)
             return False
         f.setf(slot, **{k: v for k, v in old.items() if k != 'watch_state'})
         f.setf(slot, watch_state='frozen', launch_ready=old.get('launch_ready', '1'))
-        if slot in f.workers:
+        if slot != 'supervisor':
             f.r.hdel(NAMES, label)
         rt.transaction('watch-frozen-' + uuid.uuid4().hex, lambda: rt.hold(
             slot, 'frozen; ' + why + '. Successor removed, frozen session left as it was (screen ' + screen + ')'))

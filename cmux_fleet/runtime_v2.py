@@ -1293,7 +1293,10 @@ class RuntimeV2:
             self.audit('resume.reattached', slot=slot, generation=self.f.agent(slot).get('generation'))
         # A delegated slot's pane is run by its sub-fleet (resumed below): never replace it here.
         delegated = [s for s in self.f.workers if self.f.agent(s).get('state') == 'delegated']
-        self.respawn([s for s in self.f.names if s not in reattach and s not in delegated], page)
+        # The advisor tab's next generation goes through its own fault branch (§27): never blocks the resume.
+        self.respawn([s for s in self.f.names if s not in reattach and s not in delegated and s != advisor.SLOT], page)
+        if advisor.SLOT in self.f.names:
+            self.f.advisor_restart('start --resume', source='resume')
         ran = self.codex_ran(unsettled)  # only now: respawn closed those sessions (never reattached)
         lost = [m for m in lost if m['message_id'] not in ran]
         self.f.resume()
@@ -1402,7 +1405,7 @@ class RuntimeV2:
     def respawn(self, slots, page):
         """Next generation of each slot in place; without a supervisor pane, rebuild the whole page."""
         from cmux_fleet import history
-        from cmux_fleet.fleet import SERVICE, SUPERVISOR_LABEL, NAMES, slot_base
+        from cmux_fleet.fleet import SERVICE, SUPERVISOR_LABEL, NAMES
         old = {}
         for slot in slots:
             info = self.f.agent(slot)
@@ -1410,8 +1413,6 @@ class RuntimeV2:
             if not info.get('generation'):  # never spawned (crash during provisioning)
                 if slot == 'supervisor':
                     self.f.setf(slot, label=SUPERVISOR_LABEL)
-                elif slot == advisor.SLOT:
-                    self.f.setf(slot, label='advisor')
                 else:
                     self.f.init_worker(slot)
                 continue
@@ -1424,10 +1425,10 @@ class RuntimeV2:
                 self.f.mgr.capture_to(pane, str(snapshot))
             history.record(self.f.run_dir, slot=slot, label=prev, generation=generation, handoff='',
                            snapshot=str(snapshot), source='resume', timed_out=False)
-            label = slot_base(slot) + '.' + str(generation + 1)
+            label = (SUPERVISOR_LABEL if slot == 'supervisor' else slot) + '.' + str(generation + 1)
             self.f.setf(slot, generation=generation + 1, label=label, handoff_id='', retired_pane='',
                         clear_required=0, clear_conflict=0, clear_phase='', clear_token='',
-                        prev_label=prev if slot in self.f.workers else '')
+                        prev_label='' if slot == 'supervisor' else prev)
             if info.get('rescue_launch') or info.get('rescue_relay'):
                 # An advisor respawn cut off mid-handoff: the successor still starts with the sheet's
                 # runtime (its domains are in advice_domains); the relay note / hint never leak into a later rotation.
@@ -1436,7 +1437,7 @@ class RuntimeV2:
                     fields['runtime_launch'] = info['rescue_launch']
                 self.f.setf(slot, **fields)
                 self.audit('resume.rescue_launch', slot=slot, generation=generation + 1)
-            if slot in self.f.workers:
+            if slot != 'supervisor':
                 self.f.r.hset(NAMES, mapping={label: slot})
             old[slot] = pane if alive else None
         prompt = ('You are fleet agent {label}. Read AGENTS.md in the current directory first. This run was '
@@ -1455,8 +1456,6 @@ class RuntimeV2:
                                                      [self.f.agent(w)['pane'] for w in self.f.workers],
                                                      history.page_url(self.f.run_dir))
             self.f.r.hset(SERVICE, mapping={'history_pane': self.f.history_pane or ''})
-            if advisor.SLOT in slots:
-                self.f.place_advisor(self.f.agent(advisor.SLOT)['pane'])
             return
         for slot in slots:
             new = self.f.spawn(slot, prompt.format(label=self.f.label(slot)), launch_held=True)
@@ -1468,8 +1467,6 @@ class RuntimeV2:
                                 retired_launch=self.f.agent(slot).get('runtime_launch') or '')
                     return self.f.finish('blocked', 'start --resume could not close the old session of ' + slot)
                 self.confirm_retired(slot)
-            elif slot == advisor.SLOT:
-                self.f.place_advisor(new)
             elif slot != 'supervisor':
                 peer = next((p for p in (self.f.agent(w).get('pane') for w in self.f.workers if w != slot)
                              if p and p != new and self.f.mgr.get_pane_status(p) is not None), None)
