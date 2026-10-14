@@ -548,8 +548,14 @@ def claude_rewake(cfg_path, name, generation, raw):
     data = json.loads(raw or '{}')
     cfg = load(cfg_path)
     generation = int(generation)
+    own, returning = (cfg, name, generation), False
     if cfg.get('transport_version') == 2:
         cfg, name, generation = subfleet.delegated_route(cfg, name, generation)
+        if (not claude_hook.enabled(cfg, name, claude=True) and (name, generation) != own[1:]
+                and claude_hook.enabled(own[0], own[1], claude=True)):
+            # The session supervises a sub-fleet (typed there). Its own worker channel has no Stop hook
+            # waiting when it comes back: keep watching it, idle while delegated (§29 return handoff).
+            (cfg, name, generation), returning = own, True
     if not claude_hook.enabled(cfg, name, claude=True):
         return None
     hook_on_sigterm()
@@ -570,6 +576,9 @@ def claude_rewake(cfg_path, name, generation, raw):
                 r.expire(k['rewake'], claude_hook.BIND_TTL)
             unarmed = None
             while time.monotonic() < deadline:
+                if returning and str(mine) == r.get(k['rewake']) and r.hget(key('agent', name), 'state') == 'delegated':
+                    time.sleep(1)
+                    continue
                 if str(mine) != r.get(k['rewake']) or not alive():
                     return None  # a newer Stop has its own fallback, or this generation is gone
                 if watch.poll():
@@ -4062,23 +4071,27 @@ class Fleet:
         t = self.task()
         replies = self.r.lrange(key('replies', name), 0, -1)
         pending = self.v2.pending_text(name) if self.v2 else self.r.lrange(key('inbox', name), 0, 0)
+        back = json.loads(info.get('subfleet_return') or '{}')  # §29: the slot comes back from a named sub-fleet
+        facts, open_ids = subfleet.return_lines(back) if back else ([], 'none')
         return handoff.build_skeleton(
             info['handoff_id'], SESSION, t.get('goal') or (
                 ('resident service: route each request to a worker' if name == 'supervisor'
                  else 'resident service: answer each request as role ' + name) if self.service
                 else '(no task yet, standing by)'),
-            done_lines=['recent reply: ' + ' '.join(x.split())[:600] for x in replies],
+            done_lines=facts + ['recent reply: ' + ' '.join(x.split())[:600] for x in replies],
             inprogress='none (handoff happens at an idle boundary)',
             next_lines=['read this note, reply READY, then wait for the daemon to deliver the next message'
                         + (' (pending: ' + ' '.join(pending[0].split())[:300] + ')' if pending else '')],
-            pending='none', task=t.get('id', ''), hop=int(info['generation']) + 1,
+            pending=open_ids, task=t.get('id', ''), hop=int(info['generation']) + 1,
             key_files=[str(self.workspace()), str(agent_cwd(self.cfg, name) / 'AGENTS.md')],
             risks=['role ' + name + ' and task ' + t.get('id', 'none') + ' are unchanged',
                    'anything the model claims as done must be checked against the artifacts'])
 
     def finish_rotation(self, name, timed_out=False):
         codex_queue.clear(self, name, 'rotation')  # its token can never settle (Codex's queue is not edited)
-        if self.v2 and timed_out:
+        back = self.agent(name).get('subfleet_return')
+        if self.v2 and timed_out and not (back and not self.v2.handoff_taken(name)):
+            # (§29 return: a handoff the returned session never took ran nothing; retiring it needs no hold)
             # An unfinished handoff can still run tools. Retire it reliably before
             # using a skeleton or advancing generation; Escape alone proves nothing.
             self.v2.transaction('handoff-timeout-' + uuid.uuid4().hex,
@@ -4113,10 +4126,14 @@ class Fleet:
                        snapshot=str(snapshot), source=source, timed_out=timed_out)
         if info.get('rescue_launch'):  # advisor rescue respawn: the successor starts with the new sheet's runtime
             self.setf(name, runtime_launch=info['rescue_launch'], rescue_launch='')
-        new = self.spawn(name, '[Same-task takeover] You are ' + label + ' (taking over from ' + prev
-                         + '). Read the handoff note ' + str(out) + ' and continue from it. In this turn only read '
-                         'the note, do no task work, and make your final reply exactly READY.',
-                         launch_held=bool(self.v2))
+        if back:  # §29: the successor is told where its predecessor was, not "same task"
+            self.setf(name, subfleet_return='')
+            prompt = subfleet.return_prompt(json.loads(back)['name'], str(out)).format(label=label)
+        else:
+            prompt = ('[Same-task takeover] You are ' + label + ' (taking over from ' + prev
+                      + '). Read the handoff note ' + str(out) + ' and continue from it. In this turn only read '
+                      'the note, do no task work, and make your final reply exactly READY.')
+        new = self.spawn(name, prompt, launch_held=bool(self.v2))
         placed = self.mgr.tab_into(new, old)  # the successor takes the retiring session's place on the page
         if (self.v2 and not placed) or not self.mgr.kill_pane(old) or (self.v2 and self.mgr.get_pane_status(old) is not None):
             if self.v2:

@@ -38,7 +38,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from cmux_fleet import codex_queue
+from cmux_fleet import codex_queue, handoff
 
 LIMITS = {'max_depth': 2, 'max_children': 3, 'max_agents_total': 12, 'child_workers_max': 3}
 ACTIVE = ('starting', 'running', 'stopping')
@@ -983,6 +983,7 @@ def collect(f, child_run, notify=True):
     cfg = fleet.load(Path(child_run) / 'config.json')
     slot = rec['slot']
     child_mgr = fleet.manager_for(cfg)
+    back = return_facts(f, rec, cfg) if rec.get('named') else None  # read before its Redis goes
     shutdown_redis(cfg)  # no orphan Redis even if the child crashed
     ph = rec['placeholder']
     returned = parent_detach_view(f, rec, child_mgr, child_run)
@@ -993,7 +994,25 @@ def collect(f, child_run, notify=True):
     # A Claude worker on the hook channel is never typed into after its launch prompt: instead of the
     # role-change prompt, its next generation takes the returned session's place (CLI-argument prompt).
     hooked = returned and f.v2 is not None and f.v2.hooked(slot)
-    if hooked:
+    if back and hooked:
+        # §29 (user 10-14): the returned session writes a handoff note (design §4 rotation on its own hook
+        # channel: the delivery waits in its mailbox, the session's rewake fallback hands it over), then the
+        # next generation of the slot reads it. Untaken / timed out: the daemon's skeleton note instead.
+        f.mgr.kill_pane(ph)
+        f.setf(slot, pane=rec['pane'], state='idle', subfleet_return=json.dumps(back, ensure_ascii=False))
+        f.start_rotation(slot, 0, 0, prompt=handoff.SUBFLEET_RETURN_PROMPT.replace('<name>', rec['name']))
+        f.log('subfleet.return_handoff', task=rec['task_id'], slot=slot, generation=f.agent(slot).get('generation'))
+    elif back and not returned and f.v2 is not None:
+        # §29: the delegated session is gone, nobody can write a note: the skeleton note, then the next generation
+        f.setf(slot, pane=ph or rec['pane'], state='idle', subfleet_return=json.dumps(back, ensure_ascii=False),
+               handoff_id=uuid.uuid4().hex[:10])
+        note = f.run_dir / 'handoffs' / (slot + '-g' + str(f.agent(slot).get('generation') or 0) + '-return.md')
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text(f.skeleton(slot, f.agent(slot)))
+        f.setf(slot, handoff_id='', subfleet_return='')
+        f.v2.respawn([slot], True, prompt=return_prompt(rec['name'], str(note)), handoff=str(note))
+        f.log('subfleet.slot_respawned', task=rec['task_id'], slot=slot, handoff=str(note))
+    elif hooked:
         f.mgr.kill_pane(ph)
         f.setf(slot, pane=rec['pane'], state='idle')
         f.v2.respawn([slot], True)
@@ -1053,6 +1072,64 @@ def collect(f, child_run, notify=True):
                                           + ('retired' if hooked else 'lost') + ')')
                 + '.' + extra + '\nContinue the current task using the AGENTS.md decision JSON.')
     return rec
+
+
+def return_facts(f, rec, cfg):
+    """What the next generation of a named sub-fleet's slot learns (its handoff skeleton, §29): up / down
+    times, the requests the sub-fleet answered and those still open when it went down."""
+    from cmux_fleet import named_subfleet
+    h = named_subfleet.state(f, rec['name'])
+    out = {'name': rec['name'], 'up_at': h.get('up_at') or h.get('started_at') or '', 'down_at': time.time(),
+           'outcome': rec.get('outcome') or '', 'at': time.time()}
+    # Still up (a crash, a parent stop): read it now; a planned down read it before its stop (stop_child)
+    out.update(child_requests(cfg) if redis_up(cfg) else rec.get('requests') or {'answered': [], 'open': []})
+    return out
+
+
+def child_requests(cfg):
+    """{answered: [[id, status]], open: [id]} of a running child's Redis (newest RETURN_IDS each)."""
+    fleet = _fleet()
+    out = {'answered': [], 'open': []}
+    try:
+        r = fleet.connect(cfg)
+        try:
+            for raw in r.lrange(fleet.RESULTS, -RETURN_IDS, -1):
+                res = json.loads(raw)
+                out['answered'].append([str(res.get('id')), str(res.get('status'))])
+            out['open'] = sorted(k[len(fleet.REQ):] for k in r.scan_iter(match=fleet.REQ + '*'))[:RETURN_IDS]
+        finally:
+            r.close()
+    except Exception as exc:  # unreadable: the note says so, the return goes on
+        out['error'] = str(exc)[:200]
+    return out
+
+
+RETURN_IDS = 30  # request ids listed in a return note (newest answered / open)
+
+
+def return_lines(ret):
+    """(done lines, pending text) of a §29 return note."""
+    def when(x):
+        try:
+            return time.strftime('%Y-%m-%d %H:%M', time.localtime(float(x)))
+        except (TypeError, ValueError):
+            return '?'
+    done = ['this slot supervised named sub-fleet ' + ret['name'] + ' from ' + when(ret.get('up_at')) + ' to '
+            + when(ret.get('down_at')) + ' (outcome ' + (ret.get('outcome') or '?') + '); it is down now',
+            'requests the sub-fleet answered (newest ' + str(RETURN_IDS) + '): '
+            + (', '.join(i + ' ' + st for i, st in ret.get('answered') or []) or 'none')]
+    if ret.get('error'):
+        done.append('the sub-fleet\'s Redis could not be read at down: ' + ret['error'])
+    still = ret.get('open') or []
+    return done, ('sub-fleet requests still unanswered at down: ' + ', '.join(still)) if still else 'none'
+
+
+def return_prompt(name, note):
+    """Launch prompt of the slot's next generation after a §29 return (never "resumed after an interruption")."""
+    return ('You are fleet agent {label}, a worker of the main fleet. The previous session of this slot supervised '
+            'sub-fleet ' + name + ', which is now down; that role is over. Read the handoff note ' + note
+            + ' and AGENTS.md in the current directory. In this turn only read them, do no task work, and make '
+            'your final reply exactly READY.')
 
 
 # ------------------------------------------------------------------ tree stop / resume / status

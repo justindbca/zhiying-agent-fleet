@@ -26,6 +26,7 @@ Internal API
   revive(fleet, d, rec, cfg)        autostart child daemon gone: relaunch unless crashlooping
   collected(fleet, rec, returned)   subfleet.collect finished a named child
 """
+import json
 import re
 import shlex
 import time
@@ -40,6 +41,9 @@ OP = 'fx:subfleet:op:'
 DOWN_OUTCOMES = ('down', 'stopped')  # collect outcomes that are a planned down, not a failure
 SLOT_WAIT = 600  # seconds an approved up waits for the supervisor slot to be idle / READY
 CRASH_WINDOW, CRASH_MAX = 3600, 3  # autostart: this many daemon deaths within the window = crashloop
+# A returned session's last Stop marks its channel stopping (claude_hook.STOPPING_TTL), then the rewake waits
+# claude_hook.GRACE: past this, nothing will take the return handoff (§29).
+RETURN_WAKE_S = 180
 USAGE_EVERY = 30  # seconds between two context-usage reads of an up autostart child's supervisor
 
 
@@ -232,7 +236,8 @@ def begin_drain(f, name, why):
 
 
 def stop_child(f, d, rec, cfg, reason):
-    rec.update(state='stopping', outcome='down', reason=reason)
+    rec.update(state='stopping', outcome='down', reason=reason,
+               requests=subfleet.child_requests(cfg))  # for the slot's return note: its Redis goes with the child
     subfleet.save_record(d, rec)
     subfleet.post_stop(cfg)
     f.log('subfleet.stopping', task=rec['task_id'], outcome='down', reason=reason)
@@ -297,8 +302,22 @@ def ready_limit(f):
     return float(f.cfg['profile_ready_timeout']) + subfleet.LAUNCH_GRACE
 
 
+def return_tick(f, now):
+    """A returned slot's handoff (subfleet.collect) nobody took within RETURN_WAKE_S: no rewake fallback was
+    left to wake the idle session, so the daemon's skeleton note goes to the next generation now (§29)."""
+    for slot in f.workers:
+        info = f.agent(slot)
+        if not (info.get('subfleet_return') and info.get('state') == 'handoff' and f.v2) or f.v2.handoff_taken(slot):
+            continue
+        waited = now - float(json.loads(info['subfleet_return']).get('at') or now)
+        if waited >= RETURN_WAKE_S:
+            f.log('subfleet.return_untaken', slot=slot, waited=round(waited))
+            f.finish_rotation(slot, timed_out=True)
+
+
 def tick(f):
     fleet = _fleet()
+    return_tick(f, time.time())
     decl = declared(f)
     if not decl and not f.r.llen(OPQ) and not live(f):
         return

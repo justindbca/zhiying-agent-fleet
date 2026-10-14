@@ -1378,8 +1378,9 @@ class RuntimeV2:
             self.cancel_queued(slot, {'message_id': mid}, 'start --resume: re-queued after reconcile')
         return released and not keep_out
 
-    def respawn(self, slots, page):
-        """Next generation of each slot in place; without a supervisor pane, rebuild the whole page."""
+    def respawn(self, slots, page, prompt=None, handoff=''):
+        """Next generation of each slot in place; without a supervisor pane, rebuild the whole page.
+        ``prompt`` / ``handoff``: another launch prompt ({label}) and its note (a §29 sub-fleet return)."""
         from cmux_fleet import history
         from cmux_fleet.fleet import SERVICE, SUPERVISOR_LABEL, NAMES
         old = {}
@@ -1399,7 +1400,7 @@ class RuntimeV2:
                 snapshot = self.f.run_dir / 'handoffs' / (slot + '-g' + str(generation) + '-resume.terminal.txt')
                 snapshot.parent.mkdir(parents=True, exist_ok=True)
                 self.f.mgr.capture_to(pane, str(snapshot))
-            history.record(self.f.run_dir, slot=slot, label=prev, generation=generation, handoff='',
+            history.record(self.f.run_dir, slot=slot, label=prev, generation=generation, handoff=handoff,
                            snapshot=str(snapshot), source='resume', timed_out=False)
             label = (SUPERVISOR_LABEL if slot == 'supervisor' else slot) + '.' + str(generation + 1)
             self.f.setf(slot, generation=generation + 1, label=label, handoff_id='', retired_pane='',
@@ -1416,9 +1417,9 @@ class RuntimeV2:
             if slot != 'supervisor':
                 self.f.r.hset(NAMES, mapping={label: slot})
             old[slot] = pane if alive else None
-        prompt = ('You are fleet agent {label}. Read AGENTS.md in the current directory first. This run was '
-                  'resumed after an interruption; the daemon sends the current state next. In this turn do no '
-                  'task work: your final reply must be exactly READY.')
+        prompt = prompt or ('You are fleet agent {label}. Read AGENTS.md in the current directory first. This run was '
+                            'resumed after an interruption; the daemon sends the current state next. In this turn do no '
+                            'task work: your final reply must be exactly READY.')
         if not page:  # whole page lost (e.g. cmux restarted): close leftovers, then lay it out again
             for slot, pane in old.items():
                 if pane and (not self.f.mgr.kill_pane(pane) or self.f.mgr.get_pane_status(pane) is not None):
@@ -1584,6 +1585,15 @@ class RuntimeV2:
 
     def hook_keys(self, slot, generation):
         return claude_hook.keys(self.bus.prefix, slot, generation)
+
+    def handoff_taken(self, slot):
+        """The slot's Stop hook (or its rewake fallback) handed the current handoff delivery to Claude."""
+        info = self.f.agent(slot)
+        try:
+            bind = json.loads(self.bus.r.get(self.hook_keys(slot, int(info.get('generation') or 0))['bind']) or '{}')
+        except (ValueError, TypeError):
+            return False
+        return isinstance(bind, dict) and bind.get('message_id') == 'm-handoff-' + (info.get('handoff_id') or '-')
 
     def type_into(self, slot, env):
         """Receive an offered delivery for an official CLI and hand over only its business text.

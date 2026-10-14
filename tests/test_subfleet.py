@@ -1379,29 +1379,145 @@ def test_down_drains_returns_the_same_session_and_the_name_comes_back_again(svc)
     assert [d.name for d in subfleet.children_dirs(f.run_dir)] == ['ops']
 
 
-def test_named_down_on_the_hook_channel_retires_the_session_and_the_next_generation_serves_again(svc):
-    """Merged default (hook channel): the §29 down keeps its outcome (down, no notice, name reusable), but
-    the returned session is not typed into: it is retired and worker-1's next generation takes its place."""
+def hook_yielded(f):
+    """The worker's Stop hook that waited before the delegation yielded to the typed role change (claude_hook
+    OperatorQueue): no hook of this channel waits any more (hook_sim would otherwise still count it armed)."""
+    hook_sim._armed.pop(f.v2.hook_keys('worker-1', 0)['mailbox'], None)
+
+
+def returning_rewake(t, monkeypatch):
+    """The session's own asyncRewake from its last Stop while it supervised the sub-fleet (real
+    ``fleet.claude_rewake`` in a thread). Grace / stopping shortened; the rest is the real fallback."""
+    from cmux_fleet import claude_hook
+    monkeypatch.setattr(claude_hook, 'GRACE', 0)
+    f = t.f
+    thread = t.threads[(str(f.run_dir), 'worker-1', 0)]
+    raw = json.dumps({'session_id': thread, 'transcript_path': str(t.claude / (thread + '.jsonl'))})
+    f.r.delete(f.v2.hook_keys('worker-1', 0)['stopping'])  # its last Stop finished settling
+    hook_yielded(f)
+    box = {}
+    th = threading.Thread(target=lambda: box.setdefault('text', fleet.claude_rewake(f.path, 'worker-1', '0', raw)),
+                          daemon=True)
+    th.start()
+    return th, box, thread
+
+
+def down_and_collect(t, cf):
+    rid, _ = ask(t, 'down')
+    supervisor_answers(t, rid)
+    subfleet.tick(t.f)  # approved: draining
+    subfleet.tick(t.f)  # quiet: stop posted to the child
+    stop_child_like_daemon(cf)
+    subfleet.tick(t.f)  # collected
+    return rid
+
+
+def launches(f):
+    """Each launch of this fleet's manager, with its prompt file's text when the prompt went by file."""
+    out = []
+    for kw in getattr(f.mgr, 'spawned', []):
+        path = kw.get('prompt_file')
+        out.append(json.dumps(kw, ensure_ascii=False) + (Path(path).read_text() if path and Path(path).is_file() else ''))
+    return out
+
+
+def test_named_down_on_the_hook_channel_hands_over_through_the_sessions_own_note(svc, monkeypatch):
+    """§29 (user 10-14): return = the returned session writes a handoff note (design §4 rotation on its own
+    hook channel, no typing: its rewake fallback hands the dump prompt over), then worker-1's next
+    generation reads it; a late Stop of the old session settles nothing."""
     t, f = svc, svc.f
     sid = f.agent('worker-1')['pane']
     _, rec, cf = bring_up(t)
+    th, box, thread = returning_rewake(t, monkeypatch)
+    time.sleep(1.5)
+    assert th.is_alive(), 'the rewake must wait while the session is delegated, not quit'
     before = len(t.world.sent)
-    rid, _ = ask(t, 'down')
-    supervisor_answers(t, rid)
-    subfleet.tick(f)  # approved: draining
-    subfleet.tick(f)  # quiet: stop posted to the child
-    stop_child_like_daemon(cf)
-    subfleet.tick(f)  # collected
-    rec = subfleet.record(rec['run'])
-    assert rec['state'] == 'down' and result(f, rid) == dict(result(f, rid), status='ok', state='down')
-    assert named_subfleet.state(f, 'ops')['state'] == 'down'
+    rid = down_and_collect(t, cf)
+    assert subfleet.record(rec['run'])['state'] == 'down' and result(f, rid)['status'] == 'ok'
     assert not any('[Sub-fleet' in x for x in supervisor_texts(f))
     info = f.agent('worker-1')
-    assert info['generation'] == '1' and info['pane'] != sid and info['state'] == 'starting'
-    assert not [x for p, x in t.world.sent[before:] if p in (sid, info['pane'])]
+    assert info['state'] == 'handoff' and info['generation'] == '0' and info['pane'] == sid
+    th.join(30)
+    assert not th.is_alive() and 'Sub-fleet ops is down' in box['text'] and info['handoff_draft'] in box['text']
+    assert not [x for p, x in t.world.sent[before:] if p == sid], 'a hook-channel worker is never typed into'
+    # Claude runs the rewake-delivered turn: writes the note, its Stop (now the parent's channel) settles it
+    Path(info['handoff_draft']).write_text(
+        '## Done (facts)\n- ops answered the morning requests\n## In progress\nnone\n'
+        '## Next steps (in order)\n1. wait for the next request\n')
+    transcript = t.claude / (thread + '.jsonl')
+    with transcript.open('a') as fh:
+        rows = [{'type': 'user', 'origin': {'kind': 'task-notification'}, 'promptId': 'p-ret',
+                 'message': {'role': 'user', 'content': '<task-notification>\n<summary>Stop hook feedback</summary>\n'
+                             '</task-notification>\n<system-reminder>\nFleet delivery: ' + box['text']
+                             + '\n</system-reminder>'}},
+                {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'handoff written'}]}}]
+        fh.write('\n'.join(json.dumps(x) for x in rows) + '\n')
+    raw = json.dumps({'session_id': thread, 'transcript_path': str(transcript), 'last_assistant_message': 'handoff written'})
+    drive(t, lambda: hook_sim.claude_stop(f.path, 'worker-1', '0', raw))
+    step(t)
+    info = f.agent('worker-1')
+    assert info['generation'] == '1' and info['state'] == 'starting' and info['pane'] != sid
+    assert sid not in t.world.alive and not info.get('subfleet_return')
+    note = next((f.run_dir / 'handoffs').glob('worker-1-g0-*.md'))
+    text = note.read_text()
+    assert 'ops answered the morning requests' in text  # the model's sections over the skeleton (design §4)
+    done = [x[1] for x in f.r.xrange(f.v2.bus.audit_key) if x[1].get('event') == 'rotate.done']
+    assert done and done[-1].get('source') == 'model'
+    launch = launches(f)[-1]
+    assert 'sub-fleet ops' in launch and str(note) in launch and 'resumed after an interruption' not in launch
+    assert f.r.hget(fleet.SERVICE, 'paused') != '1'
+    late = claude_turn(t, f.path, 'worker-1', 0, thread, 'anything', 'late reply')  # old session's late Stop
+    assert late['status'] == 'stale'
     assert hook(t, f, 'worker-1', 'READY', prompt='startup')['status'] == 'ready'
     _, rec2, _ = bring_up(t)  # the name comes back, now on the new generation's session
     assert rec2['attempt'] == 2 and rec2['pane'] == info['pane'] and rec2['generation'] == 1
+
+
+def test_named_return_handoff_nobody_takes_falls_back_to_the_skeleton_without_holding(svc):
+    """§29: no rewake left to wake the returned session: after RETURN_WAKE_S the daemon's skeleton note
+    (sub-fleet name, up / down time, answered and open request ids) goes to the next generation; the
+    untaken handoff ran nothing, so the fleet is not held / paused."""
+    t, f = svc, svc.f
+    sid = f.agent('worker-1')['pane']
+    _, rec, cf = bring_up(t)
+    cr = fleet.connect(fleet.load(Path(rec['run']) / 'config.json'))
+    cr.rpush(fleet.RESULTS, json.dumps({'id': 'req-answered-1', 'status': 'ok'}))
+    cr.hset(fleet.REQ + 'req-open-2', mapping={'spec': '{}'})
+    cr.close()
+    hook_yielded(f)  # and no rewake is left to take the handoff
+    down_and_collect(t, cf)
+    info = f.agent('worker-1')
+    assert info['state'] == 'handoff' and info['generation'] == '0'
+    subfleet.tick(f)  # within RETURN_WAKE_S: still waiting for the session's rewake
+    assert f.agent('worker-1')['generation'] == '0'
+    back = json.loads(info['subfleet_return'])
+    f.setf('worker-1', subfleet_return=json.dumps(dict(back, at=back['at'] - named_subfleet.RETURN_WAKE_S - 1)))
+    subfleet.tick(f)
+    info = f.agent('worker-1')
+    assert info['generation'] == '1' and info['state'] == 'starting' and sid not in t.world.alive
+    assert f.r.hget(fleet.SERVICE, 'paused') != '1'
+    events = [x[1].get('event') for x in f.r.xrange(f.v2.bus.audit_key)]
+    assert 'subfleet.return_untaken' in events and 'execution.held' not in events
+    text = next((f.run_dir / 'handoffs').glob('worker-1-g0-*.md')).read_text()
+    assert 'named sub-fleet ops' in text and 'req-answered-1 ok' in text and 'req-open-2' in text
+    launch = launches(f)[-1]
+    assert 'sub-fleet ops' in launch and 'Read the handoff note' in launch and 'resumed after an interruption' not in launch
+
+
+def test_named_return_with_the_session_gone_starts_the_next_generation_on_a_skeleton_note(svc):
+    """§29: the delegated session died with the sub-fleet: nobody can write, the skeleton note goes
+    straight to the next generation (never "resumed after an interruption")."""
+    t, f = svc, svc.f
+    sid = f.agent('worker-1')['pane']
+    _, rec, cf = bring_up(t)
+    t.world.alive.discard(sid)  # the session is gone
+    down_and_collect(t, cf)
+    info = f.agent('worker-1')
+    assert info['generation'] == '1' and info['state'] == 'starting' and not info.get('subfleet_return')
+    note = f.run_dir / 'handoffs' / 'worker-1-g0-return.md'
+    assert 'named sub-fleet ops' in note.read_text()
+    launch = launches(f)[-1]
+    assert str(note) in launch and 'sub-fleet ops' in launch and 'resumed after an interruption' not in launch
 
 
 def test_drain_timeout_takes_the_child_back_anyway(svc):
