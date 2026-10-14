@@ -22,7 +22,8 @@ Subcommands
   notify    Codex notify hook (internal)
   claude-stop  Claude Code Stop hook for claude agents (internal)
   claude-rewake  Claude Code asyncRewake Stop hook of hook-channel workers (internal)
-  claude-stop-failure  Claude Code StopFailure hook of hook-channel workers (internal)
+  claude-stop-failure  Claude Code StopFailure hook of hook-channel / clear-after-result workers (internal)
+  claude-clear  Claude Code SessionStart(clear) hook of clear-after-result workers (internal)
   claude-prompt  Claude Code UserPromptSubmit hook of a v2 claude supervisor (internal)
   pi-event  Pi settled/session extension callback (internal)
   actor     exec the configured CLI for one agent (internal)
@@ -49,6 +50,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
 from cmux_fleet import advisor, brake, claude_hook, cli_pairs, codex_queue, contracts, handoff, history, kit as kitmod, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, watchdog  # noqa: E402
+from cmux_fleet import clear_after_result
 from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -106,7 +108,8 @@ DEFAULTS = {'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 100000, 'stal
             'supervisor_model': 'opus',
             'claude_window': 200000, 'mode': 'task', 'max_busy': 0, 'request_timeout': 900,
             'apply_profiles_live': False, 'allow_profile_live_switch': False, 'profile_ready_timeout': 180,
-            'transport_version': 1, 'allow_development_v2': False, 'max_attempts': 2}
+            'transport_version': 1, 'allow_development_v2': False, 'max_attempts': 2,
+            'clear_after_result': False, 'clear_timeout': 20}
 CLAUDE_JSON = Path.home() / '.claude.json'
 CONTRACTS = 'fx:contracts'  # contract tasks only: one JSON state document (cmux_fleet/contracts.py)
 ESCALATIONS = 'fx:escalations'  # task mode: {task id: worker's split request / approval / delegation} (§20)
@@ -605,9 +608,14 @@ def claude_rewake(cfg_path, name, generation, raw):
 
 def claude_stop_failure(cfg_path, name, generation, raw):
     """Claude Code StopFailure hook (output ignored): an API error ended the turn, so no Stop hook
-    waits for the next delivery. Record it; an in-flight delivery then goes the watchdog's stall path."""
+    waits for the next delivery. Record it; an in-flight delivery then goes the watchdog's stall path.
+
+    A clear-after-result worker (typed delivery, docs/design.md §28) instead posts a ``stop_failure``
+    event: the daemon fails its in-flight request at once and clears the context."""
     data = json.loads(raw or '{}')
     cfg = load(cfg_path)
+    if clear_after_result.enabled(cfg, name):
+        return _claude_context_hook(cfg_path, name, generation, raw, 'stop_failure')
     fields = {'slot': name, 'generation': str(generation), 'error': str(data.get('error') or 'unknown')[:200],
               'session_id': str(data.get('session_id') or ''), 'level': 'warn',
               'text': str(data.get('last_assistant_message') or '')[-500:], 'at': str(int(time.time() * 1000))}
@@ -624,6 +632,7 @@ def claude_stop_failure(cfg_path, name, generation, raw):
             r.set(hook_keys(cfg, r, name, int(generation))['turnend'], str(time.time()), ex=claude_hook.BIND_TTL)
     finally:
         r.close()
+    return True
 
 # ---------------------------------------------------------------- trust gate
 def validate_artifacts(artifacts, extended=False):
@@ -1225,6 +1234,8 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
     try:
         info = r.hgetall(key('agent', name))
         base = dict(agent=name, generation=generation, run_id=bus.run_id, thread=thread, transcript=transcript)
+        if clear_after_result.enabled(cfg, name):
+            base['hook_pid'] = os.getpid()
 
         def call(kind, **fields):
             correlation = 'h-' + uuid.uuid4().hex
@@ -1296,7 +1307,8 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
                 runtime_v2.post_event(bus, dict(base, kind='unsolicited', text=text[-8000:]))
             return skipped('ignored', reason)
         lease = r.hgetall(bus.lease_key(name))
-        if lease.get('status') in ('uncertain', 'expired') and lease.get('message_id') and info.get('state') == 'held':
+        if (lease.get('status') in ('uncertain', 'expired') and lease.get('message_id')
+                and info.get('state') in ('held', 'clearing')):
             # Hold exit (docs/design.md §24): the held turn has now ended in this very session, which
             # proves its execution stopped. The daemon releases the slot; the result is not applied.
             msg = bus.message(lease['message_id'])
@@ -1318,6 +1330,40 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
                     wall_text=(text or '') if len((text or '').strip()) <= brake.TURN_WALL_MAX else '')
     finally:
         r.close(); r.connection_pool.disconnect()
+
+
+def _claude_context_hook(cfg_path, name, generation, raw, kind):
+    """Persist hooks without waiting inside Claude's lifecycle callback."""
+    cfg, data = load(cfg_path), json.loads(raw or '{}')
+    if (name not in cfg['workers'] or cfg.get('worker_cli') != 'claude'
+            or cfg.get('transport_version') != 2):
+        raise ValueError('context hook must name a Claude v2 worker')
+    if not isinstance(data, dict):
+        raise ValueError('hook JSON must be an object')
+    if kind == 'cleared' and data.get('source') != 'clear':
+        return False
+    r = connect(cfg)
+    try:
+        bus = runtime_v2.bus_for(cfg, r)
+        info = r.hgetall(key('agent', name))
+        ev = dict(kind=kind, agent=name, generation=int(generation), run_id=bus.run_id,
+                  thread=data.get('session_id'), transcript=data.get('transcript_path', ''),
+                  hook_pid=os.getpid(), old_thread=info.get('thread'), clear_token=info.get('clear_token', ''))
+        if kind == 'stop_failure':
+            ev['error'] = str(data.get('error') or data.get('error_details')
+                              or data.get('last_assistant_message') or 'Claude StopFailure')[:4000]
+            lease = r.hgetall(bus.lease_key(name))
+            if lease.get('message_id'):
+                msg = bus.message(lease['message_id'])
+                ev['delivery'] = {k: msg[k] for k in runtime_v2.IDENTITY}
+        runtime_v2.post_event(bus, ev)
+        return True
+    finally:
+        r.close(); r.connection_pool.disconnect()
+
+
+def claude_clear(cfg_path, name, generation, raw):
+    return _claude_context_hook(cfg_path, name, generation, raw, 'cleared')
 
 
 def agent_profile(cfg, name):
@@ -1378,6 +1424,15 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
         # An API error ends the turn with StopFailure instead of Stop: no hook waits afterwards.
         hooks['StopFailure'] = [{'hooks': [{'type': 'command', 'timeout': 30, 'command': shlex.join(
             [cfg['python'], str(Path(__file__).resolve()), 'claude-stop-failure', str(cfg_path), name, str(generation)])}]}]
+    if clear_after_result.enabled(cfg, name):
+        # exec ensures the PID reported by the hook is the process Claude waits for.
+        hooks['Stop'][0]['hooks'][0]['command'] = 'exec ' + hook
+        for event, verb in (('SessionStart', 'claude-clear'), ('StopFailure', 'claude-stop-failure')):
+            entry = {'hooks': [{'type': 'command', 'timeout': 10, 'command': 'exec ' + shlex.join(
+                [cfg['python'], str(Path(__file__).resolve()), verb, str(cfg_path), name, str(generation)])}]}
+            if event == 'SessionStart':
+                entry['matcher'] = 'clear'
+            hooks[event] = [entry]
     if prompt_hook_slot(cfg, name, generation):
         # Operator input typed in the supervisor tab is queued as a daemon request (design.md §5).
         hooks['UserPromptSubmit'] = [{'hooks': [{'type': 'command', 'timeout': PROMPT_HOOK_TIMEOUT, 'command': shlex.join(
@@ -3978,6 +4033,8 @@ class Fleet:
 
     def start_rotation(self, name, used, window, prompt=None):
         info = self.agent(name)
+        if info.get('state') == 'clearing' or info.get('clear_required') == '1':
+            return
         hid = uuid.uuid4().hex[:10]
         draft = agent_cwd(self.cfg, name) / '.handoff' / ('draft-' + hid + '.md')
         draft.parent.mkdir(parents=True, exist_ok=True)
@@ -5255,6 +5312,7 @@ def start(args):
            **({'budget': budget} if budget else {}),
            **({'brake_notify': shlex.split(args.brake_notify)} if getattr(args, 'brake_notify', None) else {}),
            'request_timeout': args.request_timeout, 'supervisor_profile': args.supervisor_profile,
+           'clear_after_result': args.clear_after_result, 'clear_timeout': args.clear_timeout,
            'worker_profile': args.worker_profile, 'profile': args.profile, 'codex': codex, 'redis_server': redis_server, 'codex_home': str(home),
            'handoff_ratio': args.handoff_ratio, 'handoff_timeout': args.handoff_timeout,
            'window': args.window, 'stall_timeout': args.stall_timeout,
@@ -5469,6 +5527,8 @@ def main(argv=None):
     s.add_argument('--worker-kit', help='claude workers: dir with .claude/{agents,skills} and mcp.json copied into each worker cwd')
     s.add_argument('--claude', help='claude binary (default: first on PATH)')
     s.add_argument('--claude-window', type=int, default=DEFAULTS['claude_window'], help='claude models not in the built-in 1M list ([1m]/opus/fable/sonnet): context window (§22)')
+    s.add_argument('--clear-after-result', action='store_true', help='clear Claude service worker context after every terminal result')
+    s.add_argument('--clear-timeout', type=float, default=20, help='seconds to confirm context clear (default: 20)')
     s.add_argument('--lifecycle', metavar='MODE',
                    help='required: ' + ' | '.join(lifecycle.MODE_NAMES) + ' (config/fleet_modes.yaml); '
                         'decides what done means, how the run is closed, and --mode')
@@ -5589,6 +5649,9 @@ def main(argv=None):
     h = sub.add_parser('claude-stop-failure', help='Claude Code StopFailure hook (internal; hook JSON on stdin)')
     for arg in ('cfg', 'agent', 'generation'):
         h.add_argument(arg)
+    h = sub.add_parser('claude-clear', help='Claude Code SessionStart(clear) hook of clear-after-result workers (internal)')
+    for arg in ('cfg', 'agent', 'generation'):
+        h.add_argument(arg)
     h = sub.add_parser('claude-prompt', help='Claude Code UserPromptSubmit hook (internal; hook JSON on stdin)')
     for arg in ('cfg', 'agent', 'generation'):
         h.add_argument(arg)
@@ -5624,6 +5687,8 @@ def main(argv=None):
         if text:  # exit 2 wakes Claude Code with stderr as "<rewakeMessage> <text>"
             sys.stderr.write(text)
             sys.exit(2)
+    elif args.cmd == 'claude-clear':
+        claude_clear(args.cfg, args.agent, args.generation, sys.stdin.read())
     elif args.cmd == 'claude-stop-failure':
         claude_stop_failure(args.cfg, args.agent, args.generation, sys.stdin.read())
     elif args.cmd == 'claude-prompt':

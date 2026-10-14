@@ -184,6 +184,29 @@ redis.call('HSET', KEYS[1], 'run_id', ARGV[1], 'slot', ARGV[2],
 return answer
 """
 
+# Shared by the standalone bus operation and RuntimeV2's atomic effect application.
+LUA_REBIND_CHECK = """
+local function rebindcheck(lease, inbox, group, run, slot, generation, old_session, fence)
+  local expected = {run_id=run, slot=slot, generation=tostring(generation),
+    session_id=old_session, fence=tostring(fence), current_delivery='', status='idle'}
+  for field, value in pairs(expected) do
+    if redis.call('HGET', lease, field) ~= value then error('rebind_identity:' .. field) end
+  end
+  if redis.call('XPENDING', inbox, group)[1] ~= 0 then error('undrained_pel') end
+end
+"""
+
+LUA_REBIND = LUA_HEAD + LUA_REBIND_CHECK + """
+keytype(KEYS[1], 'hash'); keytype(KEYS[2], 'stream'); keytype(KEYS[3], 'stream')
+groupcheck(KEYS[2], ARGV[7])
+rebindcheck(KEYS[1], KEYS[2], ARGV[7], ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[6])
+if ARGV[4] == ARGV[5] then error('rebind_same_session') end
+local fence = tonumber(ARGV[6]) + 1
+audit(KEYS[3], 'slot_rebound', ARGV[2], '', '', nowms())
+redis.call('HSET', KEYS[1], 'session_id', ARGV[5], 'fence', fence)
+return fence
+"""
+
 LUA_ENQUEUE = LUA_HEAD + """
 keytype(KEYS[1], 'list'); keytype(KEYS[2], 'hash'); keytype(KEYS[3], 'stream')
 local old = redis.call('HGET', KEYS[2], 'status')
@@ -430,6 +453,13 @@ class MessageBus:
         return self._call(LUA_REGISTER,
                           [self.lease_key(slot), self.inbox_key(slot), self.audit_key],
                           [self.run_id, slot, generation, session_id, self.slot_group(slot)])
+
+    def rebind_slot(self, slot, generation, old_session_id, session_id, fence):
+        """Same generation only; compare old binding/fence and require an idle, drained slot."""
+        _short(slot, 'slot'); _integer(generation, 'generation'); _integer(fence, 'fence')
+        _short(old_session_id, 'old_session_id'); _short(session_id, 'session_id')
+        return self._call(LUA_REBIND, [self.lease_key(slot), self.inbox_key(slot), self.audit_key],
+                          [self.run_id, slot, generation, old_session_id, session_id, fence, self.slot_group(slot)])
 
     def enqueue(self, slot, body, request_id=None, kind="task", deadline_at=None,
                 message_id=None):

@@ -62,7 +62,7 @@ def service_tick(f, policy, now):
             f.setf(slot, state='reclaimed', pane='', reclaimed_at=now)
             f.log('lifecycle.reclaimed', slot=slot, idle_min=minutes)
     hours = policy.get('idle_stop_hours')
-    active = f.r.llen(REQQ) or any(f.agent(s).get('state') in ('busy', 'starting', 'handoff') for s in f.names)
+    active = f.r.llen(REQQ) or any(f.agent(s).get('state') in ('busy', 'starting', 'handoff', 'clearing') for s in f.names)
     last = close._hget(f, 'service_active_at')
     if active or last is None:
         close._hset(f, service_active_at=now)

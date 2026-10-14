@@ -33,7 +33,7 @@ VERIFY = {
 }
 DEFAULTS = {'stall_grace': 300, 'stall_escapes': 3, 'watch_interval': 5, 'capture_fail_alarm': 3}
 # Slot states the watchdog never touches: someone else owns the next step.
-HANDS_OFF = ('held', 'dead', 'retired', 'delegated', 'handoff')
+HANDS_OFF = ('held', 'dead', 'retired', 'delegated', 'handoff', 'clearing')
 
 
 def setting(cfg, name):
