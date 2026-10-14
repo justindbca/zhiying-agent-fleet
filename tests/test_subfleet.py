@@ -21,7 +21,7 @@ import pytest
 
 from test_fleet import codex_rows, received, write_rollout
 import hook_sim  # noqa: E402
-from cmux_fleet import cmux_manager, fleet, redis_runtime, roster, runtime_v2, subfleet
+from cmux_fleet import clear_after_result, cmux_manager, fleet, redis_runtime, roster, runtime_v2, subfleet
 
 
 # ------------------------------------------------------------------ fake cmux world
@@ -1188,6 +1188,70 @@ def test_named_roster_section_is_validated(tmp_path):
                  'supervisor_role file not found', 'mode must be one of', 'autostart must be true or false',
                  'already supervises another sub-fleet', 'drain_s must be a positive'):
         assert want in text
+
+
+def test_named_entry_clear_switches_are_validated_and_never_inherited(tmp_path):
+    """§29 a): clear_after_result / clear_timeout / claude_hook_delivery are entry keys of their own:
+    validated with the roster, passed into the child config, and never taken from the parent."""
+    (tmp_path / 'sup.md').write_text('x')
+    (tmp_path / 'child.yaml').write_text('workers:\n  - name: a\n')
+    base = 'workers:\n  - name: worker-1\n  - name: worker-2\n'
+    good = tmp_path / 'good.yaml'
+    good.write_text(base + 'subfleets:\n'
+                    '  - {name: ops, supervisor_slot: worker-1, supervisor_role: sup.md, roster: child.yaml,\n'
+                    '     clear_after_result: true, clear_timeout: 45, claude_hook_delivery: false}\n'
+                    '  - {name: plain, supervisor_slot: worker-2, supervisor_role: sup.md, roster: child.yaml}\n')
+    ops, plain = roster.load_subfleets(good)
+    assert (ops['clear_after_result'], ops['clear_timeout'], ops['claude_hook_delivery']) == (True, 45, False)
+    assert not {'clear_after_result', 'clear_timeout', 'claude_hook_delivery'} & set(plain)
+    parent = dict(fleet.DEFAULTS, mode='service', clear_after_result=True, clear_timeout=99,
+                  claude_hook_delivery=False)
+    cfg = subfleet.child_worker_cfg(parent, ops)
+    assert (cfg['clear_after_result'], cfg['clear_timeout'], cfg['claude_hook_delivery']) == (True, 45, False)
+    cfg = subfleet.child_worker_cfg(parent, plain)  # not written: the built-in default, not the parent's
+    assert cfg['clear_after_result'] is False and cfg['clear_timeout'] == 20 and 'claude_hook_delivery' not in cfg
+    bad = tmp_path / 'bad.yaml'
+    bad.write_text(base + 'subfleets:\n'
+                   '  - {name: ops, supervisor_slot: worker-1, supervisor_role: sup.md, roster: child.yaml,\n'
+                   '     clear_after_result: 1, clear_timeout: 0, claude_hook_delivery: "no"}\n')
+    with pytest.raises(ValueError) as exc:
+        roster.load_entries(bad)
+    for want in ('clear_after_result must be true or false', 'claude_hook_delivery must be true or false',
+                 'clear_timeout must be a positive number'):
+        assert want in str(exc.value)
+
+
+def test_named_up_with_clear_on_the_hook_channel_is_rejected_by_program(svc):
+    """§29 a): the §28 / hook-delivery exclusion holds for a named child too, refused at its up."""
+    t, f = svc, svc.f
+    f.cfg['roster'] = str(write_roster(t, extra='    clear_after_result: true\n'))
+    f.roster_tick()
+    rid, answer = ask(t, 'up')
+    assert answer['status'] == 'accepted', answer
+    res = result(f, rid)
+    assert res['status'] == 'rejected' and res['reason'].startswith('program: '), res
+    assert 'claude_hook_delivery: false' in res['reason']
+    assert not subfleet.active_children(f.run_dir)
+
+
+def test_named_child_with_clear_and_typed_delivery_runs_with_its_own_switches(svc):
+    """§29 a): clear_after_result + claude_hook_delivery: false comes up; the child's config carries
+    the entry's switches and passes the run-config check (a named service child has lifecycle None)."""
+    t, f = svc, svc.f
+    f.cfg['roster'] = str(write_roster(
+        t, extra='    clear_after_result: true\n    clear_timeout: 30\n    claude_hook_delivery: false\n'))
+    f.roster_tick()
+    rid, rec, cf = bring_up(t)
+    assert result(f, rid)['status'] == 'ok'
+    child_cfg = fleet.load(Path(rec['run']) / 'config.json')
+    assert child_cfg['lifecycle'] is None and child_cfg['mode'] == 'service'
+    assert (child_cfg['clear_after_result'], child_cfg['clear_timeout'], child_cfg['claude_hook_delivery']) \
+        == (True, 30, False)
+    assert runtime_v2.validate_config(child_cfg) == 2
+    assert clear_after_result.enabled(child_cfg, 'ops-w1')
+    loose = dict(child_cfg, named=None)  # outside a named child, lifecycle None still refuses §28
+    with pytest.raises(ValueError):
+        clear_after_result.validate(loose)
 
 
 # §5.1 + §5.2

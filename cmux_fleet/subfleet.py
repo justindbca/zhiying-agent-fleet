@@ -313,6 +313,13 @@ def check(f, slot, task_id, workers, ready=True, named=None):
                 + str(task_level(task_id)) + ' (main fleet is level 1)')
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         return 'workers must be a positive integer'
+    if named and named.get('clear_after_result') is True:  # §28 in a named child: same rules as a root fleet
+        if named.get('claude_hook_delivery', True) is not False:
+            return ('sub-fleet ' + task_id + ': clear_after_result needs typed delivery, but Claude Stop-hook '
+                    'delivery is on (the default): add claude_hook_delivery: false to its subfleets entry')
+        if named['mode'] != 'service' or f.cfg.get('transport_version') != 2:
+            return ('sub-fleet ' + task_id + ': clear_after_result needs mode: service and the typed '
+                    'Redis v2 delivery path (transport_version 2)')
     if workers > lim['child_workers_max']:
         return 'child_workers_max ' + str(lim['child_workers_max']) + ': asked for ' + str(workers) + ' workers'
     live = active_children(f.run_dir)
@@ -478,7 +485,8 @@ def child_lifecycle(parent):
     return child
 
 
-NAMED_OVERRIDES = ('claude', 'worker_model', 'stall_timeout', 'request_timeout', 'max_busy')
+NAMED_OVERRIDES = ('claude', 'worker_model', 'stall_timeout', 'request_timeout', 'max_busy',
+                   'clear_after_result', 'clear_timeout', 'claude_hook_delivery')
 
 
 def child_worker_cfg(parent, named):

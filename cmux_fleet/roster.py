@@ -23,6 +23,7 @@ problem is rejected as a whole, with one reason per problem; the running roster 
 A changed `profile` (or `pi_model` / `pi_thinking`) swaps that slot to its next generation once it is idle (same slot name,
 docs/design.md §25 night switch); the card itself is resolved and checked by the daemon.
 """
+import math
 import os
 import re
 from pathlib import Path
@@ -249,7 +250,8 @@ def write_advisor(path, on, workers=()):
 
 # ------------------------------------------------------------------ named sub-fleets (docs/design.md §29)
 SUBFLEET_KEYS = {'name', 'supervisor_slot', 'supervisor_role', 'autostart', 'mode', 'roster', 'claude',
-                 'worker_model', 'timeouts', 'max_busy', 'drain_s'}
+                 'worker_model', 'timeouts', 'max_busy', 'drain_s', 'clear_after_result', 'clear_timeout',
+                 'claude_hook_delivery'}
 SUBFLEET_MODES = ('service', 'task')
 DRAIN_S = 600
 TIMEOUT_KEYS = {'stall': 'stall_timeout', 'request': 'request_timeout'}  # entry timeouts -> fleet config key
@@ -319,6 +321,17 @@ def subfleet_entries(value, base, workers):
                 bad.append('max_busy must be a non-negative integer')
             else:
                 out['max_busy'] = item['max_busy']
+        for key in ('clear_after_result', 'claude_hook_delivery'):  # §28 / §5 switches of the child itself
+            if key in item:
+                if type(item[key]) is not bool:
+                    bad.append(key + ' must be true or false')
+                else:
+                    out[key] = item[key]
+        if 'clear_timeout' in item:
+            if not _positive(item['clear_timeout']) or not math.isfinite(item['clear_timeout']):
+                bad.append('clear_timeout must be a positive number of seconds')
+            else:
+                out['clear_timeout'] = item['clear_timeout']
         if not _positive(out['drain_s']):
             bad.append('drain_s must be a positive number of seconds')
         if 'roster' in out and not bad:
