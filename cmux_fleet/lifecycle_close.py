@@ -164,6 +164,8 @@ def tick(f, now=None):
     except ValueError as exc:
         f.log('lifecycle.table_error', error=str(exc))
         return
+    if 'worker_idle_reclaim_min' in f.cfg:  # start --worker-idle-reclaim-min: this run's own value
+        policy['worker_idle_reclaim_min'] = f.cfg['worker_idle_reclaim_min']
     if f.service:
         return lifecycle_hold.service_tick(f, policy, now)
     task = f.task()

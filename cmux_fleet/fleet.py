@@ -4959,6 +4959,19 @@ def daemon_running(run):
     return False
 
 
+def reclaim_minutes(value):
+    """start --worker-idle-reclaim-min: 'off' or a positive number of minutes."""
+    if value == 'off':
+        return value
+    try:
+        minutes = float(value)
+    except ValueError:
+        minutes = 0
+    if not minutes > 0:
+        raise argparse.ArgumentTypeError('expected minutes > 0 or off')
+    return minutes
+
+
 def resume_target(value):
     """The run to reattach for start --resume, or None: 'auto' with nothing unfinished starts a new run."""
     auto = value == 'auto'
@@ -5313,6 +5326,8 @@ def start(args):
            **({'brake_notify': shlex.split(args.brake_notify)} if getattr(args, 'brake_notify', None) else {}),
            'request_timeout': args.request_timeout, 'supervisor_profile': args.supervisor_profile,
            'clear_after_result': args.clear_after_result, 'clear_timeout': args.clear_timeout,
+           **({'worker_idle_reclaim_min': None if reclaim == 'off' else reclaim}
+              if (reclaim := getattr(args, 'worker_idle_reclaim_min', None)) is not None else {}),
            **({'claude_hook_delivery': False} if getattr(args, 'claude_hook_delivery', True) is False else {}),
            'worker_profile': args.worker_profile, 'profile': args.profile, 'codex': codex, 'redis_server': redis_server, 'codex_home': str(home),
            'handoff_ratio': args.handoff_ratio, 'handoff_timeout': args.handoff_timeout,
@@ -5528,6 +5543,8 @@ def main(argv=None):
     s.add_argument('--worker-kit', help='claude workers: dir with .claude/{agents,skills} and mcp.json copied into each worker cwd')
     s.add_argument('--claude', help='claude binary (default: first on PATH)')
     s.add_argument('--claude-window', type=int, default=DEFAULTS['claude_window'], help='claude models not in the built-in 1M list ([1m]/opus/fable/sonnet): context window (§22)')
+    s.add_argument('--worker-idle-reclaim-min', metavar='MIN|off', type=reclaim_minutes,
+                   help='service: this run\'s idle-worker reclaim in minutes, or off (default: fleet_modes.yaml)')
     s.add_argument('--clear-after-result', action='store_true', help='clear Claude service worker context after every terminal result')
     s.add_argument('--clear-timeout', type=float, default=20, help='seconds to confirm context clear (default: 20)')
     s.add_argument('--no-claude-hook-delivery', dest='claude_hook_delivery', action='store_false',
