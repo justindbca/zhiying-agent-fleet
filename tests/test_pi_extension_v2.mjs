@@ -85,6 +85,39 @@ await result.execute('two',{result:{reply:'b'}},undefined,undefined,ctx);
 await emit('agent_settled',{aborted:true});
 assert.equal(records().filter(r=>r.kind==='settled').at(-1).candidates.length,2);
 assert.equal(records().filter(r=>r.kind==='settled').at(-1).aborted,true);
+fixture({event:'completed',message_id:'m-second'});
+await wait(()=>statuses.at(-1)==='等待派工');
+// Replay the hook order real Pi emitted for a sendMessage(triggerTurn) delivery run
+// (tests/record_pi_event_order.py). 1.2.0 adds before_agent_start{messageType:'custom'}.
+for (const version of ['1.1.0','1.2.0']) {
+  const recorded=JSON.parse(readFileSync(new URL(`./fixtures/pi_events_${version}.json`,import.meta.url),'utf8'));
+  assert.equal(recorded.pi_version,version);
+  const run=recorded.events.slice(recorded.events.findIndex(e=>e.hook==='delivery_frame'));
+  assert.equal(run.some(e=>e.hook==='before_agent_start'),version!=='1.1.0','fixture shows the version difference');
+  const id=`m-replay-${version}`, before=records().filter(r=>r.kind==='settled').length, startedBefore=records().filter(r=>r.kind==='started').length;
+  fixture({event:'delivery',message_id:id});
+  await wait(()=>messages.at(-1)?.msg.details.message_id===id);
+  // The fix relies on this: while a delivery is active no human run can start on the slot.
+  const sent=messages.length;
+  assert.equal((await emit('input',{source:'interactive',text:'typed during delivery'})).action,'handled');
+  assert.equal(messages.length,sent);
+  for (const e of run) {
+    idle=e.idle ?? idle;
+    if (e.hook==='before_agent_start') await emit('before_agent_start',{messageType:e.messageType,
+      message:{role:'custom',customType:e.customType,content:messages.at(-1).msg.content,display:true,details:messages.at(-1).msg.details}});
+    else if (e.hook==='agent_start') await emit('agent_start');
+    else if (e.hook==='tool_execution_start') await emit('tool_execution_start',{toolCallId:'replay-'+version,toolName:'fleet_result'});
+    else if (e.hook==='tool_execute') assert.equal((await result.execute('replay-'+version,{result:{reply:'replayed'}},undefined,undefined,ctx)).terminate,true);
+    else if (e.hook==='tool_execution_end') await emit('tool_execution_end',{toolCallId:'replay-'+version,toolName:'fleet_result',isError:e.isError});
+    else if (e.hook==='agent_settled') { idle=true; await emit('agent_settled',{aborted:e.aborted}); }
+  }
+  assert.equal(records().filter(r=>r.kind==='started').length,startedBefore+1,`${version}: delivery run reports started`);
+  const settledNow=records().filter(r=>r.kind==='settled');
+  assert.equal(settledNow.length,before+1,`${version}: delivery run must settle`);
+  assert.deepEqual(settledNow.at(-1).candidates,[{tool:'fleet_result',value:{reply:'replayed'}}]);
+  fixture({event:'completed',message_id:id});
+  await wait(()=>statuses.at(-1)==='等待派工');
+}
 const count=messages.length;
 fixture({event:'ui',event_id:'late-ui',render:'失败，不代表已停止。'});
 await wait(()=>entries.some(e=>e.data.event_id==='late-ui'));

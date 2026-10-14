@@ -11,6 +11,7 @@
 #                            supervisor unless SUPERVISOR_PI_MODEL is set
 #   SUPERVISOR_PI_MODEL=provider/model, SUPERVISOR_PI_THINKING=level  pi supervisor's own model/thinking
 #   PI_THINKING=level        run-wide pi thinking (--pi-thinking)
+#   PI=/path/to/pi           pi binary (--pi; default: first on PATH, which inside cmux is its wrapper shim)
 #   CLAUDE=/path/to/claude   official Claude Code binary (--claude; a shell function/shim is not a binary)
 #   SMOKE_PROFILE=<codex profile>  supervisor/worker Codex profile (default: fleet's own default)
 #   SMOKE_TIMEOUT=900        seconds for READY + work
@@ -89,6 +90,7 @@ if [ "$SUP" = pi ]; then
   [ -n "${SUPERVISOR_PI_MODEL:-}" ] && args+=(--supervisor-pi-model "$SUPERVISOR_PI_MODEL")
   [ -n "${SUPERVISOR_PI_THINKING:-}" ] && args+=(--supervisor-pi-thinking "$SUPERVISOR_PI_THINKING")
 fi
+[ -n "${PI:-}" ] && args+=(--pi "$PI")
 [ -n "${CLAUDE:-}" ] && args+=(--claude "$CLAUDE")
 [ -n "${SMOKE_PROFILE:-}" ] && args+=(--profile "$SMOKE_PROFILE")
 echo "smoke: $SUP+$WRK/$MODE in $TMP"

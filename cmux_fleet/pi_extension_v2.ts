@@ -105,7 +105,8 @@ export default function (pi: ExtensionAPI) {
       pi.appendEntry("fleet-binding", { message_id: env.message_id, delivery_id: env.delivery_id });
       ctx.ui.setStatus("fleet", "执行派工任务");
       // Only body text enters model context. details are non-model transport metadata.
-      // Installed Pi starts this at agent_start, without before_agent_start/input.
+      // Pi 1.1.0 starts this at agent_start without before_agent_start/input; Pi >= 1.2.0 also
+      // fires before_agent_start (messageType "custom") first, which must keep phase "delivery".
       pi.sendMessage({ customType: "fleet-delivery", content: env.body.text, display: true,
         details: { ...env, body: { title: env.body.title } } }, { triggerTurn: true });
     }
@@ -209,7 +210,13 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("before_agent_start", async (_event, ctx) => {
     context = ctx; title(ctx);
-    if (ready) phase = "manual"; // custom delivery never calls this hook
+    // Pi 1.1.0 never calls this hook for our sendMessage(triggerTurn) delivery run; Pi >= 1.2.0
+    // does (messageType "custom", see tests/fixtures/pi_events_1.*.json). Flipping to "manual"
+    // here made fleet_decision/fleet_result reject and left the delivery held forever.
+    // While a delivery is active no other run can start (input is handled/refused above),
+    // so any run start now is that delivery: keep phase/active; agent_start reports "started".
+    if (phase === "delivery" && active) return;
+    if (ready) phase = "manual"; // user prompt runs are never a fleet delivery
     else { phase = "startup"; startupBegan = true; }
     failed = false; lastError = ""; startupText = ""; toolsRunning.clear();
     if (ready) await send("availability", { idle: false }, ctx);
