@@ -986,6 +986,39 @@ def tick(f):
             collect(f, d, notify=running)
 
 
+def delegated_lost(f, slot, why):
+    """Liveness proved the delegated session of ``slot`` gone (its tmux session ended): take its running
+    sub-fleet down like a planned down / a failed one (the child daemon stops, the next tick collects it and
+    starts the slot's next generation; an autostart child comes up again from there). True: stop posted."""
+    for d in active_children(f.run_dir):
+        rec = record(d)
+        if rec.get('slot') != slot or rec.get('state') != 'running':
+            continue
+        cfg = child_config_or_fail(f, d, rec)
+        if cfg is None:
+            continue
+        if rec.get('named'):
+            from cmux_fleet import named_subfleet
+            named_subfleet.stop_child(f, d, rec, cfg, 'down (' + why + ')')
+        else:
+            rec.update(state='stopping', outcome='failed', reason=why)
+            save_record(d, rec)
+            post_stop(cfg)
+            f.log('subfleet.stopping', task=rec['task_id'], outcome='failed', reason=why)
+        f.refresh_history()
+        return True
+    return False
+
+
+def repoint(f, slot, old, new):
+    """Liveness reattached the closed tab ``old`` of a delegated tmux slot as ``new``: the return looks there."""
+    for d in active_children(f.run_dir):
+        rec = record(d)
+        if rec.get('slot') == slot and rec.get('pane') == old:
+            rec['pane'] = new
+            save_record(d, rec)
+
+
 def child_config_or_fail(f, d, rec):
     """A record without config.json is a spawn killed half-way (the spawn itself is synchronous):
     mark it failed instead of crashing every tick / stop / resume."""

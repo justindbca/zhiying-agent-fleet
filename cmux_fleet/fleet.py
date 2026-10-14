@@ -1520,7 +1520,8 @@ REVIEW_POINTER = ('\n## Review instructions\n\nWhen an instruction asks you to r
 CLAUDE_ENV = {'DISABLE_AUTOUPDATER': '1'}
 
 
-def claude_argv(cfg_path, cfg, name, generation, prompt):
+def claude_argv(cfg_path, cfg, name, generation, prompt, resume=None):
+    """``resume``: this generation continues that Claude session (``claude --resume``; a lost slot, §24)."""
     cwd = agent_cwd(cfg, name)
     hook = shlex.join([cfg['python'], str(Path(__file__).resolve()), 'claude-stop', str(cfg_path), name, str(generation)])
     settings = cwd / ('.fleet-settings-g' + str(generation) + '.json')
@@ -1583,6 +1584,8 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
         argv += ['--append-system-prompt', claude_hook.TYPED_DECLARATION]
     if (cwd / 'mcp.json').exists():
         argv += ['--mcp-config', str(cwd / 'mcp.json')]
+    if resume:
+        argv += ['--resume', resume]
     return argv + ['--', prompt]  # --add-dir / --mcp-config are variadic: end options first
 
 
@@ -1659,7 +1662,8 @@ def actor(cfg_path, name, prompt, generation=None):
         # Re-check trust at exec time: other Claude Code sessions rewrite ~/.claude.json and can drop
         # the entry spawn() wrote moments ago (real smoke 2026-10-13: worker-1 stuck on the trust dialog).
         trust_claude_dir(agent_cwd(cfg, name))
-        argv = claude_argv(cfg_path, cfg, name, generation, prompt)
+        argv = claude_argv(cfg_path, cfg, name, generation, prompt, resume=info.get('resume_session')
+                           if info.get('resume_generation') == str(generation) else None)
     else:
         argv = actor_argv(cfg_path, cfg, name, generation, prompt)
     os.execvp(argv[0], argv)
