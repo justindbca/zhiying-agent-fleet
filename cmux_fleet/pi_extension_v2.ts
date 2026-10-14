@@ -119,7 +119,10 @@ export default function (pi: ExtensionAPI) {
   const consult = Type.Object({ worker: Type.String(), task: Type.String(), finding: Type.String({ minLength: 1 }),
     want: Type.Optional(Type.String()) });
   const decisionSchema = service ? Type.Object({ status: Type.Union([Type.Literal("RUNNING"), Type.Literal("BLOCKED")]),
-    reason: Type.Optional(Type.String()), dispatch: Type.Array(dispatch), skip: Type.Optional(Type.Array(Type.Object({ reason: Type.String() }))) }) :
+    reason: Type.Optional(Type.String()), dispatch: Type.Array(dispatch), skip: Type.Optional(Type.Array(Type.Object({ reason: Type.String() }))),
+    // design §29: approve / reject the bound external sub-fleet up / down (id defaults to the bound request)
+    subfleet: Type.Optional(Type.Object({ id: Type.Optional(Type.String()),
+      decision: Type.Union([Type.Literal("approve"), Type.Literal("reject")]), note: Type.Optional(Type.String()) })) }) :
     Type.Object({ status: Type.Union([Type.Literal("RUNNING"), Type.Literal("COMPLETED"), Type.Literal("BLOCKED")]),
       completion: Type.Integer({ minimum: 0, maximum: 100 }), reason: Type.Optional(Type.String()),
       dispatch: Type.Array(dispatch), consult: Type.Optional(Type.Array(consult)), artifacts: Type.Optional(Type.Array(artifact)),
