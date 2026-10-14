@@ -1935,6 +1935,9 @@ class Fleet:
             save(cfg_path, cfg)  # generation-specific callback config; never edit old snapshots
         cwd = agent_cwd(self.cfg, name)
         cwd.mkdir(parents=True, exist_ok=True)
+        if agent_cli(cfg, name) == 'codex' and not codex_queue.is_codex(cfg, name):
+            self.log('queue.unsupported', agent=name, generation=generation, codex=cfg.get('codex') or '',
+                     version=cfg.get('codex_version') or '', fallback='typed')
         role = 'supervisor' if name == 'supervisor' else 'worker'
         scope = self.role_scope(name, cfg, launch)
         (cwd / 'AGENTS.md').write_text(scope)
@@ -5003,6 +5006,8 @@ def resume(run, args):
     pin_paths(cfg)  # a resumed run keeps its own locations; an older config gets the current ones pinned
     cfg.setdefault('fleet_home', str(HOME.expanduser().resolve()))
     cfg.setdefault('cmux_bin', cmux_manager.CMUX)
+    if 'codex_queue' not in cfg:  # a run started before the probe: decided once here, kept for the rest of the run
+        cfg['codex_queue'], cfg['codex_version'], _ = codex_queue.capability(cfg.get('codex'))
     try:
         runtime_v2.validate_config(cfg)
     except ValueError as exc:
@@ -5262,6 +5267,10 @@ def start(args):
     missing = [n for n in sorted(clis | {'redis-server'}) if not binaries[n] or not shutil.which(binaries[n])]
     if missing:
         raise SystemExit('binaries not found: ' + ', '.join(missing) + ' (pass the corresponding binary flag)')
+    queue_ok, codex_version, queue_why = codex_queue.capability(codex)  # pinned for the run (config.json)
+    if 'codex' in clis and not queue_ok:
+        print('official Codex: `codex queue` channel unsupported (' + queue_why + '); Codex slots use typed delivery',
+              file=sys.stderr)
     if 'pi' in clis:
         if not args.allow_unsandboxed_pi:
             raise SystemExit('pi has no sandbox: explicitly pass --allow-unsandboxed-pi after reviewing permissions')
@@ -5314,7 +5323,8 @@ def start(args):
            'request_timeout': args.request_timeout, 'supervisor_profile': args.supervisor_profile,
            'clear_after_result': args.clear_after_result, 'clear_timeout': args.clear_timeout,
            **({'claude_hook_delivery': False} if getattr(args, 'claude_hook_delivery', True) is False else {}),
-           'worker_profile': args.worker_profile, 'profile': args.profile, 'codex': codex, 'redis_server': redis_server, 'codex_home': str(home),
+           'worker_profile': args.worker_profile, 'profile': args.profile, 'codex': codex,
+           'codex_queue': queue_ok, 'codex_version': codex_version, 'redis_server': redis_server, 'codex_home': str(home),
            'handoff_ratio': args.handoff_ratio, 'handoff_timeout': args.handoff_timeout,
            'window': args.window, 'stall_timeout': args.stall_timeout,
            'stall_grace': args.stall_grace, 'stall_escapes': args.stall_escapes,

@@ -13,6 +13,10 @@ the cumulative notify `input-messages`, not timing. Queueing or starting a turn 
 completion: only the turn end (notify / rollout task_complete) settles. Any failure leaves the
 slot to the existing fail-closed paths; nothing falls back to typing and nothing is retried
 automatically (a timed-out CLI call is 'uncertain', held for a human).
+
+The channel needs a codex-cli that records turn_attribution (MIN_VERSION). `start` probes the binary once
+(capability) and pins the answer in config.json (codex_queue); on an older Codex every slot is typed for the
+whole run (audited queue.unsupported at each spawn), never queued into turns that could not be bound.
 """
 import datetime
 import json
@@ -30,6 +34,11 @@ FIELDS = ('cq_delivery', 'cq_token', 'cq_text', 'cq_thread', 'cq_generation', 'c
 # to queue behind an unsettled item, and --resume kills the old session before it decides (token_turn) on a replay.
 QUEUED = re.compile(r'Queued message (\S+) for thread (\S+?)\.?\s*$', re.M)
 MARK = '(fleet delivery {})'
+# The first codex-cli measured to record `task_started.turn_attribution.turn_trigger` ("queue" for a queued
+# turn). codex-cli 0.161.0 has `codex queue` but writes no turn_attribution at all, so bound() can never
+# prove a queued turn there: such a fleet is probed at start and its Codex slots stay on typed delivery.
+MIN_VERSION = (0, 162, 0)
+VERSION = re.compile(r'codex-cli (\d+)\.(\d+)\.(\d+)')
 
 
 class QueueError(RuntimeError):
@@ -42,7 +51,32 @@ def _fleet():
 
 
 def is_codex(cfg, name):
-    return _fleet().agent_cli(cfg, name) == 'codex'
+    """An official Codex slot that takes deliveries through `codex queue`. False on a fleet whose codex
+    binary was probed too old at start (cfg codex_queue false): that slot is typed, as before the queue channel."""
+    return _fleet().agent_cli(cfg, name) == 'codex' and cfg.get('codex_queue', True) is not False
+
+
+def capability(codex, *, run=subprocess.run, timeout=15):
+    """(supported, version, why) of the codex binary for the queue channel, from `codex --version`.
+
+    Supported only from MIN_VERSION: the binding needs the rollout's turn_attribution. Anything
+    unreadable (no binary, error, timeout, unknown output) is unsupported: typed delivery, never a
+    queue whose turns can never be bound."""
+    if not codex:
+        return False, '', 'no codex binary'
+    try:
+        p = run([codex, '--version'], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, '', 'codex --version failed: ' + str(exc)[:200]
+    out = (p.stdout or '').strip()
+    m = VERSION.search(out)
+    if p.returncode != 0 or not m:
+        return False, out[:80], 'unrecognised codex --version output (rc ' + str(p.returncode) + '): ' + out[:80]
+    version = '.'.join(m.groups())
+    if tuple(int(x) for x in m.groups()) < MIN_VERSION:
+        return False, version, ('codex-cli ' + version + ' records no turn_attribution in its rollout, so a queued '
+                                'turn cannot be bound (needs >= ' + '.'.join(map(str, MIN_VERSION)) + ')')
+    return True, version, ''
 
 
 def new_token():
@@ -94,7 +128,7 @@ def _ms(stamp):
 
 
 def turn_record(thread, turn, sessions):
-    """What the rollout says about one turn: {'trigger', 'started_ms', 'users': [{'text'}]}."""
+    """What the rollout says about one turn: {'trigger', 'started_ms', 'attributed', 'users': [{'text'}]}."""
     fleet = _fleet()
     for path in fleet.rollouts(thread, sessions):
         try:
@@ -117,7 +151,8 @@ def turn_record(thread, turn, sessions):
             if payload.get('type') == 'task_started':
                 attribution = payload.get('turn_attribution') or {}
                 if (attribution.get('turn_id') or payload.get('turn_id')) == turn:
-                    found = {'trigger': attribution.get('turn_trigger') or '', 'started_ms': _ms(row.get('timestamp'))}
+                    found = {'trigger': attribution.get('turn_trigger') or '', 'started_ms': _ms(row.get('timestamp')),
+                             'attributed': 'turn_attribution' in payload}
             elif payload.get('type') == 'item_completed' and payload.get('turn_id') == turn:
                 item = payload.get('item') or {}
                 if item.get('type') == 'UserMessage':
@@ -186,6 +221,8 @@ def bound(rec, thread, turn, sessions, generation=None):
     facts = turn_record(thread, turn, sessions)
     if not facts:
         return False, 'turn not found in the rollout'
+    if not facts.get('attributed', True):  # codex-cli < MIN_VERSION: nothing proves the queue started it (start probes this)
+        return False, 'rollout records no turn_attribution (codex-cli too old for the queue channel)'
     if facts['trigger'] != 'queue':
         return False, 'turn was not started by the queue (trigger ' + (facts['trigger'] or 'none') + ')'
     if len(facts['users']) != 1:
