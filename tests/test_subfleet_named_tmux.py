@@ -293,3 +293,28 @@ def test_hot_declared_plain_slot_falls_back_once_then_its_next_generation_runs_i
     finally:
         for _ in t.gen:
             pass
+
+
+def test_hot_added_supervisor_slot_spawns_in_tmux_from_its_first_generation(tmp_path, monkeypatch):
+    """10-14 Studio: a worker added together with its sub-fleet entry (hot roster) spawned before
+    cfg['subfleets'] knew it, so it came up as a plain tab (and, with the advisor on, held for a sheet)."""
+    t = service_tree(tmp_path, monkeypatch, declared_at_start=False)
+    try:
+        f = t.f
+        (tmp_path / 'sup.md').write_text(SUP_ROLE)
+        (tmp_path / 'child.yaml').write_text('workers:\n  - name: ops-w1\n')
+        path = tmp_path / 'roster.yaml'
+        path.write_text('workers:\n  - name: worker-1\n  - name: worker-2\n  - name: worker-3\n'
+                        'subfleets:\n  - name: ops\n    supervisor_slot: worker-3\n    supervisor_role: sup.md\n'
+                        '    roster: child.yaml\n    autostart: false\n    drain_s: 60\n')
+        st = path.stat()
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 9_000_000_000))
+        f.roster_tick()
+        assert 'worker-3' in f.workers
+        assert [e['supervisor_slot'] for e in f.cfg['subfleets']] == ['worker-3']
+        assert fleet.load(f.path)['subfleets'] == f.cfg['subfleets']
+        spawned = [s for s in f.mgr.spawned if s.get('tmux_session', '').startswith('worker-3')]
+        assert spawned and spawned[-1]['tmux_session'] == 'worker-3-g0'  # dual display from generation 0
+    finally:
+        for _ in t.gen:
+            pass
