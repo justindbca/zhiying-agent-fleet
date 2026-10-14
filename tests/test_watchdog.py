@@ -11,7 +11,8 @@ import time
 import pytest
 
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
-from test_v2_codex_claude import answer_turn, dispatch_one, mixed, typed  # noqa: F401  (fixture)
+from test_v2_codex_claude import answer_turn, decision, dispatch_one, drive, mixed, submit, typed  # noqa: F401
+import hook_sim
 from cmux_fleet import runtime_v2, subfleet, watchdog
 
 DIALOG_RM = ('Bash command\n  rm -rf "$OUT/"*\n\nDangerous rm on possibly-empty variable\n'
@@ -399,13 +400,98 @@ def test_blocked_task_hold_is_released_when_the_turn_ends(wd):
     assert answer_turn(f, 'worker-1', REPORT, prompt=typed(f, 'worker-1')[-1])['status'] == 'ignored'
 
 
-def test_hold_exit_needs_the_held_delivery_own_turn(wd):
+def stop_with(f, slot, rows, *, thread=None, text=REPORT, background=None):
+    """The real Stop hook of `slot`'s current generation over a hand-written transcript."""
+    gen = str(f.agent(slot)['generation'])
+    thread = thread or f.agent(slot)['thread']
+    transcript = f.test_claude / slot / (thread + '.jsonl')
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    rows = list(rows) + [{'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': text}]}}]
+    transcript.write_text('\n'.join(json.dumps(x) for x in rows) + '\n')
+    payload = {'session_id': thread, 'transcript_path': str(transcript), 'last_assistant_message': text}
+    if background is not None:
+        payload['background_tasks'] = background
+    return drive(f, lambda: hook_sim.claude_stop(f.path, slot, gen, json.dumps(payload)))
+
+
+def released_not_applied(f, slot, msg_id):
+    assert f.agent(slot)['state'] == 'idle' and f.v2.bus.slot_state(slot)['status'] == 'idle'
+    msg = f.v2.bus.message(msg_id)
+    assert msg['outcome'] == 'cancelled' and str(msg['stop_confirmed']) == '1'     # result NOT applied
+    assert f.r.llen(f.v2.bus.pending_key('supervisor')) == 0                      # no report forwarded
+
+
+def test_hold_exit_is_any_turn_end_of_the_held_session_and_generation(wd):
+    # Plan E-1 (2026-10-14): the held delivery's own turn need not be the one that ends; Claude runs one turn
+    # at a time, so any Stop of the same session and generation proves the held execution stopped.
+    f = wd
+    dispatch_one(f)
+    msg_id = f.v2.bus.slot_state('worker-1')['message_id']
+    f.v2.finish('blocked', 'supervisor gave up')
+    assert answer_turn(f, 'worker-1', REPORT, generation=4)['status'] == 'stale'
+    other = stop_with(f, 'worker-1', [hook_sim.user_row('just chatting', False)], thread='another-session')
+    assert other['status'] == 'ignored' and 'another generation/session' in other['reason']
+    assert f.agent('worker-1')['state'] == 'held' and f.v2.bus.slot_state('worker-1')['status'] == 'uncertain'
+    assert answer_turn(f, 'worker-1', REPORT, prompt='just chatting')['status'] == 'released'
+    released_not_applied(f, 'worker-1', msg_id)
+
+
+def test_hold_exit_survives_later_notifications_and_typed_lines(wd):
+    # 15bdd30e worker-2: background-task notifications and operator lines pushed the delivery out of the
+    # last prompts; every later Stop was ignored and the slot stayed held for 2 h 27 min.
+    f = wd
+    dispatch_one(f)
+    msg_id = f.v2.bus.slot_state('worker-1')['message_id']
+    f.v2.finish('blocked', 'supervisor gave up')
+    note = {'type': 'user', 'origin': {'kind': 'task-notification'},
+            'message': {'role': 'user', 'content': '<task-notification> bbx5c6eem done</task-notification>'}}
+    rows = [hook_sim.user_row(typed(f, 'worker-1')[-1], True), note, note, note,
+            hook_sim.user_row('operator: status?', False), hook_sim.user_row('operator: go on', False),
+            hook_sim.user_row('operator: and?', False)]
+    assert stop_with(f, 'worker-1', rows)['status'] == 'released'
+    released_not_applied(f, 'worker-1', msg_id)
+
+
+def test_hold_exit_also_counts_the_hook_keepalive_turn(wd):
+    from cmux_fleet import claude_hook, fleet
+    f = wd
+    dispatch_one(f)
+    msg_id = f.v2.bus.slot_state('worker-1')['message_id']
+    f.v2.finish('blocked', 'supervisor gave up')
+    k = fleet.hook_keys(f.cfg, f.r, 'worker-1', 0)
+    f.r.set(k['bind'], json.dumps({'kind': 'keepalive', 'generation': 0, 'session_id': f.agent('worker-1')['thread']}))
+    assert stop_with(f, 'worker-1', [hook_sim.user_row(claude_hook.KEEPALIVE, True)], text='IDLE')['status'] == 'released'
+    released_not_applied(f, 'worker-1', msg_id)
+    assert f.r.get(k['bind']) is None or json.loads(f.r.get(k['bind'])).get('kind') != 'keepalive'
+
+
+def test_stop_deferred_by_background_tasks_is_audited_and_releases_nothing(wd):
     f = wd
     dispatch_one(f)
     f.v2.finish('blocked', 'supervisor gave up')
-    assert answer_turn(f, 'worker-1', REPORT, prompt='just chatting')['status'] == 'ignored'
-    assert answer_turn(f, 'worker-1', REPORT, generation=4)['status'] == 'stale'
-    assert f.agent('worker-1')['state'] == 'held' and f.v2.bus.slot_state('worker-1')['status'] == 'uncertain'
+    assert stop_with(f, 'worker-1', [hook_sim.user_row('x', False)], background=[{'id': 'b1'}, {'id': 'b2'}]) is False
+    deferred, = audits(f, 'turn.deferred')
+    assert deferred['slot'] == 'worker-1' and deferred['tasks'] == '2' and deferred['generation'] == '0'
+    assert [a for a in audits(f) if a.get('slot') == 'worker-1' and a['event'] in ('turn_ended', 'settled', 'hold.released')] == []
+    assert f.agent('worker-1')['state'] == 'held'
+
+
+def test_hook_mailbox_delivery_left_at_hold_is_dropped_after_release_never_run(wd):
+    # The hold came before the worker's hook took the delivery: after the release the hook re-validates the
+    # entry against the (now idle) lease and drops it, so it never runs; the next delivery goes through.
+    f = wd
+    submit(f)
+    answer_turn(f, 'supervisor', decision(['worker-1']))
+    hook_sim._armed.clear()               # no hook waiting: the delivery stays in the mailbox
+    f.pump()
+    assert hook_sim.handed_to(f, 'worker-1') == []
+    msg_id = f.v2.bus.slot_state('worker-1')['message_id']
+    f.v2.finish('blocked', 'supervisor gave up')
+    assert stop_with(f, 'worker-1', [hook_sim.user_row('operator: anything?', False)])['status'] == 'released'
+    released_not_applied(f, 'worker-1', msg_id)
+    dropped = [a for a in audits(f, 'hook.dropped') if a.get('message_id') == msg_id]
+    assert dropped and hook_sim.handed_to(f, 'worker-1') == []   # dropped as stale, never handed to Claude
+    assert len([a for a in audits(f, 'tui.hooked') if a.get('message_id') == msg_id]) == 1
 
 
 def test_forged_release_event_is_rejected(wd):

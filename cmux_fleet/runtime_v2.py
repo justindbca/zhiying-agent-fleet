@@ -835,6 +835,9 @@ class RuntimeV2:
             return
         self.f.setf(slot, state='idle', idle_confirmed=1, bridge_available=0, request='', watch_state='idle',
                     stall_escapes=0, watch_since=0)
+        if codex_queue.is_codex(self.slot_cfg(slot), slot):
+            # The rollout proved the held item ran to completion; an unsettled record would refuse the next deliver.
+            codex_queue.clear(self.f, slot, 'held delivery released')
         if self.clear_enabled(slot):
             self.begin_clear(slot, hook_pid=ev.get('hook_pid'))
         self.audit('hold.released', slot=slot, level='warn', message_id=env['message_id'],

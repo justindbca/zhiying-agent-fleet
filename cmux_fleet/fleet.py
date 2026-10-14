@@ -321,7 +321,10 @@ def claude_stop(cfg_path, name, generation, raw):
     started = time.monotonic()
     data = json.loads(raw or '{}')
     if data.get('background_tasks'):
-        return False  # subagents still running in the background: the session will wake and stop again
+        # Subagents still running in the background: the session will wake and stop again. Not settled,
+        # not released; only audited (a held slot waiting on this was invisible before, plan E-2).
+        turn_deferred(cfg_path, name, generation, data.get('background_tasks'))
+        return False
     text = data.get('last_assistant_message')
     if text is None:
         text = ''
@@ -384,6 +387,25 @@ def claude_stop(cfg_path, name, generation, raw):
     r.close()
     return claude_hook_next(cfg, name, int(generation), data.get('session_id'), deadline,
                             transcript=data.get('transcript_path', ''))
+
+
+def turn_deferred(cfg_path, name, generation, tasks):
+    """Audit a Stop deferred by background tasks (v2 only). Never raises: the hook's answer is unchanged."""
+    try:
+        cfg = load(cfg_path)
+        if cfg.get('transport_version') != 2:
+            return
+        r = connect(cfg)
+        try:
+            bus = runtime_v2.bus_for(cfg, r)
+            r.xadd(bus.audit_key, {'event': 'turn.deferred', 'slot': name, 'run_id': bus.run_id,
+                                   'generation': str(generation), 'level': 'info',
+                                   'tasks': str(len(tasks) if isinstance(tasks, (list, dict)) else 1),
+                                   'at': str(int(time.time() * 1000))})
+        finally:
+            r.close(); r.connection_pool.disconnect()
+    except Exception as exc:  # noqa: BLE001 - an audit must never change the hook's answer
+        print('fleet claude-stop: turn.deferred not audited: ' + str(exc)[:300], file=sys.stderr)
 
 
 def hook_keys(cfg, r, name, generation):
@@ -1285,8 +1307,8 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
             bus.register_slot(name, generation, thread)
             return call('startup', text=text, failed=False, aborted=False)
         k = hook_keys(cfg, r, name, generation) if not codex and claude_hook.enabled(cfg, name) else None
-        if k and claude_hook_keepalive(cfg, r, name, generation, thread):
-            return skipped('ignored', 'hook channel keepalive turn')
+        # Our own keepalive turn is never settled; it still ends a turn of this session (hold exit below).
+        kept = bool(k) and claude_hook_keepalive(cfg, r, name, generation, thread)
 
         def answered(body_text, lease):
             if codex:  # official Codex: the queued delivery's token binding (codex_queue.bound)
@@ -1309,13 +1331,24 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
         lease = r.hgetall(bus.lease_key(name))
         if (lease.get('status') in ('uncertain', 'expired') and lease.get('message_id')
                 and info.get('state') in ('held', 'clearing')):
-            # Hold exit (docs/design.md §24): the held turn has now ended in this very session, which
-            # proves its execution stopped. The daemon releases the slot; the result is not applied.
+            # Hold exit (docs/design.md §24): any turn end of the held delivery's own session and
+            # generation proves its execution stopped (Claude runs one turn at a time; a Stop with
+            # background work never reaches here). Codex: its queue may still hold the item, so the
+            # rollout must show the token's turn complete. The daemon releases; the result is not applied.
             msg = bus.message(lease['message_id'])
-            if (msg.get('generation') != generation or msg.get('session_id') != thread
-                    or not answered(msg['body']['text'], lease)):
-                return skipped('ignored', 'held delivery was not answered by this session' + (': ' + '; '.join(why) if why else ''))
+            if msg.get('generation') != generation or msg.get('session_id') != thread:
+                return skipped('ignored', 'held delivery belongs to another generation/session')
+            if codex:
+                rec = codex_queue.record(info)
+                ran = (codex_queue.token_turn(thread, rec['cq_token'], sessions_dir(cfg))
+                       if rec['cq_token'] and rec['cq_delivery'] == lease.get('current_delivery') else None)
+                if not ran or not ran['complete']:
+                    return skipped('ignored', 'held Codex delivery ' + (lease.get('current_delivery') or '')
+                                   + (' has not started' if not ran else ' is still running') + ' in the rollout')
+                codex_queue.mark_bound(r, name, ran['turn'], rec['cq_token'])  # a live record: proven ran; abandoned stays
             return call('turn_ended', delivery={k: msg[k] for k in runtime_v2.IDENTITY})
+        if kept:
+            return skipped('ignored', 'hook channel keepalive turn')
         if lease.get('status') != 'received' or not lease.get('message_id'):
             return ignored('no received delivery (manual or duplicate turn)')
         msg = bus.message(lease['message_id'])
