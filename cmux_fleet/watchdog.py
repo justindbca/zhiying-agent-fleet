@@ -1,13 +1,16 @@
 """Watchdog for transport v2 (docs/design.md §24): one of five states per slot, per check.
 
   idle       no delivery in flight and not starting: never acted on, however long (E1).
-  working    a delivery is in flight and the transcript / rollout moved within stall_timeout.
+  working    a delivery is in flight and something moved: the transcript / rollout, the screen, or the
+             CPU time of the pane's process tree, within stall_window; and the transcript within
+             stall_timeout (the hard limit: a spinning screen does not hide a dead stream for ever).
   prompting  the screen shows a confirmation dialog. Whitelisted (prompt table) and verified -> save
              the screen and press its keys; anything else -> save the screen, mark the slot
              prompt_wait, pause dispatch, press nothing (the lease stays received: once a human
              answers in the pane the turn settles normally). Deletes / moves are never pressed.
-  stalled    in flight, no activity for stall_timeout: Escape, at most stall_escapes times
-             spread over stall_grace. Activity after that -> working again.
+  stalled    in flight, and either all three signals still for stall_window or the transcript still for
+             stall_timeout: Escape, at most stall_escapes times spread over stall_grace. Transcript
+             activity after that -> working again (the screen does not count there: Escape changes it).
   frozen     stalled for stall_grace, or every Escape left the screen unchanged, or `ps` shows
              the pane's processes in uninterruptible wait on two checks in a row: save the
              screen, kill this fleet's own pane (its process tree), confirm the delivery
@@ -36,7 +39,12 @@ VERIFY = {
     'paths_in_run': 'every path on the dialog is inside the slot directory or the run workspace (--add-dir)',
 }
 DEFAULTS = {'stall_grace': 300, 'stall_escapes': 3, 'watch_interval': 5, 'capture_fail_alarm': 3,
-            'dialog_escalation_timeout': 600}  # seconds the supervisor has to rule on a dialog it received
+            'dialog_escalation_timeout': 600,  # seconds the supervisor has to rule on a dialog it received
+            # §24 stall window: transcript, screen and process-tree CPU all still this long -> stalled (0 = off).
+            'stall_window': 300,
+            # CPU the process tree must gain within one window to count as moving, in % of one core. Not 0: an
+            # idle Claude TUI (text pasted, Enter never pressed) still burns 0.6-1.5 % (measured 2026-10-14).
+            'stall_cpu_pct': 5}
 # The supervisor cannot rule on a worker's dialog now (plan F' 8.3 step 5): the user gets it.
 SUPERVISOR_AWAY = ('held', 'dead', 'starting', 'retired', 'delegated', 'handoff', 'clearing', 'walled', 'reclaimed')
 YES_CURSOR = re.compile(r'❯\s*(?:1\.\s*)?yes\b')
@@ -270,8 +278,13 @@ def uninterruptible(stats):
 
 
 def classify(*, active, in_flight, age, stall_timeout, prev, since, now, grace, escapes, max_escapes,
-             screen_same, proc_frozen, prompt=None, unknown=None, prompt_hits=0, max_hits=3, moved=False):
-    """Pure state decision. `since` = when the current stall began; `moved` = activity after it."""
+             screen_same, proc_frozen, prompt=None, unknown=None, prompt_hits=0, max_hits=3, moved=False,
+             quiet=0, stall_window=0):
+    """Pure state decision. `since` = when the current stall began; `moved` = transcript activity after it.
+
+    `age` = seconds since the transcript / rollout last moved (the stall_timeout hard limit); `quiet` = seconds
+    the transcript, the screen and the process-tree CPU have all been still (the stall_window rule).
+    """
     if not active:
         return 'idle'
     if in_flight and proc_frozen >= 2:
@@ -289,7 +302,8 @@ def classify(*, active, in_flight, age, stall_timeout, prev, since, now, grace, 
         if now - since >= grace or (escapes >= max_escapes and screen_same):
             return 'frozen'
         return 'stalled'
-    if stuck_dialog or (stall_timeout > 0 and age >= stall_timeout):
+    if (stuck_dialog or (stall_timeout > 0 and age >= stall_timeout)
+            or (stall_window > 0 and quiet >= stall_window)):
         if prev == 'stalled' and (now - since >= grace or (escapes >= max_escapes and screen_same)):
             return 'frozen'
         return 'stalled'
@@ -340,6 +354,34 @@ class Watchdog:
         probe = getattr(self.f.mgr, 'process_states', None)
         return probe(pane) if probe else []
 
+    def proc_cpu(self, pane):
+        """CPU seconds of the pane's process tree; None when it cannot be read."""
+        probe = getattr(self.f.mgr, 'process_cpu', None)
+        return probe(pane) if probe else None
+
+    def quiet_for(self, slot, info, now, act, digest, cpu):
+        """Seconds the transcript, the screen and the process-tree CPU have all been still (§24 stall window).
+
+        The baseline lives in slot fields (like esc_digest / esc_at). Any signal moving, or one that cannot be
+        read (empty screen, no CPU probe), restarts the window: an unreadable signal never proves stillness.
+        CPU gain is summed per check over positive steps only (a child exiting lowers the total; that step is 0).
+        """
+        cfg = self.f.cfg
+        window = float(setting(cfg, 'stall_window'))
+        since = float(info.get('quiet_since') or 0)
+        gain = float(info.get('quiet_gain') or 0)
+        last = info.get('quiet_cpu', '')
+        if cpu is not None and last != '':
+            gain += max(0.0, cpu - float(last))
+        moved = (not since or not digest or cpu is None or act > float(info.get('quiet_act') or 0)
+                 or digest != info.get('quiet_digest') or gain > window * float(setting(cfg, 'stall_cpu_pct')) / 100)
+        if moved:
+            self.f.setf(slot, quiet_since=now, quiet_act=act, quiet_digest=digest,
+                        quiet_cpu='' if cpu is None else cpu, quiet_gain=0)
+            return 0
+        self.f.setf(slot, quiet_cpu=cpu, quiet_gain=gain)
+        return now - since
+
     def authorized(self, slot, info, prompt, screen, table):
         """This run's own pane, and the dialog's concrete operation inside a grant the run already has."""
         from cmux_fleet import subfleet
@@ -370,9 +412,10 @@ class Watchdog:
             if not active:
                 if info.get('prompt_wait'):  # the delivery settled / the startup READY came
                     self.clear_prompt_wait(slot, 'inactive')
-                if info.get('watch_state', 'idle') != 'idle' or info.get('stall_escapes', '0') != '0':
+                if (info.get('watch_state', 'idle') != 'idle' or info.get('stall_escapes', '0') != '0'
+                        or info.get('quiet_since', '0') != '0'):
                     self.set_state(slot, info, 'idle')
-                    self.f.setf(slot, stall_escapes=0, watch_since=0, proc_frozen=0, prompt_hits=0)
+                    self.f.setf(slot, stall_escapes=0, watch_since=0, proc_frozen=0, prompt_hits=0, quiet_since=0)
                 continue
             if now < self.next_check.get(slot, 0):
                 continue
@@ -569,14 +612,17 @@ class Watchdog:
         prev = info.get('watch_state') or 'idle'
         since = float(info.get('watch_since') or 0)
         stall_timeout = float(cfg.get('stall_timeout') or 0)
-        age = now - self.f.last_activity(info) if in_flight else 0
-        moved = prev == 'stalled' and self.f.last_activity(info) > since
+        act = self.f.last_activity(info)
+        age = now - act if in_flight else 0
+        quiet = self.quiet_for(slot, info, now, act, digest, self.proc_cpu(pane)) if in_flight else 0
+        moved = prev == 'stalled' and act > since
         escapes = int(info.get('stall_escapes') or 0)
         state = classify(active=True, in_flight=in_flight, age=age, stall_timeout=stall_timeout, prev=prev,
                          since=since, now=now, grace=float(setting(cfg, 'stall_grace')), escapes=escapes,
                          max_escapes=int(setting(cfg, 'stall_escapes')),
                          screen_same=bool(digest) and digest == info.get('esc_digest'), proc_frozen=frozen_seen,
-                         prompt=prompt, unknown=unknown, prompt_hits=hits, max_hits=table['max_hits'], moved=moved)
+                         prompt=prompt, unknown=unknown, prompt_hits=hits, max_hits=table['max_hits'], moved=moved,
+                         quiet=quiet, stall_window=float(setting(cfg, 'stall_window')))
         if state == 'prompting' and prompt is not None:
             path = self.save_screen(slot, info, screen, 'prompt-' + prompt['name'])
             allowed, reason = self.authorized(slot, info, prompt, screen, table)
@@ -615,7 +661,8 @@ class Watchdog:
             if prev != 'stalled':
                 since, escapes = now, 0
                 self.f.setf(slot, watch_since=now, stall_escapes=0)
-                self.set_state(slot, info, state, idle_s=int(age), dialog=prompt['name'] if prompt else '')
+                self.set_state(slot, info, state, idle_s=int(age), quiet_s=int(quiet),
+                               dialog=prompt['name'] if prompt else '')
             spacing = float(setting(cfg, 'stall_grace')) / max(1, int(setting(cfg, 'stall_escapes')))
             last = float(info.get('esc_at') or 0) if prev == 'stalled' else 0
             if escapes < int(setting(cfg, 'stall_escapes')) and now - last >= spacing:
@@ -677,7 +724,7 @@ class Watchdog:
         # refuses 'busy'), and its READY is refused while launch_ready=0. Every failure below removes
         # the successor again, so at most one session of this slot is ever left.
         f.setf(slot, generation=generation + 1, label=label, handoff_id='', watch_state='frozen',
-               stall_escapes=0, watch_since=0, esc_digest='', proc_frozen=0, prompt_hits=0,
+               stall_escapes=0, watch_since=0, esc_digest='', proc_frozen=0, prompt_hits=0, quiet_since=0,
                prev_label='' if slot == 'supervisor' else prev)
         if slot != 'supervisor':
             f.r.hset(NAMES, mapping={label: slot})
@@ -757,6 +804,56 @@ class Watchdog:
                 'handoff note. Its instruction was cancelled and NOT re-run; it may be partly done. Check the '
                 'workspace, then dispatch again or reply BLOCKED if a human is needed.'
                 '\n\nReply with the JSON format from AGENTS.md.')
+
+
+def ps_seconds(text):
+    """`ps -o time=` as seconds: macOS [H:]MM:SS.cc, Linux [DD-]HH:MM:SS."""
+    text = text.strip()
+    days, _, text = text.rpartition('-')
+    total = 0.0
+    for part in text.split(':'):
+        total = total * 60 + float(part)
+    return (int(days) if days else 0) * 86400 + total
+
+
+def pane_tty_cpu(ttys):
+    """Cumulative CPU seconds of the processes on these ttys and all their descendants; None when unreadable.
+
+    Descendants by ppid, not by tty: Claude Code / Codex run their tools in a session of their own (tty '??'), so
+    a pytest under the Bash tool is invisible to `ps -t`. One `ps -ax` per call.
+    """
+    import subprocess
+    names = {t[len('/dev/'):] if t.startswith('/dev/') else t for t in ttys or () if t}
+    if not names:
+        return None
+    try:
+        p = subprocess.run(['ps', '-axo', 'pid=,ppid=,tty=,time='], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None
+    kids, cpu, todo = {}, {}, []
+    for line in p.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 4 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        pid = int(parts[0])
+        try:
+            cpu[pid] = ps_seconds(parts[3])
+        except ValueError:
+            continue
+        kids.setdefault(int(parts[1]), []).append(pid)
+        if parts[2] in names:
+            todo.append(pid)
+    if not todo:
+        return None
+    seen = set()
+    while todo:
+        pid = todo.pop()
+        if pid not in seen:
+            seen.add(pid)
+            todo += kids.get(pid, [])
+    return round(sum(cpu.get(pid, 0.0) for pid in seen), 2)
 
 
 def pane_tty_stats(tty):

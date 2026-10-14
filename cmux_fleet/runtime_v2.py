@@ -844,7 +844,7 @@ class RuntimeV2:
             self.reply(ev, {'status': 'rejected', 'reason': problem})
             return
         self.f.setf(slot, state='idle', idle_confirmed=1, bridge_available=0, request='', watch_state='idle',
-                    stall_escapes=0, watch_since=0)
+                    stall_escapes=0, watch_since=0, quiet_since=0)
         if codex_queue.is_codex(self.slot_cfg(slot), slot):
             # The rollout proved the held item ran to completion; an unsettled record would refuse the next deliver.
             codex_queue.clear(self.f, slot, 'held delivery released')
@@ -1092,7 +1092,7 @@ class RuntimeV2:
                     clear_hook_pid=ev.get('hook_pid') or '', clear_idle_since=0, idle_confirmed=0, bridge_available=0,
                     clear_deadline=info.get('clear_deadline') if info['state'] == 'clearing'
                         else time.time() + float(self.f.cfg.get('clear_timeout', 20)),
-                    watch_state='idle', stall_escapes=0, watch_since=0)
+                    watch_state='idle', stall_escapes=0, watch_since=0, quiet_since=0)
         self.audit('slot_rebound', slot=slot, generation=ev['generation'], old_session=info['thread'],
                    session_id=ev['thread'], fence=fence + 1)
 

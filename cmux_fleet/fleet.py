@@ -105,7 +105,7 @@ RESUME_CLIS = ('codex', 'claude')  # CLIs whose live process proves a reattachab
 # to kill it). If the operator supplies a broker script, the daemon runs these verbs for them.
 CHROME_VERBS = {'check', 'tabs', 'newtab', 'go', 'url', 'js'}
 THREAD_RE = r'[0-9a-f-]{36}'
-DEFAULTS = {'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 100000, 'stall_timeout': 1800,
+DEFAULTS = {'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 100000, 'stall_timeout': 1200,
             'chrome_min_interval': 20, 'profile': 'fleet', 'worker_cli': 'codex', 'worker_model': 'sonnet',
             'supervisor_model': 'opus',
             'claude_window': 200000, 'mode': 'task', 'max_busy': 0, 'request_timeout': 900,
@@ -6173,6 +6173,7 @@ def start(args):
            'handoff_ratio': args.handoff_ratio, 'handoff_timeout': args.handoff_timeout,
            'window': args.window, 'stall_timeout': args.stall_timeout,
            'stall_grace': args.stall_grace, 'stall_escapes': args.stall_escapes,
+           'stall_window': args.stall_window, 'stall_cpu_pct': args.stall_cpu_pct,
            **({'prompt_table': str(Path(args.prompt_table).expanduser().resolve())} if args.prompt_table else {}),
            'compact_limit': args.compact_limit, 'chrome_script': args.chrome_script,
            'chrome_min_interval': args.chrome_min_interval, 'worker_cli': args.worker_cli,
@@ -6384,7 +6385,14 @@ def main(argv=None):
     s.add_argument('--window', type=int, default=DEFAULTS['window'],
                    help='context window fallback when the rollout has not reported one yet')
     s.add_argument('--stall-timeout', type=float, default=DEFAULTS['stall_timeout'],
-                   help='seconds without rollout activity before a busy agent is treated as stalled (0 = off)')
+                   help='seconds without rollout activity before a busy agent is treated as stalled (0 = off); '
+                        'in transport v2 the hard limit behind --stall-window')
+    s.add_argument('--stall-window', type=float, default=watchdog.DEFAULTS['stall_window'],
+                   help='transport v2: seconds the transcript, the screen and the pane process-tree CPU must all '
+                        'stay still before a busy agent is treated as stalled (0 = off, only --stall-timeout)')
+    s.add_argument('--stall-cpu-pct', type=float, default=watchdog.DEFAULTS['stall_cpu_pct'],
+                   help='transport v2: CPU (%% of one core, averaged over --stall-window) the pane process tree '
+                        'must use to count as moving; an idle TUI uses about 1 %%')
     s.add_argument('--stall-grace', type=float, default=watchdog.DEFAULTS['stall_grace'],
                    help='transport v2: seconds a stalled agent gets after its first Escape before it is treated '
                         'as frozen (killed and restarted in place)')

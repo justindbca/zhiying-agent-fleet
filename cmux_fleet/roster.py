@@ -254,7 +254,8 @@ SUBFLEET_KEYS = {'name', 'supervisor_slot', 'supervisor_role', 'autostart', 'mod
                  'claude_hook_delivery', 'worker_domains'}
 SUBFLEET_MODES = ('service', 'task')
 DRAIN_S = 600
-TIMEOUT_KEYS = {'stall': 'stall_timeout', 'request': 'request_timeout'}  # entry timeouts -> fleet config key
+TIMEOUT_KEYS = {'stall': 'stall_timeout', 'stall_window': 'stall_window',  # entry timeouts -> fleet config key
+                'request': 'request_timeout'}
 
 
 def _positive(v):
@@ -263,7 +264,7 @@ def _positive(v):
 
 def subfleet_entries(value, base, workers):
     """(entries, errors) of the optional ``subfleets:`` list. Each entry is a dict with every key resolved:
-    paths absolute, ``timeouts`` split into stall_timeout / request_timeout, drain_s defaulted."""
+    paths absolute, ``timeouts`` split into stall_timeout / stall_window / request_timeout, drain_s defaulted."""
     if value is None:
         return [], []
     if not isinstance(value, list):
@@ -313,7 +314,7 @@ def subfleet_entries(value, base, workers):
         if timeouts is not None:
             if not isinstance(timeouts, dict) or not set(timeouts) <= set(TIMEOUT_KEYS) \
                     or not all(_positive(v) for v in timeouts.values()):
-                bad.append('timeouts must be a mapping of stall / request to positive seconds')
+                bad.append('timeouts must be a mapping of stall / stall_window / request to positive seconds')
             else:
                 out.update({TIMEOUT_KEYS[k]: v for k, v in timeouts.items()})
         if 'max_busy' in item:

@@ -584,6 +584,17 @@ class CmuxSessionManager:
             return [st for tty in self._tmux_pids(tm, '#{pane_tty}') for st in pane_tty_stats(tty)]
         return pane_tty_stats(self._surfaces(ws).get(pane_id, {}).get('tty')) if ws else []
 
+    def process_cpu(self, pane_id: str) -> Optional[float]:
+        """CPU seconds of an owned surface's process tree (watchdog stall window); None when unreadable."""
+        from cmux_fleet.watchdog import pane_tty_cpu
+        ws = self._where(pane_id)
+        if not ws:
+            return None
+        tm = self._tmux_of(pane_id)
+        if tm:
+            return pane_tty_cpu(self._tmux_pids(tm, '#{pane_tty}'))
+        return pane_tty_cpu([self._surfaces(ws).get(pane_id, {}).get('tty')])
+
     def capture_output(self, pane_id: str, lines: int = 2000) -> str:
         ws = self._where(pane_id)
         if not ws:

@@ -489,7 +489,7 @@ def child_lifecycle(parent):
     return child
 
 
-NAMED_OVERRIDES = ('claude', 'worker_model', 'stall_timeout', 'request_timeout', 'max_busy',
+NAMED_OVERRIDES = ('claude', 'worker_model', 'stall_timeout', 'stall_window', 'request_timeout', 'max_busy',
                    'clear_after_result', 'clear_timeout', 'claude_hook_delivery')
 
 

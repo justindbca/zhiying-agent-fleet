@@ -44,7 +44,7 @@ What the daemon enforces, independently of what the models claim:
   does not write, the skeleton is used; missing model-written notes alone do not block rotation.
   Window/process failures still follow the normal failure path.
 - **Stall watchdog.** A busy agent whose rollout file has not changed for `--stall-timeout` seconds
-  (default 30 min) is aborted and reported to the supervisor; a stalled supervisor gets one retry, then
+  (default 20 min; transport v2 also has the 5-minute multi-signal `--stall-window`, docs/design.md §24) is aborted and reported to the supervisor; a stalled supervisor gets one retry, then
   the task is blocked for a human.
 - **Stale callbacks are dropped.** Every spawn bakes a generation number into the notify hook; a late
   callback from a retired session is ignored.

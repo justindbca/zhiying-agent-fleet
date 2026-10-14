@@ -189,6 +189,7 @@ def test_supervisor_slot_runs_in_the_fleets_tmux_and_shows_in_two_workspaces(wor
     assert wait(lambda: w.parent.has_cli_process(sid, ('claude',)))
     assert claude_pids(w)
     assert w.parent.process_states(sid)
+    assert w.parent.process_cpu(sid) is not None  # §24 stall window: the tmux pane's process tree
     # the tab only runs the client, exec'd: nothing of the CLI is on its tty
     tab = next(t for t in w.fake.tabs() if t.alive())
     ps = subprocess.run(['ps', '-t', tab.tty, '-o', 'comm='], capture_output=True, text=True).stdout
