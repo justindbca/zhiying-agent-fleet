@@ -52,7 +52,8 @@ def test_bad_markers_cannot_be_partially_matched(marker):
 @pytest.mark.parametrize("marker", [
     "Recommended profile: flashnext-coder。", "Recommended profile: flashnext-coder。请修测试",
     "请按 Recommended profile: flashnext-coder，修测试", "Recommended profile: flashnext-coder；",
-    "（Recommended profile: flashnext-coder）",
+    "（Recommended profile: flashnext-coder）", "Recommended profile: flashnext-coder（备选 claude-coder）",
+    "Recommended profile: flashnext-coder【必须】",
 ])
 def test_cjk_punctuation_ends_the_marker(marker, task):
     # Incident: a Chinese 。 after the id kept the token invalid and blocked the task after 3 tries.

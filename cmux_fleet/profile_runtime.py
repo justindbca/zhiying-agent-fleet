@@ -12,7 +12,7 @@ class ProfileRuntimeError(ValueError):
     """A profile request is untrusted, ambiguous, or unsupported."""
 
 
-_CJK_STOP = "。，；：、！？）」』】》"
+_CJK_STOP = "。，；：、！？（）「」『』【】《》"
 
 
 def _marker(instruction: str, name: str) -> Optional[str]:
