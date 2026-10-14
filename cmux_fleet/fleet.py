@@ -3668,15 +3668,19 @@ class Fleet:
     def advice_poll(self, name, pending):
         """A pre-dispatch consultation out with the resident advisor: None while it is still out, else what
         advise() returns for it (the validated sheet, or the fallback after one correction / the time limit)."""
-        cfg = self.runtime_cfg(name)
-        ctx = self.advice_context(name, agent_cli(cfg, name), cfg)
-        state, sheet, errors = self.advisor_poll(pending['ticket'], ctx['check'])
+        cfg, ctx = self.runtime_cfg(name), {}
+
+        def context():  # read the cards / matrix only once there is an answer to check (not on every pump)
+            if not ctx:
+                ctx.update(self.advice_context(name, agent_cli(cfg, name), cfg))
+            return ctx
+        state, sheet, errors = self.advisor_poll(pending['ticket'], lambda raw: context()['check'](raw))
         if state == 'wait':
             return None
         self.setf(name, advice_pending='')
         t = self.r.hgetall(ADVICE + pending['ticket'])
-        return self.advice_finish(name, pending.get('kind') or 'dispatch', pending['ticket'], sheet, None, errors, ctx,
-                                  t.get('input', ''), float(t.get('started') or time.time()))
+        return self.advice_finish(name, pending.get('kind') or 'dispatch', pending['ticket'], sheet, None, errors,
+                                  context(), t.get('input', ''), float(t.get('started') or time.time()))
 
     def advice_pending_for(self, name, identity):
         """The resident consultation this queued message waits for, or None. A pending consultation of another
@@ -4192,8 +4196,9 @@ class Fleet:
             if pending['req'].get('run_task') != self.task().get('id'):
                 self.r.delete(RESCUE_PENDING)
                 self.advisor_abandon(pending['ticket'], 'left over from an earlier task')
-            else:
-                self.rescue(pending['req'], pending)
+            elif (self.r.hget(ADVICE + pending['ticket'], 'status') != 'pending'
+                    or self.advisor_poll(pending['ticket'], None)[0] != 'wait'):
+                self.rescue(pending['req'], pending)  # answered or over: rebuild its check and act
             return
         for raw in self.r.lrange(RESCUE, 0, -1):
             req = json.loads(raw)
