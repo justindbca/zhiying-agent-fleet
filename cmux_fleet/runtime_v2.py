@@ -1232,7 +1232,8 @@ class RuntimeV2:
                    message_id=self.context.get('bound_message', ''), delivery_id=self.context.get('bound_delivery', ''),
                    level='info' if status=='ok' else 'error', detail={'public_result': rec, 'request': req})
 
-    def hold(self, slot, reason, public_status=None):
+    def hold(self, slot, reason, public_status=None, pause=True):
+        """``pause=False``: only this slot is held (no new work for it); the fleet keeps working."""
         from cmux_fleet import fleet as legacy
         r = self.effects or self.bus.r
         state = r.hgetall(self.bus.lease_key(slot))
@@ -1251,13 +1252,16 @@ class RuntimeV2:
             self.f.setf(slot, advisor_fault=reason[:300])
             return
         if public_status is None:
-            card = routing_card(self.f.label(slot) + ' 执行状态未确认，已暂停派工；原执行尚未确认停止。详情见 control。',
+            text = ('执行状态未确认，已暂停派工；原执行尚未确认停止。' if pause else
+                    '执行状态未确认，该槽已扣下、不再派活，其他槽照常；原执行尚未确认停止。')
+            card = routing_card(self.f.label(slot) + ' ' + text + '详情见 control。',
                                 kind='notice', slot=self.f.label(slot), severity='warn')
             card['metadata']['event_id'] = 'ui-held-' + digest(slot + ':' + (mid or 'startup'))[:32]
             self.ui(slot, card)
             if slot != 'supervisor':
                 self.ui('supervisor', card)
-        self.f.pause(slot + ': ' + reason)
+        if pause:
+            self.f.pause(slot + ': ' + reason)
 
     def prompt_wait(self, slot, scope, reason, screen, kind=None):
         """A dialog waits for the user (plan F B-1 / F' 8.2): mark the slot, pause dispatch, tell the user.
@@ -1577,20 +1581,10 @@ class RuntimeV2:
         """Re-queue lost dispatches (attempt-capped) and brief the new supervisor generation. `ran`: worker
         instructions that ran to completion before the interruption (never re-queued, reported instead)."""
         task = self.f.task()
-        cap = int(self.f.cfg['max_attempts'])
         head = lambda text: ' '.join(text.split())[:200]
-        over = next((m for m in lost if int(m.get('replay') or 1) >= cap), None)
-        if over:
-            return self.f.finish('blocked', 'start --resume: the dispatch to ' + self.f.label(over['slot'])
-                                 + ' was lost again after ' + str(int(over.get('replay') or 1)) + ' attempt(s) '
-                                 '(max-attempts ' + str(cap) + '): ' + head(over['body']['text']))
-        requeued = []
-        for msg in lost:
-            attempt = int(msg.get('replay') or 1) + 1
-            mid = self.f.queue(msg['slot'], '[Supervisor instruction ' + task['id'] + '] ' + msg['body']['text'])
-            self.effects.hset(self.bus.msg_key(mid), {'replay': attempt})
-            requeued.append('- ' + self.f.label(msg['slot']) + ' (attempt ' + str(attempt) + ' of ' + str(cap)
-                            + '): ' + head(msg['body']['text']))
+        requeued = self.requeue_lost(lost)
+        if requeued is None:
+            return
         done = ['- ' + self.f.label(slot) + ': ' + head(self.bus.message(mid).get('body', {}).get('text', ''))
                 for mid, (slot, _rec, _turn) in (ran or {}).items() if slot != 'supervisor']
         progress = self.progress(task)
@@ -1612,34 +1606,61 @@ class RuntimeV2:
                         if state else '')
                      + '\nDispatch only work that is still missing. Reply with the JSON format from AGENTS.md.')
 
+    def requeue_lost(self, lost, when='start --resume'):
+        """Re-queue lost worker dispatches of the running task once more (``replay`` = attempt). Returns the
+        brief's lines, or None when one is over max-attempts: the task is blocked (§17)."""
+        task = self.f.task()
+        cap = int(self.f.cfg['max_attempts'])
+        head = lambda text: ' '.join(text.split())[:200]
+        over = next((m for m in lost if int(m.get('replay') or 1) >= cap), None)
+        if over:
+            self.f.finish('blocked', when + ': the dispatch to ' + self.f.label(over['slot'])
+                          + ' was lost again after ' + str(int(over.get('replay') or 1)) + ' attempt(s) '
+                          '(max-attempts ' + str(cap) + '): ' + head(over['body']['text']))
+            return None
+        requeued = []
+        for msg in lost:
+            attempt = int(msg.get('replay') or 1) + 1
+            mid = self.f.queue(msg['slot'], '[Supervisor instruction ' + task['id'] + '] ' + msg['body']['text'])
+            self.effects.hset(self.bus.msg_key(mid), {'replay': attempt})
+            requeued.append('- ' + self.f.label(msg['slot']) + ' (attempt ' + str(attempt) + ' of ' + str(cap)
+                            + '): ' + head(msg['body']['text']))
+        return requeued
+
     def requeue_requests(self, ran=None):
         """Service: accepted requests without a public result run once more (unless replay is false, or a
         Codex item of theirs already ran to completion before the interruption)."""
-        from cmux_fleet.fleet import REQ, REQQ
-        cap = int(self.f.cfg['max_attempts'])
+        from cmux_fleet.fleet import REQQ
         done = {self.bus.message(mid).get('request_id') for mid in (ran or {})}
         for rid in self.f.r.lrange(REQQ, 0, -1):
-            req = self.f.r.hgetall(REQ + rid)
-            if not req:
-                continue
-            spec = json.loads(req['spec'])
-            attempt = int(req.get('replay') or 1) + 1
-            worker = req.get('worker') or 'supervisor'
-            if rid in done:
-                self.publish(rid, 'timeout', worker=worker, error='not replayed on resume: it already ran to '
-                             'completion before the interruption and its result was not received')
-            elif spec.get('replay') is False:
-                self.publish(rid, 'timeout', worker=worker, error='not replayed on resume (request has replay: false)')
-            elif attempt > cap:
-                self.publish(rid, 'timeout', worker=worker, error='not replayed on resume: ' + str(cap)
-                             + ' attempt(s) used (max-attempts ' + str(cap) + ')')
-            else:
-                # A fresh timeout window: the downtime does not count against the replay.
-                self.f.r.hset(REQ + rid, mapping={'replay': attempt, 'status': 'routing', 'worker': '',
-                                                  'created': time.time()})
-                self.f.route(rid, spec)
-                self.audit('request.replayed', request_id=rid, attempt=attempt)
+            self.replay_request(rid, done)
         named_subfleet.requeue_awaiting(self.f)  # §29 external ops wait in their own queue, not REQQ
+
+    def replay_request(self, rid, done=(), when='on resume'):
+        """One accepted request without a public result is routed once more (§17: ``replay`` = attempt; replay
+        false, over max-attempts, or already run to completion -> published timeout instead)."""
+        from cmux_fleet.fleet import REQ
+        cap = int(self.f.cfg['max_attempts'])
+        req = self.f.r.hgetall(REQ + rid)
+        if not req:
+            return
+        spec = json.loads(req['spec'])
+        attempt = int(req.get('replay') or 1) + 1
+        worker = req.get('worker') or 'supervisor'
+        if rid in done:
+            self.publish(rid, 'timeout', worker=worker, error='not replayed ' + when + ': it already ran to '
+                         'completion before the interruption and its result was not received')
+        elif spec.get('replay') is False:
+            self.publish(rid, 'timeout', worker=worker, error='not replayed ' + when + ' (request has replay: false)')
+        elif attempt > cap:
+            self.publish(rid, 'timeout', worker=worker, error='not replayed ' + when + ': ' + str(cap)
+                         + ' attempt(s) used (max-attempts ' + str(cap) + ')')
+        else:
+            # A fresh timeout window: the downtime does not count against the replay.
+            self.f.r.hset(REQ + rid, mapping={'replay': attempt, 'status': 'routing', 'worker': '',
+                                              'created': time.time()})
+            self.f.route(rid, spec)
+            self.audit('request.replayed', request_id=rid, attempt=attempt)
 
     def deliver(self, slot):
         from cmux_fleet.fleet import REQ
@@ -1836,6 +1857,129 @@ class RuntimeV2:
         self.f.setf(slot, state='dead', runtime_ready=0, bridge_available=0, launch_ready=0)
         return True
 
+    # -- liveness (tick, every 30 s): a slot's tab is gone. Outside any Redis intent (tabs / spawn).
+    def tab_missing(self, slot, info):
+        """Only proof that the session stopped (its tmux session ended) starts the slot's next generation; a
+        tab closed over a live tmux session is reattached. Without proof a worker is held alone; only the
+        supervisor still pauses the fleet (nobody else would dispatch). A delegated slot is never held."""
+        pane = info['pane']
+        adopted = subfleet.adopted(self.f.cfg, slot, info.get('generation'))
+        probe = getattr(self.f.mgr, 'tmux_session_alive', None)
+        alive = probe(pane) if probe else None  # only False is evidence that execution stopped
+        reason = 'runtime tab missing; stop evidence unavailable'
+        if alive:
+            peer = self.peer_tab(slot)
+            new = self.f.mgr.reattach_client(pane, peer) if peer else None
+            if new:
+                self.f.setf(slot, pane=new)
+                if info.get('delegated_pane') == pane:
+                    self.f.setf(slot, delegated_pane=new)
+                    subfleet.repoint(self.f, slot, pane, new)
+                self.audit('liveness.reattached', slot=slot, level='warn', detail={'old_pane': pane, 'pane': new})
+                return
+            reason = 'runtime tab missing; its tmux session runs on but no tab could be reattached'
+        elif alive is False:
+            reason = 'runtime tab missing; its tmux session ended'
+        if info.get('state') == 'delegated':
+            # A hold would end the hook route into its sub-fleet (delegated_route): never held here.
+            down = alive is False and subfleet.delegated_lost(self.f, slot, reason)
+            self.audit('liveness.delegated_tab_missing', slot=slot, level='error', error=reason,
+                       detail={'subfleet_down': down})
+            return
+        if alive is False and not adopted and slot != advisor.SLOT and self.restart_lost(slot, info, reason):
+            return
+        # An adopted supervisor proven gone: the parent takes this sub-fleet down (its own liveness check).
+        pause = slot == 'supervisor' and not (adopted and alive is False)
+        self.transaction('closed-' + uuid.uuid4().hex, lambda: self.hold(slot, reason, pause=pause))
+
+    def peer_tab(self, slot):
+        """A live tab of another slot to open ``slot``'s tab next to (workers first, then the supervisor)."""
+        names = [n for n in self.f.workers + ['supervisor'] if n != slot]
+        return next((p for p in (self.f.agent(n).get('pane') for n in names)
+                     if p and self.f.mgr.get_pane_status(p) is not None), None)
+
+    def restart_lost(self, slot, info, why):
+        """A worker's session is proven gone: what ``start --resume`` does for a dead tab, for this slot alone
+        (§17): release its lease and queue (clear_slot), next generation in place (next_generation), its lost
+        work replayed once more under the same rules (requeue_lost / replay_request: attempt count,
+        max-attempts, replay false). A resumed generation lost before its READY ran nothing: only replaced.
+        False (the caller holds the slot instead): the supervisor (never in tmux, never proven), run paused
+        (§7: no rotation while paused; this check comes back after a resume), a fresh generation that never
+        said READY (no restart loop), mid handoff / clear."""
+        from cmux_fleet.fleet import REQ, REQQ
+        resumed = info.get('resume_generation') == info.get('generation') and info.get('state') == 'starting'
+        if (slot == 'supervisor' or self.f.paused() or info.get('handoff_id') or not resumed and (
+                info.get('runtime_ready') != '1' or info.get('state') not in ('idle', 'busy', 'held'))):
+            return False
+        lost = [m for m in self.lost_dispatches() if m.get('slot') == slot]  # read before clear_slot cancels them
+        rids = [rid for rid in self.f.r.lrange(REQQ, 0, -1) if self.f.service
+                and self.f.r.hmget(REQ + rid, 'status', 'worker') == ['dispatched', slot]]
+        self.f.mgr.kill_pane(info['pane'])  # forgets the closed tab; its session is already gone
+        if not resumed and not self.clear_slot(slot, False):
+            self.transaction('lost-' + uuid.uuid4().hex, lambda: self.hold(slot, why + '; lease not released', pause=False))
+            return True
+        prev = self.f.label(slot)
+        try:
+            resume = self.next_generation(slot, info, why)
+        except RuntimeError as exc:
+            self.transaction('lost-' + uuid.uuid4().hex, lambda: self.hold(
+                slot, why + '; the next generation did not start: ' + str(exc)[:300], pause=False))
+            return True
+        if not resumed:
+            when = 'after the session of ' + prev + ' ended'
+            self.transaction('lost-replay-' + uuid.uuid4().hex, lambda: self.requeue_lost(lost, when) if lost else [
+                self.replay_request(rid, when=when) for rid in rids])
+        self.audit('liveness.restarted', slot=slot, level='error', prev=prev, label=self.f.label(slot), reason=why,
+                   detail={'resume_session': resume, 'replayed_dispatches': len(lost), 'replayed_requests': rids})
+        return True
+
+    def next_generation(self, slot, info, why):
+        """``respawn`` of a lost slot. A Claude worker resumes its own session first (``claude --resume``, the
+        transcript must still be there); a resumed generation lost again (or one that never said READY) gets a
+        fresh generation from a skeleton handoff note, pointed at PROGRESS.md when the worker keeps one.
+        Returns the resumed session id ('' for a fresh generation)."""
+        from cmux_fleet import handoff
+        from cmux_fleet.fleet import agent_cwd, is_claude
+        thread, transcript = info.get('thread') or '', info.get('transcript') or ''
+        generation, prev = int(info.get('generation') or 0), self.f.label(slot)
+        esc = lambda text: text.replace('{', '{{').replace('}', '}}')
+        progress = agent_cwd(self.f.cfg, slot) / 'PROGRESS.md'
+        if (is_claude(self.slot_cfg(slot), slot) and thread and info.get('resume_generation') != str(generation)
+                and transcript and Path(transcript).is_file()):
+            self.f.setf(slot, resume_session=thread, resume_generation=generation + 1)
+            prompt = ('Your session was interrupted (' + esc(why) + ') and the daemon resumed it: you are now fleet '
+                      'agent {label}. Your unfinished work is delivered to you again after READY: check what is '
+                      'already on disk (' + esc(str(progress)) + ' if it exists) and continue from there instead of '
+                      'redoing it. In this turn do no task work: your final reply must be exactly READY.')
+            self.respawn([slot], True, prompt=prompt)
+            return thread
+        note = self.f.run_dir / 'handoffs' / (slot + '-g' + str(generation) + '-lost.md')
+        note.parent.mkdir(parents=True, exist_ok=True)
+        text = self.f.skeleton(slot, dict(info, handoff_id='lost-' + uuid.uuid4().hex[:8]))
+        if progress.is_file():
+            text = handoff.add_next_step(text, 'continue from ' + str(progress) + ': the milestones already reached')
+        note.write_text(text)
+        prompt = ('You are fleet agent {label}. The session of ' + esc(prev) + ' ended unexpectedly (' + esc(why)
+                  + '). Read the handoff note ' + esc(str(note)) + ' and AGENTS.md; the previous transcript is '
+                  + esc(transcript or 'unknown') + '. Its unfinished work is delivered to you again after READY: '
+                  'check what is already on disk before redoing anything. In this turn do no task work: your final '
+                  'reply must be exactly READY.')
+        self.respawn([slot], True, prompt=prompt, handoff=str(note))
+        return ''
+
+    def resume_fallback(self):
+        """A resumed session that did not say READY in time (``expire`` marks it): a fresh generation instead."""
+        for slot in self.f.workers:
+            info = self.f.agent(slot)
+            if info.get('resume_failed') == '1' and info.get('state') == 'starting':
+                self.f.setf(slot, resume_failed=0)
+                try:
+                    self.next_generation(slot, info, 'the resumed session did not say READY in time')
+                except RuntimeError as exc:
+                    self.transaction('lost-' + uuid.uuid4().hex, lambda: self.hold(
+                        slot, 'resume fallback: the next generation did not start: ' + str(exc)[:300], pause=False))
+                self.audit('liveness.resume_failed', slot=slot, level='error', label=self.f.label(slot))
+
     def render_cards(self, refresh_every=5.0):
         """Official-CLI slots have no UI-only entry: render their cards off-model (tui_cards)."""
         slots = [slot for slot in self.f.names if tui_slot(self.f.cfg, slot)]
@@ -1874,6 +2018,9 @@ class RuntimeV2:
                         # a dialog before READY waits for a human (plan F B-2b): not a dead start
                         and info.get('prompt_wait') != 'startup-g' + str(info.get('generation', '0'))
                         and now >= float(info.get('startup_deadline') or 0)):
+                    if info.get('resume_generation') == info.get('generation') and slot in self.f.workers:
+                        self.f.setf(slot, resume_failed=1)  # a resumed session: a fresh generation next (tick)
+                        continue
                     self.f.setf(slot, state='dead', bridge_available=0, runtime_ready=0)
                     if slot == advisor.SLOT:  # §27: restarted in place by advisor_tick, never blocks the task
                         self.audit('advisor.startup_timeout', slot=slot, level='error')
@@ -1886,6 +2033,7 @@ class RuntimeV2:
                         self.hold(slot, 'lease/delivery deadline expired; execution stop unconfirmed', public_status='timeout')
                     # Stalls are the watchdog's (docs/design.md §24): Escape ladder, then kill + next generation.
         self.transaction('tick-' + uuid.uuid4().hex, expire)
+        self.resume_fallback()
         self.clear_tick(now)
         self.renew_tui()
         self.render_cards()
@@ -1899,7 +2047,7 @@ class RuntimeV2:
             for slot in self.f.names:
                 info = self.f.agent(slot)
                 if info.get('pane') and self.f.mgr.get_pane_status(info['pane']) is None:
-                    self.transaction('closed-' + uuid.uuid4().hex, lambda slot=slot: self.hold(slot, 'runtime tab missing; stop evidence unavailable'))
+                    self.tab_missing(slot, info)
 
     def run(self):
         marker = self.prefix + ':boot'

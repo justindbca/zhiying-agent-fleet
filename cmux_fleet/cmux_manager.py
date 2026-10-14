@@ -505,6 +505,41 @@ class CmuxSessionManager:
             return None
         return sid
 
+    def tmux_session_alive(self, sid: str) -> Optional[bool]:
+        """Whether the tmux session behind ``sid`` (a client tab of the fleet's tmux, live or closed) still
+        exists: True; False only when tmux proves it gone (its server answered without it, no server runs
+        on the socket, or the socket is gone); None when ``sid`` is no tmux tab or tmux could not be read."""
+        tm = self._tmux_of(sid)
+        if not tm:
+            return None
+        if not Path(tm['tmux_socket']).exists():
+            return False
+        try:
+            p = _tmux(tm['tmux_socket'], 'list-sessions', '-F', '#{session_name}')
+        except OSError:
+            return None
+        if p.returncode == 0:
+            return tm['tmux_session'] in p.stdout.split()
+        return False if 'no server running' in p.stderr + p.stdout else None
+
+    def reattach_client(self, sid: str, peer: str) -> Optional[str]:
+        """``sid`` (a client tab of the fleet's tmux) was closed while its session runs on: open a new client
+        tab of that session just before ``peer``. It takes over ``sid``'s registry entry (owner / view role,
+        output file, label); ``sid`` is forgotten, never killed (that would end the session). None: not done
+        (not a tmux tab, the tab is still there, cmux does not show ``peer``, or the session is gone)."""
+        tm = self._tmux_of(sid)
+        if not tm or not self._where(peer) or self._where(sid):
+            return None
+        new = self.attach_view(self.tmux_view_info(sid), peer)
+        if not new:
+            return None
+        meta = self._meta()
+        meta['surfaces'][new] = meta['surfaces'].pop(sid, None) or tm
+        self._save_meta(meta)
+        if tm.get('label'):
+            self.rename(new, tm['label'])
+        return new
+
     def _client_tty(self, sid: str) -> Optional[str]:
         ws = self._where(sid)
         tty = self._surfaces(ws).get(sid, {}).get('tty') if ws else None
