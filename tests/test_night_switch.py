@@ -541,3 +541,29 @@ def test_night_swapped_slot_takes_its_card_handoff_ratio_through_the_one_resolve
     window, ratio, source = f.handoff_limits('worker-2')
     assert ratio == .5 and source.endswith('ratio: card flashnext-coder')  # FlashNext card: 0.5
     assert f.handoff_limits('worker-1')[1] == float(f.cfg['handoff_ratio'])  # day slot: fleet default
+
+
+def test_night_roster_must_declare_the_same_subfleets(tmp_path):
+    """design §29 d) (user 10-14): the night roster's ``subfleets:`` section equals the day roster's
+    (compared with paths resolved), else the pair is refused as a whole with the differing names."""
+    cfg = dict(fleet.DEFAULTS, transport_version=2, supervisor_cli='codex', worker_cli='claude',
+               allow_development_v2=True, mode='task')
+    (tmp_path / 'sup.md').write_text('x')
+    (tmp_path / 'child.yaml').write_text('workers:\n  - name: a\n')
+    (tmp_path / 'n').mkdir()
+    sub = ('subfleets:\n  - {name: ops, supervisor_slot: worker-1, supervisor_role: SUP, roster: CHILD'
+           + ', autostart: AUTO}\n')
+    day, other = tmp_path / 'day.yaml', tmp_path / 'n' / 'night.yaml'
+    day.write_text('workers:\n  - name: worker-1\n'
+                   + sub.replace('SUP', 'sup.md').replace('CHILD', 'child.yaml').replace('AUTO', 'false'))
+    # same targets through other relative paths: accepted
+    other.write_text('workers:\n  - {name: worker-1, profile: claude-coder}\n'
+                     + sub.replace('SUP', '../sup.md').replace('CHILD', '../child.yaml').replace('AUTO', 'false'))
+    night.check_rosters(cfg, day, other)
+    other.write_text('workers:\n  - {name: worker-1, profile: claude-coder}\n'
+                     + sub.replace('SUP', '../sup.md').replace('CHILD', '../child.yaml').replace('AUTO', 'true'))
+    with pytest.raises(ValueError, match=r'same "subfleets:".*differing: ops'):
+        night.check_rosters(cfg, day, other)
+    other.write_text('workers:\n  - {name: worker-1, profile: claude-coder}\n')
+    with pytest.raises(ValueError, match=r'same "subfleets:".*differing: ops'):
+        night.check_rosters(cfg, day, other)
