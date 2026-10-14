@@ -293,3 +293,36 @@ def test_failed_tab_leaves_no_session(world, monkeypatch):
     res = w.parent.spawn_interactive_cli(window_name='fx-ops-a', cli_command=w.claude + ' 600', output_file=str(out),
                                          start_directory=str(w.run), tmux_socket=w.sock, tmux_session='ops-a-g0')
     assert not res.success and cm.tmux_sessions(w.sock) == []
+
+
+def test_session_probe_proves_a_stop_only_from_tmux_itself(world, monkeypatch):
+    """Liveness evidence (runtime_v2.tab_missing): False only when tmux shows the session gone."""
+    w = world
+    sid, _ = spawn(w)
+    plain = w.parent.spawn_window('worker-2', 'sleep 600', metadata={'type': 'worker'}, start_directory=str(w.run))
+    assert w.parent.tmux_session_alive(sid) is True and w.parent.tmux_session_alive(plain.pane_id) is None
+    other, _ = spawn(w, slot='ops-b')
+    tmux(w, 'kill-session', '-t', '=ops-a-g0')  # the session ended; the server still answers
+    assert w.parent.tmux_session_alive(sid) is False and w.parent.tmux_session_alive(other) is True
+    tmux(w, 'kill-server')  # no server at all; its socket file is left behind
+    assert Path(w.sock).exists() and w.parent.tmux_session_alive(other) is False
+    monkeypatch.setattr(cm, 'TMUX', str(w.run / 'no-such-tmux'))  # tmux unreadable: no evidence either way
+    assert w.parent.tmux_session_alive(other) is None
+
+
+def test_closed_client_tab_is_reattached_with_its_registry_entry(world):
+    w = world
+    sid, out = spawn(w)
+    peer = w.parent.spawn_window('worker-2', 'sleep 600', metadata={'type': 'worker'}, start_directory=str(w.run))
+    assert wait(lambda: len(clients(w, 'ops-a-g0')) == 1)
+    assert w.parent.reattach_client(sid, peer.pane_id) is None  # its tab is still there
+    next(t for s, t in w.fake.ws[w.parent._where(sid)].items() if s == sid).kill()  # the ✕ on the tab
+    assert wait(lambda: w.parent.get_pane_status(sid) is None)
+    assert wait(lambda: not clients(w, 'ops-a-g0')) and 'ops-a-g0' in cm.tmux_sessions(w.sock)
+    new = w.parent.reattach_client(sid, peer.pane_id)
+    assert new and w.parent.owns(new) and wait(lambda: len(clients(w, 'ops-a-g0')) == 1)
+    entry = w.parent._meta()['surfaces'][new]
+    assert entry['tmux_role'] == 'owner' and entry['output_file'] == str(out) and entry['label'] == 'fx-ops-a'
+    assert sid not in w.parent._meta()['surfaces'] and w.parent.has_cli_process(new, ('claude',))
+    assert w.parent.kill_pane(new) and 'ops-a-g0' not in cm.tmux_sessions(w.sock)  # still the owner
+    assert w.parent.reattach_client(new, peer.pane_id) is None  # the session is gone: nothing to reattach
