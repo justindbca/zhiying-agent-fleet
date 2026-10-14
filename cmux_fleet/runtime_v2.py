@@ -1907,7 +1907,7 @@ class RuntimeV2:
         (§7: no rotation while paused; this check comes back after a resume), a fresh generation that never
         said READY (no restart loop), mid handoff / clear."""
         from cmux_fleet.fleet import REQ, REQQ
-        resumed = info.get('resume_generation') == info.get('generation') and info.get('state') == 'starting'
+        resumed = info.get('resume_generation') == info.get('generation') and info.get('runtime_ready') != '1'
         if (slot == 'supervisor' or self.f.paused() or info.get('handoff_id') or not resumed and (
                 info.get('runtime_ready') != '1' or info.get('state') not in ('idle', 'busy', 'held'))):
             return False
