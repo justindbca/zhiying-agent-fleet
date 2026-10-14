@@ -67,7 +67,8 @@ def enabled(cfg, name, claude=None):
     if claude is None:
         from cmux_fleet.fleet import is_claude
         claude = is_claude(cfg, name)
-    return bool(claude) and name != 'supervisor' and cfg.get('claude_hook_delivery', True) is not False
+    return (bool(claude) and name != 'supervisor' and cfg.get('claude_hook_delivery', True) is not False
+            and cfg.get('clear_after_result') is not True)  # §28 needs typed delivery (validate refuses both)
 
 
 def hook_timeout(cfg):

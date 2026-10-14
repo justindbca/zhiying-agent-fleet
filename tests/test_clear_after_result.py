@@ -117,13 +117,65 @@ def test_start_accepts_service_claude_before_provisioning(monkeypatch):
     monkeypatch.setattr(cmux_manager, 'cmux_available', reached)
     with pytest.raises(Reached):
         fleet.main(['start', '--lifecycle', 'service', '--worker-cli', 'claude', '--clear-after-result',
+                    '--no-claude-hook-delivery', '--allow-development-v2'])
+
+
+def test_start_refuses_clear_with_claude_hook_delivery(monkeypatch):
+    # The Stop-hook channel (default on) blocks inside every Stop hook: /clear could never be pasted.
+    monkeypatch.setattr(cmux_manager, 'cmux_available', lambda: pytest.fail('must reject before provisioning'))
+    with pytest.raises(SystemExit, match='--no-claude-hook-delivery'):
+        fleet.main(['start', '--lifecycle', 'service', '--worker-cli', 'claude', '--clear-after-result',
                     '--allow-development-v2'])
+
+
+@pytest.mark.parametrize('hook', [True, None])
+def test_config_refuses_clear_with_claude_hook_delivery(hook):
+    cfg = dict(clear_after_result=True, lifecycle='service', mode='service', worker_cli='claude', transport_version=2,
+               allow_development_v2=True)
+    if hook is not None:
+        cfg['claude_hook_delivery'] = hook
+    with pytest.raises(ValueError, match='claude_hook_delivery: false'):
+        runtime_v2.validate_config(cfg)
+    runtime_v2.validate_config(dict(cfg, claude_hook_delivery=False))
+    runtime_v2.validate_config(dict(cfg, clear_after_result=False))  # switch off: hook channel stays legal
+
+
+def test_hook_channel_is_off_whenever_clear_is_on():
+    from cmux_fleet import claude_hook
+    cfg = dict(worker_cli='claude', transport_version=2, mode='service')
+    assert claude_hook.enabled(cfg, SLOT, claude=True)
+    assert claude_hook.enabled(dict(cfg, clear_after_result=False), SLOT, claude=True)
+    assert not claude_hook.enabled(dict(cfg, clear_after_result=True), SLOT, claude=True)
+
+
+def test_switch_off_keeps_hook_channel_settings(tmp_path):
+    cfg = dict(run=str(tmp_path), workers=[SLOT], python=sys.executable, transport_version=2,
+               worker_cli='claude', mode='service')
+    fleet.agent_cwd(cfg, SLOT).mkdir(parents=True)
+    def settings(c):
+        argv = fleet.claude_argv(tmp_path / 'config.json', c, SLOT, 3, 'READY')
+        return json.loads(Path(argv[argv.index('--settings') + 1]).read_text()), argv
+    (default, argv_default), (off, argv_off) = settings(cfg), settings(dict(cfg, clear_after_result=False))
+    assert default == off and argv_default == argv_off
+    assert set(default['hooks']) == {'Stop', 'StopFailure'} and len(default['hooks']['Stop'][0]['hooks']) == 2
+
+
+def test_resume_refuses_clear_with_claude_hook_delivery(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    run = tmp_path / 'run'
+    run.mkdir()
+    fleet.save(run / 'config.json', dict(run=str(run), python=sys.executable, workers=[SLOT], lifecycle='service',
+               mode='service', supervisor_cli='codex', worker_cli='claude', transport_version=2,
+               allow_development_v2=True, clear_after_result=True))
+    monkeypatch.setattr(fleet, 'daemon_running', lambda path: pytest.fail('must reject before reattaching'))
+    with pytest.raises(SystemExit, match='cannot resume .*--no-claude-hook-delivery'):
+        fleet.resume(run, SimpleNamespace(max_attempts=None, roster=None, advisor=False))
 
 
 @pytest.mark.parametrize('on,slot', [(False, SLOT), (True, 'supervisor'), (True, SLOT)])
 def test_worker_only_opt_in_hooks(tmp_path, on, slot):
     cfg = dict(run=str(tmp_path), workers=[SLOT], python=sys.executable, transport_version=2,
-               worker_cli='claude', mode='service', clear_after_result=on)
+               worker_cli='claude', mode='service', clear_after_result=on, claude_hook_delivery=False)
     fleet.agent_cwd(cfg, slot).mkdir(parents=True)
     argv = fleet.claude_argv(tmp_path / 'config.json', cfg, slot, 3, 'READY')
     hooks = json.loads(Path(argv[argv.index('--settings') + 1]).read_text())['hooks']
@@ -308,6 +360,26 @@ def test_rebind_plan_updates_bus_and_agent_together_then_waits_for_hook(plan, mo
     assert not f.mgr.sent  # manual clear does not trigger a second /clear
 
 
+def test_rebind_keeps_the_slot_launch_record(plan, monkeypatch):
+    # The launch record (runtime_launch + installed_domains = layout) is per slot and replayed by the next
+    # generation (§27); a same-generation rebind changes only the session binding, never the record.
+    f, v, r, env = enable(plan)
+    record = dict(runtime_launch=json.dumps({'profile_id': 'haiku', 'overrides': {'worker_cli': 'claude'}}),
+                  installed_domains=json.dumps(['us_options']), runtime_profile='haiku', advice_hold='0')
+    f.setf(SLOT, state='idle', **record)
+    r.hset(v.bus.lease_key(SLOT), mapping={'current_delivery': '', 'status': 'idle'})
+    monkeypatch.setattr(r, 'xpending', lambda *a: {'pending': 0}, raising=False)
+    v.begin_clear(SLOT, hook_pid=12345)
+    v.handle(clear_event(f))
+    apply_stub(plan, monkeypatch)
+    monkeypatch.setattr(clear, 'hook_exited', lambda pid: True)
+    monkeypatch.setattr(f.mgr, 'capture_output', lambda *a, **kw: IDLE, raising=False)
+    idle_twice(v)
+    info = f.agent(SLOT)
+    assert info['state'] == 'idle' and info['thread'] == 'new-session' and info['generation'] == '0'
+    assert {k: info[k] for k in record} == record
+
+
 def test_rebind_with_residual_pel_is_held(plan, monkeypatch):
     f, v, r, env = enable(plan)
     r.hset(v.bus.lease_key(SLOT), mapping={'current_delivery': '', 'status': 'idle'})
@@ -365,7 +437,7 @@ def test_resume_keeps_saved_clear_switch_and_timeout(tmp_path, monkeypatch):
     run.mkdir()
     cfg = dict(run=str(run), python=sys.executable, workers=[SLOT], lifecycle='service', mode='service',
                supervisor_cli='codex', worker_cli='claude', transport_version=2, allow_development_v2=True,
-               clear_after_result=True, clear_timeout=17)
+               clear_after_result=True, clear_timeout=17, claude_hook_delivery=False)
     fleet.save(run / 'config.json', cfg)
     monkeypatch.setattr(fleet, 'daemon_running', lambda path: False)
     monkeypatch.setattr(cmux_manager, 'cmux_available', lambda: True)

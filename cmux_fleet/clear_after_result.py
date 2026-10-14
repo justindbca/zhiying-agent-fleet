@@ -21,6 +21,11 @@ def validate(cfg):
                  or cfg.get('worker_cli') != 'claude' or cfg.get('transport_version') != 2):
         raise ValueError('--clear-after-result requires --lifecycle service, Claude Code workers '
                          'and the typed Redis v2 delivery path')
+    if flag and cfg.get('claude_hook_delivery', True) is not False:
+        # The Stop-hook channel (docs/design.md §5, default on) blocks inside every Stop hook for the
+        # next item, so the worker never goes idle and /clear could never be pasted (§28).
+        raise ValueError('--clear-after-result needs typed delivery, but Claude Stop-hook delivery is on '
+                         '(the default): also pass --no-claude-hook-delivery (run config claude_hook_delivery: false)')
 
 
 def hook_exited(pid):

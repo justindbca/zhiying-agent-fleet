@@ -5313,6 +5313,7 @@ def start(args):
            **({'brake_notify': shlex.split(args.brake_notify)} if getattr(args, 'brake_notify', None) else {}),
            'request_timeout': args.request_timeout, 'supervisor_profile': args.supervisor_profile,
            'clear_after_result': args.clear_after_result, 'clear_timeout': args.clear_timeout,
+           **({'claude_hook_delivery': False} if getattr(args, 'claude_hook_delivery', True) is False else {}),
            'worker_profile': args.worker_profile, 'profile': args.profile, 'codex': codex, 'redis_server': redis_server, 'codex_home': str(home),
            'handoff_ratio': args.handoff_ratio, 'handoff_timeout': args.handoff_timeout,
            'window': args.window, 'stall_timeout': args.stall_timeout,
@@ -5529,6 +5530,8 @@ def main(argv=None):
     s.add_argument('--claude-window', type=int, default=DEFAULTS['claude_window'], help='claude models not in the built-in 1M list ([1m]/opus/fable/sonnet): context window (§22)')
     s.add_argument('--clear-after-result', action='store_true', help='clear Claude service worker context after every terminal result')
     s.add_argument('--clear-timeout', type=float, default=20, help='seconds to confirm context clear (default: 20)')
+    s.add_argument('--no-claude-hook-delivery', dest='claude_hook_delivery', action='store_false',
+                   help='Claude workers: typed delivery instead of the Stop-hook channel (required by --clear-after-result)')
     s.add_argument('--lifecycle', metavar='MODE',
                    help='required: ' + ' | '.join(lifecycle.MODE_NAMES) + ' (config/fleet_modes.yaml); '
                         'decides what done means, how the run is closed, and --mode')
