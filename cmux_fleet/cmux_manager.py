@@ -187,6 +187,53 @@ class CmuxSessionManager:
                         found[s['id']] = {'pane_id': s.get('pane_id'), 'tty': s.get('tty'), 'title': s.get('title')}
         return found
 
+    def _windows(self) -> Optional[List[Dict]]:
+        """All windows with their workspaces (``tree --all``); None when cmux did not answer in JSON."""
+        p = _run('--json', '--id-format', 'uuids', 'tree', '--all')
+        try:
+            windows = json.loads(p.stdout).get('windows') if p.returncode == 0 else None
+        except (ValueError, AttributeError):
+            return None
+        return windows if isinstance(windows, list) else None
+
+    def keep_windows_open(self, ours: List[str]) -> bool:
+        """Before closing our workspaces: no window may be left with none. cmux 0.64.25 closes a
+        window together with its last workspace, and the workspace goes as soon as its last surface does
+        (2026-10-13 macmini: the driver closed the lone leftover workspace, the window went with it, and
+        every later start failed until someone ran new-window). A window holding only workspaces of
+        ``ours`` gets an empty shell workspace first. False if that could not be confirmed.
+
+        An unreadable topology (cmux not answering JSON) is let through, as ``_surfaces`` treats a
+        failed tree as "nothing live"; real cmux answers ``tree --all``."""
+        ours = {ws for ws in ours if ws}
+        windows = self._windows()
+        if windows is None:
+            return True
+        for window in windows:
+            ids = {ws.get('id') for ws in window.get('workspaces', [])}
+            if not ids & ours or ids - ours:
+                continue
+            p = _run('--id-format', 'uuids', 'new-workspace', '--window', window.get('id', ''), '--focus', 'false')
+            again = {w.get('id'): w for w in self._windows() or []}.get(window.get('id'))
+            if p.returncode or not again or not {ws.get('id') for ws in again.get('workspaces', [])} - ours:
+                return False
+        return True
+
+    def _ensure_window(self) -> bool:
+        """new-workspace needs a window: with none open (after the last one closed) cmux answers
+        "TabManager not available". Open one; an unreadable answer is let through as before."""
+        def listed():
+            p = _run('--json', '--id-format', 'uuids', 'list-windows')
+            try:
+                return json.loads(p.stdout) if p.returncode == 0 else None
+            except ValueError:
+                return None
+        if listed() != []:
+            return True
+        if _run('new-window').returncode:
+            return False
+        return _wait_until(lambda: bool(listed()))
+
     def _where(self, sid: str) -> Optional[str]:
         """Workspace holding an owned, live surface; None if not ours or gone."""
         meta = self._meta()
@@ -231,12 +278,16 @@ class CmuxSessionManager:
                 return None, False
             return parts[1], ran
         name = self.control_title if control else self.agents_title
+        if not self._ensure_window():
+            self.last_error = 'cmux has no window open and new-window failed'
+            return None, False
         before = _run('--id-format', 'uuids', 'current-workspace').stdout.strip()
         extra = ['--command', command] if command else []
         p = _run('--id-format', 'uuids', 'new-workspace', '--name', name, '--focus', 'false', *extra)
         if before:  # --focus false still switches the view; give the user their workspace back
             _run('select-workspace', '--workspace', before)
         if p.returncode:
+            self.last_error = 'new-workspace failed: ' + ((p.stderr or p.stdout or '').strip()[:200] or 'no output')
             return None, False
         ref = p.stdout.split()[-1]  # prints a ref (workspace:N); pin the UUID right away
         t = _run('--json', '--id-format', 'uuids', 'tree', '--workspace', ref)
@@ -251,6 +302,10 @@ class CmuxSessionManager:
         self._save_meta(meta)
         live = self._surfaces(ws)
         return (next(iter(live)), bool(command)) if live else (None, False)
+
+    def _spawn_error(self) -> str:
+        why, self.last_error = getattr(self, 'last_error', ''), ''
+        return why or 'run inside cmux'
 
     def _launcher(self, name: str, script: str, folder: Optional[Path] = None) -> str:
         """Write ``script`` to a launcher file and return the short command that runs it."""
@@ -293,7 +348,7 @@ class CmuxSessionManager:
         full = self._launcher(window_name, 'cd ' + shlex.quote(start_directory or '.') + ' && exec ' + command)
         sid, ran = self._new_surface(control=control, command=full)
         if not sid:
-            return SpawnResult(success=False, error='cmux surface creation failed (run inside cmux)')
+            return SpawnResult(success=False, error='cmux surface creation failed (' + self._spawn_error() + ')')
         self._tag(sid, type=(metadata or {}).get('type', ''), label=window_name)
         if not _wait_until(lambda: self._where(sid)):
             return SpawnResult(success=False, pane_id=sid, error='cmux surface did not become visible')
@@ -317,7 +372,7 @@ class CmuxSessionManager:
                               Path(output_file).parent if output_file else None)
         sid, ran = self._new_surface(command=full)
         if not sid:
-            return SpawnResult(success=False, error='cmux surface creation failed (run inside cmux)')
+            return SpawnResult(success=False, error='cmux surface creation failed (' + self._spawn_error() + ')')
         self._tag(sid, type=(metadata or {}).get('type', ''), label=window_name, output_file=output_file or '')
         if not _wait_until(lambda: self._where(sid)):
             return SpawnResult(success=False, pane_id=sid, error='cmux surface did not become visible')
@@ -464,7 +519,7 @@ class CmuxSessionManager:
         meta = self._meta()
         meta['control_workspace'] = ws
         self._save_meta(meta)
-        if source != ws and not self._surfaces(source):
+        if source != ws and not self._surfaces(source) and self.keep_windows_open([source]):
             _run('close-workspace', '--workspace', source)  # empty only; never --force
         # move-surface can select the moved tab even with --focus false. Select the
         # history surface explicitly, not just its pane (which could show control).
@@ -579,8 +634,15 @@ class CmuxSessionManager:
 
     def close_all(self) -> bool:
         """Close every surface this registry owns, then its now-empty workspaces (history files
-        stay on disk). False if anything could not be confirmed closed."""
-        failed = {sid for sid in list(self._meta()['surfaces']) if not self.kill_pane(sid)}
+        stay on disk). False if anything could not be confirmed closed.
+
+        First make sure no window is left empty (keep_windows_open): killing the last terminal of a
+        workspace closes the workspace too, so the check comes before any kill. If a window cannot be
+        kept open, nothing is touched (False): a leftover tab is better than a cmux with no window."""
+        meta = self._meta()
+        if not self.keep_windows_open([meta.get('workspace'), meta.get('control_workspace')]):
+            return False
+        failed = {sid for sid in list(meta['surfaces']) if not self.kill_pane(sid)}
         ok = True
         meta = self._meta()
         for ws in dict.fromkeys(meta.get(k) for k in ('workspace', 'control_workspace')):
