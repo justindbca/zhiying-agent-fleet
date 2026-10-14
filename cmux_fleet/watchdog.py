@@ -24,6 +24,8 @@ import time
 import uuid
 from pathlib import Path
 
+from cmux_fleet import advisor
+
 STATES = ('idle', 'working', 'stalled', 'frozen', 'prompting')
 DEFAULT_TABLE = Path(__file__).resolve().parent / 'config' / 'watchdog_prompts.yaml'
 KEYS = frozenset(('Enter', 'Escape', 'Tab', 'Up', 'Down', 'Left', 'Right', 'Space',
@@ -652,6 +654,12 @@ class Watchdog:
             rt.transaction('watch-frozen-' + uuid.uuid4().hex, lambda: rt.hold(
                 slot, 'frozen (' + why + '); pane ' + pane + ' is not in this fleet\'s registry, not killed'))
             return False
+        if slot == advisor.SLOT:
+            # §27: one advisor fault branch (retire, next generation by the supervisor, queued consultations fall
+            # back on failure); its in-flight consultation is cancelled and that slot falls back. Never raises.
+            f.advisor_restart('frozen: ' + why)
+            self.next_check.pop(slot, None)
+            return f.agent(slot).get('state') == 'starting'
         lease = f.r.hgetall(rt.bus.lease_key(slot))
         msg = rt.bus.message(lease['message_id']) if lease.get('message_id') else {}
         hid = 'frozen-' + uuid.uuid4().hex[:8]

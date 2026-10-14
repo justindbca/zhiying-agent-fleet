@@ -16,7 +16,7 @@ from pathlib import Path
 
 import redis
 
-from cmux_fleet import claude_hook, clear_after_result, cli_pairs, contracts
+from cmux_fleet import advisor, claude_hook, clear_after_result, cli_pairs, contracts
 from cmux_fleet.message_bus import BusError, MessageBus, LUA_REBIND_CHECK, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
 from cmux_fleet import codex_queue, lifecycle_close, named_subfleet, subfleet, tui_cards
@@ -58,7 +58,10 @@ def tui_slot(cfg, slot):
     """Official interactive CLIs (Codex/Claude) have no in-process bridge: the daemon
     receives their delivery and hands the business text to the TUI (typed for Codex and a
     Claude supervisor; through the Stop-hook mailbox for Claude workers, see claude_hook);
-    the CLI's own turn-end hook (Codex notify / Claude Stop) settles it."""
+    the CLI's own turn-end hook (Codex notify / Claude Stop) settles it. The resident advisor is always
+    official Claude (docs/design.md §27)."""
+    if slot == advisor.SLOT:
+        return cfg.get('transport_version') == 2
     return cfg.get('transport_version') == 2 and (
         cfg.get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') or 'codex') != 'pi'
 
@@ -103,6 +106,8 @@ def tui_candidates(slot, purpose, text, mode='task'):
     """
     if purpose == 'handoff':
         return []
+    if slot == advisor.SLOT:  # the raw answer: the waiting slot validates it as a configuration sheet (§27)
+        return [{'tool': 'advisor_sheet', 'value': {'text': text}}]
     try:
         value = json.loads(text[text.index('{'):text.rindex('}') + 1])
     except ValueError:
@@ -431,7 +436,7 @@ class RuntimeV2:
             text = text.replace('Continue the current task using the AGENTS.md decision JSON.', 'Continue the current task using fleet_decision.')
         self.queue_index += 1
         mid = 'm-' + digest(self.context['intent_id'] + ':' + str(self.queue_index))[:32]
-        body = {'text': text, 'title': '派工任务' if slot != 'supervisor' else '待处理业务',
+        body = {'text': text, 'title': '顾问会诊' if kind == 'advisor' else '派工任务' if slot != 'supervisor' else '待处理业务',
                 'mode': self.f.cfg['mode'], 'purpose': kind}
         if self.f.service and head and slot != 'supervisor':
             body['reply'] = json.loads(self.f.r.hget(REQ + request_id, 'spec'))['reply']
@@ -642,7 +647,10 @@ class RuntimeV2:
                 elif (info.get('launch_ready', '1') != '1'
                         or ev.get('failed') or ev.get('aborted') or not text_ok):
                     self.f.setf(slot, state='dead', runtime_ready=0, bridge_available=0)
-                    self.f.finish('blocked', slot + ': startup failed before READY')
+                    if slot == advisor.SLOT:  # §27: restarted in place by advisor_tick, never blocks the task
+                        self.audit('advisor.startup_failed', slot=slot, level='error')
+                    else:
+                        self.f.finish('blocked', slot + ': startup failed before READY')
                     self.reply(ev, {'status': 'rejected', 'reason': 'startup did not settle with READY'})
                 else:
                     self.f.pi_metadata(slot, ev)
@@ -890,6 +898,17 @@ class RuntimeV2:
         candidates = ev.get('candidates')
         purpose = msg['body'].get('purpose')
         error = None
+        if slot == advisor.SLOT and purpose != 'handoff':
+            # §27: the advisor's answer to one consultation. Never a report, never task state, never the brake:
+            # the waiting slot reads and validates it (Fleet.advisor_poll); a wall restarts the tab.
+            if ev.get('aborted') is not False or ev.get('failed') is not False or ev.get('unfinished'):
+                self.hold(slot, 'aborted/error/unfinished settlement; execution stop unconfirmed')
+                return
+            first = candidates[0] if isinstance(candidates, list) and len(candidates) == 1 else {}
+            text = str(((first.get('value') if isinstance(first, dict) else None) or {}).get('text') or '')
+            self.release(env, {'advisor_reply': text[-4000:]})
+            self.f.advisor_settled(env['request_id'], env['message_id'], text)
+            return
         if purpose != 'handoff' and self.wall_settle(slot, ev, env, msg):
             return
         if ev.get('aborted') is not False or ev.get('failed') is not False or ev.get('unfinished'):
@@ -1226,6 +1245,11 @@ class RuntimeV2:
             if public_status and r.hgetall(legacy.REQ + rid):
                 self.publish(rid, public_status, worker=self.f.label(slot), error=reason)
         self.audit('execution.held', slot=slot, message_id=mid or '', level='error', error=reason)
+        if slot == advisor.SLOT:
+            # §27: an advisor fault never pauses the fleet nor holds another slot. Its consultation falls back
+            # (the waiting slot sees the uncertain message) and advisor_tick restarts the tab in place.
+            self.f.setf(slot, advisor_fault=reason[:300])
+            return
         if public_status is None:
             card = routing_card(self.f.label(slot) + ' 执行状态未确认，已暂停派工；原执行尚未确认停止。详情见 control。',
                                 kind='notice', slot=self.f.label(slot), severity='warn')
@@ -1340,7 +1364,10 @@ class RuntimeV2:
             self.audit('resume.reattached', slot=slot, generation=self.f.agent(slot).get('generation'))
         # A delegated slot's pane is run by its sub-fleet (resumed below): never replace it here.
         delegated = [s for s in self.f.workers if self.f.agent(s).get('state') == 'delegated']
-        self.respawn([s for s in self.f.names if s not in reattach and s not in delegated], page)
+        # The advisor tab's next generation goes through its own fault branch (§27): never blocks the resume.
+        self.respawn([s for s in self.f.names if s not in reattach and s not in delegated and s != advisor.SLOT], page)
+        if advisor.SLOT in self.f.names:
+            self.f.advisor_restart('start --resume', source='resume')
         ran = self.codex_ran(unsettled)  # only now: respawn closed those sessions (never reattached)
         lost = [m for m in lost if m['message_id'] not in ran]
         self.f.resume()
@@ -1752,8 +1779,8 @@ class RuntimeV2:
             for mid in self.f.r.lrange(self.bus.pending_key(slot), 0, -1):
                 msg = dict(message_id=mid)
                 self.cancel_queued(slot, msg, reason)
-            if self.f.r.hget(self.bus.lease_key(slot), 'current_delivery'):
-                self.hold(slot, status + ': ' + reason)
+            if self.f.r.hget(self.bus.lease_key(slot), 'current_delivery') and slot != advisor.SLOT:
+                self.hold(slot, status + ': ' + reason)  # the advisor's answer just comes late and is ignored (§27)
         self.audit('task.' + status, request_id=self.f.task().get('id', ''), detail={'reason': reason})
 
     def offer_handoff(self, slot, prompt):
@@ -1848,7 +1875,10 @@ class RuntimeV2:
                         and info.get('prompt_wait') != 'startup-g' + str(info.get('generation', '0'))
                         and now >= float(info.get('startup_deadline') or 0)):
                     self.f.setf(slot, state='dead', bridge_available=0, runtime_ready=0)
-                    self.finish('blocked', slot + ' startup timed out before READY')
+                    if slot == advisor.SLOT:  # §27: restarted in place by advisor_tick, never blocks the task
+                        self.audit('advisor.startup_timeout', slot=slot, level='error')
+                    else:
+                        self.finish('blocked', slot + ' startup timed out before READY')
                 elif state.get('current_delivery') and state.get('status') not in ('uncertain', 'expired'):
                     mid = state['message_id']
                     deadline = int(self.f.r.hget(self.bus.msg_key(mid), 'deadline_at'))

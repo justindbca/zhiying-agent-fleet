@@ -144,6 +144,13 @@ BRAKE = 'fx:brake'  # budget card + counters + last trip of the current task / s
 ADVICE, ADVICE_SEQ, ADVICE_PENDING, ADVICE_NOTES = 'fx:advice:', 'fx:advice:seq', 'fx:advice:pending:', 'fx:advice:notes'
 # Mid-task rescue (advisor plan §3.2): supervisor consult items waiting for an idle slot, relays per task+slot.
 RESCUE, RESCUE_RELAYS = 'fx:advice:rescue', 'fx:advice:relays'
+# Resident advisor slot (docs/design.md §27, v2 task mode): its tab sits in the supervisor's pane; the first
+# generation is labelled 'advisor', successors advisor-1.1, advisor-1.2 (like supervisor-1.1).
+ADVISOR, ADVISOR_BASE = advisor.SLOT, 'advisor-1'
+ADVICE_WAIT = 180  # s a consultation may wait for the advisor (READY / queue), and again once it has it
+ADVISOR_RESTART_GAP = 60  # s between two in-place restarts of a failed advisor tab
+# The one rescue consultation out with the resident advisor; the tickets its handoff note lists.
+RESCUE_PENDING, ADVICE_RECENT = 'fx:advice:rescue_pending', 'fx:advice:recent'
 RESCUE_FIELDS = ('rescue_note', 'rescue_launch', 'rescue_hint', 'rescue_relay', 'advice_preset')
 
 
@@ -168,6 +175,8 @@ def connect(cfg, socket_timeout=5):
 
 
 def agent_cwd(cfg, name):
+    if name == ADVISOR:
+        return Path(cfg['run']) / 'advisor'  # the one-shot advisor's cwd too: one transcript directory per run
     if name == 'supervisor' and cfg.get('supervisor_cwd'):
         return Path(cfg['supervisor_cwd'])  # sub-fleet: the adopted worker pane keeps its own directory
     run = Path(cfg['run'])
@@ -176,6 +185,11 @@ def agent_cwd(cfg, name):
 
 def key(kind, name):
     return 'fx:' + kind + ':' + name
+
+
+def slot_base(name):
+    """The label stem of a slot's successors: supervisor-1.1, advisor-1.1, worker-1.1."""
+    return SUPERVISOR_LABEL if name == 'supervisor' else ADVISOR_BASE if name == ADVISOR else name
 
 
 def manager_for(cfg):
@@ -234,6 +248,8 @@ def trust_agent_dir(home, cwd):
 
 
 def agent_cli(cfg, name):
+    if name == ADVISOR:
+        return 'claude'  # always the official Claude CLI, whatever --worker-cli the run has (§27)
     return cfg.get('supervisor_cli' if name == 'supervisor' else 'worker_cli') or 'codex'
 
 
@@ -1299,7 +1315,7 @@ def tui_turn(cfg, name, generation, *, thread, transcript, text, inputs, wait=No
     (Claude: its typed text; Codex: the rollout proves the queued delivery started `turn`, see
     codex_queue.bound). The daemon validates identity, lease, fence and schema as for Pi.
     """
-    if name not in ['supervisor'] + cfg['workers'] or not runtime_v2.tui_slot(cfg, name):
+    if name not in ['supervisor', ADVISOR] + cfg['workers'] or not runtime_v2.tui_slot(cfg, name):
         raise ValueError('turn hook must name an official-CLI v2 agent in this fleet')
     # Events are durable either way; waiting long only keeps this generation's startup
     # sequence (bind -> register -> READY) intact while the daemon is still spawning tabs.
@@ -1510,6 +1526,14 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
         # An API error ends the turn with StopFailure instead of Stop: no hook waits afterwards.
         hooks['StopFailure'] = [{'hooks': [{'type': 'command', 'timeout': 30, 'command': shlex.join(
             [cfg['python'], str(Path(__file__).resolve()), 'claude-stop-failure', str(cfg_path), name, str(generation)])}]}]
+    if name == ADVISOR:
+        # Resident advisor (§27): the one-shot advisor's flags, only Read, and this file's hooks.
+        settings.write_text(json.dumps({'hooks': hooks, 'autoMemoryEnabled': False,
+                                        'env': dict(CLAUDE_ENV, **(claude_hook.ENV if hooked else {}))}))
+        argv = advisor.resident_argv(cfg, cfg['run'], settings)
+        if hooked:
+            argv += ['--append-system-prompt', claude_hook.DECLARATION]
+        return argv + ['--', prompt]  # --add-dir is variadic: end options first
     if clear_after_result.enabled(cfg, name):
         # exec ensures the PID reported by the hook is the process Claude waits for.
         hooks['Stop'][0]['hooks'][0]['command'] = 'exec ' + hook
@@ -1547,6 +1571,8 @@ def claude_argv(cfg_path, cfg, name, generation, prompt):
 
 
 def claude_model(cfg, name):
+    if name == ADVISOR:
+        return advisor.MODEL
     if name == 'supervisor':
         return cfg.get('supervisor_model') or DEFAULTS['supervisor_model']
     return cfg.get('worker_model') or DEFAULTS['worker_model']
@@ -1576,7 +1602,8 @@ def pi_event(cfg_path, name, generation, raw):
 
 def actor(cfg_path, name, prompt, generation=None):
     cfg = agent_cfg(load(cfg_path), name)
-    runtime_v2.validate_config(cfg)
+    if name != ADVISOR:  # the advisor's CLI is its identity (§27), not a supervisor x worker pair choice
+        runtime_v2.validate_config(cfg)
     r = connect(cfg)
     info = r.hgetall(key('agent', name))
     # Every daemon launch pins this value in argv, never adopts a newer generation.
@@ -1640,7 +1667,11 @@ class Fleet:
         self.r, self.mgr = r, mgr
         self.sessions = Path(sessions) if sessions else sessions_dir(self.cfg)
         self.workers = list(self.cfg['workers'])
-        self.names = ['supervisor'] + self.workers
+        # The resident advisor tab (§27) is a slot (bus, hooks, watchdog, handoff), never a worker. A restarted
+        # daemon finds it from Redis; a new run starts it in start_all.
+        advisor_info = self.r.hgetall(key('agent', ADVISOR))
+        self.advisor_slot = advisor_info.get('role') == 'advisor' and advisor_info.get('state') != 'retired'
+        self.names = self.slot_names()
         # Hot roster (start --roster): workers missing from `desired` are retiring. They finish
         # queued work, then retire; until then they still count as busy but take no new work.
         self.desired = list(self.workers)
@@ -1678,9 +1709,27 @@ class Fleet:
         elif self.r.hget(SERVICE, 'advisor') == 'on':  # resumed after the roster turned it off
             self.r.hset(SERVICE, mapping={'advisor': 'off', 'advisor_by': 'user', 'advisor_at': time.time()})
 
-    # -- advisor switch (advisor plan §2.1): every advisor gate asks advisor_online()
-    def advisor_online(self):
+    # -- advisor switch (advisor plan §2.1). Switch and readiness are two questions (design §27):
+    # advisor_enabled() = the roster switch (holds first generations, accepts consults, off notes);
+    # advisor_ready() = a consultation can be answered now (the resident tab is idle / busy).
+    def advisor_enabled(self):
         return self.cfg.get('advisor') is True
+
+    advisor_online = advisor_enabled  # the earlier name of the switch
+
+    def advisor_resident(self):
+        """Consultations go to the resident advisor tab: transport v2, task mode, a main fleet. Otherwise
+        (v1, service mode, a sub-fleet, or a test that injects advisor_runner) the one-shot `claude -p`
+        runner answers them at once, as before."""
+        return bool(self.v2) and not self.service and not self.cfg.get('adopt') and self.advisor_runner is None
+
+    def advisor_ready(self):
+        if not self.advisor_enabled():
+            return False
+        return not self.advisor_resident() or (self.advisor_slot and self.agent(ADVISOR).get('state') in ('idle', 'busy'))
+
+    def slot_names(self):
+        return ['supervisor'] + self.workers + ([ADVISOR] if self.advisor_slot else [])
 
     def roster_advisor(self):
         """advisor on/off from the roster file at daemon start (a bad file: off; roster_tick reports it)."""
@@ -1721,11 +1770,18 @@ class Fleet:
             for name in self.workers:
                 if self.r.llen(ADVICE_PENDING + name):
                     self.r.delete(ADVICE_PENDING + name)
+                self.drop_advice_pending(name, 'advisor turned off')  # the message goes out with its runtime now
                 info = self.agent(name)
                 if info.get('advice_hold') == '1' and info.get('launch_ready') == '0':
                     self.release_default(name)
                 else:
                     self.drop_advice_wait(name)
+            rescue = json.loads(self.r.get(RESCUE_PENDING) or 'null')
+            if rescue:  # the consult out with the resident advisor: answered like one queued while on
+                self.r.delete(RESCUE_PENDING)
+                self.advisor_abandon(rescue['ticket'], 'advisor turned off')
+                if self.running():
+                    self.queue('supervisor', self.consult_off_note([rescue['req']]) + '\nReply with the JSON format from AGENTS.md.')
         state = 'on' if on else 'off'
         self.r.hset(SERVICE, mapping={'advisor': state, 'advisor_by': who, 'advisor_at': time.time()})
         self.log('advisor.' + state, who=who)
@@ -1755,6 +1811,10 @@ class Fleet:
         return self.r.hgetall(key('agent', name))
 
     def runtime_cfg(self, name):
+        if name == ADVISOR:  # fixed: official Claude CLI, fable / high, no launch record (§27)
+            cfg = {k: v for k, v in self.cfg.items() if k != 'advisor'}
+            cfg.update(worker_cli='claude', worker_model=advisor.MODEL, worker_effort=advisor.EFFORT)
+            return cfg
         launch = json.loads(self.agent(name).get('runtime_launch') or '{}')
         cfg = pi_adapter.for_agent(self.cfg, name, launch.get('overrides'))
         if (launch.get('extras') or {}).get('effort'):
@@ -2000,6 +2060,8 @@ class Fleet:
     def spawn(self, name, prompt, *, launch_held=False, advice_hold=False, advised=None):
         """``advised``: only a slot's first generation (spawn_ready) passes it, from the advisor switch;
         every later generation replays the slot's launch record (advised_layout), whatever the switch says."""
+        if name == ADVISOR:
+            return self.spawn_advisor(prompt, launch_held=launch_held)
         cfg = self.runtime_cfg(name)
         info = self.agent(name)
         generation = int(info.get('generation', 0))
@@ -2079,6 +2141,43 @@ class Fleet:
         self.log('spawn', agent=name, generation=generation, pane=result.pane_id)
         return result.pane_id
 
+    def spawn_advisor(self, prompt, launch_held=False):
+        """One generation of the resident advisor tab (§27): fixed argv (claude_argv), cwd <run>/advisor, the
+        role prompt <run>/advisor.md; no AGENTS.md, no kit, no domains, no launch record."""
+        name = ADVISOR
+        generation = int(self.agent(name).get('generation') or 0)
+        prompt = prompt.replace(' Read AGENTS.md in the current directory first.', '')  # its role is advisor.md
+        cfg_path = self.run_dir / 'runtime' / (name + '-g' + str(generation) + '.json')
+        save(cfg_path, self.runtime_cfg(name))
+        cwd = agent_cwd(self.cfg, name)
+        cwd.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / 'handoffs').mkdir(parents=True, exist_ok=True)  # --add-dir must exist
+        (self.run_dir / 'advisor.md').write_text(advisor.PROMPT.read_text() + advisor.RESIDENT_NOTE)
+        trust_claude_dir(cwd)
+        self.setf(name, role='advisor', generation=generation, state='starting', thread='', pane='',
+                  transcript='', ctx_used=0, ctx_window=0, msg_id='', msg_done='', busy_since=time.time(),
+                  delivered=0, retry_at=0, last_msg='', empty_tries=0, launch_ready=int(not launch_held),
+                  runtime_ready=0, idle_confirmed=0, bridge_available=0, spawn_failed=0, advisor_fault='',
+                  startup_deadline=time.time() + float(self.cfg['profile_ready_timeout']))
+        prompt_file = self.run_dir / 'prompts' / (name + '-g' + str(generation) + '.md')
+        prompt_file.parent.mkdir(parents=True, exist_ok=True)
+        prompt_file.write_text(prompt)
+        result = self.mgr.spawn_interactive_cli(
+            window_name='fx-' + self.cfg.get('tab_prefix', '') + self.label(name), prompt_file=str(prompt_file),
+            start_directory=str(cwd),
+            cli_command=shlex.join([self.cfg['python'], str(Path(__file__).resolve()), 'actor', str(cfg_path), name,
+                                    '--generation', str(generation)]),
+            output_file=str(self.run_dir / 'prompts' / (name + '-g' + str(generation) + '.terminal.log')),
+            auto_close=False, metadata={'type': 'advisor', 'cli_type': 'claude', 'profile': advisor.MODEL},
+            env_vars=dict({'PATH': os.environ.get('PATH', '')}, **CLAUDE_ENV))
+        if not result.success:
+            if result.pane_id:
+                self.setf(name, pane=result.pane_id)
+            raise RuntimeError('spawn failed: ' + name + ': ' + str(result.error))
+        self.setf(name, pane=result.pane_id)
+        self.log('spawn', agent=name, generation=generation, pane=result.pane_id)
+        return result.pane_id
+
     def advised_layout(self, name):
         """Whether this slot's next generation is laid out advised (domain kit links + RULES in CLAUDE.md,
         --setting-sources project, --strict-mcp-config, --effort), read only from the slot's launch record:
@@ -2129,6 +2228,8 @@ class Fleet:
                                              [self.agent(w)['pane'] for w in self.workers],
                                              history.page_url(self.run_dir))
         self.r.hset(SERVICE, mapping={'history_pane': self.history_pane or ''})
+        if self.advisor_resident() and self.advisor_enabled():
+            self.advisor_start()  # its tab next to the supervisor's; the held first workers wait for it
 
     def history_slots(self):
         # Workers removed from the roster keep their history (they have entries but no slot).
@@ -3307,7 +3408,7 @@ class Fleet:
         if use_contracts:
             self.contracts_text = None
             self.save_contract(contracts.new_state(skeleton_worker))
-            for name in self.names:
+            for name in ['supervisor'] + self.workers:  # never the advisor: it sees only consultations
                 cwd = agent_cwd(self.cfg, name)
                 cwd.mkdir(parents=True, exist_ok=True)
                 (cwd / 'CONTRACTS.md').write_text(self.contract_doc('supervisor' if name == 'supervisor' else 'worker', name))
@@ -3325,9 +3426,14 @@ class Fleet:
                 self.r.delete(ADVICE_PENDING + w)
         if self.r.llen(RESCUE):  # an earlier task's consults and rescue leftovers never act in this one
             self.r.delete(RESCUE)
+        rescue = json.loads(self.r.get(RESCUE_PENDING) or 'null')
+        if rescue:
+            self.r.delete(RESCUE_PENDING)
+            self.advisor_abandon(rescue['ticket'], 'a new task started')
         for w in self.workers:
             info = self.agent(w)
             self.drop_advice_wait(w)
+            self.drop_advice_pending(w, 'a new task started')
             left = {k: '' for k in RESCUE_FIELDS + ('advice_domains',) if info.get(k)}
             if left:
                 self.setf(w, **left)
@@ -3503,7 +3609,7 @@ class Fleet:
         busy = sum(self.agent(w).get('state') in ('busy', 'handoff', 'held') for w in self.workers)
         for name in self.names:
             info = self.agent(name)
-            if name != 'supervisor' and cap and busy >= cap:
+            if name in self.workers and cap and busy >= cap:
                 continue  # e.g. a local model server that rejects concurrent large requests
             if (info.get('advice_hold') == '1' and info.get('state') == 'starting'
                     and info.get('launch_ready') == '0' and (self.inbox_depth(name) or not self.advisor_online())):
@@ -3515,7 +3621,7 @@ class Fleet:
             if (info.get('state') == 'idle' and self.inbox_depth(name)
                     and time.time() >= float(info.get('retry_at') or 0)):
                 self.deliver(name)
-                if name != 'supervisor' and self.agent(name).get('state') in ('busy', 'handoff'):
+                if name in self.workers and self.agent(name).get('state') in ('busy', 'handoff'):
                     busy += 1
 
     def handoff_limits(self, name):
@@ -3606,7 +3712,7 @@ class Fleet:
         if not pending:
             return
         text = pending[0]
-        if name != 'supervisor' and not self.service:
+        if name in self.workers and not self.service:
             head = SUPERVISOR_INSTRUCTION_HEAD.search(text)
             if self.v2:
                 mid = self.v2.bus.pending(name, 1)[0]
@@ -3738,10 +3844,9 @@ class Fleet:
                 return entry
         return None
 
-    def advise(self, name, entry, cli, cfg, kind='dispatch'):
-        """One consultation (with one retry). Returns the validated or fallback sheet.
-
-        ``kind`` is reserved for the mid-task rescue path (phase 2: consult / respawn / reassign)."""
+    def advice_context(self, name, cli, cfg):
+        """What one pre-dispatch consultation of ``name`` is checked against (re-read per consultation and,
+        for a resident one, again when its answer is read)."""
         try:
             registry, registry_error = AgentRegistry(), None
         except (OSError, ValueError) as exc:  # a broken card file: treat as advisor unavailable (§8), never exit
@@ -3751,6 +3856,24 @@ class Fleet:
         current = advisor.fingerprint(cli, model, effort)
         models = list(dict.fromkeys(([model] if model else []) + list(cards)))
         whitelist = (cards[model].kit_domains if model in cards else None)
+        matrix, matrix_error = advisor.load_matrix()
+        catalog = self.kit.domains_catalog() if self.kit and cli == 'claude' else []
+
+        def check(raw):
+            target = raw.get('model')
+            wl = cards[target].kit_domains if target in cards else whitelist
+            return advisor.validate(raw, cli=cli, models=models, current=current,
+                                    catalog=[c['name'] for c in catalog], whitelist=wl, matrix=matrix, cards=cards)
+        return dict(registry=registry, registry_error=registry_error, cards=cards, model=model, effort=effort,
+                    current=current, models=models, matrix=matrix, matrix_error=matrix_error, catalog=catalog,
+                    check=check)
+
+    def advise(self, name, entry, cli, cfg, kind='dispatch', identity=''):
+        """One consultation: (sheet, current, cards, registry) with the validated or fallback sheet, or None
+        while the resident advisor has not answered (the caller keeps its message queued and asks again on a
+        later pump through advice_poll; design §27). The one-shot runner answers at once (one retry).
+        ``kind`` is reserved for the mid-task rescue path (phase 2: consult / respawn / reassign)."""
+        ctx = self.advice_context(name, cli, cfg)
         info = self.agent(name)
         installed = json.loads(info.get('installed_domains') or '[]')
         preset = json.loads(info.get('advice_preset') or '{}')
@@ -3760,28 +3883,36 @@ class Fleet:
             self.setf(name, advice_preset='')
             self.log('advice.preset', agent=name, ticket=preset['sheet']['ticket'], task=entry['task'])
             sheet = {k: v for k, v in preset['sheet'].items() if k not in ('action', 'to', 'handoff_hint')}
-            return sheet, current, cards, registry
-        matrix, matrix_error = advisor.load_matrix()
-        catalog = self.kit.domains_catalog() if self.kit and cli == 'claude' else []
+            return sheet, ctx['current'], ctx['cards'], ctx['registry']
         payload = advisor.build_input(
             kind=kind, goal=self.task().get('goal', ''), instruction=entry['instruction'], advise_note=entry.get('note', ''),
-            slot={'name': name, 'cli': cli, 'generation': int(info.get('generation') or 0), 'model': model,
-                  'effort': effort, 'installed_domains': installed},
-            models=models, matrix=matrix, catalog=catalog)
-
-        def check(raw):
-            target = raw.get('model')
-            wl = cards[target].kit_domains if target in cards else whitelist
-            return advisor.validate(raw, cli=cli, models=models, current=current,
-                                    catalog=[c['name'] for c in catalog], whitelist=wl, matrix=matrix, cards=cards)
-        runner = self.advisor_runner or (lambda data: advisor.run_claude(data, cfg=self.cfg, run_dir=self.run_dir))
+            slot={'name': name, 'cli': cli, 'generation': int(info.get('generation') or 0), 'model': ctx['model'],
+                  'effort': ctx['effort'], 'installed_domains': installed},
+            models=ctx['models'], matrix=ctx['matrix'], catalog=ctx['catalog'])
+        view = json.dumps({k: payload[k] for k in ('goal', 'instruction', 'advise_note', 'slot')},
+                          ensure_ascii=False)[:4000]
         started = time.time()
-        if registry_error:
-            sheet, envelope, errors = None, None, [registry_error]
+        if self.advisor_resident() and not ctx['registry_error']:
+            ticket = self.new_ticket()
+            if self.advisor_request(ticket, name, kind, payload, view):
+                self.setf(name, advice_pending=json.dumps({'ticket': ticket, 'msg': identity, 'kind': kind},
+                                                          ensure_ascii=False))
+                return None
+            sheet, envelope, errors = None, None, ['advisor tab could not be started']
         else:
-            sheet, envelope, errors = advisor.consult(payload, runner, check)
-        seq = self.r.hincrby(ADVICE_SEQ, 'n', 1)
-        ticket = 'adv-' + str(self.cfg.get('token') or self.run_dir.name[-8:]) + '-' + str(seq)
+            runner = self.advisor_runner or (lambda data: advisor.run_claude(data, cfg=self.cfg, run_dir=self.run_dir))
+            if ctx['registry_error']:
+                sheet, envelope, errors = None, None, [ctx['registry_error']]
+            else:
+                sheet, envelope, errors = advisor.consult(payload, runner, ctx['check'])
+            ticket = self.new_ticket()
+        return self.advice_finish(name, kind, ticket, sheet, envelope, errors, ctx, view, started)
+
+    def advice_finish(self, name, kind, ticket, sheet, envelope, errors, ctx, view, started):
+        """Close a pre-dispatch consultation: the fallback sheet when there is no valid one (§8), the audit hash
+        fx:advice:<ticket>, the supervisor note, the slot's advice_last."""
+        info = self.agent(name)
+        model, effort, models = ctx['model'], ctx['effort'], ctx['models']
         unavailable = sheet is None
         if unavailable:
             last = json.loads(info.get('advice_last') or '{}')
@@ -3790,23 +3921,303 @@ class Fleet:
             else:  # the slot's running runtime, no domains: never forces a respawn (§8 reading, see report)
                 sheet = {'model': model, 'effort': effort, 'domains': [], 'reason': 'advisor unavailable: running runtime, domains []'}
         sheet['ticket'] = ticket
-        audit = {'slot': name, 'task': self.task().get('id', ''), 'kind': kind,
-                 'input': json.dumps({k: payload[k] for k in ('goal', 'instruction', 'advise_note', 'slot')},
-                                     ensure_ascii=False)[:4000],
+        audit = {'slot': name, 'task': self.task().get('id', ''), 'kind': kind, 'input': view,
                  'output': json.dumps(sheet, ensure_ascii=False), 'errors': json.dumps(errors, ensure_ascii=False),
                  'elapsed_s': round(time.time() - started, 3), 'status': 'unavailable' if unavailable else 'ok',
                  'at': time.time()}
         audit.update(advisor.usage_fields(envelope))
-        if matrix_error:
-            audit['matrix_error'] = matrix_error[:500]
+        if ctx['matrix_error']:
+            audit['matrix_error'] = ctx['matrix_error'][:500]
         self.r.hset(ADVICE + ticket, mapping=audit)
+        self.advice_recent(ticket)
         if unavailable:
             self.log('advice.unavailable', agent=name, ticket=ticket, errors=errors)
             self.r.rpush(ADVICE_NOTES, '[advisor unavailable] 按缺省派出 ' + self.label(name) + '（' + sheet['reason'] + '）')
         if sheet.get('capability_gap'):
             self.log('capability.gap', agent=name, ticket=ticket, capability=sheet.get('capability'), model=sheet['model'])
         self.setf(name, advice_last=json.dumps({'task': self.task().get('id', ''), 'sheet': sheet}, ensure_ascii=False))
-        return sheet, current, cards, registry
+        return sheet, ctx['current'], ctx['cards'], ctx['registry']
+
+    def advice_poll(self, name, pending):
+        """A pre-dispatch consultation out with the resident advisor: None while it is still out, else what
+        advise() returns for it (the validated sheet, or the fallback after one correction / the time limit)."""
+        cfg, ctx = self.runtime_cfg(name), {}
+
+        def context():  # read the cards / matrix only once there is an answer to check (not on every pump)
+            if not ctx:
+                ctx.update(self.advice_context(name, agent_cli(cfg, name), cfg))
+            return ctx
+        state, sheet, errors = self.advisor_poll(pending['ticket'], lambda raw: context()['check'](raw))
+        if state == 'wait':
+            return None
+        self.setf(name, advice_pending='')
+        t = self.r.hgetall(ADVICE + pending['ticket'])
+        return self.advice_finish(name, pending.get('kind') or 'dispatch', pending['ticket'], sheet, None, errors,
+                                  context(), t.get('input', ''), float(t.get('started') or time.time()))
+
+    def advice_pending_for(self, name, identity):
+        """The resident consultation this queued message waits for, or None. A pending consultation of another
+        message (that message left the queue) is abandoned."""
+        pending = json.loads(self.agent(name).get('advice_pending') or 'null')
+        if pending and pending.get('msg') != identity:
+            self.drop_advice_pending(name, 'the advised message left the queue')
+            return None
+        return pending
+
+    def drop_advice_pending(self, name, why):
+        pending = json.loads(self.agent(name).get('advice_pending') or 'null')
+        if pending:
+            self.setf(name, advice_pending='')
+            self.advisor_abandon(pending['ticket'], why)
+
+    # -- resident advisor tab (docs/design.md §27): consultations are queued to it and read back later
+    def new_ticket(self):
+        seq = self.r.hincrby(ADVICE_SEQ, 'n', 1)
+        return 'adv-' + str(self.cfg.get('token') or self.run_dir.name[-8:]) + '-' + str(seq)
+
+    def advice_recent(self, ticket):
+        """Tickets the advisor's handoff skeleton lists (sheets and reasons only, never worker text)."""
+        if self.advisor_resident():
+            self.r.rpush(ADVICE_RECENT, ticket)
+            self.r.ltrim(ADVICE_RECENT, -10, -1)
+
+    def advisor_send(self, ticket, request, error=''):
+        """Queue one consultation (or its correction) on the advisor's bus inbox; returns the message id."""
+        head = ('[Advisor correction ' + ticket + '] The daemon refused your last sheet: ' + ' '.join(error.split())[:500]
+                + '\nReply again with one corrected JSON sheet for this input.' if error
+                else '[Advisor consultation ' + ticket + ']')
+        return self.v2.queue(ADVISOR, head + '\n' + request, request_id=ticket, kind='advisor')
+
+    def advisor_request(self, ticket, slot, kind, payload, view):
+        """Queue a consultation for the resident advisor; its audit hash fx:advice:<ticket> is its state.
+        False when the tab cannot take it (it could not be started): the caller falls back at once (§8)."""
+        info = self.agent(ADVISOR)
+        if not self.advisor_enabled() or info.get('spawn_failed') == '1':
+            return False
+        now, state = time.time(), info.get('state') or 'not started'
+        ahead = self.inbox_depth(ADVISOR) + (state == 'busy')
+        request = json.dumps(payload, ensure_ascii=False)
+        mid = self.advisor_send(ticket, request)
+        self.r.hset(ADVICE + ticket, mapping={
+            'slot': slot, 'task': self.task().get('id', ''), 'kind': kind, 'input': view, 'request': request,
+            'status': 'pending', 'mid': mid, 'attempt': 1, 'phase': 'queued', 'deadline': now + ADVICE_WAIT,
+            'started': now, 'errors': '[]', 'at': now})
+        self.log('advice.queued', agent=slot, ticket=ticket, path=kind, advisor=state, ahead=ahead)
+        if state != 'idle' or ahead:  # merge seam M1: say once why the supervisor hears nothing for a while
+            why = ('顾问未就绪（' + state + '）' if state not in ('idle', 'busy') else '前面还有 ' + str(ahead) + ' 条会诊')
+            self.r.rpush(ADVICE_NOTES, '[advisor] waiting: ' + self.label(slot) + ' 的 ' + kind + ' 会诊排队中，' + why
+                         + '；最多等 ' + str(ADVICE_WAIT) + ' 秒，超时按缺省')
+        return True
+
+    def advisor_poll(self, ticket, check, request=None):
+        """('wait' | 'ok' | 'unavailable', sheet or None, errors) of a resident consultation. An unusable answer
+        gets one correction; a second one, the time limit, or a failed / cancelled advisor turn: unavailable.
+        ``request``: the input as it is now (rescue: idle slots may have changed), sent with the correction."""
+        t = self.r.hgetall(ADVICE + ticket)
+        errors = json.loads(t.get('errors') or '[]')
+        now = time.time()
+        if t.get('status') == 'answered':
+            try:
+                return 'ok', check(advisor.sheet_text({'result': t.get('raw') or ''})), errors
+            except (advisor.AdviceError, ValueError, KeyError, TypeError) as exc:
+                errors.append(str(exc)[:500])
+            attempt = int(t.get('attempt') or 1)
+            if attempt >= advisor.ATTEMPTS or not self.advisor_enabled():
+                return 'unavailable', None, errors
+            request = request or t.get('request') or ''
+            mid = self.advisor_send(ticket, request, error=errors[-1])
+            self.r.hset(ADVICE + ticket, mapping={'status': 'pending', 'mid': mid, 'attempt': attempt + 1, 'request': request,
+                                                  'phase': 'queued', 'deadline': now + ADVICE_WAIT, 'raw': '',
+                                                  'errors': json.dumps(errors, ensure_ascii=False)})
+            self.log('advice.correction', ticket=ticket, attempt=attempt + 1, error=errors[-1])
+            return 'wait', None, errors
+        if t.get('status') != 'pending':  # failed (a wall), abandoned, or already closed
+            return 'unavailable', None, errors
+        msg = self.v2.bus.message(t['mid']) if t.get('mid') else {}
+        status = msg.get('status')
+        if status in ('uncertain', 'expired') or (status == 'committed' and msg.get('outcome') != 'completed'):
+            # The advisor turn failed, was held (fault, closed tab) or cancelled (restart / resume): §8 at once.
+            errors.append('advisor turn ' + (msg.get('outcome') or status) + ': '
+                          + str(msg.get('uncertain_reason') or msg.get('cancel_reason') or '')[:300])
+            return 'unavailable', None, errors
+        if self.agent(ADVISOR).get('spawn_failed') == '1':
+            errors.append('advisor tab could not be started')
+            return 'unavailable', None, errors
+        if status in ('offered', 'received') and t.get('phase') == 'queued':
+            # The advisor has it now: the time limit starts again for the answer itself.
+            self.r.hset(ADVICE + ticket, mapping={'phase': 'answering', 'deadline': now + ADVICE_WAIT})
+            return 'wait', None, errors
+        if now >= float(t.get('deadline') or 0):
+            errors.append('advisor gave no sheet within ' + str(ADVICE_WAIT) + ' s ('
+                          + ('waiting for the advisor' if t.get('phase') == 'queued' else 'answering') + ')')
+            if status == 'queued':
+                self.advisor_cancel(t['mid'], 'consultation timed out')
+            return 'unavailable', None, errors
+        return 'wait', None, errors
+
+    def advisor_cancel(self, mid, why):
+        if self.v2 and self.r.hget(self.v2.bus.msg_key(mid), 'status') == 'queued':
+            self.v2.cancel_queued(ADVISOR, {'message_id': mid}, why)
+
+    def advisor_abandon(self, ticket, why):
+        """Nobody waits for this consultation any more: closed as unavailable, its queued message withdrawn."""
+        t = self.r.hgetall(ADVICE + ticket)
+        if t.get('status') not in ('pending', 'answered'):
+            return
+        errors = json.loads(t.get('errors') or '[]') + [why]
+        self.r.hset(ADVICE + ticket, mapping={'status': 'unavailable', 'effect': 'abandoned',
+                                              'errors': json.dumps(errors, ensure_ascii=False)})
+        if t.get('mid'):
+            self.advisor_cancel(t['mid'], why)
+        self.log('advice.abandoned', ticket=ticket, reason=why)
+
+    def advisor_settled(self, ticket, mid, text):
+        """The advisor's turn for one consultation ended (RuntimeV2.settle, inside its transaction): keep the raw
+        answer for the waiting slot to validate. Never a report, never task state (§27)."""
+        t = self.r.hgetall(ADVICE + ticket)
+        if t.get('status') != 'pending' or t.get('mid') != mid:
+            self.log('advice.late', ticket=ticket, message_id=mid)  # timed out / abandoned meanwhile: ignored
+            return
+        if len(text.strip()) <= brake.TURN_WALL_MAX and brake.classify_wall(text):
+            # A usage wall instead of a sheet: this consultation falls back now, the tab restarts in place.
+            errors = json.loads(t.get('errors') or '[]') + ['advisor hit a usage wall: ' + ' '.join(text.split())[:200]]
+            self.r.hset(ADVICE + ticket, mapping={'status': 'failed', 'errors': json.dumps(errors, ensure_ascii=False)})
+            self.setf(ADVISOR, advisor_fault='usage wall: ' + ' '.join(text.split())[:200])
+            return
+        self.r.hset(ADVICE + ticket, mapping={'status': 'answered', 'raw': text[-20000:]})
+
+    def advisor_skeleton(self, info, t):
+        """The advisor's handoff note (§27): recent sheets and their reasons from fx:advice:*, no worker text."""
+        done = []
+        for ticket in self.r.lrange(ADVICE_RECENT, 0, -1):
+            a = self.r.hgetall(ADVICE + ticket)
+            if a:
+                done.append(ticket + ' ' + a.get('kind', '') + ' ' + a.get('slot', '') + ' [' + a.get('status', '')
+                            + ']: ' + ' '.join((a.get('output') or '').split())[:400])
+        return handoff.build_skeleton(
+            info['handoff_id'], SESSION, 'fleet advisor: answer each consultation with one configuration sheet '
+            '(advisor.md); the lowest model / effort that is enough, the smallest set of domains',
+            done_lines=done, inprogress='none (handoff happens at an idle boundary)',
+            next_lines=['read this note, reply READY, then answer each consultation the daemon sends on its own input'],
+            pending='none', task=t.get('id', ''), hop=int(info['generation']) + 1,
+            key_files=[str(self.run_dir / 'advisor.md')],
+            risks=['earlier sheets are history, not input: never copy one without checking the matrix again',
+                   'zero memory: this note carries no worker conversation, only the daemon\'s audit of sheets'])
+
+    def advisor_start(self):
+        """The first generation of the advisor tab (run start, or the switch turned on), in the supervisor's
+        pane. A failed spawn falls back every consultation at once (§8) and is retried by advisor_tick."""
+        info = self.agent(ADVISOR)
+        generation = int(info['generation']) + 1 if info.get('generation') else 0
+        self.setf(ADVISOR, label='advisor' if generation == 0 else slot_base(ADVISOR) + '.' + str(generation),
+                  generation=generation, handoff_id='', restart_at=time.time() + ADVISOR_RESTART_GAP)
+        self.advisor_slot = True
+        self.names = self.slot_names()
+        try:
+            pane = self.spawn(ADVISOR, 'You are the fleet advisor ' + self.label(ADVISOR) + '. There is no '
+                              'consultation yet: your final reply must be exactly READY.')
+        except (Exception, SystemExit) as exc:
+            self.setf(ADVISOR, state='dead', spawn_failed=1, launch_ready=0)
+            self.log('advisor.spawn_failed', level='error', error=str(exc)[:500])
+            return
+        self.place_advisor(pane)
+        self.refresh_history()
+        self.log('advisor.started', generation=generation, pane=pane)
+
+    def place_advisor(self, pane):
+        """The advisor's tab joins the supervisor's pane (after the supervisor tab): the fixed explicit window."""
+        sup = self.agent('supervisor').get('pane')
+        if not (sup and self.mgr.tab_into(pane, sup, before=False)):
+            self.log('advisor.placement_failed', level='warning', pane=pane, supervisor=sup or '')
+
+    def advisor_tick(self):
+        """Resident advisor tab lifecycle, outside any v2 transaction (§27): start it when the switch turns on,
+        retire it once its current consultation is done when the switch turns off, restart it in place after
+        a fault (watchdog hold, closed tab, wall, startup timeout / failure). Never pauses or blocks the fleet."""
+        if not self.advisor_resident():
+            return
+        on, info = self.advisor_enabled(), self.agent(ADVISOR)
+        if not self.advisor_slot:
+            if on:
+                self.advisor_start()
+            return
+        busy = self.r.hget(self.v2.bus.lease_key(ADVISOR), 'status') in ('offered', 'received')
+        if not on:
+            if not busy and info.get('state') not in ('busy', 'handoff'):
+                self.advisor_retire()
+            return
+        failed = info.get('state') in ('dead', 'held') or info.get('advisor_fault')
+        if failed and not self.paused() and time.time() >= float(info.get('restart_at') or 0):
+            self.advisor_restart(info.get('advisor_fault') or ('startup failed' if info.get('state') == 'dead'
+                                                                else 'held'))
+
+    def advisor_retire(self):
+        info = self.agent(ADVISOR)
+        for mid in self.v2.bus.pending(ADVISOR):  # their tickets were abandoned when the switch went off
+            self.v2.cancel_queued(ADVISOR, {'message_id': mid}, 'advisor turned off')
+        if info.get('pane') and not self.v2.retire(ADVISOR, 'advisor turned off'):
+            self.log('advisor.retire_failed', level='error', pane=info['pane'])
+            return
+        history.record(self.run_dir, slot=ADVISOR, label=self.label(ADVISOR), generation=int(info.get('generation') or 0),
+                       handoff='', snapshot='', source='retired', timed_out=False)
+        self.setf(ADVISOR, state='retired', pane='', launch_ready=0, runtime_ready=0)
+        self.advisor_slot = False
+        self.names = self.slot_names()
+        self.refresh_history()
+        self.log('advisor.retired')
+
+    def advisor_restart(self, reason, source='advisor-restart'):
+        """Next generation of the advisor tab next to the supervisor: after a fault, for a §22 handoff
+        (``source='handoff'``) and on start --resume. Every failure here is an advisor fault (design §27 §2c-6):
+        nothing raises into the daemon, nothing blocks the task, pauses the fleet or holds another slot. On
+        failure the queued consultations are withdrawn (their slots fall back to the default on their next
+        pump) and advisor_tick tries the next generation again after ADVISOR_RESTART_GAP."""
+        info = self.agent(ADVISOR)
+        generation, old, prev = int(info.get('generation') or 0), info.get('pane'), self.label(ADVISOR)
+        self.setf(ADVISOR, restart_at=time.time() + ADVISOR_RESTART_GAP, advisor_fault='', handoff_id='')
+        try:
+            alive = bool(old) and self.mgr.get_pane_status(old) is not None
+            hid = ('handoff-' if source == 'handoff' else 'restart-') + uuid.uuid4().hex[:8]
+            note = self.run_dir / 'handoffs' / (ADVISOR + '-g' + str(generation) + '-' + hid + '.md')
+            note.parent.mkdir(parents=True, exist_ok=True)
+            note.write_text(self.skeleton(ADVISOR, dict(info, handoff_id=hid)))
+            snapshot = ''
+            if alive:  # retire first: two advisor sessions never run at once
+                snapshot = str(note.with_suffix('.terminal.txt'))
+                self.mgr.capture_to(old, snapshot)
+                if not self.mgr.kill_pane(old) or self.mgr.get_pane_status(old) is not None:
+                    return self.advisor_failed('held', reason, 'old advisor tab ' + prev + ' did not close')
+            self.v2.confirm_retired(ADVISOR)  # its in-flight consultation is cancelled: that slot falls back (§8)
+            history.record(self.run_dir, slot=ADVISOR, label=prev, generation=generation, handoff=str(note),
+                           snapshot=snapshot, source=source, timed_out=source != 'handoff')
+            label = slot_base(ADVISOR) + '.' + str(generation + 1)
+            self.setf(ADVISOR, generation=generation + 1, label=label)
+            why = ('took over at its context threshold' if source == 'handoff' else
+                   'the advisor tab ' + prev + ' failed: ' + ' '.join(reason.split())[:200])
+            pane = self.spawn(ADVISOR, '[Advisor takeover] You are ' + label + ' (' + why + '). Read the handoff note '
+                              + str(note) + '. In this turn only read the note and make your final reply exactly READY.')
+        except (Exception, SystemExit) as exc:
+            return self.advisor_failed('dead', reason, str(exc))
+        self.place_advisor(pane)
+        try:
+            self.refresh_history()
+        except Exception as exc:  # the page is cosmetic: never an advisor failure
+            self.log('advisor.history_failed', level='warning', error=str(exc)[:300])
+        self.log('advisor.restarted', prev=prev, label=label, reason=reason, source=source)
+
+    def advisor_failed(self, state, reason, error):
+        """The next advisor generation could not be started: dead (no tab) or held (old tab still there).
+        Queued consultations fall back now; advisor_tick retries after the gap."""
+        fields = dict(state=state, launch_ready=0, runtime_ready=0, advisor_fault=('restart failed: ' + error)[:300])
+        if state == 'dead':
+            fields['spawn_failed'] = 1
+        self.setf(ADVISOR, **fields)
+        try:
+            for mid in self.v2.bus.pending(ADVISOR):
+                self.v2.cancel_queued(ADVISOR, {'message_id': mid}, 'advisor restart failed')
+        except Exception as exc:
+            self.log('advisor.cancel_failed', level='error', error=str(exc)[:300])
+        self.log('advisor.restart_failed', level='error', reason=reason, error=error[:500])
 
     def advice_launch(self, cli, sheet, cards, registry):
         card = cards[sheet['model']]
@@ -3889,15 +4300,22 @@ class Fleet:
             except (OSError, ValueError, RuntimeError, KeyError, SystemExit, subprocess.SubprocessError) as exc:
                 self.block_profile(name, str(exc))
                 return False
-        if identity and info.get('advice_msg') == identity:
-            return True  # already advised (e.g. delivered again after the respawn's READY)
-        entry = self.take_pending_advice(name, text)
-        if entry is None:
-            return True
-        self.setf(name, advice_msg=identity)
         cfg = self.runtime_cfg(name)
         cli = agent_cli(cfg, name)
-        sheet, current, cards, registry = self.advise(name, entry, cli, cfg)
+        pending = self.advice_pending_for(name, identity)
+        if pending is not None:  # out with the resident advisor (§27): the message stays queued meanwhile
+            result = self.advice_poll(name, pending)
+        else:
+            if identity and info.get('advice_msg') == identity:
+                return True  # already advised (e.g. delivered again after the respawn's READY)
+            entry = self.take_pending_advice(name, text)
+            if entry is None:
+                return True
+            self.setf(name, advice_msg=identity)
+            result = self.advise(name, entry, cli, cfg, identity=identity)
+        if result is None:
+            return False
+        sheet, current, cards, registry = result
         installed = json.loads(info.get('installed_domains') or '[]')
         target = advisor.fingerprint(cli, sheet['model'], sheet.get('effort'))
         effect = advisor.decide(current, target, installed, sheet['domains'])
@@ -3950,9 +4368,21 @@ class Fleet:
         sheet = self.advice_waiting(name, identity)
         try:
             if sheet is None:
-                entry = self.take_pending_advice(name, text) or {'instruction': text[:2000], 'note': ''}
-                sheet, current, cards, registry = self.advise(name, entry, 'claude', self.runtime_cfg(name))
-                self.setf(name, advice_msg=identity)
+                pending = self.advice_pending_for(name, identity)
+                if pending is not None:
+                    result = self.advice_poll(name, pending)
+                else:
+                    entry = self.take_pending_advice(name, text) or {'instruction': text[:2000], 'note': ''}
+                    result = self.advise(name, entry, 'claude', self.runtime_cfg(name), identity=identity)
+                    self.setf(name, advice_msg=identity)
+                if result is None:
+                    return  # held until the resident advisor answers, at most ADVICE_WAIT (§27)
+                if self.advisor_resident() and self.r.hget(ADVICE + result[0]['ticket'], 'status') == 'unavailable':
+                    # The advisor tab could not start or did not answer in time (180 s): the user's rule is the
+                    # plain default launch; the [advisor unavailable] note is already queued (advice_finish).
+                    self.release_default(name)
+                    return
+                sheet, current, cards, registry = result
             else:  # waited for a model ticket with this sheet: gate again, never re-advise
                 registry = AgentRegistry()
                 cards = advisor.launch_cards(registry, 'claude')
@@ -4054,6 +4484,15 @@ class Fleet:
             if info.get('rescue_note') and info.get('state') == 'idle':
                 self.setf(w, rescue_note='')
                 self.queue('supervisor', info['rescue_note'])
+        pending = json.loads(self.r.get(RESCUE_PENDING) or 'null')
+        if pending:  # the one rescue out with the resident advisor (§27): read its answer, nothing new meanwhile
+            if pending['req'].get('run_task') != self.task().get('id'):
+                self.r.delete(RESCUE_PENDING)
+                self.advisor_abandon(pending['ticket'], 'left over from an earlier task')
+            elif (self.r.hget(ADVICE + pending['ticket'], 'status') != 'pending'
+                    or self.advisor_poll(pending['ticket'], None)[0] != 'wait'):
+                self.rescue(pending['req'], pending)  # answered or over: rebuild its check and act
+            return
         for raw in self.r.lrange(RESCUE, 0, -1):
             req = json.loads(raw)
             if req.get('run_task') != self.task().get('id'):
@@ -4092,8 +4531,10 @@ class Fleet:
                 out.append(w)
         return out
 
-    def rescue(self, req):
-        """One rescue consultation. Unavailable advisor = no action, the supervisor is told (§8)."""
+    def rescue(self, req, pending=None):
+        """One rescue consultation. Unavailable advisor = no action, the supervisor is told (§8). With the
+        resident advisor it is queued (RESCUE_PENDING) and acted on once answered, at the worker's idle
+        boundary (``pending``: that consultation, read again on each pump)."""
         name, task_id, t = req['slot'], req['task'], self.task()
         state = self.contract_state()
         instruction = self.escalation_item(task_id, state)[1] or ''
@@ -4130,17 +4571,36 @@ class Fleet:
 
         def check(raw):
             return advisor.validate_rescue(raw, actions=actions, check_slot=check_slot, candidates=candidates)
-        runner = self.advisor_runner or (lambda data: advisor.run_claude(data, cfg=self.cfg, run_dir=self.run_dir))
-        started = time.time()
-        if registry_error:
-            sheet, envelope, errors = None, None, [registry_error]
+        shown = json.dumps({k: payload[k] for k in ('goal', 'task', 'instruction', 'finding', 'want', 'slot',
+                                                    'relays', 'actions')}, ensure_ascii=False)[:4000]
+        started, envelope = time.time(), None
+        if pending is not None:
+            if (self.r.hget(ADVICE + pending['ticket'], 'status') == 'answered'
+                    and (self.agent(name).get('state') != 'idle' or self.inbox_depth(name))):
+                return  # answered: acted on at the worker's next idle boundary
+            # The correction carries the input as it is now: a reassign target that went busy meanwhile is
+            # refused against the current idle slots and the advisor sees those (review astra r1 P2-01).
+            state_, sheet, errors = self.advisor_poll(pending['ticket'], check, json.dumps(payload, ensure_ascii=False))
+            if state_ == 'wait':
+                return
+            self.r.delete(RESCUE_PENDING)
+            ticket = pending['ticket']
+            started = float(self.r.hget(ADVICE + ticket, 'started') or started)
+        elif self.advisor_resident() and not registry_error:
+            ticket = self.new_ticket()
+            if self.advisor_request(ticket, name, 'rescue', payload, shown):
+                self.r.set(RESCUE_PENDING, json.dumps({'ticket': ticket, 'req': req}, ensure_ascii=False))
+                return
+            sheet, errors = None, ['advisor tab could not be started']
         else:
-            sheet, envelope, errors = advisor.consult(payload, runner, check)
-        seq = self.r.hincrby(ADVICE_SEQ, 'n', 1)
-        ticket = 'adv-' + str(self.cfg.get('token') or self.run_dir.name[-8:]) + '-' + str(seq)
+            runner = self.advisor_runner or (lambda data: advisor.run_claude(data, cfg=self.cfg, run_dir=self.run_dir))
+            if registry_error:
+                sheet, errors = None, [registry_error]
+            else:
+                sheet, envelope, errors = advisor.consult(payload, runner, check)
+            ticket = self.new_ticket()
         audit = {'slot': name, 'task': t.get('id', ''), 'kind': 'rescue', 'item': task_id,
-                 'input': json.dumps({k: payload[k] for k in ('goal', 'task', 'instruction', 'finding', 'want', 'slot',
-                                                              'relays', 'actions')}, ensure_ascii=False)[:4000],
+                 'input': shown,
                  'output': json.dumps(sheet, ensure_ascii=False), 'errors': json.dumps(errors, ensure_ascii=False),
                  'elapsed_s': round(time.time() - started, 3), 'status': 'unavailable' if sheet is None else 'ok',
                  'action': (sheet or {}).get('action', 'none'), 'at': time.time()}
@@ -4148,6 +4608,7 @@ class Fleet:
         if matrix_error:
             audit['matrix_error'] = matrix_error[:500]
         self.r.hset(ADVICE + ticket, mapping=audit)
+        self.advice_recent(ticket)
         who = task_id + ' (' + self.label(name) + ')'
         if sheet is None:
             self.log('advice.unavailable', agent=name, ticket=ticket, path='rescue', errors=errors)
@@ -4308,6 +4769,11 @@ class Fleet:
         info = self.agent(name)
         if info.get('state') == 'clearing' or info.get('clear_required') == '1':
             return
+        if name == ADVISOR:
+            # §22 handoff of the advisor (§27): it has only Read and cannot write a draft, so no handoff turn;
+            # the daemon's skeleton (recent sheets) is its note. Failures stay advisor faults (advisor_restart).
+            self.log('rotate.start', agent=name, used=used, window=window, generation=info.get('generation'))
+            return self.advisor_restart('context ' + str(used) + '/' + str(window), source='handoff')
         hid = uuid.uuid4().hex[:10]
         draft = agent_cwd(self.cfg, name) / '.handoff' / ('draft-' + hid + '.md')
         draft.parent.mkdir(parents=True, exist_ok=True)
@@ -4326,6 +4792,8 @@ class Fleet:
 
     def skeleton(self, name, info):
         t = self.task()
+        if name == ADVISOR:
+            return self.advisor_skeleton(info, t)
         replies = self.r.lrange(key('replies', name), 0, -1)
         pending = self.v2.pending_text(name) if self.v2 else self.r.lrange(key('inbox', name), 0, 0)
         back = json.loads(info.get('subfleet_return') or '{}')  # §29: the slot comes back from a named sub-fleet
@@ -4373,10 +4841,9 @@ class Fleet:
         snapshot = out.with_suffix('.terminal.txt')
         self.mgr.capture_to(old, str(snapshot))
         prev = self.label(name)
-        base = SUPERVISOR_LABEL if name == 'supervisor' else name
-        label = base + '.' + str(generation + 1)  # supervisor-1 -> supervisor-1.1, worker-1 -> worker-1.1
+        label = slot_base(name) + '.' + str(generation + 1)  # supervisor-1 -> supervisor-1.1, worker-1 -> worker-1.1
         self.setf(name, generation=generation + 1, handoff_id='', label=label)
-        if name != 'supervisor':
+        if name in self.workers:
             self.setf(name, prev_label=prev)
             self.r.hset(NAMES, mapping={label: name})  # old names keep routing to this slot
         history.record(self.run_dir, slot=name, label=prev, generation=generation, handoff=str(out),
@@ -4517,7 +4984,7 @@ class Fleet:
         self.cfg['worker_roles'] = roles
         if adds:
             self.workers = self.workers + adds
-            self.names = ['supervisor'] + self.workers
+            self.names = self.slot_names()
         if adds or roles != old_roles or profiles != old_profiles or pi_changed:
             # Hooks and bridges check membership in the config file: write it before spawning.
             self.persist_roster()
@@ -4604,7 +5071,7 @@ class Fleet:
                        snapshot=str(snapshot), source='retired', timed_out=False)
         self.setf(name, state='retired', launch_ready=0, runtime_ready=0)
         self.workers = [w for w in self.workers if w != name]
-        self.names = ['supervisor'] + self.workers
+        self.names = self.slot_names()
         (self.cfg.get('worker_roles') or {}).pop(name, None)
         self.persist_roster()  # its workspace stays: declared artifact paths must still verify
         self.refresh_history()
@@ -5074,6 +5541,13 @@ class Fleet:
         and leaves the slot alone this tick (a wall menu is never a dialog to answer). None: no wall."""
         if not brake.screen_wall(screen):
             return None
+        if name == ADVISOR:
+            # §27: the advisor's wall never pauses the fleet. Its consultation falls back to the default
+            # (the held message) and advisor_tick restarts the tab in place.
+            if self.agent(name).get('state') != 'held':
+                self.v2.transaction('advisor-wall-' + uuid.uuid4().hex,
+                                    lambda: self.v2.hold(name, 'usage wall on the advisor tab'))
+            return {'kind': 'wall', 'agent': name, 'advisor': True}
         tripped = json.loads(self.r.hget(BRAKE, 'tripped') or 'null')
         if self.paused() and tripped and tripped.get('kind') == 'wall' and tripped.get('agent') == name:
             return tripped  # already braked on this agent's wall: hands off, no second notify
@@ -5091,7 +5565,7 @@ class Fleet:
         limit = float(self.cfg['stall_timeout'])
         if limit <= 0 or not self.running() or self.paused():
             return {}
-        return {name: self.capture_screen(name, info) for name, info in ((n, self.agent(n)) for n in self.names)
+        return {name: self.capture_screen(name, info) for name, info in ((n, self.agent(n)) for n in self.names if n != ADVISOR)
                 if info.get('state') == 'busy' and now - self.last_activity(info) >= limit}
 
     def capture_screen(self, name, info):
@@ -5129,6 +5603,7 @@ class Fleet:
         # Each part is guarded: under v2 this runs in the daemon loop, and one failing part (a bad
         # roster, a broken sub-fleet record, a full disk) must not kill the daemon. Bus errors stay fatal.
         for part, run in (('roster', self.roster_tick),  # the only place the roster changes
+                          ('advisor', self.advisor_tick),  # resident advisor tab: start / retire / restart (§27)
                           ('lifecycle', lambda: lifecycle_close.tick(self)),  # mode policy (done gate, hold, timeouts, idle); before result.json
                           ('result', self.write_result), ('contracts', self.sync_contract_files),
                           ('subfleet', lambda: subfleet.tick(self)),  # side effects, outside any v2 transaction
@@ -5583,9 +6058,10 @@ def start(args):
     if not roster_path:
         workers = (args.worker_names.split(',') if args.worker_names
                    else ['worker-' + str(i + 1) for i in range(max(1, args.workers or 1))])
-    if len(set(workers)) != len(workers) or not all(re.fullmatch(WORKER_NAME_RE, w) and w != 'supervisor'
+    if len(set(workers)) != len(workers) or not all(re.fullmatch(WORKER_NAME_RE, w) and w not in ('supervisor', ADVISOR)
                                                     for w in workers):
-        raise SystemExit('--worker-names: distinct names matching ' + WORKER_NAME_RE + ' (no dots: dots mark generations)')
+        raise SystemExit('--worker-names: distinct names matching ' + WORKER_NAME_RE + ', not supervisor / advisor '
+                         '(no dots: dots mark generations)')
     if args.roles and not Path(args.roles).expanduser().is_dir():
         raise SystemExit('--roles must be a directory of <agent-name>.md files')
     profiles = [args.supervisor_profile or args.profile] if args.supervisor_cli == 'codex' else []
