@@ -3,6 +3,7 @@
 Fake cmux and fake Pi agents on a private Redis (tests/test_runtime_v2.py fixture); merge / test /
 enqueue run against a temporary git repository. No real notification leaves the machine: a notifier is
 injected (and without one, no channel command is configured)."""
+import argparse
 import json
 import os
 import shutil
@@ -335,6 +336,28 @@ def test_service_idle_worker_reclaimed_supervisor_kept_and_respawned_on_demand(f
     lifecycle_close.tick(f)
     assert f.agent('worker-1')['state'] == 'starting' and f.agent('worker-1')['pane'] not in ('', old)
     assert f.agent('worker-1')['generation'] == '1'
+
+
+def test_start_flag_overrides_the_table_reclaim_for_this_run_only(fx, table, notes):
+    """start --worker-idle-reclaim-min off keeps experts resident while the shared table says 30."""
+    f = fx
+    f.cfg['lifecycle'] = 'service'
+    f.cfg['worker_idle_reclaim_min'] = None  # off
+    lifecycle_close.tick(f, now=time.time() + 10 * 3600)
+    assert f.agent('worker-1')['state'] == 'idle'
+    f.cfg['worker_idle_reclaim_min'] = 120.0
+    lifecycle_close.tick(f, now=time.time() + 60 * 60)
+    assert f.agent('worker-1')['state'] == 'idle'
+    lifecycle_close.tick(f, now=time.time() + 121 * 60)
+    assert f.agent('worker-1')['state'] == 'reclaimed'
+
+
+def test_reclaim_flag_parses_minutes_or_off():
+    from cmux_fleet import fleet
+    assert fleet.reclaim_minutes('off') == 'off' and fleet.reclaim_minutes('45') == 45.0
+    for bad in ('0', '-5', 'never', ''):
+        with pytest.raises(argparse.ArgumentTypeError):
+            fleet.reclaim_minutes(bad)
 
 
 def test_service_idle_stop_hours_null_by_default_then_hot_enabled(fx, table, notes):
