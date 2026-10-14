@@ -107,8 +107,16 @@ def is_op(spec):
     return isinstance(spec, dict) and spec.get('op') in OPS
 
 
+class InProgress(Exception):
+    """The same id resent while its op is still open (awaiting / approved): not a new op, not refused."""
+    def __init__(self, rid, status):
+        super().__init__(rid + ' is in progress (' + status + ')')
+        self.rid, self.status = rid, status
+
+
 def request(f, spec):
-    """Take one external up / down. ValueError: refused before it got an id (malformed / duplicate)."""
+    """Take one external up / down. ValueError: refused before it got an id (malformed / duplicate).
+    InProgress: the same op under the same id is still open (a retry, e.g. after the parent resumed)."""
     fleet = _fleet()
     rid = spec.get('id')
     if not isinstance(rid, str) or not re.fullmatch(fleet.REQ_ID_RE, rid):
@@ -120,7 +128,10 @@ def request(f, spec):
     extra = sorted(set(spec) - {'id', 'op', 'name', 'reason'})
     if extra:
         raise ValueError('unknown keys for ' + spec['op'] + ': ' + ', '.join(extra))
-    if (f.r.hgetall(OP + rid) or f.r.hgetall(fleet.REQ + rid) or f.r.get(fleet.RESULT + rid)
+    open_op = f.r.hgetall(OP + rid)
+    if open_op and open_op.get('op') == spec['op'].split('.', 1)[1] and open_op.get('name') == spec['name']:
+        raise InProgress(rid, open_op.get('status') or 'awaiting')
+    if (open_op or f.r.hgetall(fleet.REQ + rid) or f.r.get(fleet.RESULT + rid)
             or (f.v2 and f.r.get(f.v2.prefix + ':public:' + _digest(rid)))):
         raise ValueError('duplicate request id: ' + rid)
     op, name = spec['op'].split('.', 1)[1], spec['name']
@@ -132,12 +143,27 @@ def request(f, spec):
     if verdict is not None:
         finish(f, rid, *verdict)
         return rid
+    ask(f, rid, op, name, spec.get('reason') or '')
+    return rid
+
+
+def ask(f, rid, op, name, reason):
     f.queue('supervisor', '[Request ' + rid + '] External request ' + rid + ' wants sub-fleet ' + name + ' '
-            + op + ('. Reason: ' + spec['reason'] if spec.get('reason') else '') + '.\nYou only approve or reject; '
+            + op + ('. Reason: ' + reason if reason else '') + '.\nYou only approve or reject; '
             'the daemon does the rest. Reply with the service decision JSON from AGENTS.md: status RUNNING, '
             'dispatch [], skip [], plus "subfleet": {"id": "' + rid + '", "decision": "approve" or "reject", '
             '"note": "<one sentence>"}.')
-    return rid
+
+
+def requeue_awaiting(f):
+    """Parent ``--resume`` (service): resume cancels every undelivered supervisor message, approvals included.
+    Each op still awaiting its approval is asked again, so every accepted op reaches a final result; approved
+    ops need nothing (tick runs them)."""
+    for rid in f.r.lrange(OPQ, 0, -1):
+        op = f.r.hgetall(OP + rid)
+        if op.get('status') == 'awaiting':
+            ask(f, rid, op['op'], op['name'], op.get('reason') or '')
+            f.log('subfleet.request_requeued', id=rid, op=op['op'], name=op['name'])
 
 
 def _digest(rid):

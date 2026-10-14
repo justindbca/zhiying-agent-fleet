@@ -2075,6 +2075,8 @@ class Fleet:
         elif kind == 'request':
             try:
                 answer = {'status': 'accepted', 'id': self.request(ev.get('spec'))}
+            except named_subfleet.InProgress as exc:  # §29: a retry of an op still open
+                answer = {'status': 'in_progress', 'id': exc.rid, 'op_status': exc.status}
             except (ValueError, TypeError) as exc:
                 answer = {'status': 'rejected', 'reason': str(exc)}
             self.r.set('fx:reply:' + ev['request_id'], json.dumps(answer, ensure_ascii=False), ex=86400)

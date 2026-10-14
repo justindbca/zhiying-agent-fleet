@@ -1544,6 +1544,7 @@ class RuntimeV2:
                                                   'created': time.time()})
                 self.f.route(rid, spec)
                 self.audit('request.replayed', request_id=rid, attempt=attempt)
+        named_subfleet.requeue_awaiting(self.f)  # §29 external ops wait in their own queue, not REQQ
 
     def deliver(self, slot):
         from cmux_fleet.fleet import REQ
