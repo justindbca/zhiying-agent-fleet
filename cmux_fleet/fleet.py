@@ -5042,7 +5042,12 @@ class Fleet:
         if adds:
             self.workers = self.workers + adds
             self.names = self.slot_names()
-        if adds or roles != old_roles or profiles != old_profiles or pi_changed:
+        # §29: a hot-added supervisor_slot must be known before it spawns (tmux slot + no advisor hold read
+        # cfg['subfleets']); written after the adds, it started as a plain held tab and its sub-fleet waited (10-14).
+        subs_changed = subfleets != (self.cfg.get('subfleets') or [])
+        if subs_changed:
+            self.cfg['subfleets'] = subfleets
+        if adds or roles != old_roles or profiles != old_profiles or pi_changed or subs_changed:
             # Hooks and bridges check membership in the config file: write it before spawning.
             self.persist_roster()
         # Before the adds: a worker added together with `advisor: on` is spawned advised (held for its sheet).
@@ -5056,10 +5061,6 @@ class Fleet:
         for name in self.names:  # status shows the effective values without waiting for a delivery
             if self.agent(name):
                 self.handoff_limits(name)
-        if subfleets != (self.cfg.get('subfleets') or []):
-            # §29 + dual display: tmux_slot reads cfg['subfleets'] at every spawn (memory and config file)
-            self.cfg['subfleets'] = subfleets
-            self.persist_roster()
         if subfleets or named_subfleet.declared(self):
             named_subfleet.declare(self, subfleets)
 
