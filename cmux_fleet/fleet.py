@@ -1395,8 +1395,9 @@ class Fleet:
             # Roll back the reservation (model_usage): with the new tab gone the slot holds only what
             # its old generation runs, and only while that tab is still alive. A new tab that could
             # not be closed keeps holding the new model.
-            if cleaned:
-                self.setf(name, runtime_launch=info.get('runtime_launch') or '')
+            if cleaned:  # the whole launch record, not only its runtime half
+                self.setf(name, runtime_launch=info.get('runtime_launch') or '',
+                          installed_domains=info.get('installed_domains') or '')
             try:
                 gone = self.mgr.get_pane_status(old) is None
             except Exception:
@@ -1439,15 +1440,23 @@ class Fleet:
         return scope
 
     # -- actors
-    def spawn(self, name, prompt, *, launch_held=False, advice_hold=False):
+    def spawn(self, name, prompt, *, launch_held=False, advice_hold=False, advised=None):
+        """``advised``: only a slot's first generation (spawn_ready) passes it, from the advisor switch;
+        every later generation replays the slot's launch record (advised_layout), whatever the switch says."""
         cfg = self.runtime_cfg(name)
         info = self.agent(name)
         generation = int(info.get('generation', 0))
         launch = json.loads(info.get('runtime_launch') or '{}')
         cfg_path = self.path
-        advised = self.advised_layout(name)
+        if advised is None:
+            advised = self.advised_layout(name)
+        if not is_claude(cfg, name) and info.get('advice_domains'):
+            self.setf(name, advice_domains='')  # a codex / pi sheet stages no kit: never left behind
+        # This generation's argv (--effort / --setting-sources project) follows the layout, never the
+        # in-memory switch that runtime_cfg copies from self.cfg.
+        cfg.pop('advisor', None)
         if advised and is_claude(cfg, name):
-            cfg['advisor'] = True  # this generation's argv: --effort / --setting-sources project, also while off
+            cfg['advisor'] = True
         # A held first spawn gets its model / effort written here on release; an advised Claude
         # generation keeps `advisor` in its own snapshot (the actor builds its argv from it).
         if launch or advice_hold or (advised and is_claude(cfg, name)):
@@ -1459,7 +1468,9 @@ class Fleet:
         scope = self.role_scope(name, cfg, launch)
         (cwd / 'AGENTS.md').write_text(scope)
         if is_claude(cfg, name) and advised:
-            self.install_advised_kit(name, cwd, scope)  # CLAUDE.md = scope + core + domain rules
+            # CLAUDE.md = scope + core + domain rules. A held first generation has not started: its record
+            # is written when the gate opens (release_hold with the sheet, release_default with nothing).
+            self.install_advised_kit(name, cwd, scope, record=not advice_hold)
             # CLAUDE.md already carries the scope: do not make Claude read the same text twice.
             prompt = prompt.replace(' Read AGENTS.md in the current directory first.', '').replace(' Read AGENTS.md first.', '')
             trust_claude_dir(cwd)
@@ -1475,7 +1486,7 @@ class Fleet:
                   launch_ready=int(not launch_held), runtime_ready=0, current_profile='', idle_confirmed=0)
         if self.v2:
             self.setf(name, bridge_available=0, startup_deadline=time.time() + float(self.cfg['profile_ready_timeout']))
-        if advised:
+        if advised or info.get('advice_hold'):  # a resumed, never-released held slot must not stay marked held
             self.setf(name, advice_hold=int(advice_hold))
         if launch:
             self.setf(name, profile_state='switching', runtime_profile=launch['profile_id'],
@@ -1504,12 +1515,15 @@ class Fleet:
 
     def advised_layout(self, name):
         """Whether this slot's next generation is laid out advised (domain kit links + RULES in CLAUDE.md,
-        --setting-sources project, --effort). Online: every worker. Off: a slot whose persisted launch record
-        is an advisor-applied one (installed_domains, written only by install_advised_kit / a hot-load) keeps
-        it across handoffs and resumes; turning the advisor off never strips config from running work."""
+        --setting-sources project, --strict-mcp-config, --effort), read only from the slot's launch record:
+        installed_domains '' = the default layout (user-level settings, full kit copy), a JSON list (even
+        []) = advised; a sheet staged in advice_domains for this spawn counts as advised. The advisor switch
+        is never asked: a handoff / respawn / resume successor launches exactly like its predecessor, and
+        only an applied advisor sheet changes the record (2026-10-14)."""
         if name == 'supervisor':
             return False
-        return self.advisor_online() or bool(self.agent(name).get('installed_domains'))
+        info = self.agent(name)
+        return bool(info.get('advice_domains') or info.get('installed_domains'))
 
     def init_worker(self, name):
         self.setf(name, label=name, current_profile='', runtime_profile='', advisory_profile='',
@@ -1521,9 +1535,11 @@ class Fleet:
         # v2 + advisor online: a Claude worker waits behind the launch gate for its first sheet (no
         # default generation that the first dispatch would have to replace).
         hold = bool(self.v2) and self.advisor_online() and name != 'supervisor' and is_claude(self.runtime_cfg(name), name)
+        # The first generation is the one place the switch picks the layout; later ones replay the record.
         return self.spawn(name, 'You are fleet agent ' + name + '. Read AGENTS.md in the current directory first. '
                                 'There is no task yet: your final reply must be exactly READY.',
-                          launch_held=hold, advice_hold=hold)
+                          launch_held=hold, advice_hold=hold,
+                          advised=self.advisor_online() and name != 'supervisor')
 
     def start_all(self):
         if self.cfg.get('adopt'):
@@ -2883,9 +2899,10 @@ class Fleet:
         self.log('deliver', agent=name, text=text[:120])
 
     # -- advisor (roster advisor: on; advisor plan §3.1, pre-dispatch path)
-    def install_advised_kit(self, name, cwd, scope):
+    def install_advised_kit(self, name, cwd, scope, record=True):
         """Advisor runs: Claude CLAUDE.md = role scope + project core + this generation's domain rules;
-        cwd/.claude/{skills,agents} cleared, then the domains linked; full kit mcp.json."""
+        cwd/.claude/{skills,agents} cleared, then the domains linked; full kit mcp.json. ``record``: write
+        installed_domains (the slot's launch record); False for a held generation that has not started."""
         info = self.agent(name)
         domains = json.loads(info.get('advice_domains') or info.get('installed_domains') or '[]')
         if self.kit is None and self.cfg.get('worker_kit'):  # off at daemon start: an inherited layout still needs it
@@ -2901,7 +2918,8 @@ class Fleet:
             kitmod.Kit.clear(cwd)
             domains = []
             (cwd / 'CLAUDE.md').write_text(scope)
-        self.setf(name, installed_domains=json.dumps(domains, ensure_ascii=False), advice_domains='')
+        if record:
+            self.setf(name, installed_domains=json.dumps(domains, ensure_ascii=False), advice_domains='')
 
     def advice_identity(self, name, text):
         if self.v2:
@@ -3174,7 +3192,9 @@ class Fleet:
         cfg = self.runtime_cfg(name)
         cfg.pop('advisor', None)
         self.drop_advice_wait(name)
-        self.setf(name, installed_domains='', advice_domains='')  # the slot defaults are its launch record now
+        # It launches with the slot defaults, and that is its record (installed_domains '' = default layout;
+        # runtime_launch as it was). Only a held first generation gets here, so no running record is cleared.
+        self.setf(name, installed_domains='', advice_domains='')
         try:
             save(self.run_dir / 'runtime' / (name + '-g' + str(generation) + '.json'), cfg)
             cwd = agent_cwd(self.cfg, name)
