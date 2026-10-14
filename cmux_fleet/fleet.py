@@ -5757,6 +5757,8 @@ def start_redis(cfg, tries=30):
     """Start the run's private Redis on its pinned socket and directory. v2 has AOF on, so a
     restart with the same --dir reloads everything written up to the last fsync (about 1 s)."""
     redis_dir = Path(cfg['redis_runtime_dir'])
+    if cfg.get('run'):
+        save(redis_dir / REDIS_OWNER, {'run': str(cfg['run'])})  # lets reap_orphan_redis find the run later
     subprocess.run([cfg['redis_server'], '--port', '0', '--unixsocket', cfg['redis_socket'],
                     '--unixsocketperm', '700', '--dir', str(redis_dir), '--dbfilename', 'fleet.rdb',
                     '--appendonly', 'yes' if cfg.get('transport_version') == 2 else 'no',
@@ -5768,6 +5770,77 @@ def start_redis(cfg, tries=30):
         except Exception:
             time.sleep(.1)
     raise SystemExit('private Redis did not become ready')
+
+
+REDIS_OWNER = 'owner.json'
+ORPHAN_REDIS_GRACE = 120  # seconds between start_redis and the daemon taking its lock
+
+
+def _own_processes():
+    """(pid, command line) of this user's processes; [] when ps fails."""
+    try:
+        out = subprocess.run(['ps', '-x', '-o', 'pid=,command='], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = []
+    for line in out.splitlines():
+        pid, _, command = line.strip().partition(' ')
+        if pid.isdigit():
+            rows.append((int(pid), command))
+    return rows
+
+
+def _run_alive(run, procs):
+    """A daemon holds the run's lock, or any live process (actor, hook, child fleet) names the run."""
+    if (Path(run) / 'daemon.lock').exists() and daemon_running(run):
+        return True
+    return any(str(run) in command for pid, command in procs if 'redis-server' not in command)
+
+
+def reap_orphan_redis(keep=None, grace=ORPHAN_REDIS_GRACE, root=None):
+    """Shut down private Redis instances whose run was abandoned without `stop` (v2 keeps Redis
+    up when a daemon dies, for --resume). Lossless: SHUTDOWN saves, and --resume restarts Redis
+    from the same directory. Only instances with an owner record are touched; a sub-fleet's Redis
+    is left to its parent while any ancestor run is alive. `root` limits the sweep to one runtime
+    root (tests). Returns the sockets shut down."""
+    procs = _own_processes()
+    reaped = []
+    for pid, command in procs:
+        if 'redis-server' not in command or 'unixsocket:' not in command:
+            continue
+        sock = Path(command.split('unixsocket:', 1)[1].split()[0])
+        if root is not None and Path(root).resolve() not in sock.parents:
+            continue
+        owner_file = sock.parent / REDIS_OWNER
+        try:
+            run = Path(load(owner_file)['run'])
+            if time.time() - owner_file.stat().st_mtime < grace:
+                continue
+        except (OSError, ValueError, KeyError, TypeError):
+            continue  # started before owner records, or not a fleet instance: leave it
+        if keep is not None and Path(keep) == run:
+            continue
+        chain = [run] + [a.parent for a in run.parents if a.name == 'sub']  # the run, then each ancestor run
+        if any(_run_alive(r, procs) for r in chain):
+            continue
+        try:
+            import redis
+            redis.Redis(unix_socket_path=str(sock), socket_connect_timeout=3, socket_timeout=10).shutdown()
+        except Exception as exc:
+            if sock.exists():
+                print('orphan Redis not shut down:', sock, str(exc)[:200])
+                continue
+        print('shut down orphan Redis of', run)
+        reaped.append(str(sock))
+    return reaped
+
+
+def sweep_orphan_redis(keep=None):
+    """reap_orphan_redis for start / start --resume: housekeeping never blocks a start."""
+    try:
+        reap_orphan_redis(keep=keep)
+    except Exception as exc:
+        print('orphan Redis sweep skipped:', str(exc)[:200])
 
 
 def daemon_running(run):
@@ -5869,6 +5942,7 @@ def resume(run, args):
             raise SystemExit('--advisor: roster not written: ' + str(exc)) from exc
     if not cmux_available():
         raise SystemExit('run this inside a cmux terminal: cmux only accepts processes started in its windows')
+    sweep_orphan_redis(keep=run)
     try:
         r = connect(cfg)  # only the daemon died: its Redis is still up
     except Exception:
@@ -6149,6 +6223,7 @@ def start(args):
     home = Path(getattr(args, 'codex_home', None) or HOME / 'codex-home').expanduser()
     if profiles:
         prepare_codex_home(home, profiles)
+    sweep_orphan_redis()
     token = uuid.uuid4().hex[:8]
     try:
         redis_cfg = redis_runtime.prepare(args.redis_runtime_dir, token)

@@ -65,3 +65,11 @@ def _waiting_hook_stand_in(request, monkeypatch):
     hook_sim.install(monkeypatch)
     yield
     hook_sim.reset()
+
+
+@pytest.fixture(autouse=True)
+def _no_machine_wide_redis_sweep(monkeypatch):
+    """start / --resume sweep every Redis of this user; tests must never touch a real fleet's
+    (tests/test_orphan_redis.py calls reap_orphan_redis directly, scoped to its own root)."""
+    from cmux_fleet import fleet
+    monkeypatch.setattr(fleet, 'sweep_orphan_redis', lambda keep=None: None)

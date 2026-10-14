@@ -389,6 +389,7 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - socket 按编码字节数检查：macOS 最长 103 字节（保留 NUL），Linux 107 字节。超长在创建/启动前失败，提示缩短路径；不建立 `/tmp` 软链、不自动退回 `/tmp` 或 TCP。仍 `--port 0` / `--unixsocketperm 700`。
 - 旧无 managed 元数据的 `/tmp/cmux-fleet-<token>.sock` config 继续严格兼容，供在途实例正常 status/stop/callback；不迁移、重启旧 fleet。它不是新 start 的 fallback。
 - stop 沿用唯一 daemon 的 Redis shutdown；socket/PID 由 Redis 清理，日志/RDB/AOF 保留供排错和恢复。不引入共享系统 Redis，不杀其他 Redis。
+- **孤儿 Redis 回收（2026-10-15）**：v2 daemon 非显式退出（崩溃、被杀、工作区被关）时故意不关 Redis，留给 `--resume`；但 run 被直接撇下（换成别的 fleet、从不 stop）时，它的 Redis 永远没人关（10/14 Studio 两套旧 evermem-haiku run 各留一个）。修法：`start_redis` 在实例目录写 `owner.json`（`{"run": ...}`）；`start` 真起新 run 前、`start --resume` 接回前各扫一次本用户的 `redis-server unixsocket:` 进程，对有 `owner.json` 的实例，三条同时满足才 SHUTDOWN：① owner run 没有 daemon 持锁；② 没有任何活进程命令行带该 run 路径（actor / 钩子还在写它时不关）；③ `owner.json` 已过 120 秒（挡 start_redis → daemon 拿锁之间的空窗）。子 fleet（路径含 `/sub/`）只要任一祖先 run 还活着就不碰，归父 `collect()` 管；`--resume` 的目标 run 不碰；没有 `owner.json` 的（本修复前起的、非 fleet 的）一律不碰。SHUTDOWN 走 save，AOF / RDB 留在原目录，之后 `--resume` 照常从同一目录重启 Redis，无损。扫描失败只打印、不阻断 start；测试经 conftest 关掉全机扫描，`tests/test_orphan_redis.py` 限定自己的 root。这是「不杀其他 Redis」的唯一例外，且只限 fleet 自己起的、owner run 已撇下的实例。
 - `.runtime/` 不进入版本控制。本工作区用 Git 本地 `info/exclude` 排除，没有修改 `.gitignore`；其他 checkout 需同样排除。
 
 ## 14. Redis 信箱本地集成验证（2026-10-12）
