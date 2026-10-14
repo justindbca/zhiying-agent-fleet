@@ -118,11 +118,16 @@ export default function (pi: ExtensionAPI) {
     id: Type.Optional(Type.String()), advise_note: Type.Optional(Type.String()) });
   const consult = Type.Object({ worker: Type.String(), task: Type.String(), finding: Type.String({ minLength: 1 }),
     want: Type.Optional(Type.String()) });
+  // §20 split requests, plan F' [dialog] (approve / reject) and [blocked] (revise needs a note: checked by the daemon).
+  const escalation = Type.Object({ task: Type.String({ minLength: 1 }),
+    decision: Type.Union([Type.Literal("approve"), Type.Literal("revise"), Type.Literal("reject")]),
+    workers: Type.Optional(Type.Integer({ minimum: 1 })), note: Type.Optional(Type.String()) });
   const decisionSchema = service ? Type.Object({ status: Type.Union([Type.Literal("RUNNING"), Type.Literal("BLOCKED")]),
     reason: Type.Optional(Type.String()), dispatch: Type.Array(dispatch), skip: Type.Optional(Type.Array(Type.Object({ reason: Type.String() }))) }) :
     Type.Object({ status: Type.Union([Type.Literal("RUNNING"), Type.Literal("COMPLETED"), Type.Literal("BLOCKED")]),
       completion: Type.Integer({ minimum: 0, maximum: 100 }), reason: Type.Optional(Type.String()),
       dispatch: Type.Array(dispatch), consult: Type.Optional(Type.Array(consult)), artifacts: Type.Optional(Type.Array(artifact)),
+      escalations: Type.Optional(Type.Array(escalation)),
       advisor: Type.Optional(Type.Union([Type.Literal("on"), Type.Literal("off")])),
       withdraw: Type.Optional(Type.Array(Type.String())) });
   pi.registerTool({

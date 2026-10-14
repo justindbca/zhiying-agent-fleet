@@ -44,6 +44,8 @@ def validate_config(cfg):
             raise ValueError('transport v2 requires --allow-development-v2; real SDK/TUI acceptance is pending')
         for name in watchdog.DEFAULTS:
             watchdog.setting(cfg, name)
+        if watchdog.setting(cfg, 'dialog_escalation_timeout') < 60:
+            raise ValueError('dialog_escalation_timeout must be at least 60 seconds')
         if cfg.get('prompt_table'):
             try:
                 watchdog.parse_table(Path(cfg['prompt_table']).read_text(encoding='utf-8'))
@@ -1232,6 +1234,36 @@ class RuntimeV2:
         if slot != 'supervisor':
             self.ui('supervisor', card)
         self.f.pause(slot + ': ' + reason)
+
+    def prompt_escalate(self, slot, rec, tail):
+        """A non-delete dialog goes to the supervisor to rule on (plan F' 8.3): mark the slot, record the
+        escalation, queue the [dialog] question. No pause, no key; the lease stays received."""
+        from cmux_fleet.fleet import DIALOG_KEY
+        key = DIALOG_KEY + slot + ':g' + str(rec['generation'])
+        label = self.f.label(slot)
+        self.f.setf(slot, prompt_wait=rec['scope'], prompt_wait_at=time.time(), prompt_route='supervisor',
+                    prompt_digest=rec['digest'], watch_state='prompting')
+        keys = ', '.join(rec['keys_approve']) if rec['keys_approve'] else 'no key (it will go to the user)'
+        text = ('[dialog] ' + label + ' is stopped at a confirmation dialog (' + rec['prompt'] + '); the program '
+                'classified it as not a delete / move. Last ' + str(len(tail.splitlines())) + ' screen lines:\n'
+                + tail + '\n[end of screen]\nAnswer in your next JSON: "escalations": [{"task": "' + key + '", '
+                '"decision": "approve" | "reject", "note": "<optional>"}]. approve = the program presses ' + keys
+                + ' for it; reject = the program presses Escape. Do not dispatch to ' + label + ' in this reply. If '
+                'you think it deletes or moves anything, or only the user can decide, answer reject and say why in '
+                'reason.\n\nReply with the JSON format from AGENTS.md.')
+        rec = dict(rec, message_id=self.f.queue('supervisor', text), delivered_at=0, status='escalated',
+                   asked_at=time.time())
+        esc = self.f.escalation_state()
+        esc[key] = rec
+        self.f.save_escalations(esc)
+        self.audit('watch.prompt_escalated', slot=slot, level='warn', task=key, prompt=rec['prompt'],
+                   screen=rec['screen'], digest=rec['digest'], message_id=rec['message_id'])
+        card = routing_card(label + ' 停在确认框（非删除类），等监工裁定；屏幕见 ' + rec['screen'] + '。',
+                            kind='notice', slot=label, severity='warn')
+        card['metadata']['event_id'] = 'ui-dialog-' + digest(key + ':' + rec['scope'])[:32]
+        self.ui(slot, card)
+        self.ui('supervisor', card)
+        return key
 
     def replay_intents(self):
         # Replay prepared effects only; applied plans never run validators again.

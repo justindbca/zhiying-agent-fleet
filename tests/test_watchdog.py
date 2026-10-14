@@ -589,12 +589,15 @@ def test_read_outside_inside_the_run_workspace_is_answered(wd):
     (READ.format('/Users/justin/Documents/projects/cmux-fleet/cmux_fleet/fleet.py'), 'outside the granted area'),
     ('Read outside the working directories?\n❯ 1. Yes', 'no path'),   # scope not on the screen
 ])
-def test_read_outside_the_run_or_without_a_path_waits_for_a_human(wd, screen, reason):
+def test_read_outside_the_run_or_without_a_path_goes_to_the_supervisor(wd, screen, reason):
+    # Plan F' 8.3: not a delete, so the supervisor rules on it (step 2 sent it to the user).
     f = wd
     dispatch_one(f)
     f.mgr.screens[f.agent('worker-1')['pane']] = screen
     f.v2.watchdog.tick(time.time())
-    waits_unpressed(f, 'worker-1', 'read_outside', reason)
+    escalated(f, 'worker-1', 'read_outside', ['Enter'])
+    unverified, = audits(f, 'watch.prompt_unverified')
+    assert reason in unverified['reason'] and unverified['dialog_class'] == 'other'
 
 
 @pytest.mark.parametrize('screen,name,reason', [
@@ -737,6 +740,277 @@ def test_unmarked_starting_slot_past_its_deadline_is_still_dead(wd):
     f.setf('worker-2', state='starting', startup_deadline=time.time() - 1)
     f.v2.tick()
     assert f.agent('worker-2')['state'] == 'dead' and f.task()['status'] == 'blocked'
+
+
+# ------------------------------------------------------------------ plan F' 8.3: non-delete dialog -> supervisor
+READ_FAR = READ.format('/Users/someone/notes/today.md')
+UNKNOWN_EDIT = 'Do you want to make this edit to report.md?\n❯ 1. Yes\n  2. No'
+DIALOG_KEY = 'dialog:worker-1:g0'
+
+
+def escalations(f):
+    return json.loads(f.r.get('fx:escalations') or '{}')
+
+
+def escalated(f, slot, prompt, keys_approve, scope=None, state='busy'):
+    """Handed to the supervisor: no key, no pause, slot / lease untouched, one escalation and one [dialog] message."""
+    info = f.agent(slot)
+    assert keys(f, slot) == [] and not f.paused() and info['state'] == state
+    assert info['prompt_wait'] == (scope or f.v2.bus.slot_state(slot)['current_delivery'])
+    assert info['prompt_route'] == 'supervisor'
+    if state == 'busy':
+        assert f.v2.bus.slot_state(slot)['status'] == 'received'
+    rec = escalations(f)['dialog:' + slot + ':g' + info['generation']]
+    assert rec['kind'] == 'dialog' and rec['prompt'] == prompt and rec['keys_approve'] == keys_approve
+    assert rec['status'] == 'escalated' and len(rec['digest']) == 16 and rec['keys_reject'] == ['Escape']
+    text = f.v2.bus.message(rec['message_id'])['body']['text']
+    assert text.startswith('[dialog] ' + f.label(slot)) and '"task": "dialog:' + slot in text
+    assert audits(f, 'watch.prompt_escalated') and audits(f, 'execution.held') == []
+    assert audits(f, 'execution.prompt_wait') == []
+    return rec
+
+
+def rule(f, decision, key=DIALOG_KEY, status='RUNNING', extra=None):
+    """The supervisor receives the queued [dialog] message and answers it."""
+    f.pump()
+    body = dict({'status': status, 'completion': 10, 'reason': 'ruling', 'dispatch': [],
+                 'escalations': [{'task': key, 'decision': decision}] if decision else []}, **(extra or {}))
+    return answer_turn(f, 'supervisor', json.dumps(body))
+
+
+def test_non_delete_dialog_waits_for_the_supervisor_and_presses_nothing(wd):
+    f = wd
+    dispatch_one(f)
+    f.mgr.screens[f.agent('worker-1')['pane']] = READ_FAR
+    f.v2.watchdog.tick(time.time())
+    rec = escalated(f, 'worker-1', 'read_outside', ['Enter'])
+    assert 'Read outside the working directories?' in f.v2.bus.message(rec['message_id'])['body']['text']
+    now = time.time()
+    for i in range(30):                                     # past stall_timeout: still nothing pressed
+        f.v2.watchdog.tick(now + 60 * i)
+    assert keys(f, 'worker-1') == [] and audits(f, 'watch.escape') == []
+
+
+@pytest.mark.parametrize('decision,pressed', [('approve', ['Enter']), ('reject', ['Escape'])])
+def test_supervisor_ruling_is_pressed_after_a_fresh_check_and_the_turn_settles(wd, decision, pressed):
+    f = wd
+    dispatch_one(f)
+    f.mgr.screens[f.agent('worker-1')['pane']] = READ_FAR
+    f.v2.watchdog.tick(time.time())
+    assert rule(f, decision)['status'] == 'committed'
+    assert escalations(f)[DIALOG_KEY]['status'] == 'answered' and keys(f, 'worker-1') == []   # no key in the transaction
+    f.v2.watchdog.tick(time.time() + 1)
+    assert keys(f, 'worker-1') == pressed
+    answered, = audits(f, 'watch.prompt_answered')
+    assert answered['authorized'] == 'supervisor:' + decision and answered['task'] == DIALOG_KEY
+    assert DIALOG_KEY not in escalations(f) and f.agent('worker-1')['prompt_wait'] == ''
+    assert f.agent('worker-1')['watch_state'] == 'working'
+    f.mgr.screens[f.agent('worker-1')['pane']] = WORKING   # the dialog closed on the key
+    f.v2.watchdog.tick(time.time() + 2)
+    assert keys(f, 'worker-1') == pressed                  # pressed once, never again
+    assert answer_turn(f, 'worker-1', REPORT)['status'] == 'committed'
+    f.pump()
+    assert typed(f, 'supervisor')[-1].startswith('[worker-1 report]')
+
+
+def test_dialog_gone_or_changed_before_the_press_is_not_pressed(wd):
+    f = wd
+    dispatch_one(f)
+    pane = f.agent('worker-1')['pane']
+    f.mgr.screens[pane] = READ_FAR
+    f.v2.watchdog.tick(time.time())
+    rule(f, 'approve')
+    f.mgr.screens[pane] = WORKING                           # answered in the pane meanwhile / the agent moved on
+    f.v2.watchdog.tick(time.time() + 1)
+    assert keys(f, 'worker-1') == [] and DIALOG_KEY not in escalations(f)
+    assert audits(f, 'dialog.stale')[-1]['reason'] == 'dialog_gone' and f.agent('worker-1')['prompt_wait'] == ''
+
+
+def test_another_dialog_before_the_press_is_routed_afresh(wd):
+    f = wd
+    dispatch_one(f)
+    pane = f.agent('worker-1')['pane']
+    f.mgr.screens[pane] = READ_FAR
+    f.v2.watchdog.tick(time.time())
+    old = escalations(f)[DIALOG_KEY]['message_id']
+    rule(f, 'approve')
+    f.mgr.screens[pane] = READ.format('/Users/someone/other/file.md')   # another read: new digest
+    f.v2.watchdog.tick(time.time() + 1)
+    assert keys(f, 'worker-1') == [] and audits(f, 'dialog.stale')[-1]['reason'] == 'dialog_changed'
+    rec = escalations(f)[DIALOG_KEY]
+    assert rec['status'] == 'escalated' and rec['message_id'] != old   # a new question for the supervisor
+
+
+def test_identity_change_before_the_press_is_not_pressed(wd):
+    f = wd
+    dispatch_one(f)
+    f.mgr.screens[f.agent('worker-1')['pane']] = READ_FAR
+    f.v2.watchdog.tick(time.time())
+    rule(f, 'approve')
+    f.setf('worker-1', thread='another-session')
+    f.v2.watchdog.tick(time.time() + 1)
+    assert keys(f, 'worker-1') == [] and audits(f, 'dialog.stale')[-1]['reason'] == 'identity'
+    assert DIALOG_KEY not in escalations(f)
+
+
+def test_a_delete_appearing_before_the_press_goes_to_the_user(wd):
+    f = wd
+    dispatch_one(f)
+    pane = f.agent('worker-1')['pane']
+    f.mgr.screens[pane] = READ_FAR
+    f.v2.watchdog.tick(time.time())
+    rule(f, 'approve')
+    f.mgr.screens[pane] = 'Bash command\n  rm -rf notes\n' + READ_FAR    # the tail now shows a delete
+    f.v2.watchdog.tick(time.time() + 1)
+    f.v2.watchdog.tick(time.time() + 2)
+    assert keys(f, 'worker-1') == [] and f.paused() and f.agent('worker-1')['prompt_route'] == 'user'
+    assert json.loads(audits(f, 'execution.prompt_wait')[-1]['detail'])['dialog_class'] == 'delete'
+
+
+def test_reclassified_delete_on_the_same_screen_goes_to_the_user(wd, tmp_path):
+    f = wd
+    table = tmp_path / 'prompts.yaml'
+    table.write_text(watchdog.DEFAULT_TABLE.read_text())
+    f.cfg['prompt_table'] = str(table)
+    f.v2.watchdog = watchdog.Watchdog(f.v2)
+    dispatch_one(f)
+    f.mgr.screens[f.agent('worker-1')['pane']] = READ_FAR
+    f.v2.watchdog.tick(time.time())
+    rule(f, 'approve')
+    table.write_text(watchdog.DEFAULT_TABLE.read_text().replace('delete_markers: []', 'delete_markers: ["today"]'))
+    f.v2.watchdog.tick(time.time() + 1)
+    assert keys(f, 'worker-1') == [] and f.paused() and audits(f, 'dialog.reclassified_delete')
+    assert f.agent('worker-1')['prompt_route'] == 'user' and DIALOG_KEY not in escalations(f)
+
+
+def test_unknown_dialog_without_a_visible_yes_cursor_has_no_key_and_goes_to_the_user(wd):
+    f = wd
+    dispatch_one(f)
+    f.mgr.screens[f.agent('worker-1')['pane']] = 'Do you want to make this edit to report.md?\n  1. Yes\n❯ 2. No'
+    f.v2.watchdog.tick(time.time())
+    escalated(f, 'worker-1', 'unknown:do you want to make this edit', None)
+    rule(f, 'approve')
+    f.v2.watchdog.tick(time.time() + 1)
+    assert keys(f, 'worker-1') == [] and f.paused() and audits(f, 'dialog.to_human')[-1]['reason'] == 'no_safe_key'
+    assert any('no safe key' in t for t in f.v2.pending_text('supervisor'))
+
+
+def test_unknown_dialog_with_the_cursor_on_yes_is_pressed_enter_on_approve(wd):
+    f = wd
+    dispatch_one(f)
+    f.mgr.screens[f.agent('worker-1')['pane']] = UNKNOWN_EDIT
+    f.v2.watchdog.tick(time.time())
+    escalated(f, 'worker-1', 'unknown:do you want to make this edit', ['Enter'])
+    rule(f, 'approve')
+    f.v2.watchdog.tick(time.time() + 1)
+    assert keys(f, 'worker-1') == ['Enter']
+
+
+def test_supervisor_timeout_counts_from_delivery_and_hands_the_dialog_to_the_user(wd):
+    f = wd
+    f.cfg['stall_timeout'] = 0   # the hours skipped below would otherwise stall / rotate the supervisor itself
+    dispatch_one(f)
+    f.mgr.screens[f.agent('worker-1')['pane']] = READ_FAR
+    now = time.time()
+    f.v2.watchdog.tick(now)
+    f.v2.watchdog.tick(now + 3600)                         # still queued for the supervisor: no clock yet
+    assert not f.paused() and escalations(f)[DIALOG_KEY]['delivered_at'] == 0
+    f.pump()                                                # the supervisor receives the [dialog] message
+    f.v2.watchdog.tick(now + 3601)
+    assert escalations(f)[DIALOG_KEY]['delivered_at'] == now + 3601
+    f.v2.watchdog.tick(now + 3601 + 599)
+    assert not f.paused()
+    f.v2.watchdog.tick(now + 3601 + 600)
+    assert f.paused() and keys(f, 'worker-1') == [] and f.agent('worker-1')['prompt_route'] == 'user'
+    assert audits(f, 'dialog.to_human')[-1]['reason'] == 'supervisor_timeout' and DIALOG_KEY not in escalations(f)
+
+
+def test_running_reply_that_ignores_the_dialog_is_sent_back_once_without_a_strike(wd):
+    f = wd
+    dispatch_one(f)
+    f.mgr.screens[f.agent('worker-1')['pane']] = READ_FAR
+    f.v2.watchdog.tick(time.time())
+    rule(f, None)                                           # RUNNING, nothing answered
+    assert f.task()['bad_replies'] == '0' and escalations(f)[DIALOG_KEY]['nudged'] == 1
+    f.pump()
+    assert 'answer ' + DIALOG_KEY + ' first' in typed(f, 'supervisor')[-1]
+    answer_turn(f, 'supervisor', json.dumps({'status': 'RUNNING', 'completion': 10, 'reason': 'x', 'dispatch': []}))
+    assert f.paused() and f.agent('worker-1')['prompt_route'] == 'user' and DIALOG_KEY not in escalations(f)
+    assert audits(f, 'dialog.to_human')[-1]['reason'] == 'supervisor_unanswered' and keys(f, 'worker-1') == []
+
+
+def test_supervisor_own_dialog_goes_to_the_user(wd):
+    f = wd
+    dispatch_one(f)
+    f.v2.queue('supervisor', 'something to think about')
+    f.pump()
+    f.mgr.screens[f.agent('supervisor')['pane']] = READ_FAR
+    f.v2.watchdog.tick(time.time())
+    assert f.paused() and f.agent('supervisor')['prompt_route'] == 'user' and escalations(f) == {}
+
+
+def test_worker_dialog_goes_to_the_user_while_the_supervisor_is_held(wd):
+    f = wd
+    dispatch_one(f)
+    f.setf('supervisor', state='held')
+    f.mgr.screens[f.agent('worker-1')['pane']] = READ_FAR
+    f.v2.watchdog.tick(time.time())
+    assert f.paused() and f.agent('worker-1')['prompt_route'] == 'user' and DIALOG_KEY not in escalations(f)
+    assert audits(f, 'dialog.to_human')[-1]['reason'] == 'supervisor_unavailable'
+
+
+def test_dialog_record_cleared_by_a_new_task_falls_back_to_the_user(wd):
+    f = wd
+    dispatch_one(f)
+    f.mgr.screens[f.agent('worker-1')['pane']] = READ_FAR
+    f.v2.watchdog.tick(time.time())
+    f.r.delete('fx:escalations')
+    f.v2.watchdog.tick(time.time() + 1)
+    assert f.paused() and f.agent('worker-1')['prompt_route'] == 'user' and keys(f, 'worker-1') == []
+
+
+def test_starting_slot_foreign_trust_dialog_is_ruled_by_the_supervisor_then_ready(wd):
+    f = wd
+    submit(f)
+    f.setf('worker-2', state='starting', startup_deadline=time.time() + 180)
+    f.mgr.screens[f.agent('worker-2')['pane']] = claude_trust('/Users/someone/elsewhere')
+    f.v2.watchdog.tick(time.time())
+    escalated(f, 'worker-2', 'trust_folder', ['Down', 'Enter'], scope='startup-g0', state='starting')
+    f.setf('worker-2', startup_deadline=time.time() - 1)
+    f.v2.tick()
+    assert f.agent('worker-2')['state'] == 'starting'                  # waiting is not a dead start
+    rule(f, 'approve', key='dialog:worker-2:g0')
+    f.v2.watchdog.tick(time.time() + 1)
+    assert keys(f, 'worker-2') == ['Down', 'Enter']
+    f.mgr.screens[f.agent('worker-2')['pane']] = WORKING
+    assert answer_turn(f, 'worker-2', 'READY', startup=True)['status'] == 'ready'
+    assert f.agent('worker-2')['state'] == 'idle'
+
+
+def test_stale_answer_to_a_gone_dialog_is_not_a_bad_reply(wd):
+    f = wd
+    dispatch_one(f)
+    f.v2.queue('supervisor', '[worker-2 note] something to answer')
+    assert rule(f, 'approve', key='dialog:worker-2:g0')['status'] == 'committed'
+    assert f.task()['bad_replies'] == '0'
+
+
+def test_dialog_answer_must_be_approve_or_reject(wd):
+    f = wd
+    dispatch_one(f)
+    f.mgr.screens[f.agent('worker-1')['pane']] = READ_FAR
+    f.v2.watchdog.tick(time.time())
+    rule(f, 'revise')
+    assert f.task()['bad_replies'] == '1' and escalations(f)[DIALOG_KEY]['status'] == 'escalated'
+
+
+def test_dialog_escalation_timeout_is_validated():
+    base = dict(transport_version=2, allow_development_v2=True, supervisor_cli='codex', worker_cli='claude',
+                mode='task', workers=['worker-1'])
+    for bad in (59, -1, 'x'):
+        with pytest.raises(ValueError, match='dialog_escalation_timeout'):
+            runtime_v2.validate_config(dict(base, dialog_escalation_timeout=bad))
+    runtime_v2.validate_config(dict(base, dialog_escalation_timeout=60))
 
 
 # ------------------------------------------------------------------ plan F' 8.1: delete classifier
