@@ -277,10 +277,22 @@ def trust_claude_dir(cwd):
         # Unreadable or half-written config: refuse rather than replace the user's file with {}.
         data = json.loads(CLAUDE_JSON.read_text()) if CLAUDE_JSON.exists() else {}
         projects = data.setdefault('projects', {})
-        if any(projects.get(str(d), {}).get('hasTrustDialogAccepted') for d in [cwd, *cwd.parents]):
+        changed = False
+        if not any(projects.get(str(d), {}).get('hasTrustDialogAccepted') for d in [cwd, *cwd.parents]):
+            root = HOME.resolve() if HOME.exists() and HOME.resolve() in cwd.parents else cwd
+            projects.setdefault(str(root), {})['hasTrustDialogAccepted'] = True
+            changed = True
+        # "Allow external CLAUDE.md file imports?" is asked per exact cwd (a trusted parent does not cover
+        # it): pre-answer No so a fleet worker never stops on it and never loads the operator's personal
+        # imports (macmini 2026-10-14: an advisor-respawned worker sat on this dialog). Never overrides an
+        # answer already recorded for that directory.
+        entry = projects.setdefault(str(cwd), {})
+        if not entry.get('hasClaudeMdExternalIncludesWarningShown'):
+            entry.setdefault('hasClaudeMdExternalIncludesApproved', False)
+            entry['hasClaudeMdExternalIncludesWarningShown'] = True
+            changed = True
+        if not changed:
             return
-        root = HOME.resolve() if HOME.exists() and HOME.resolve() in cwd.parents else cwd
-        projects.setdefault(str(root), {})['hasTrustDialogAccepted'] = True
         tmp = CLAUDE_JSON.with_suffix('.json.fleet-tmp')
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
         tmp.replace(CLAUDE_JSON)

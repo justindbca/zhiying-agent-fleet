@@ -909,9 +909,12 @@ def test_trust_claude_dir_refuses_to_overwrite_unreadable_config(tmp_path, monke
     data = json.loads(cj.read_text())
     assert data['other'] == 2 and data['projects']['/a'] == {'x': 1}
     assert data['projects'][str(tmp_path.resolve())]['hasTrustDialogAccepted'] is True
-    before = cj.read_text()
     (tmp_path / 'child').mkdir()
-    fleet.trust_claude_dir(tmp_path / 'child')  # parent already trusted: no write at all
+    fleet.trust_claude_dir(tmp_path / 'child')  # parent already trusted: only the child's import answer
+    child = json.loads(cj.read_text())['projects'][str((tmp_path / 'child').resolve())]
+    assert child == {'hasClaudeMdExternalIncludesApproved': False, 'hasClaudeMdExternalIncludesWarningShown': True}
+    before = cj.read_text()
+    fleet.trust_claude_dir(tmp_path / 'child')  # everything already answered: no write at all
     assert cj.read_text() == before
 
 
@@ -924,7 +927,23 @@ def test_trust_goes_to_fleet_home_once(tmp_path, monkeypatch):
     monkeypatch.setattr(fleet, 'CLAUDE_JSON', cj)
     monkeypatch.setattr(fleet, 'HOME', home)
     fleet.trust_claude_dir(run_cwd)
-    assert list(json.loads(cj.read_text())['projects']) == [str(home.resolve())]
+    projects = json.loads(cj.read_text())['projects']
+    assert [k for k, v in projects.items() if v.get('hasTrustDialogAccepted')] == [str(home.resolve())]
+    assert projects[str(run_cwd.resolve())] == {'hasClaudeMdExternalIncludesApproved': False,
+                                                'hasClaudeMdExternalIncludesWarningShown': True}
+
+
+def test_external_imports_answer_is_never_overridden(tmp_path, monkeypatch):
+    cj = tmp_path / 'claude.json'
+    cwd = tmp_path / 'w'
+    cwd.mkdir()
+    cj.write_text(json.dumps({'projects': {str(cwd.resolve()): {'hasClaudeMdExternalIncludesApproved': True,
+                                                               'hasClaudeMdExternalIncludesWarningShown': True},
+                                           str(tmp_path.resolve()): {'hasTrustDialogAccepted': True}}}))
+    before = cj.read_text()
+    monkeypatch.setattr(fleet, 'CLAUDE_JSON', cj)
+    fleet.trust_claude_dir(cwd)
+    assert cj.read_text() == before  # a recorded human answer stays as it is
 
 
 def test_claude_usage_and_activity_come_from_transcript(cfx, tmp_path):
