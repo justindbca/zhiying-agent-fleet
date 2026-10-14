@@ -14,6 +14,8 @@
       claude:opus: {window: 1000000}
       codex: {ratio: 0.6}
     advisor: off              # optional, default off: on = consult the advisor before every dispatch
+    subfleets:                # optional named sub-fleets (docs/design.md §29); worker ``exit`` supervises one
+      - {name: ops, supervisor_slot: exit, supervisor_role: roles/ops-sup.md, roster: ops.yaml, autostart: false}
 
 The daemon re-reads the file while running (hot add / graceful remove; advisor on / off without
 a restart, also via `fleet advisor on|off` or the supervisor's decision key). A file with any
@@ -46,9 +48,10 @@ def parse_entries(raw, base):
     except yaml.YAMLError as exc:
         raise ValueError('invalid YAML: ' + ' '.join(str(exc).split())) from exc
     if (not isinstance(data, dict) or 'workers' not in data
-            or not set(data) <= {'workers', 'limits', 'handoff', 'advisor'} or not isinstance(data['workers'], list)):
+            or not set(data) <= {'workers', 'limits', 'handoff', 'advisor', 'subfleets'}
+            or not isinstance(data['workers'], list)):
         raise ValueError('the roster must be a mapping with only a "workers" list '
-                         '(and optional "limits", "handoff", "advisor")')
+                         '(and optional "limits", "handoff", "advisor", "subfleets")')
     parse_limits(data.get('limits'))
     advisor_value(data)
     if not data['workers']:
@@ -82,6 +85,7 @@ def parse_entries(raw, base):
                 errors.append(where + ' (' + name + '): role file not found: ' + str(role))
                 continue
             roles[name] = str(path.resolve())
+    errors += subfleet_errors(data.get('subfleets'), base, workers)
     if errors:
         raise ValueError('\n'.join(errors))
     return workers, roles, profiles
@@ -241,3 +245,109 @@ def write_advisor(path, on, workers=()):
     tmp.write_text(text)
     os.replace(tmp, path)
     return path
+
+
+# ------------------------------------------------------------------ named sub-fleets (docs/design.md §29)
+SUBFLEET_KEYS = {'name', 'supervisor_slot', 'supervisor_role', 'autostart', 'mode', 'roster', 'claude',
+                 'worker_model', 'timeouts', 'max_busy', 'drain_s'}
+SUBFLEET_MODES = ('service', 'task')
+DRAIN_S = 600
+TIMEOUT_KEYS = {'stall': 'stall_timeout', 'request': 'request_timeout'}  # entry timeouts -> fleet config key
+
+
+def _positive(v):
+    return not isinstance(v, bool) and isinstance(v, (int, float)) and v > 0
+
+
+def subfleet_entries(value, base, workers):
+    """(entries, errors) of the optional ``subfleets:`` list. Each entry is a dict with every key resolved:
+    paths absolute, ``timeouts`` split into stall_timeout / request_timeout, drain_s defaulted."""
+    if value is None:
+        return [], []
+    if not isinstance(value, list):
+        return [], ['subfleets must be a list of mappings']
+    entries, errors, names, slots = [], [], set(), set()
+    for i, item in enumerate(value):
+        where = 'subfleets[' + str(i) + ']'
+        if not isinstance(item, dict) or not set(item) <= SUBFLEET_KEYS:
+            errors.append(where + ': must be a mapping with keys ' + ', '.join(sorted(SUBFLEET_KEYS)) + ' only')
+            continue
+        name = item.get('name')
+        if not isinstance(name, str) or not re.fullmatch(NAME_RE, name) or name == 'supervisor':
+            errors.append(where + ': name must match ' + NAME_RE + ' and not be "supervisor"')
+            continue
+        where += ' (' + name + ')'
+        bad = []
+        if name in names:
+            bad.append('duplicate sub-fleet name')
+        if name in workers:
+            bad.append('name is also a worker name')
+        slot = item.get('supervisor_slot')
+        if slot not in workers:
+            bad.append('supervisor_slot must be one of the workers: ' + ', '.join(workers))
+        elif slot in slots:
+            bad.append('supervisor_slot ' + slot + ' already supervises another sub-fleet')
+        out = {'name': name, 'supervisor_slot': slot, 'autostart': item.get('autostart', False),
+               'mode': item.get('mode', 'service'), 'drain_s': item.get('drain_s', DRAIN_S)}
+        for key in ('supervisor_role', 'roster'):
+            path = item.get(key)
+            path = (Path(base) / Path(path).expanduser()) if isinstance(path, str) and path.strip() else None
+            if path is None or not path.is_file():
+                bad.append(key + ' file not found: ' + str(item.get(key)))
+            else:
+                out[key] = str(path.resolve())
+        if type(out['autostart']) is not bool:
+            bad.append('autostart must be true or false')
+        if out['mode'] not in SUBFLEET_MODES:
+            bad.append('mode must be one of ' + ', '.join(SUBFLEET_MODES))
+        for key in ('claude', 'worker_model'):
+            if key in item:
+                if not isinstance(item[key], str) or not item[key].strip():
+                    bad.append(key + ' must be a non-empty string')
+                else:
+                    out[key] = str(Path(base) / Path(item[key]).expanduser()) if (
+                        key == 'claude' and '/' in item[key]) else item[key]
+        timeouts = item.get('timeouts')
+        if timeouts is not None:
+            if not isinstance(timeouts, dict) or not set(timeouts) <= set(TIMEOUT_KEYS) \
+                    or not all(_positive(v) for v in timeouts.values()):
+                bad.append('timeouts must be a mapping of stall / request to positive seconds')
+            else:
+                out.update({TIMEOUT_KEYS[k]: v for k, v in timeouts.items()})
+        if 'max_busy' in item:
+            if isinstance(item['max_busy'], bool) or not isinstance(item['max_busy'], int) or item['max_busy'] < 0:
+                bad.append('max_busy must be a non-negative integer')
+            else:
+                out['max_busy'] = item['max_busy']
+        if not _positive(out['drain_s']):
+            bad.append('drain_s must be a positive number of seconds')
+        if 'roster' in out and not bad:
+            try:
+                load_entries(out['roster'])
+            except (OSError, ValueError) as exc:
+                bad.append('sub-fleet roster ' + out['roster'] + ' rejected: ' + ' '.join(str(exc).split()))
+        names.add(name)
+        if slot in workers:
+            slots.add(slot)
+        if bad:
+            errors += [where + ': ' + b for b in bad]
+        else:
+            entries.append(out)
+    return entries, errors
+
+
+def subfleet_errors(value, base, workers):
+    return subfleet_entries(value, base, workers)[1]
+
+
+def subfleets(raw, base):
+    """Validated ``subfleets:`` entries of an already validated roster (empty list without the section)."""
+    import yaml
+    data = yaml.safe_load(raw)
+    workers = [w['name'] for w in data['workers']]
+    return subfleet_entries(data.get('subfleets'), base, workers)[0]
+
+
+def load_subfleets(path):
+    path = Path(path).expanduser().resolve()
+    return subfleets(path.read_bytes(), path.parent)
