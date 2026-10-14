@@ -120,7 +120,10 @@ def _tmux(sock: str, *args: str) -> subprocess.CompletedProcess:
 def tmux_attach_command(sock: str, session: str) -> str:
     """A client tab's command. ``exec``: cmux types it into a login shell; a detached client then ends the
     tab instead of dropping back to the prompt."""
-    return 'exec ' + shlex.join([TMUX, '-S', str(sock), '-f', str(tmux_conf(sock)), 'attach', '-t', '=' + session])
+    # '=name' (tmux exact match) must be quoted by hand: shlex leaves a leading '=' bare, and zsh (the macOS
+    # login shell) expands '=word' to a command path -> "name not found", the tab drops to a prompt (10-14 Studio).
+    return ('exec ' + shlex.join([TMUX, '-S', str(sock), '-f', str(tmux_conf(sock)), 'attach', '-t'])
+            + " '=" + session.replace("'", "'\\''") + "'")
 
 
 def tmux_sessions(sock: str) -> List[str]:
