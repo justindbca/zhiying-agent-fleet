@@ -189,6 +189,10 @@ workers:
   - name: reentry
 ```
 
+`start --worker-kit KIT --kit-fleet NAME` takes the roster template from `KIT/fleets/NAME/` instead: the
+whole directory is copied to `<run>/fleet-config/` and the run follows that copy exactly like
+`--roster <run>/fleet-config/roster.yaml`; `--resume` keeps the copy (docs/design.md §30).
+
 - **Add**: a new name is written to `config.json` (and `latest.json` if it points at this run), then
   spawned with the READY prompt as a tab at the end of the worker column. The supervisor sees the new
   list appended to its next message (`[Roster change] Workers you can dispatch to now: ...`).

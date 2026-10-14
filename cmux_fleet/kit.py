@@ -8,6 +8,8 @@ Layout of a kit directory (built on the project side, consumed here read-only):
     DIR/domains/<domain>/skills/<name>/
     DIR/domains/<domain>/agents/<name>.md
     DIR/mcp.json                       full MCP set, started with every Claude worker
+    DIR/fleets/<name>/roster.yaml      roster templates for start --kit-fleet (fleet.py copies them into the
+                                       run; not read or checked here, design doc §30)
 
 The kit never carries memory files. A Claude worker gets its domains linked into
 ``cwd/.claude/{skills,agents}``: a respawn clears both first and links the chosen domains,

@@ -689,3 +689,17 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - **夜间名单**：`start --night-roster` / `night on|off` 的 `check_rosters` 要求夜间名单的 `subfleets:` 段与日间名单一致（按解析后的条目比较，相对路径各按自己文件目录解析），不一致整份拒收并列出不一致的名字——具名子 fleet 按 run 定，夜间切换不加、不删、不改。
 
 **验证**：`tests/test_subfleet.py` 具名部分（名单校验、设计稿 §5 第 1–10 条、钩子通道收回换代、clear 三键 3 条、顾问 4 条）、`tests/test_subfleet_named_tmux.py` / `tests/test_subfleet_tmux.py`（双连接）、`tests/test_night_switch.py`（夜间 subfleets 一致）、`tests/test_pi_decision_schema.py`（pi service schema 合同，无 node 跳过）；全套结果见外部项目 `tasks/plans/named-subfleet-rebase-1027f4f8-20261014.md`。**未做**：父工作区标签标题后缀「（兼子 fleet <名字> 监工）」、真机 cmux / Claude 验证、独立复核、合进在役分支、部署。
+
+## 30. 从 worker kit 起 fleet：`start --kit-fleet NAME`（2026-10-14 用户新要求）
+
+用户定：各 fleet 的**业务**角色提示词与名单模板进 worker kit（外部项目 `scripts/context/build_worker_kit.py` 组装，§27），fleet 发版 = fleet 代码 + kit 两样。本节只加一个名单来源；§16 名单语义 / 热载、§17 续跑、§27 顾问开关、§29 具名子 fleet 全部不变。
+
+- **协议提示词不进 kit**：`cmux_fleet/agents/*.md`（监工 / worker 协议、契约、同伴通知、顾问等）是 fleet 协议的一部分，留在 fleet 代码里随代码发版；kit 只带业务角色（`role` / `supervisor_role` 指的文件）和名单。
+- **kit 布局**：`<worker_kit>/fleets/<NAME>/roster.yaml` 必有；同目录可有子名单（如 `memx_roster.yaml`）、`roles/*.md` 等，名单里的路径照 §16 / §29 相对名单所在目录。`<NAME>` 匹配 `^[a-z][a-z0-9-]*$`。kit 的 MANIFEST 含这些文件。`kit.py` 不读也不校验 `fleets/`（多出的目录照常接受）。
+- **为什么复制**：kit 目录按哈希定版、只读；名单在运行中会被热改（§16 加减 worker、`fleet advisor on|off` 经 `roster.write_advisor` 写回），所以 kit 里的只是模板。
+- **新起**：`start --kit-fleet NAME` 必须同给 `--worker-kit`，且 kit 里有 `fleets/NAME/roster.yaml`；与 `--roster` / `--workers` / `--worker-names` 互斥（同 `--roster` 口径）；名字非法、缺 kit、缺文件、同给 → provisioning 前 SystemExit 写明缺什么。校验直接对 kit 里的名单走 `--roster` 原路径（含 `--night-roster`、pi 模型、模型卡计票）；建出 run 目录后把 `<kit>/fleets/NAME/` 整棵树复制到 `<run>/fleet-config/`（补上属主写权限），按副本重解析名单（角色 / 子名单的绝对路径落在副本里，kit 删了也不断），之后完全等同 `--roster <run>/fleet-config/roster.yaml`（subfleets、advisor 开关、热载）。
+- **config.json**：`kit_fleet: {"name": NAME, "kit": <kit 绝对路径>, "roster_md5": <kit 里 roster.yaml 的 md5>}`，只作来源记录，daemon 不读；`roster` 指副本。
+- **续跑**：`start --resume` 沿用 `<run>/fleet-config/` 现有副本，**不重新复制**（热改不能丢），kit 目录不在了也不影响；续跑时带的 `--kit-fleet` 只做旗标互斥 / 名字检查，NAME 不与 config 比对、被忽略。
+- **已知边界**：kit 升级不会进在跑或续跑的 run（要新版就新起 run）；副本与 kit 的差异只能拿 `roster_md5` 对 kit 版本的名单，子名单 / 角色文件不记哈希。
+
+**验证**：`tests/test_kit_fleet.py`（只读 kit 新起复制 + 副本可写 + 与 `--roster <副本>` 的 config 一致；子名单相对路径在副本里解析；缺 kit / 缺 `fleets/NAME` / 名字非法 / 与 `--roster`、`--workers`、`--worker-names` 同给 → provisioning 前拒；改副本、删 kit 后 `--resume` 不重复制、热改保留；`Kit` 接受 `fleets/`）。**未做**：真机 cmux 起一次、独立复核、合进在役分支、部署。

@@ -40,6 +40,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -94,6 +95,7 @@ REQ_ID_RE = r'[A-Za-z0-9][A-Za-z0-9:._-]{0,127}'
 REQ_HEAD = re.compile(r'^\[Request (' + REQ_ID_RE + r')\]')
 SUPERVISOR_INSTRUCTION_HEAD = re.compile(r'^\[Supervisor instruction ([^\]\n]+)\] ', re.MULTILINE)
 WORKER_NAME_RE = r'[a-z][a-z0-9-]{0,30}'
+KIT_FLEET_RE = r'[a-z][a-z0-9-]*'  # start --kit-fleet NAME: <worker kit>/fleets/NAME/ (design.md §30)
 # Display name of the supervisor's first generation; successors are supervisor-1.1, supervisor-1.2, ...
 # (same <slot>.<generation> pattern as worker-1 -> worker-1.1). Redis keys and the cwd stay 'supervisor'.
 SUPERVISOR_LABEL = 'supervisor-1'
@@ -5989,6 +5991,12 @@ def start(args):
     from cmux_fleet.cmux_manager import CmuxSessionManager, cmux_available
     if getattr(args, 'max_attempts', None) is not None and args.max_attempts < 1:
         raise SystemExit('--max-attempts must be at least 1')
+    kit_fleet = getattr(args, 'kit_fleet', None)
+    if kit_fleet is not None:  # flag checks only: a resumed run keeps its copy even when the kit is gone
+        if not re.fullmatch(KIT_FLEET_RE, kit_fleet):
+            raise SystemExit('--kit-fleet: name must match ' + KIT_FLEET_RE)
+        if args.roster or args.workers is not None or args.worker_names:
+            raise SystemExit('--kit-fleet replaces --roster / --workers / --worker-names; pass only one of them')
     if getattr(args, 'resume', None):
         run = resume_target(args.resume)
         if run and resume(run, args):
@@ -6026,6 +6034,8 @@ def start(args):
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     roster_path, night_path, worker_roles, worker_profiles, profile_clis = None, None, {}, {}, set()
+    if kit_fleet is not None:  # validated in the kit like --roster; copied into the run below
+        args.roster = str(kit_fleet_roster(args.worker_kit, kit_fleet))
     if getattr(args, 'night_roster', None) and not args.roster:
         raise SystemExit('--night-roster needs --roster (the day roster with the same worker names)')
     if args.roster:  # validate before any provisioning
@@ -6142,6 +6152,10 @@ def start(args):
         raise SystemExit('cannot prepare private Redis runtime: ' + str(exc)) from exc
     run = Path(getattr(args, 'runs_dir', None) or HOME / 'runs').expanduser() / ('fleet-' + time.strftime('%Y%m%d-%H%M%S-') + token)
     (run / 'workspace').mkdir(parents=True)
+    if kit_fleet is not None:  # the kit is read-only and versioned: the run follows (and hot-edits) its own copy
+        kit_roster = roster_path
+        roster_path = (copy_kit_fleet(kit_roster.parent, run / 'fleet-config') / 'roster.yaml').resolve()
+        workers, worker_roles, worker_profiles = roster.load_entries(roster_path)  # role paths into the copy
     from cmux_fleet import cmux_manager
     cfg = {'run': str(run), 'python': sys.executable, **redis_cfg,
            'cmux_state_dir': str(mgr.meta_path.parent),
@@ -6188,6 +6202,9 @@ def start(args):
                    subfleets=roster.load_subfleets(roster_path))
     if night_path:
         cfg['roster_night'] = str(night_path)
+    if kit_fleet is not None:
+        cfg['kit_fleet'] = {'name': kit_fleet, 'kit': str(Path(args.worker_kit).expanduser().resolve()),
+                            'roster_md5': hashlib.md5(kit_roster.read_bytes()).hexdigest()}
     if 'pi' in clis:
         cfg['pi_home'] = str(pi_adapter.prepare_home(run / 'pi-home', args.pi_agent_dir))
     save(run / 'config.json', cfg)
@@ -6221,6 +6238,25 @@ def night_cmd(cfg, state):
     except (OSError, ValueError) as exc:
         raise SystemExit('night ' + state + ' refused, nothing changed:\n' + str(exc)) from exc
     return dict(night.write_state(run, state == 'on'), roster=cfg['roster_night' if state == 'on' else 'roster'])
+
+
+def kit_fleet_roster(worker_kit, name):
+    """start --kit-fleet NAME: <worker kit>/fleets/NAME/roster.yaml, or SystemExit naming what is missing."""
+    if not worker_kit:
+        raise SystemExit('--kit-fleet needs --worker-kit (the kit that carries fleets/' + name + '/roster.yaml)')
+    path = Path(worker_kit).expanduser().resolve() / 'fleets' / name / 'roster.yaml'
+    if not path.is_file():
+        raise SystemExit('--kit-fleet ' + name + ': the worker kit has no ' + str(path))
+    return path
+
+
+def copy_kit_fleet(source, target):
+    """Copy a kit fleet directory (roster, sub-rosters, roles) into the run, writable (the kit is read-only)."""
+    shutil.copytree(source, target)
+    for root, dirs, files in os.walk(target):
+        for entry in [root] + [os.path.join(root, f) for f in files]:
+            os.chmod(entry, os.stat(entry).st_mode | stat.S_IWUSR)
+    return target
 
 
 def parse_worker_domains(value, worker_kit):
@@ -6411,6 +6447,9 @@ def main(argv=None):
     s.add_argument('--worker-names', help='comma-separated worker names (default worker-1..N), e.g. exit,reentry,rung')
     s.add_argument('--roster', help='worker roster YAML (workers: [{name, role?}]); edits while running add or '
                                     'retire workers. Replaces --workers / --worker-names')
+    s.add_argument('--kit-fleet', metavar='NAME',
+                   help='take the roster from the --worker-kit: copies <kit>/fleets/NAME/ to <run>/fleet-config/, then '
+                        'runs like --roster <run>/fleet-config/roster.yaml; --resume keeps the copy (design.md §30)')
     s.add_argument('--night-roster', help='night roster YAML: the same worker names as --roster, each with its night '
                                           'profile; `night on|off` switches between them (docs/design.md §25)')
     s.add_argument('--roles', help='dir of <agent-name>.md files appended to that agent\'s AGENTS.md (one prompt per worker)')
