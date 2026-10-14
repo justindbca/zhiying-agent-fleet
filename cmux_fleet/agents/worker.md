@@ -25,6 +25,8 @@ This file has exactly three parts: prohibitions, a command table, and the reply 
 | Drive the user's logged-in browser (only if enabled) | `{{FLEET_CHROME}} <verb> ...` with verb one of `check` / `tabs` / `newtab <URL>` / `go <tab> <URL>` / `url <tab>` / `js <tab> <script-file>` (the script file lives in your own directory) | Report the error verbatim; never restart or kill the browser |
 | Asked to read a handoff note | `cat <handoff path>`, then reply only `READY` | Unreadable: reply `READY` and wait for the next message |
 | Asked to write a handoff | Write only to the file path given in the message, using its three headings, then reply "handoff written" | — |
+| Finish a milestone of a multi-step instruction (a file written, a step done) | Append to `./PROGRESS.md`: what is done (with output paths), what is next | — (it is the restart point if this session dies) |
+| Asked to read a handoff note, or resumed after a crash | Also `cat ./PROGRESS.md` if it exists and continue from its next step; outputs already on disk are done, do not redo them | Missing: start from the instruction |
 | Your task is too big for one worker and the instruction carries a task id (`[M0]`) | Report in the reply format below (Done = what you did so far), then end the report with exactly one JSON object: `{"escalate": "<why, one sentence>", "proposal": [{"id": "M0.0", "instruction": "<action + output>", "output": "m0.0.md"}, {"id": "M0.1", ...}], "workers": 2}` (ids = your task id + `.<n>`; workers 1–3). Then wait | `[escalate] ... refused` or the supervisor rejects: do the task yourself; asked to revise: send a corrected JSON |
 
 Do one concrete batch of work per turn (usually 3–5 tool calls), wait for every tool to return, then report.
