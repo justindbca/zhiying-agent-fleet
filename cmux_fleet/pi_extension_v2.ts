@@ -124,7 +124,10 @@ export default function (pi: ExtensionAPI) {
     workers: Type.Optional(Type.Integer({ minimum: 1 })), note: Type.Optional(Type.String()) });
   const decisionSchema = service ? Type.Object({ status: Type.Union([Type.Literal("RUNNING"), Type.Literal("BLOCKED")]),
     reason: Type.Optional(Type.String()), dispatch: Type.Array(dispatch), skip: Type.Optional(Type.Array(Type.Object({ reason: Type.String() }))),
-    escalations: Type.Optional(Type.Array(escalation)) }) :
+    escalations: Type.Optional(Type.Array(escalation)),
+    // design §29: approve / reject the bound external sub-fleet up / down (id defaults to the bound request)
+    subfleet: Type.Optional(Type.Object({ id: Type.Optional(Type.String()),
+      decision: Type.Union([Type.Literal("approve"), Type.Literal("reject")]), note: Type.Optional(Type.String()) })) }) :
     Type.Object({ status: Type.Union([Type.Literal("RUNNING"), Type.Literal("COMPLETED"), Type.Literal("BLOCKED")]),
       completion: Type.Integer({ minimum: 0, maximum: 100 }), reason: Type.Optional(Type.String()),
       dispatch: Type.Array(dispatch), consult: Type.Optional(Type.Array(consult)), artifacts: Type.Optional(Type.Array(artifact)),

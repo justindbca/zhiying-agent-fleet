@@ -21,7 +21,7 @@ import pytest
 
 from test_fleet import codex_rows, received, write_rollout
 import hook_sim  # noqa: E402
-from cmux_fleet import cmux_manager, fleet, redis_runtime, roster, runtime_v2, subfleet
+from cmux_fleet import clear_after_result, cmux_manager, fleet, redis_runtime, roster, runtime_v2, subfleet
 
 
 # ------------------------------------------------------------------ fake cmux world
@@ -183,6 +183,11 @@ def redis_down(cfg):
 
 @pytest.fixture
 def tree(tmp_path, monkeypatch):
+    yield from start_tree(tmp_path, monkeypatch)
+
+
+def start_tree(tmp_path, monkeypatch, **over):
+    """Main fleet (task mode, or ``mode='service'`` for named sub-fleets) on a private Redis + fake cmux."""
     if shutil.which('redis-server') is None:
         pytest.skip('redis-server unavailable')
     root = Path('/tmp/cfs-' + uuid.uuid4().hex[:8])  # short: macOS Unix socket path limit
@@ -196,6 +201,7 @@ def tree(tmp_path, monkeypatch):
                supervisor_cli='codex', worker_cli='claude', codex_home=str(tmp_path / 'codex-home'),
                allow_development_v2=True, stall_timeout=0, v2_lease_ms=300000, max_busy=0, max_attempts=2,
                name='研报', token='a1b2c3d4')
+    cfg.update(over)
     path = run / 'config.json'
     fleet.save(path, cfg)
     t = SimpleNamespace(world=world, root=root, sessions=tmp_path / 'codex-home' / 'sessions',
@@ -207,7 +213,9 @@ def tree(tmp_path, monkeypatch):
     f.r.set(f.v2.prefix + ':boot', 'running')
     for slot in f.names:
         assert hook(t, f, slot, 'READY', prompt='startup')['status'] == 'ready'
-    runtime_v2.post_event(f.v2.bus, dict(kind='task', request_id='new-task', spec={'goal': 'write the report'}), 'new-task')
+    if cfg['mode'] == 'task':
+        runtime_v2.post_event(f.v2.bus, dict(kind='task', request_id='new-task', spec={'goal': 'write the report'}),
+                              'new-task')
     step(t)
     yield t
     for x in t.fleets:
@@ -858,7 +866,8 @@ def test_v2_matrix_allows_claude_supervisor_only_for_adopted_subfleets():
     assert runtime_v2.v2_cli_problem(base) is None
     assert runtime_v2.v2_cli_problem(dict(base, mode='service'))
     assert runtime_v2.v2_cli_problem(dict(base, adopt={'pane': 'x'})) is None
-    assert runtime_v2.v2_cli_problem(dict(base, adopt={'pane': 'x'}, mode='service'))
+    # §29 (design change): an adopted service sub-fleet (a named sub-fleet) is allowed too.
+    assert runtime_v2.v2_cli_problem(dict(base, adopt={'pane': 'x'}, mode='service')) is None
 
 
 def test_roster_limits_are_validated(tmp_path):
@@ -1047,3 +1056,667 @@ def test_lost_session_is_replaced_by_the_next_generation_in_place(tree):
     assert info['generation'] == '1' and info['label'] == 'worker-1.1' and info['state'] == 'starting'
     assert rec['placeholder'] not in t.world.alive and info['pane'] not in (rec['pane'], rec['placeholder'])
     assert subfleet.record(rec['run'])['state'] == 'returned'
+
+
+# ------------------------------------------------------------------ §29 named sub-fleets
+from cmux_fleet import named_subfleet  # noqa: E402
+
+SUP_ROLE = 'You are the ops sub-fleet supervisor. ROLE-MARKER-OPS.\n'
+
+
+def write_roster(t, autostart=False, declare=True, extra=''):
+    (t.tmp / 'sup.md').write_text(SUP_ROLE)
+    (t.tmp / 'child.yaml').write_text('workers:\n  - name: ops-w1\n')
+    body = 'workers:\n  - name: worker-1\n  - name: worker-2\n'
+    if declare:
+        body += ('subfleets:\n  - name: ops\n    supervisor_slot: worker-1\n    supervisor_role: sup.md\n'
+                 '    roster: child.yaml\n    autostart: ' + str(autostart).lower() + '\n    drain_s: 60\n' + extra)
+    path = t.tmp / 'roster.yaml'
+    path.write_text(body)
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000 * (1 + len(t.__dict__.get('rosters', [])))))
+    t.__dict__.setdefault('rosters', []).append(body)
+    return path
+
+
+@pytest.fixture
+def svc(tmp_path, monkeypatch):
+    monkeypatch.setattr(subfleet, 'default_launch', no_launch)
+    gen = start_tree(tmp_path, monkeypatch, mode='service', max_attempts=1)
+    t = next(gen)
+    t.f.cfg['roster'] = str(write_roster(t))
+    t.f.roster_tick()
+    try:
+        yield t
+    finally:
+        for _ in gen:
+            pass
+
+
+def ask(t, op, name='ops', rid=None, **extra):
+    rid = rid or 'op-' + uuid.uuid4().hex[:8]
+    ev = dict(kind='request', spec=dict(id=rid, op='subfleet.' + op, name=name, **extra))
+    return rid, drive(t, lambda: fleet.request(t.f.cfg, ev))
+
+
+def result(f, rid):
+    raw = f.r.get(fleet.RESULT + rid)
+    return json.loads(raw) if raw else None
+
+
+def supervisor_answers(t, rid, decision='approve', note='fine'):
+    f = t.f
+    step(t)
+    prompt = given(t, f, 'supervisor')[-1]  # Codex supervisor: its queued delivery (no typing)
+    assert rid in prompt and '"subfleet"' in prompt
+    text = json.dumps({'status': 'RUNNING', 'dispatch': [], 'skip': [],
+                       'subfleet': {'id': rid, 'decision': decision, 'note': note}})
+    assert hook(t, f, 'supervisor', text, prompt=prompt)['status'] == 'committed'
+
+
+def adopt_child(t, name='ops'):
+    """The child daemon boots in process and its supervisor (the parent's worker pane) says READY."""
+    rec = subfleet.record(t.f.run_dir / 'sub' / name)
+    cf = child_daemon(t, rec)
+    for w in cf.workers:
+        assert hook(t, cf, w, 'READY', prompt='startup')['status'] == 'ready'
+    role_change = [x for p, x in t.world.sent if p == rec['pane']][-1]
+    assert parent_hook(t, 'READY', role_change)['status'] == 'ready'
+    return rec, cf
+
+
+def bring_up(t, name='ops'):
+    rid, answer = ask(t, 'up', name)
+    assert answer['status'] == 'accepted' and result(t.f, rid) is None, answer
+    supervisor_answers(t, rid)
+    subfleet.tick(t.f)
+    assert named_subfleet.state(t.f, name)['state'] == 'starting'
+    rec, cf = adopt_child(t, name)
+    subfleet.tick(t.f)
+    return rid, rec, cf
+
+
+def take_down(t, cf, name='ops'):
+    rid, _ = ask(t, 'down', name)
+    supervisor_answers(t, rid)
+    subfleet.tick(t.f)  # draining -> quiet -> stop posted
+    stop_child_like_daemon(cf)
+    subfleet.tick(t.f)  # collected
+    return rid
+
+
+def typed_return(t):
+    """Run this test on the typed fallback path (``claude_hook_delivery: false``, as the §19 tests'
+    ``typed_fallback`` parameter does). The §29 / §3.1 promise "the delegated session itself comes back
+    as the worker" holds only there: on the hook channel (the default since the no-typing batch) a
+    returned Claude worker is never typed into, it is retired and its next generation starts (R1-01;
+    covered by the ``*_on_the_hook_channel_*`` tests). The user chose the hook-channel behaviour for named
+    sub-fleets on 2026-10-14 (design §29: return = retire the session, next generation in the parent slot)."""
+    f = t.f
+    f.cfg['claude_hook_delivery'] = False
+    fleet.save(f.path, dict(fleet.load(f.path), claude_hook_delivery=False))
+
+
+def supervisor_texts(f):
+    mids = f.v2.bus.pending('supervisor') + [f.v2.bus.slot_state('supervisor').get('message_id') or 'x']
+    return [f.v2.bus.message(m)['body']['text'] for m in mids if f.v2.bus.message(m)]
+
+
+def test_named_roster_section_is_validated(tmp_path):
+    (tmp_path / 'sup.md').write_text('x')
+    (tmp_path / 'child.yaml').write_text('workers:\n  - name: a\n')
+    base = 'workers:\n  - name: worker-1\n  - name: worker-2\n'
+    good = tmp_path / 'good.yaml'
+    good.write_text(base + 'subfleets:\n  - {name: ops, supervisor_slot: worker-1, supervisor_role: sup.md, '
+                    'roster: child.yaml, claude: bin/ro-claude, worker_model: haiku, timeouts: {stall: 150}, '
+                    'max_busy: 1}\n')
+    roster.load_entries(good)  # the worker part is unchanged
+    [e] = roster.load_subfleets(good)
+    assert e['autostart'] is False and e['mode'] == 'service' and e['drain_s'] == 600
+    assert e['stall_timeout'] == 150 and 'request_timeout' not in e and e['max_busy'] == 1
+    assert e['claude'] == str(tmp_path / 'bin/ro-claude') and e['roster'] == str(tmp_path / 'child.yaml')
+    bad = tmp_path / 'bad.yaml'
+    bad.write_text(base + 'subfleets:\n'
+                   '  - {name: worker-2, supervisor_slot: worker-1, supervisor_role: sup.md, roster: child.yaml}\n'
+                   '  - {name: b, supervisor_slot: nobody, supervisor_role: none.md, roster: child.yaml, mode: x}\n'
+                   '  - {name: c, supervisor_slot: worker-2, supervisor_role: sup.md, roster: child.yaml, autostart: 1}\n'
+                   '  - {name: d, supervisor_slot: worker-2, supervisor_role: sup.md, roster: child.yaml, drain_s: 0}\n')
+    with pytest.raises(ValueError) as exc:
+        roster.load_entries(bad)
+    text = str(exc.value)
+    for want in ('name is also a worker name', 'supervisor_slot must be one of the workers',
+                 'supervisor_role file not found', 'mode must be one of', 'autostart must be true or false',
+                 'already supervises another sub-fleet', 'drain_s must be a positive'):
+        assert want in text
+
+
+def test_named_entry_clear_switches_are_validated_and_never_inherited(tmp_path):
+    """§29 a): clear_after_result / clear_timeout / claude_hook_delivery are entry keys of their own:
+    validated with the roster, passed into the child config, and never taken from the parent."""
+    (tmp_path / 'sup.md').write_text('x')
+    (tmp_path / 'child.yaml').write_text('workers:\n  - name: a\n')
+    base = 'workers:\n  - name: worker-1\n  - name: worker-2\n'
+    good = tmp_path / 'good.yaml'
+    good.write_text(base + 'subfleets:\n'
+                    '  - {name: ops, supervisor_slot: worker-1, supervisor_role: sup.md, roster: child.yaml,\n'
+                    '     clear_after_result: true, clear_timeout: 45, claude_hook_delivery: false}\n'
+                    '  - {name: plain, supervisor_slot: worker-2, supervisor_role: sup.md, roster: child.yaml}\n')
+    ops, plain = roster.load_subfleets(good)
+    assert (ops['clear_after_result'], ops['clear_timeout'], ops['claude_hook_delivery']) == (True, 45, False)
+    assert not {'clear_after_result', 'clear_timeout', 'claude_hook_delivery'} & set(plain)
+    parent = dict(fleet.DEFAULTS, mode='service', clear_after_result=True, clear_timeout=99,
+                  claude_hook_delivery=False)
+    cfg = subfleet.child_worker_cfg(parent, ops)
+    assert (cfg['clear_after_result'], cfg['clear_timeout'], cfg['claude_hook_delivery']) == (True, 45, False)
+    cfg = subfleet.child_worker_cfg(parent, plain)  # not written: the built-in default, not the parent's
+    assert cfg['clear_after_result'] is False and cfg['clear_timeout'] == 20 and 'claude_hook_delivery' not in cfg
+    bad = tmp_path / 'bad.yaml'
+    bad.write_text(base + 'subfleets:\n'
+                   '  - {name: ops, supervisor_slot: worker-1, supervisor_role: sup.md, roster: child.yaml,\n'
+                   '     clear_after_result: 1, clear_timeout: 0, claude_hook_delivery: "no"}\n')
+    with pytest.raises(ValueError) as exc:
+        roster.load_entries(bad)
+    for want in ('clear_after_result must be true or false', 'claude_hook_delivery must be true or false',
+                 'clear_timeout must be a positive number'):
+        assert want in str(exc.value)
+
+
+def test_named_up_with_clear_on_the_hook_channel_is_rejected_by_program(svc):
+    """§29 a): the §28 / hook-delivery exclusion holds for a named child too, refused at its up."""
+    t, f = svc, svc.f
+    f.cfg['roster'] = str(write_roster(t, extra='    clear_after_result: true\n'))
+    f.roster_tick()
+    rid, answer = ask(t, 'up')
+    assert answer['status'] == 'accepted', answer
+    res = result(f, rid)
+    assert res['status'] == 'rejected' and res['reason'].startswith('program: '), res
+    assert 'claude_hook_delivery: false' in res['reason']
+    assert not subfleet.active_children(f.run_dir)
+
+
+def test_named_child_with_clear_and_typed_delivery_runs_with_its_own_switches(svc):
+    """§29 a): clear_after_result + claude_hook_delivery: false comes up; the child's config carries
+    the entry's switches and passes the run-config check (a named service child has lifecycle None)."""
+    t, f = svc, svc.f
+    f.cfg['roster'] = str(write_roster(
+        t, extra='    clear_after_result: true\n    clear_timeout: 30\n    claude_hook_delivery: false\n'))
+    f.roster_tick()
+    rid, rec, cf = bring_up(t)
+    assert result(f, rid)['status'] == 'ok'
+    child_cfg = fleet.load(Path(rec['run']) / 'config.json')
+    assert child_cfg['lifecycle'] is None and child_cfg['mode'] == 'service'
+    assert (child_cfg['clear_after_result'], child_cfg['clear_timeout'], child_cfg['claude_hook_delivery']) \
+        == (True, 30, False)
+    assert runtime_v2.validate_config(child_cfg) == 2
+    assert clear_after_result.enabled(child_cfg, 'ops-w1')
+    loose = dict(child_cfg, named=None)  # outside a named child, lifecycle None still refuses §28
+    with pytest.raises(ValueError):
+        clear_after_result.validate(loose)
+
+
+@pytest.mark.parametrize('switch', ['', 'advisor: off\n', 'advisor: on\n'])
+def test_named_child_roster_has_its_own_advisor_switch_default_off(svc, switch):
+    """§29 c) (user 10-14): a sub-fleet roster may say advisor: on | off; not written = off. The parent's
+    switch never reaches the child (child_config drops it)."""
+    t, f = svc, svc.f
+    f.cfg['advisor'] = True  # the parent's own (in-memory) switch is on
+    path = write_roster(t)
+    (t.tmp / 'child.yaml').write_text('workers:\n  - name: ops-w1\n' + switch)
+    f.cfg['roster'] = str(path)
+    f.roster_tick()
+    rid, answer = ask(t, 'up')
+    assert answer['status'] == 'accepted', answer
+    supervisor_answers(t, rid)
+    subfleet.tick(f)
+    rec = subfleet.record(f.run_dir / 'sub' / 'ops')
+    assert 'advisor' not in fleet.load(Path(rec['run']) / 'config.json')
+    cf = child_daemon(t, rec)  # the child daemon's first boot reads its own roster
+    on = switch == 'advisor: on\n'
+    assert cf.advisor_online() is on
+    assert (cf.r.hget(fleet.SERVICE, 'advisor') == 'on') is on
+    # advisor on: the child's Claude worker starts held for its first configuration sheet (§27)
+    assert (cf.agent('ops-w1').get('launch_ready') == '0') is on
+
+
+def test_named_child_roster_advisor_value_is_checked_with_the_parent_roster(tmp_path):
+    (tmp_path / 'sup.md').write_text('x')
+    (tmp_path / 'child.yaml').write_text('workers:\n  - name: a\nadvisor: maybe\n')
+    bad = tmp_path / 'bad.yaml'
+    bad.write_text('workers:\n  - name: worker-1\nsubfleets:\n'
+                   '  - {name: ops, supervisor_slot: worker-1, supervisor_role: sup.md, roster: child.yaml}\n')
+    with pytest.raises(ValueError, match='advisor must be on or off'):
+        roster.load_entries(bad)
+
+
+# §5.1 + §5.2
+def test_external_up_is_gated_approved_and_answered_with_the_child_address(svc):
+    t, f = svc, svc.f
+    rid, answer = ask(t, 'up', 'nope')
+    assert answer['status'] == 'accepted', answer
+    assert result(f, rid)['status'] == 'rejected' and result(f, rid)['reason'].startswith('program: ')
+    assert not f.r.llen(fleet.REQQ)  # never a service request queue entry
+    rid, rec, cf = bring_up(t)
+    res = result(f, rid)
+    child_cfg = fleet.load(Path(rec['run']) / 'config.json')
+    assert res['status'] == 'ok' and res['state'] == 'up' and res['redis_socket'] == child_cfg['redis_socket']
+    assert res['run_dir'] == str(f.run_dir / 'sub' / 'ops')
+    assert f.agent('worker-1')['state'] == 'delegated' and child_cfg['mode'] == 'service'
+    assert child_cfg['lifecycle'] is None and child_cfg['workers'] == ['ops-w1']
+    assert 'ROLE-MARKER-OPS' in (fleet.agent_cwd(f.cfg, 'worker-1') / 'AGENTS.md').read_text()
+    # up again (new id): answered by the program from state, same address
+    again, _ = ask(t, 'up')
+    assert {k: result(f, again)[k] for k in ('status', 'redis_socket')} == {'status': 'ok',
+                                                                            'redis_socket': res['redis_socket']}
+    # the same id again is a duplicate
+    _, dup = ask(t, 'up', rid=again)
+    assert dup['status'] == 'rejected' and 'duplicate' in dup['reason']
+    # a service request sent to the child's socket reaches the child supervisor (the parent's worker session)
+    spec = dict(id='q1', payload={'message': 'check the gateway'}, reply={'required': ['reply']})
+    assert drive(t, lambda: fleet.request(child_cfg, dict(kind='request', spec=spec)))['status'] == 'accepted'
+    step(t)
+    assert 'check the gateway' in [x for p, x in t.world.sent if p == rec['pane']][-1]
+    assert not subfleet.child_result(rec['run'])  # a service child never writes result.json
+
+
+# §5.3
+def test_reject_silence_and_busy_slot(svc, monkeypatch):
+    t, f = svc, svc.f
+    rid, _ = ask(t, 'up')
+    supervisor_answers(t, rid, 'reject', 'not now')
+    assert result(f, rid) == dict(result(f, rid), status='rejected', reason='supervisor: not now')
+    silent, _ = ask(t, 'up')
+    for _ in range(3):
+        subfleet.tick(f)
+    assert result(f, silent) is None and not subfleet.active_children(f.run_dir)
+    assert f.agent('worker-1')['state'] == 'idle'
+    step(t)
+    prompt = given(t, f, 'supervisor')[-1]  # Codex supervisor: its queued delivery (no typing)
+    f.setf('worker-1', state='busy')
+    hook(t, f, 'supervisor', json.dumps({'status': 'RUNNING', 'dispatch': [], 'skip': [],
+                                         'subfleet': {'id': silent, 'decision': 'approve'}}), prompt=prompt)
+    subfleet.tick(f)
+    assert result(f, silent) is None and not subfleet.active_children(f.run_dir)  # waits for the slot
+    monkeypatch.setattr(named_subfleet, 'SLOT_WAIT', 0)
+    subfleet.tick(f)
+    assert result(f, silent) == dict(result(f, silent), status='timeout', reason='slot busy')
+
+
+# §5.4 + §5.6a
+def test_down_drains_returns_the_same_session_and_the_name_comes_back_again(svc):
+    t, f = svc, svc.f
+    typed_return(t)  # same-session return: typed path only (see typed_return)
+    sid = f.agent('worker-1')['pane']
+    worker_rules = (fleet.agent_cwd(f.cfg, 'worker-1') / 'CLAUDE.md').read_text()
+    for round_ in range(3):  # more ups than max_attempts (1): never refused, one directory
+        _, rec, cf = bring_up(t)
+        assert rec['run'] == str(f.run_dir / 'sub' / 'ops') and rec['attempt'] == round_ + 1
+        child_cfg = fleet.load(Path(rec['run']) / 'config.json')
+        cr = fleet.connect(child_cfg)
+        cr.rpush(fleet.REQQ, 'in-flight')  # an unanswered child request: the down waits for it
+        rid, _ = ask(t, 'down')
+        supervisor_answers(t, rid)
+        subfleet.tick(f)
+        assert named_subfleet.state(f, 'ops')['state'] == 'draining'
+        assert subfleet.record(rec['run'])['state'] == 'running' and result(f, rid) is None
+        cr.lrem(fleet.REQQ, 0, 'in-flight')
+        cr.close()
+        subfleet.tick(f)
+        assert subfleet.record(rec['run'])['state'] == 'stopping'
+        stop_child_like_daemon(cf)
+        subfleet.tick(f)
+        rec = subfleet.record(rec['run'])
+        assert rec['state'] == 'down' and result(f, rid) == dict(result(f, rid), status='ok', state='down')
+        assert named_subfleet.state(f, 'ops')['state'] == 'down' and redis_down(child_cfg)
+        assert (fleet.agent_cwd(f.cfg, 'worker-1') / 'CLAUDE.md').read_text() == worker_rules
+        info = f.agent('worker-1')
+        assert info['pane'] == sid and info['generation'] == '0'
+        back = [x for p, x in t.world.sent if p == sid][-1]
+        assert parent_hook(t, 'READY', back)['status'] == 'ready' and f.agent('worker-1')['state'] == 'idle'
+        assert not any('[Sub-fleet' in x for x in supervisor_texts(f))  # no failed / completed notice
+        again, _ = ask(t, 'down')
+        assert result(f, again)['status'] == 'ok'  # already down: answered from state
+    assert len(list((f.run_dir / 'sub' / 'ops' / 'archive').glob('*/*'))) == 2
+    assert [d.name for d in subfleet.children_dirs(f.run_dir)] == ['ops']
+
+
+def hook_yielded(f):
+    """The worker's Stop hook that waited before the delegation yielded to the typed role change (claude_hook
+    OperatorQueue): no hook of this channel waits any more (hook_sim would otherwise still count it armed)."""
+    hook_sim._armed.pop(f.v2.hook_keys('worker-1', 0)['mailbox'], None)
+
+
+def returning_rewake(t, monkeypatch):
+    """The session's own asyncRewake from its last Stop while it supervised the sub-fleet (real
+    ``fleet.claude_rewake`` in a thread). Grace / stopping shortened; the rest is the real fallback."""
+    from cmux_fleet import claude_hook
+    monkeypatch.setattr(claude_hook, 'GRACE', 0)
+    f = t.f
+    thread = t.threads[(str(f.run_dir), 'worker-1', 0)]
+    raw = json.dumps({'session_id': thread, 'transcript_path': str(t.claude / (thread + '.jsonl'))})
+    f.r.delete(f.v2.hook_keys('worker-1', 0)['stopping'])  # its last Stop finished settling
+    hook_yielded(f)
+    box = {}
+    th = threading.Thread(target=lambda: box.setdefault('text', fleet.claude_rewake(f.path, 'worker-1', '0', raw)),
+                          daemon=True)
+    th.start()
+    return th, box, thread
+
+
+def down_and_collect(t, cf):
+    rid, _ = ask(t, 'down')
+    supervisor_answers(t, rid)
+    subfleet.tick(t.f)  # approved: draining
+    subfleet.tick(t.f)  # quiet: stop posted to the child
+    stop_child_like_daemon(cf)
+    subfleet.tick(t.f)  # collected
+    return rid
+
+
+def launches(f):
+    """Each launch of this fleet's manager, with its prompt file's text when the prompt went by file."""
+    out = []
+    for kw in getattr(f.mgr, 'spawned', []):
+        path = kw.get('prompt_file')
+        out.append(json.dumps(kw, ensure_ascii=False) + (Path(path).read_text() if path and Path(path).is_file() else ''))
+    return out
+
+
+def test_named_down_on_the_hook_channel_hands_over_through_the_sessions_own_note(svc, monkeypatch):
+    """§29 (user 10-14): return = the returned session writes a handoff note (design §4 rotation on its own
+    hook channel, no typing: its rewake fallback hands the dump prompt over), then worker-1's next
+    generation reads it; a late Stop of the old session settles nothing."""
+    t, f = svc, svc.f
+    sid = f.agent('worker-1')['pane']
+    _, rec, cf = bring_up(t)
+    th, box, thread = returning_rewake(t, monkeypatch)
+    time.sleep(1.5)
+    assert th.is_alive(), 'the rewake must wait while the session is delegated, not quit'
+    before = len(t.world.sent)
+    rid = down_and_collect(t, cf)
+    assert subfleet.record(rec['run'])['state'] == 'down' and result(f, rid)['status'] == 'ok'
+    assert not any('[Sub-fleet' in x for x in supervisor_texts(f))
+    info = f.agent('worker-1')
+    assert info['state'] == 'handoff' and info['generation'] == '0' and info['pane'] == sid
+    th.join(30)
+    assert not th.is_alive() and 'Sub-fleet ops is down' in box['text'] and info['handoff_draft'] in box['text']
+    assert not [x for p, x in t.world.sent[before:] if p == sid], 'a hook-channel worker is never typed into'
+    # Claude runs the rewake-delivered turn: writes the note, its Stop (now the parent's channel) settles it
+    Path(info['handoff_draft']).write_text(
+        '## Done (facts)\n- ops answered the morning requests\n## In progress\nnone\n'
+        '## Next steps (in order)\n1. wait for the next request\n')
+    transcript = t.claude / (thread + '.jsonl')
+    with transcript.open('a') as fh:
+        rows = [{'type': 'user', 'origin': {'kind': 'task-notification'}, 'promptId': 'p-ret',
+                 'message': {'role': 'user', 'content': '<task-notification>\n<summary>Stop hook feedback</summary>\n'
+                             '</task-notification>\n<system-reminder>\nFleet delivery: ' + box['text']
+                             + '\n</system-reminder>'}},
+                {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'handoff written'}]}}]
+        fh.write('\n'.join(json.dumps(x) for x in rows) + '\n')
+    raw = json.dumps({'session_id': thread, 'transcript_path': str(transcript), 'last_assistant_message': 'handoff written'})
+    drive(t, lambda: hook_sim.claude_stop(f.path, 'worker-1', '0', raw))
+    step(t)
+    info = f.agent('worker-1')
+    assert info['generation'] == '1' and info['state'] == 'starting' and info['pane'] != sid
+    assert sid not in t.world.alive and not info.get('subfleet_return')
+    note = next((f.run_dir / 'handoffs').glob('worker-1-g0-*.md'))
+    text = note.read_text()
+    assert 'ops answered the morning requests' in text  # the model's sections over the skeleton (design §4)
+    done = [x[1] for x in f.r.xrange(f.v2.bus.audit_key) if x[1].get('event') == 'rotate.done']
+    assert done and done[-1].get('source') == 'model'
+    launch = launches(f)[-1]
+    assert 'sub-fleet ops' in launch and str(note) in launch and 'resumed after an interruption' not in launch
+    assert f.r.hget(fleet.SERVICE, 'paused') != '1'
+    late = claude_turn(t, f.path, 'worker-1', 0, thread, 'anything', 'late reply')  # old session's late Stop
+    assert late['status'] == 'stale'
+    assert hook(t, f, 'worker-1', 'READY', prompt='startup')['status'] == 'ready'
+    _, rec2, _ = bring_up(t)  # the name comes back, now on the new generation's session
+    assert rec2['attempt'] == 2 and rec2['pane'] == info['pane'] and rec2['generation'] == 1
+
+
+def test_named_return_handoff_nobody_takes_falls_back_to_the_skeleton_without_holding(svc):
+    """§29: no rewake left to wake the returned session: after RETURN_WAKE_S the daemon's skeleton note
+    (sub-fleet name, up / down time, answered and open request ids) goes to the next generation; the
+    untaken handoff ran nothing, so the fleet is not held / paused."""
+    t, f = svc, svc.f
+    sid = f.agent('worker-1')['pane']
+    _, rec, cf = bring_up(t)
+    cr = fleet.connect(fleet.load(Path(rec['run']) / 'config.json'))
+    cr.rpush(fleet.RESULTS, json.dumps({'id': 'req-answered-1', 'status': 'ok'}))
+    cr.hset(fleet.REQ + 'req-open-2', mapping={'spec': '{}'})
+    cr.close()
+    hook_yielded(f)  # and no rewake is left to take the handoff
+    down_and_collect(t, cf)
+    info = f.agent('worker-1')
+    assert info['state'] == 'handoff' and info['generation'] == '0'
+    subfleet.tick(f)  # within RETURN_WAKE_S: still waiting for the session's rewake
+    assert f.agent('worker-1')['generation'] == '0'
+    back = json.loads(info['subfleet_return'])
+    f.setf('worker-1', subfleet_return=json.dumps(dict(back, at=back['at'] - named_subfleet.RETURN_WAKE_S - 1)))
+    subfleet.tick(f)
+    info = f.agent('worker-1')
+    assert info['generation'] == '1' and info['state'] == 'starting' and sid not in t.world.alive
+    assert f.r.hget(fleet.SERVICE, 'paused') != '1'
+    events = [x[1].get('event') for x in f.r.xrange(f.v2.bus.audit_key)]
+    assert 'subfleet.return_untaken' in events and 'execution.held' not in events
+    text = next((f.run_dir / 'handoffs').glob('worker-1-g0-*.md')).read_text()
+    assert 'named sub-fleet ops' in text and 'req-answered-1 ok' in text and 'req-open-2' in text
+    launch = launches(f)[-1]
+    assert 'sub-fleet ops' in launch and 'Read the handoff note' in launch and 'resumed after an interruption' not in launch
+
+
+def test_named_return_with_the_session_gone_starts_the_next_generation_on_a_skeleton_note(svc):
+    """§29: the delegated session died with the sub-fleet: nobody can write, the skeleton note goes
+    straight to the next generation (never "resumed after an interruption")."""
+    t, f = svc, svc.f
+    sid = f.agent('worker-1')['pane']
+    _, rec, cf = bring_up(t)
+    t.world.alive.discard(sid)  # the session is gone
+    down_and_collect(t, cf)
+    info = f.agent('worker-1')
+    assert info['generation'] == '1' and info['state'] == 'starting' and not info.get('subfleet_return')
+    note = f.run_dir / 'handoffs' / 'worker-1-g0-return.md'
+    assert 'named sub-fleet ops' in note.read_text()
+    launch = launches(f)[-1]
+    assert str(note) in launch and 'sub-fleet ops' in launch and 'resumed after an interruption' not in launch
+
+
+def test_drain_timeout_takes_the_child_back_anyway(svc):
+    t, f = svc, svc.f
+    typed_return(t)  # same-session return: typed path only (see typed_return)
+    _, rec, cf = bring_up(t)
+    cr = fleet.connect(fleet.load(Path(rec['run']) / 'config.json'))
+    cr.rpush(fleet.REQQ, 'stuck')
+    cr.close()
+    rid, _ = ask(t, 'down')
+    supervisor_answers(t, rid)
+    subfleet.tick(f)
+    assert subfleet.record(rec['run'])['state'] == 'running'
+    f.r.hset(named_subfleet.HASH + 'ops', mapping={'drain_since': time.time() - 61})
+    subfleet.tick(f)
+    assert subfleet.record(rec['run'])['state'] == 'stopping'
+    assert result(f, rid) == dict(result(f, rid), status='timeout', reason='drain exceeded')
+    assert any(x[1].get('event') == 'subfleet.drain_timeout' for x in f.r.xrange(f.v2.bus.audit_key))
+    stop_child_like_daemon(cf)
+    subfleet.tick(f)
+    assert subfleet.record(rec['run'])['state'] == 'down' and f.agent('worker-1')['pane'] == rec['pane']
+
+
+# §5.5
+def test_autostart_delegates_on_ready_revives_and_stops_on_crashloop(svc):
+    t, f = svc, svc.f
+    typed_return(t)  # same-session return: typed path only (see typed_return)
+    write_roster(t, autostart=True)
+    f.roster_tick()
+    rid, _ = ask(t, 'down')
+    assert result(f, rid)['reason'].startswith('program: ops is autostart')
+    subfleet.tick(f)  # worker-1 is idle and READY: delegated at once, no supervisor involved
+    rec = subfleet.record(f.run_dir / 'sub' / 'ops')
+    assert rec['state'] == 'running' and rec['autostart'] is True
+    _, cf = adopt_child(t)
+    subfleet.tick(f)
+    assert named_subfleet.state(f, 'ops')['state'] == 'up'
+    child_cfg = fleet.load(Path(rec['run']) / 'config.json')
+    mgr = t.world.mgrs['cmux-fleet:ops']
+    for crash in range(1, 4):
+        die(cf)
+        subfleet.shutdown_redis(child_cfg)
+        rec = subfleet.record(rec['run'])
+        rec['launched'] = rec['created'] = time.time() - subfleet.LAUNCH_GRACE - 1
+        subfleet.save_record(rec['run'], rec)
+        windows = len(getattr(mgr, 'windows', []))
+        subfleet.tick(f)
+        rec = subfleet.record(rec['run'])
+        if crash < 3:  # relaunched before the collect branch: Redis back, daemon --resume
+            assert rec['state'] == 'running' and not redis_down(child_cfg)
+            assert '--resume' in mgr.windows[-1][1] and len(mgr.windows) == windows + 1
+            cf = fleet.Fleet(Path(rec['run']) / 'config.json', fleet.connect(child_cfg), t.world.manager(child_cfg),
+                             sessions=t.sessions)
+            cf.lock = (Path(rec['run']) / 'daemon.lock').open('a+')
+            fcntl.flock(cf.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            t.fleets.append(cf)
+        else:
+            assert rec['state'] == 'failed' and rec['outcome'] == 'crashloop'  # collected, not relaunched
+    h = named_subfleet.state(f, 'ops')
+    assert h['crashloop'] == '1' and h['state'] == 'down'
+    assert any(x[1].get('event') == 'subfleet.crashloop' for x in f.r.xrange(f.v2.bus.audit_key))
+    assert f.agent('worker-1')['pane'] == rec['pane']
+    parent_hook(t, 'READY', [x for p, x in t.world.sent if p == rec['pane']][-1])
+    subfleet.tick(f)
+    assert not subfleet.active_children(f.run_dir)  # waits for an operator
+
+
+# §5.5 (resume) + §5.7
+def test_parent_resume_restarts_autostart_and_takes_back_external_ones(svc):
+    t, f = svc, svc.f
+    typed_return(t)  # same-session return: typed path only (see typed_return)
+    _, rec, cf = bring_up(t)
+    die(cf)
+    subfleet.resume_children(f, launch=lambda *a: pytest.fail('an external sub-fleet is never relaunched'))
+    assert subfleet.record(rec['run'])['state'] == 'down' and named_subfleet.state(f, 'ops')['state'] == 'down'
+    assert f.agent('worker-1')['pane'] == rec['pane'] and redis_down(fleet.load(Path(rec['run']) / 'config.json'))
+    parent_hook(t, 'READY', [x for p, x in t.world.sent if p == rec['pane']][-1])
+    write_roster(t, autostart=True)
+    f.roster_tick()
+    subfleet.tick(f)
+    rec = subfleet.record(rec['run'])
+    _, cf = adopt_child(t)
+    die(cf)
+    launched = []
+    subfleet.resume_children(f, launch=lambda path, cfg, mgr: launched.append(path))
+    assert launched == [Path(rec['run']) / 'config.json']
+    assert subfleet.stop_children(f, wait=1)  # parent stop: taken back, no orphan Redis
+    child_cfg = fleet.load(Path(rec['run']) / 'config.json')
+    assert redis_down(child_cfg) and named_subfleet.state(f, 'ops')['state'] == 'down'
+    assert subfleet.record(rec['run'])['state'] == 'down'
+
+
+# §5.6
+def test_rotation_gate_rotates_before_delegating(svc, monkeypatch):
+    t, f = svc, svc.f
+    usage = {'worker-1': (90, 100)}
+    monkeypatch.setattr(f, 'usage', lambda name: usage.get(name, (0, 0)))
+    rotations = []
+
+    def rotate(name, used, window):
+        rotations.append(name)
+        f.setf(name, state='handoff')
+    monkeypatch.setattr(f, 'start_rotation', rotate)
+    f.setf('worker-1', delivered=3)
+    rid, _ = ask(t, 'up')
+    supervisor_answers(t, rid)
+    subfleet.tick(f)
+    assert rotations == ['worker-1'] and not subfleet.active_children(f.run_dir)
+    subfleet.tick(f)
+    assert rotations == ['worker-1']  # handing off: not idle, no second rotation
+    usage['worker-1'] = (5, 100)  # the next generation is READY with a fresh session
+    f.setf('worker-1', state='idle', generation=1, label='worker-1.1', delivered=0)
+    subfleet.tick(f)
+    assert subfleet.record(f.run_dir / 'sub' / 'ops')['generation'] == 1
+
+
+def test_autostart_supervisor_over_threshold_goes_down_and_rotates_once(svc, monkeypatch):
+    t, f = svc, svc.f
+    typed_return(t)  # same-session return: typed path only (see typed_return)
+    usage = {'worker-1': (5, 100)}
+    monkeypatch.setattr(f, 'usage', lambda name: usage.get(name, (0, 0)))
+    rotations = []
+    monkeypatch.setattr(f, 'start_rotation', lambda name, used, window: rotations.append(name)
+                        or f.setf(name, state='handoff'))
+    write_roster(t, autostart=True)
+    f.roster_tick()
+    subfleet.tick(f)
+    rec, cf = adopt_child(t)
+    subfleet.tick(f)
+    assert named_subfleet.state(f, 'ops')['state'] == 'up'
+    usage['worker-1'] = (95, 100)
+    f.r.hset(named_subfleet.HASH + 'ops', mapping={'usage_at': 0})
+    subfleet.tick(f)  # over threshold while idle: draining
+    assert any(x[1].get('event') == 'subfleet.rotate' for x in f.r.xrange(f.v2.bus.audit_key))
+    assert named_subfleet.state(f, 'ops')['state'] == 'draining'
+    subfleet.tick(f)  # quiet: stop posted
+    assert subfleet.record(rec['run'])['state'] == 'stopping'
+    stop_child_like_daemon(cf)
+    subfleet.tick(f)
+    parent_hook(t, 'READY', [x for p, x in t.world.sent if p == rec['pane']][-1])
+    subfleet.tick(f)  # the same session is never delegated again: rotation first
+    assert rotations == ['worker-1'] and not subfleet.active_children(f.run_dir)
+    subfleet.tick(f)
+    assert rotations == ['worker-1']
+
+
+# §5.8
+def test_hot_roster_declare_remove_cancel_and_redeclare(svc):
+    t, f = svc, svc.f
+    typed_return(t)  # same-session return: typed path only (see typed_return)
+    _, rec, cf = bring_up(t)
+    write_roster(t, declare=False)
+    f.roster_tick()
+    assert named_subfleet.state(f, 'ops')['state'] == 'draining' and 'ops' not in named_subfleet.declared(f)
+    write_roster(t)  # added back before it went down: cancelled
+    f.roster_tick()
+    assert named_subfleet.state(f, 'ops')['state'] == 'up'
+    subfleet.tick(f)
+    assert subfleet.record(rec['run'])['state'] == 'running'
+    write_roster(t, declare=False)
+    f.roster_tick()
+    subfleet.tick(f)
+    stop_child_like_daemon(cf)
+    subfleet.tick(f)
+    assert subfleet.record(rec['run'])['state'] == 'down'
+    rid, _ = ask(t, 'up')
+    assert result(f, rid)['status'] == 'rejected'  # no longer declared
+    parent_hook(t, 'READY', [x for p, x in t.world.sent if p == rec['pane']][-1])
+    write_roster(t)
+    f.roster_tick()
+    bring_up(t)  # declared again (the name was used in this run): not refused
+
+
+# §5.9
+def test_child_workers_take_entry_values_or_builtin_defaults_never_the_parents(svc):
+    t, f = svc, svc.f
+    f.cfg.update(claude='/opt/ro-wrapper/claude-read-only', stall_timeout=150, request_timeout=77, max_busy=4)
+    [entry] = named_subfleet.declared(f).values()
+    cfg = subfleet.child_config(f, 'worker-1', 'ops', 1, t.tmp / 'c', 'pane-x', None, {}, 'n', named=entry)
+    assert 'claude' not in cfg and cfg['stall_timeout'] == fleet.DEFAULTS['stall_timeout']
+    assert cfg['request_timeout'] == fleet.DEFAULTS['request_timeout'] and cfg['max_busy'] == 0
+    assert cfg['worker_model'] == fleet.DEFAULTS['worker_model'] and cfg['worker_cli'] == 'claude'
+    entry = dict(entry, claude='/opt/child/claude', worker_model='haiku', stall_timeout=600, request_timeout=900,
+                 max_busy=2)
+    cfg = subfleet.child_config(f, 'worker-1', 'ops', 1, t.tmp / 'c', 'pane-x', None, {}, 'n', named=entry)
+    assert (cfg['claude'], cfg['worker_model'], cfg['stall_timeout'], cfg['request_timeout'], cfg['max_busy']) == (
+        '/opt/child/claude', 'haiku', 600, 900, 2)
+    assert f.cfg['claude'] == '/opt/ro-wrapper/claude-read-only'  # the delegated slot itself is unchanged
+
+
+# §5.10
+def test_child_self_pause_shows_as_paused_in_the_parent_hash(svc):
+    t, f = svc, svc.f
+    _, rec, cf = bring_up(t)
+    cf.pause('supervisor gave no valid decision JSON three times in a row')
+    subfleet.tick(f)
+    assert named_subfleet.state(f, 'ops')['state'] == 'paused'
+    rid, _ = ask(t, 'up')
+    assert result(f, rid)['state'] == 'paused'
+    cf.resume()
+    subfleet.tick(f)
+    assert named_subfleet.state(f, 'ops')['state'] == 'up'

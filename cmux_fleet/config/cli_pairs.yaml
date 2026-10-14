@@ -6,7 +6,7 @@
 #   adapter_missing: non-empty -> refused even for smoke
 #   reason: the refusal text shown to the user (unverified / forbidden / adapter_missing rows)
 #   verified_by: the real smoke (scripts/smoke_pair.sh, 1 supervisor + 2 workers, 4 v2 checks) that flipped it
-# Exception kept in code: claude+claude task with cfg adopt (docs/design.md §19 sub-fleet).
+# Exception kept in code: claude+claude task or service with cfg adopt (docs/design.md §19 sub-fleet, §29 named).
 # CLI boundary (docs/design.md §6, §11 2026-10-13 "Codex/FlashNext via pi"): Claude agents run only the
 # official `claude` CLI; pi never uses Claude subscription credentials. Codex models (openai-codex/*, ChatGPT
 # login) and FlashNext run through pi. The official Codex TUI supervisor stays optional:

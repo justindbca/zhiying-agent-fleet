@@ -17,7 +17,10 @@ def validate(cfg):
     timeout = cfg.get('clear_timeout', 20)
     if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
         raise ValueError('clear_timeout must be a positive finite number')
-    if flag and (cfg.get('lifecycle') != 'service' or cfg.get('mode') != 'service'
+    # A named service sub-fleet (docs/design.md §29) runs with lifecycle None by design: its parent owns it.
+    service_life = cfg.get('lifecycle') == 'service' or (
+        cfg.get('lifecycle') is None and bool(cfg.get('named')) and bool(cfg.get('parent_config')))
+    if flag and (not service_life or cfg.get('mode') != 'service'
                  or cfg.get('worker_cli') != 'claude' or cfg.get('transport_version') != 2):
         raise ValueError('--clear-after-result requires --lifecycle service, Claude Code workers '
                          'and the typed Redis v2 delivery path')

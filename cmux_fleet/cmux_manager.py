@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import time
@@ -47,6 +48,10 @@ from typing import Dict, List, Optional, Tuple
 
 CMUX = os.environ.get('CMUX_BIN') or '/Applications/cmux.app/Contents/Resources/bin/cmux'
 STATE_DIR = Path(os.environ.get('CMUX_FLEET_STATE') or (Path.home() / '.local/state/cmux-fleet'))
+TMUX = os.environ.get('CMUX_FLEET_TMUX') or shutil.which('tmux') or '/opt/homebrew/bin/tmux'
+# The fleet's own tmux server (docs/design.md §19 dual display): never the user's ~/.tmux.conf, whose
+# resurrect / continuum plugins would copy the user's sessions into it and overwrite their saves.
+TMUX_CONF = 'set -g window-size latest\nset -g history-limit 50000\n'
 
 
 @dataclass
@@ -87,6 +92,57 @@ def cmux_available() -> bool:
         return _run('ping').stdout.strip() == 'PONG'
     except OSError:
         return False
+
+
+# -- the fleet's own tmux server (a sub-fleet supervisor_slot shown in two workspaces) -------------
+def tmux_session_name(slot: str, generation) -> str:
+    """``<slot>-g<generation>``: a ``.`` (pane separator) or ``:`` (window separator) breaks ``-t``."""
+    safe = ''.join(c if c.isalnum() or c in '-_' else '_' for c in slot)
+    return safe + '-g' + str(int(generation))
+
+
+def tmux_conf(sock: str) -> Path:
+    """The minimal config next to the socket (written on first use)."""
+    conf = Path(sock).with_name('tmux.conf')
+    if not conf.exists():
+        conf.parent.mkdir(parents=True, exist_ok=True)
+        conf.write_text(TMUX_CONF)
+    return conf
+
+
+def _tmux(sock: str, *args: str) -> subprocess.CompletedProcess:
+    # Always -f: any tmux command may start a server, which would otherwise read ~/.tmux.conf.
+    env = {k: v for k, v in os.environ.items() if k != 'TMUX'}
+    return subprocess.run([TMUX, '-S', str(sock), '-f', str(tmux_conf(sock)), *args],
+                          capture_output=True, text=True, env=env)
+
+
+def tmux_attach_command(sock: str, session: str) -> str:
+    """A client tab's command. ``exec``: cmux types it into a login shell; a detached client then ends the
+    tab instead of dropping back to the prompt."""
+    return 'exec ' + shlex.join([TMUX, '-S', str(sock), '-f', str(tmux_conf(sock)), 'attach', '-t', '=' + session])
+
+
+def tmux_sessions(sock: str) -> List[str]:
+    if not Path(sock).exists():
+        return []
+    p = _tmux(sock, 'list-sessions', '-F', '#{session_name}')
+    return p.stdout.split() if p.returncode == 0 else []
+
+
+def tmux_kill_server(sock: str) -> bool:
+    """Last step of a fleet's exit; True when no server is left on ``sock``."""
+    if Path(sock).exists():
+        _tmux(sock, 'kill-server')
+    return not tmux_sessions(sock)
+
+
+def _tree_pids(pid: int) -> List[int]:
+    pids = [pid]
+    for p in pids:
+        result = subprocess.run(['pgrep', '-P', str(p)], capture_output=True, text=True)
+        pids += [int(c) for c in result.stdout.split() if c.isdigit()]
+    return pids
 
 
 def kill_process_tree(pid: int, term_timeout: float = 3.0) -> None:
@@ -249,6 +305,12 @@ class CmuxSessionManager:
     def owns(self, sid: str) -> bool:
         return self._where(sid) is not None
 
+    def _tmux_of(self, sid: str) -> Optional[Dict[str, str]]:
+        """tmux tag of a surface that is a client of the fleet's tmux server (owner: the slot's own tab,
+        whose retirement ends the session; view: a second client, e.g. in a sub-fleet's workspace)."""
+        info = self._meta()['surfaces'].get(sid) or {}
+        return info if info.get('tmux_socket') and info.get('tmux_session') else None
+
     # -- session ------------------------------------------------------------
     def session_exists(self) -> bool:
         meta = self._meta()
@@ -362,7 +424,8 @@ class CmuxSessionManager:
     def spawn_interactive_cli(self, window_name: str, cli_command: str, prompt_file: Optional[str] = None,
                               output_file: Optional[str] = None, metadata: Optional[Dict[str, str]] = None,
                               start_directory: Optional[str] = None, auto_close: bool = True,
-                              env_vars: Optional[Dict[str, str]] = None, **_) -> SpawnResult:
+                              env_vars: Optional[Dict[str, str]] = None, tmux_socket: Optional[str] = None,
+                              tmux_session: Optional[str] = None, **_) -> SpawnResult:
         inner = cli_command
         if prompt_file:
             inner = f'{cli_command} "$(<{prompt_file})"'
@@ -372,16 +435,106 @@ class CmuxSessionManager:
         command = ('env ' + env + ' ' if env else '') + 'bash -lc ' + shlex.quote(inner)
         full = self._launcher(window_name, 'cd ' + shlex.quote(start_directory or '.') + ' && exec ' + command,
                               Path(output_file).parent if output_file else None)
+        tag = {}
+        if tmux_socket and tmux_session:
+            # The CLI runs in the fleet's tmux server (same launcher string); the tab is only its client.
+            self._reap_tmux(tmux_socket, tmux_session)
+            p = _tmux(tmux_socket, 'new-session', '-d', '-s', tmux_session, '-c', start_directory or '.', full)
+            if p.returncode:
+                return SpawnResult(success=False, error='tmux new-session failed: ' + (p.stderr or p.stdout).strip())
+            tag = {'tmux_socket': str(tmux_socket), 'tmux_session': tmux_session, 'tmux_role': 'owner'}
+            full = tmux_attach_command(tmux_socket, tmux_session)
         sid, ran = self._new_surface(command=full)
         if not sid:
+            if tag:
+                _tmux(tmux_socket, 'kill-session', '-t', '=' + tmux_session)  # no session without its tab
             return SpawnResult(success=False, error='cmux surface creation failed (' + self._spawn_error() + ')')
-        self._tag(sid, type=(metadata or {}).get('type', ''), label=window_name, output_file=output_file or '')
+        self._tag(sid, type=(metadata or {}).get('type', ''), label=window_name, output_file=output_file or '', **tag)
         if not _wait_until(lambda: self._where(sid)):
             return SpawnResult(success=False, pane_id=sid, error='cmux surface did not become visible')
         if not ran and not self._type_command(sid, full):
             return SpawnResult(success=False, pane_id=sid, error='cmux command delivery failed')
         self.rename(sid, window_name)
         return SpawnResult(success=True, pane_id=sid, window_name=window_name)
+
+    def _reap_tmux(self, sock: str, session: str) -> None:
+        """Before ``<slot>-g<n>`` starts: end the slot's other generations whose tab is gone (a resume after
+        the tab was closed), saving their history first. A generation still shown in a tab of ours (the
+        predecessor during a handoff) is left to its own retirement."""
+        prefix = session.rsplit('-g', 1)[0] + '-g'
+        surfaces = self._meta()['surfaces']
+        for name in tmux_sessions(sock):
+            if name == session or not name.startswith(prefix) or not name[len(prefix):].isdigit():
+                continue
+            tabs = [sid for sid, info in surfaces.items() if info.get('tmux_session') == name]
+            if any(self._where(sid) for sid in tabs):
+                continue
+            for sid in tabs:
+                if surfaces[sid].get('output_file'):
+                    with open(surfaces[sid]['output_file'], 'a', encoding='utf-8') as fh:
+                        fh.write(self._tmux_history(sock, name))
+            _tmux(sock, 'kill-session', '-t', '=' + name)
+
+    def tmux_view_info(self, sid: str) -> Optional[Dict[str, str]]:
+        """What another fleet needs to open a second client of this surface's session (None: not tmux)."""
+        tm = self._tmux_of(sid)
+        if not tm:
+            return None
+        return {k: v for k, v in tm.items() if k in ('type', 'label', 'tmux_socket', 'tmux_session')}
+
+    def attach_view(self, info: Dict[str, str], peer: str) -> Optional[str]:
+        """Open a second client of ``info``'s session as a tab just before ``peer`` and own that tab.
+        The session and the other client are untouched. Returns the new surface (None on failure)."""
+        sock, session = info.get('tmux_socket'), info.get('tmux_session')
+        if not sock or not session or not self._where(peer) or session not in tmux_sessions(sock):
+            return None
+        command = tmux_attach_command(sock, session)
+        sid, ran = self._new_surface(command=command)
+        if not sid:
+            return None
+        self._tag(sid, **{k: v for k, v in info.items() if isinstance(v, str) and k != 'output_file'},
+                  tmux_role='view')
+        if not _wait_until(lambda: self._where(sid)) or (not ran and not self._type_command(sid, command)):
+            self.kill_pane(sid)
+            return None
+        if not self.tab_into(sid, peer):
+            self.kill_pane(sid)
+            return None
+        return sid
+
+    def _client_tty(self, sid: str) -> Optional[str]:
+        ws = self._where(sid)
+        tty = self._surfaces(ws).get(sid, {}).get('tty') if ws else None
+        return '/dev/' + os.path.basename(tty) if tty else None
+
+    def detach_view(self, sid: str) -> bool:
+        """Disconnect this tab's tmux client (the session keeps running) and forget the tab, which ends by
+        itself (exec). Never ``close-surface --force``: a confirmation dialog belongs to the user."""
+        tm = self._tmux_of(sid)
+        if not tm:
+            return False
+        ws = self._where(sid)
+        if ws:
+            tty = self._client_tty(sid)
+            if tty:
+                _tmux(tm['tmux_socket'], 'detach-client', '-t', tty)
+            if not _wait_until(lambda: sid not in self._surfaces(ws)):
+                _run('close-surface', '--workspace', ws, '--surface', sid)
+                if not _wait_until(lambda: sid not in self._surfaces(ws)):
+                    return False
+        meta = self._meta()
+        meta['surfaces'].pop(sid, None)
+        self._save_meta(meta)
+        return True
+
+    def _tmux_history(self, sock: str, session: str) -> str:
+        # pane target: ``=<session>:`` (a bare ``=<session>`` is read as a pane name and fails)
+        p = _tmux(sock, 'capture-pane', '-p', '-S', '-', '-t', '=' + session + ':')
+        return p.stdout if p.returncode == 0 else ''
+
+    def _tmux_pids(self, tm: Dict[str, str], fmt: str) -> List[str]:
+        p = _tmux(tm['tmux_socket'], 'list-panes', '-s', '-t', '=' + tm['tmux_session'], '-F', fmt)
+        return [line.strip() for line in p.stdout.splitlines() if line.strip()] if p.returncode == 0 else []
 
     # -- status / io ----------------------------------------------------------
     def get_pane_status(self, pane_id: str) -> Optional[PaneStatus]:
@@ -396,11 +549,19 @@ class CmuxSessionManager:
         ws = self._where(pane_id)
         if not ws:
             return False
-        tty = self._surfaces(ws)[pane_id].get('tty')
-        if not tty:
-            return False
+        tm = self._tmux_of(pane_id)
+        if tm:  # the tab shows only a tmux client; the CLI runs under the tmux server's pane
+            pids = [str(p) for pane in self._tmux_pids(tm, '#{pane_pid}') if pane.isdigit() for p in _tree_pids(int(pane))]
+            if not pids:
+                return False
+            sel = ['-p', ','.join(pids)]
+        else:
+            tty = self._surfaces(ws)[pane_id].get('tty')
+            if not tty:
+                return False
+            sel = ['-t', tty]
         # comm: one executable path per line (may contain spaces); a bare shell never matches.
-        result = subprocess.run(['ps', '-t', tty, '-o', 'comm='], capture_output=True, text=True)
+        result = subprocess.run(['ps', *sel, '-o', 'comm='], capture_output=True, text=True)
         if result.returncode != 0:
             return False
         exes = [_exe(line) for line in result.stdout.splitlines() if line.strip()]
@@ -408,19 +569,25 @@ class CmuxSessionManager:
             return True
         if 'node' not in exes:
             return False
-        result = subprocess.run(['ps', '-t', tty, '-o', 'args='], capture_output=True, text=True)
+        result = subprocess.run(['ps', *sel, '-o', 'args='], capture_output=True, text=True)
         return result.returncode == 0 and any(_node_runs(line, names) for line in result.stdout.splitlines())
 
     def process_states(self, pane_id: str) -> List[str]:
         """`ps` STAT of the processes on an owned surface's tty (watchdog frozen check)."""
         from cmux_fleet.watchdog import pane_tty_stats
         ws = self._where(pane_id)
+        tm = self._tmux_of(pane_id) if ws else None
+        if tm:
+            return [st for tty in self._tmux_pids(tm, '#{pane_tty}') for st in pane_tty_stats(tty)]
         return pane_tty_stats(self._surfaces(ws).get(pane_id, {}).get('tty')) if ws else []
 
     def capture_output(self, pane_id: str, lines: int = 2000) -> str:
         ws = self._where(pane_id)
         if not ws:
             return ''
+        tm = self._tmux_of(pane_id)
+        if tm:  # whole scrollback of the session, not the client's current screen
+            return self._tmux_history(tm['tmux_socket'], tm['tmux_session'])
         p = _run('read-screen', '--workspace', ws, '--surface', pane_id, '--scrollback', '--lines', str(lines))
         return p.stdout if p.returncode == 0 else ''
 
@@ -452,7 +619,13 @@ class CmuxSessionManager:
         if pane_id not in meta['surfaces']:
             return False  # never touch a surface this fleet did not spawn
         ws = self._where(pane_id)
+        tm = self._tmux_of(pane_id)
         if not ws:  # already closed (e.g. by the ✕)
+            if tm and tm.get('tmux_role') == 'owner':  # its session must not outlive it as an orphan
+                if tm.get('output_file'):
+                    with open(tm['output_file'], 'a', encoding='utf-8') as f:
+                        f.write(self._tmux_history(tm['tmux_socket'], tm['tmux_session']))
+                _tmux(tm['tmux_socket'], 'kill-session', '-t', '=' + tm['tmux_session'])
             meta['surfaces'].pop(pane_id)
             self._save_meta(meta)
             return True
@@ -461,6 +634,18 @@ class CmuxSessionManager:
         if output_file:  # cmux has no streaming pipe-pane; keep the final screen instead
             with open(output_file, 'a', encoding='utf-8') as f:
                 f.write(self.capture_output(pane_id))
+        if tm:
+            # The tab holds only a tmux client: killing its tty would orphan the CLI in the tmux server.
+            # Owner: end the session; view: disconnect this client only. Either way the tab exits (exec).
+            if tm.get('tmux_role') == 'owner':
+                _tmux(tm['tmux_socket'], 'kill-session', '-t', '=' + tm['tmux_session'])
+            elif info.get('tty'):
+                _tmux(tm['tmux_socket'], 'detach-client', '-t', '/dev/' + os.path.basename(info['tty']))
+            if _wait_until(lambda: pane_id not in self._surfaces(ws)):
+                meta = self._meta()
+                meta['surfaces'].pop(pane_id, None)
+                self._save_meta(meta)
+                return True
         if info.get('tty'):
             ps = subprocess.run(['ps', '-t', info['tty'], '-o', 'pid=,ppid='], capture_output=True, text=True)
             rows = [line.split() for line in ps.stdout.splitlines() if line.strip()]

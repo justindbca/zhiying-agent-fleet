@@ -351,13 +351,15 @@ def test_pair_check_unverified_needs_smoke(pairs):
     assert night.resolve_launches(v2cfg(), {'worker-1': 'flashnext-coder'})['worker-1']['overrides']['worker_cli'] == 'pi'
 
 
-def test_pair_check_adopt_exception_is_claude_claude_task_only(pairs):
-    """Sub-fleet (design §19): an adopted Claude supervisor passes before the row is consulted."""
+def test_pair_check_adopt_exception_is_claude_claude_task_or_service(pairs):
+    """Sub-fleet (design §19, service: §29): an adopted Claude supervisor passes before the row is consulted."""
     pairs(('claude', 'claude', 'task', 'unverified', ('claude_supervisor',)))
     sub = v2cfg(supervisor_cli='claude', adopt=True)
     assert night.resolve_launches(sub, {'worker-1': 'claude-coder'})['worker-1']['overrides']['worker_cli'] == 'claude'
     assert '[adapter_missing]' in refusal(dict(sub, adopt=False), 'claude-coder')
-    assert '[unlisted]' in refusal(dict(sub, mode='service'), 'claude-coder')   # service: no exception
+    service = night.resolve_launches(dict(sub, mode='service'), {'worker-1': 'claude-coder'})  # §29: allowed
+    assert service['worker-1']['overrides']['worker_cli'] == 'claude'
+    assert '[unlisted]' in refusal(dict(sub, mode='service', adopt=False), 'claude-coder')  # without adopt: no
     assert 'claude+pi/task [unlisted]' in refusal(sub)                          # other worker CLI: no exception
 
 
@@ -539,3 +541,29 @@ def test_night_swapped_slot_takes_its_card_handoff_ratio_through_the_one_resolve
     window, ratio, source = f.handoff_limits('worker-2')
     assert ratio == .5 and source.endswith('ratio: card flashnext-coder')  # FlashNext card: 0.5
     assert f.handoff_limits('worker-1')[1] == float(f.cfg['handoff_ratio'])  # day slot: fleet default
+
+
+def test_night_roster_must_declare_the_same_subfleets(tmp_path):
+    """design §29 d) (user 10-14): the night roster's ``subfleets:`` section equals the day roster's
+    (compared with paths resolved), else the pair is refused as a whole with the differing names."""
+    cfg = dict(fleet.DEFAULTS, transport_version=2, supervisor_cli='codex', worker_cli='claude',
+               allow_development_v2=True, mode='task')
+    (tmp_path / 'sup.md').write_text('x')
+    (tmp_path / 'child.yaml').write_text('workers:\n  - name: a\n')
+    (tmp_path / 'n').mkdir()
+    sub = ('subfleets:\n  - {name: ops, supervisor_slot: worker-1, supervisor_role: SUP, roster: CHILD'
+           + ', autostart: AUTO}\n')
+    day, other = tmp_path / 'day.yaml', tmp_path / 'n' / 'night.yaml'
+    day.write_text('workers:\n  - name: worker-1\n'
+                   + sub.replace('SUP', 'sup.md').replace('CHILD', 'child.yaml').replace('AUTO', 'false'))
+    # same targets through other relative paths: accepted
+    other.write_text('workers:\n  - {name: worker-1, profile: claude-coder}\n'
+                     + sub.replace('SUP', '../sup.md').replace('CHILD', '../child.yaml').replace('AUTO', 'false'))
+    night.check_rosters(cfg, day, other)
+    other.write_text('workers:\n  - {name: worker-1, profile: claude-coder}\n'
+                     + sub.replace('SUP', '../sup.md').replace('CHILD', '../child.yaml').replace('AUTO', 'true'))
+    with pytest.raises(ValueError, match=r'same "subfleets:".*differing: ops'):
+        night.check_rosters(cfg, day, other)
+    other.write_text('workers:\n  - {name: worker-1, profile: claude-coder}\n')
+    with pytest.raises(ValueError, match=r'same "subfleets:".*differing: ops'):
+        night.check_rosters(cfg, day, other)

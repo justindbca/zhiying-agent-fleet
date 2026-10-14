@@ -158,4 +158,10 @@ def check_rosters(cfg, day_path, night_path):
     if roster.advisor(Path(day_path).read_bytes()) != roster.advisor(Path(night_path).read_bytes()):
         raise ValueError('the day and night rosters must set the same "advisor" (on / off): the advisor is per run, '
                          'a night on / off must not turn it on or off')
+    day = {e['name']: e for e in roster.load_subfleets(day_path)}
+    nite = {e['name']: e for e in roster.load_subfleets(night_path)}
+    if day != nite:  # paths compared resolved: each file's relative paths may differ, the targets may not
+        diff = sorted(n for n in set(day) | set(nite) if day.get(n) != nite.get(n))
+        raise ValueError('the day and night rosters must declare the same "subfleets:" (named sub-fleets are per '
+                         'run, a night on / off must not add, drop or change one); differing: ' + ', '.join(diff))
     return parsed

@@ -48,6 +48,13 @@ RESCUE_PROMPT = DUMP_PROMPT.replace(
     'Context is almost full ({used}/{window}). ',
     'The supervisor is handing your current task to a successor session with a new configuration. ')
 
+# Named sub-fleet return (design §29): the session that supervised sub-fleet <name> hands over to the
+# slot's next generation. The caller replaces <name>; {path} / {used} / {window} are formatted as above.
+SUBFLEET_RETURN_PROMPT = DUMP_PROMPT.replace(
+    'Context is almost full ({used}/{window}). ',
+    'Sub-fleet <name> is down and your role as its supervisor is over; a fresh session of this slot takes '
+    'over as the main fleet\'s worker. Write what it needs to know about that sub-fleet. ')
+
 
 def read_usage(path: str, window_fallback: int) -> Tuple[int, int]:
     """(tokens used, context window) from the newest token_count event in a rollout.

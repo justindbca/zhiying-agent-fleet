@@ -19,7 +19,7 @@ import redis
 from cmux_fleet import claude_hook, clear_after_result, cli_pairs, contracts
 from cmux_fleet.message_bus import BusError, MessageBus, LUA_REBIND_CHECK, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
-from cmux_fleet import codex_queue, lifecycle_close, subfleet, tui_cards
+from cmux_fleet import codex_queue, lifecycle_close, named_subfleet, subfleet, tui_cards
 from cmux_fleet import watchdog
 
 
@@ -927,6 +927,9 @@ class RuntimeV2:
                     item['request_id'] = env['request_id']
                 if not error and len(value.get('dispatch', [])) + len(value.get('skip', [])) > 1:
                     error = 'one route or skip per bound service request'
+                if not error and isinstance(value.get('subfleet'), dict):  # §29: only its bound external op
+                    if value['subfleet'].setdefault('id', env['request_id']) != env['request_id']:
+                        error = 'service decision may answer only its bound sub-fleet request'
                 if not error:
                     text = dumps(value)
             if not error:
@@ -1443,8 +1446,9 @@ class RuntimeV2:
             self.cancel_queued(slot, {'message_id': mid}, 'start --resume: re-queued after reconcile')
         return released and not keep_out
 
-    def respawn(self, slots, page):
-        """Next generation of each slot in place; without a supervisor pane, rebuild the whole page."""
+    def respawn(self, slots, page, prompt=None, handoff=''):
+        """Next generation of each slot in place; without a supervisor pane, rebuild the whole page.
+        ``prompt`` / ``handoff``: another launch prompt ({label}) and its note (a §29 sub-fleet return)."""
         from cmux_fleet import history
         from cmux_fleet.fleet import SERVICE, SUPERVISOR_LABEL, NAMES
         old = {}
@@ -1464,7 +1468,7 @@ class RuntimeV2:
                 snapshot = self.f.run_dir / 'handoffs' / (slot + '-g' + str(generation) + '-resume.terminal.txt')
                 snapshot.parent.mkdir(parents=True, exist_ok=True)
                 self.f.mgr.capture_to(pane, str(snapshot))
-            history.record(self.f.run_dir, slot=slot, label=prev, generation=generation, handoff='',
+            history.record(self.f.run_dir, slot=slot, label=prev, generation=generation, handoff=handoff,
                            snapshot=str(snapshot), source='resume', timed_out=False)
             label = (SUPERVISOR_LABEL if slot == 'supervisor' else slot) + '.' + str(generation + 1)
             self.f.setf(slot, generation=generation + 1, label=label, handoff_id='', retired_pane='',
@@ -1481,9 +1485,9 @@ class RuntimeV2:
             if slot != 'supervisor':
                 self.f.r.hset(NAMES, mapping={label: slot})
             old[slot] = pane if alive else None
-        prompt = ('You are fleet agent {label}. Read AGENTS.md in the current directory first. This run was '
-                  'resumed after an interruption; the daemon sends the current state next. In this turn do no '
-                  'task work: your final reply must be exactly READY.')
+        prompt = prompt or ('You are fleet agent {label}. Read AGENTS.md in the current directory first. This run was '
+                            'resumed after an interruption; the daemon sends the current state next. In this turn do no '
+                            'task work: your final reply must be exactly READY.')
         if not page:  # whole page lost (e.g. cmux restarted): close leftovers, then lay it out again
             for slot, pane in old.items():
                 if pane and (not self.f.mgr.kill_pane(pane) or self.f.mgr.get_pane_status(pane) is not None):
@@ -1608,6 +1612,7 @@ class RuntimeV2:
                                                   'created': time.time()})
                 self.f.route(rid, spec)
                 self.audit('request.replayed', request_id=rid, attempt=attempt)
+        named_subfleet.requeue_awaiting(self.f)  # §29 external ops wait in their own queue, not REQQ
 
     def deliver(self, slot):
         from cmux_fleet.fleet import REQ
@@ -1626,7 +1631,8 @@ class RuntimeV2:
         if not mids:
             return
         msg = self.bus.message(mids[0])
-        if self.f.service and msg['kind'] != 'followup' and not self.f.r.hgetall(REQ + msg['request_id']):
+        if (self.f.service and msg['kind'] != 'followup' and not self.f.r.hgetall(REQ + msg['request_id'])
+                and not self.f.r.hgetall(named_subfleet.OP + msg['request_id'])):  # §29: an open sub-fleet op
             self.transaction('drop-' + msg['message_id'], lambda: self.cancel_queued(slot, msg, 'already terminal'))
             return
         env = self.bus.offer(slot, mids[0])
@@ -1648,6 +1654,15 @@ class RuntimeV2:
 
     def hook_keys(self, slot, generation):
         return claude_hook.keys(self.bus.prefix, slot, generation)
+
+    def handoff_taken(self, slot):
+        """The slot's Stop hook (or its rewake fallback) handed the current handoff delivery to Claude."""
+        info = self.f.agent(slot)
+        try:
+            bind = json.loads(self.bus.r.get(self.hook_keys(slot, int(info.get('generation') or 0))['bind']) or '{}')
+        except (ValueError, TypeError):
+            return False
+        return isinstance(bind, dict) and bind.get('message_id') == 'm-handoff-' + (info.get('handoff_id') or '-')
 
     def type_into(self, slot, env):
         """Receive an offered delivery for an official CLI and hand over only its business text.
