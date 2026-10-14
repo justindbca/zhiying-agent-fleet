@@ -1658,7 +1658,8 @@ class RuntimeV2:
         if not mids:
             return
         msg = self.bus.message(mids[0])
-        if (self.f.service and msg['kind'] != 'followup' and not self.f.r.hgetall(REQ + msg['request_id'])
+        # A consultation (kind advisor) is bound to its ticket, never to a request: its own deadline ends it (§27).
+        if (self.f.service and msg['kind'] not in ('followup', 'advisor') and not self.f.r.hgetall(REQ + msg['request_id'])
                 and not self.f.r.hgetall(named_subfleet.OP + msg['request_id'])):  # §29: an open sub-fleet op
             self.transaction('drop-' + msg['message_id'], lambda: self.cancel_queued(slot, msg, 'already terminal'))
             return
