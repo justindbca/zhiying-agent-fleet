@@ -1217,6 +1217,22 @@ class RuntimeV2:
                 self.ui('supervisor', card)
         self.f.pause(slot + ': ' + reason)
 
+    def prompt_wait(self, slot, scope, reason, screen, kind=None):
+        """A dialog waits for the user (plan F B-1 / F' 8.2): mark the slot, pause dispatch, tell the user.
+
+        Not a hold: the lease, the message and the slot state stay as they are (busy / received, or
+        starting), so once a human answers in the pane the turn ends and settles normally."""
+        self.f.setf(slot, prompt_wait=scope, prompt_wait_at=time.time(), prompt_route='user', watch_state='prompting')
+        self.audit('execution.prompt_wait', slot=slot, level='error', error=reason,
+                   detail={'scope': scope, 'screen': screen, 'route': 'user', 'dialog_class': kind or 'unread'})
+        card = routing_card(self.f.label(slot) + ' 停在确认框等人答，已暂停派工；屏幕见 ' + screen + '。',
+                            kind='notice', slot=self.f.label(slot), severity='warn')
+        card['metadata']['event_id'] = 'ui-prompt-' + digest(slot + ':' + scope)[:32]
+        self.ui(slot, card)
+        if slot != 'supervisor':
+            self.ui('supervisor', card)
+        self.f.pause(slot + ': ' + reason)
+
     def replay_intents(self):
         # Replay prepared effects only; applied plans never run validators again.
         clean = True
@@ -1764,6 +1780,8 @@ class RuntimeV2:
                 info = self.f.agent(slot)
                 state = self.f.r.hgetall(self.bus.lease_key(slot))
                 if (info.get('state') == 'starting' and info.get('advice_hold') != '1'  # held for its first advisor sheet
+                        # a dialog before READY waits for a human (plan F B-2b): not a dead start
+                        and info.get('prompt_wait') != 'startup-g' + str(info.get('generation', '0'))
                         and now >= float(info.get('startup_deadline') or 0)):
                     self.f.setf(slot, state='dead', bridge_available=0, runtime_ready=0)
                     self.finish('blocked', slot + ' startup timed out before READY')

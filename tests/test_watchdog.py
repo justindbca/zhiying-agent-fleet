@@ -205,14 +205,15 @@ def test_same_dialog_three_times_becomes_stalled(wd):
     assert f.agent('worker-1')['watch_state'] == 'stalled' and keys(f, 'worker-1')[-1] == 'Escape'
 
 
-def test_unknown_dialog_is_held_not_pressed(wd):
+def test_unknown_dialog_waits_for_a_human_not_pressed(wd):
+    # Plan F B-1: an unanswerable dialog no longer holds the slot (the result used to be thrown away after the
+    # human answered); it is marked prompt_wait, dispatch pauses, the lease stays received.
     f = wd
     dispatch_one(f)
     f.mgr.screens[f.agent('worker-1')['pane']] = DIALOG_UNKNOWN
     f.v2.watchdog.tick(time.time())
     assert keys(f, 'worker-1') == []
-    assert f.agent('worker-1')['state'] == 'held' and f.paused()
-    assert f.v2.bus.slot_state('worker-1')['status'] == 'uncertain'
+    waiting(f, 'worker-1')
     saved, = screens(f)
     assert saved.endswith('prompt-unknown.txt') and 'git push --force' in (f.run_dir / 'watchdog' / saved).read_text()
     assert audits(f, 'watch.prompt_unknown')[0]['marker'] == 'do you want to proceed?'
@@ -507,44 +508,56 @@ def test_forged_release_event_is_rejected(wd):
 
 
 # ------------------------------------------------------------------ dialog text is not an authorisation
-def held_unpressed(f, slot, prompt, reason):
-    assert keys(f, slot) == [] and f.agent(slot)['state'] == 'held' and f.paused()
+def waiting(f, slot, state='busy', scope=None):
+    """Plan F B-1: the dialog waits for a human. Nothing pressed, slot state and lease untouched (no hold),
+    the slot marked prompt_wait with its scope, dispatch paused, one execution.prompt_wait audit."""
+    info = f.agent(slot)
+    lease = f.v2.bus.slot_state(slot)
+    assert keys(f, slot) == [] and info['state'] == state and f.paused()
+    assert info['prompt_wait'] == (scope or lease['current_delivery']) and info['prompt_route'] == 'user'
+    if state == 'busy':
+        assert lease['status'] == 'received'
+    assert len(audits(f, 'execution.prompt_wait')) == 1 and audits(f, 'execution.held') == []
+
+
+def waits_unpressed(f, slot, prompt, reason, state='busy', scope=None):
+    waiting(f, slot, state, scope)
     unverified, = audits(f, 'watch.prompt_unverified')
     assert unverified['prompt'] == prompt and reason in unverified['reason']
     assert any(n.endswith('prompt-' + prompt + '.txt') for n in screens(f))
     assert audits(f, 'watch.prompt_answered') == []
 
 
-def held_for_the_user(f, slot, marker):
-    """An unknown dialog: screen saved, slot held (fleet paused), not a single key pressed."""
-    assert keys(f, slot) == [] and f.agent(slot)['state'] == 'held' and f.paused()
+def waits_for_the_user(f, slot, marker):
+    """An unknown dialog: screen saved, slot marked for the user (fleet paused), not a single key pressed."""
+    waiting(f, slot)
     assert audits(f, 'watch.prompt_unknown')[0]['marker'] == marker
     assert any(n.endswith('prompt-unknown.txt') for n in screens(f))
     assert audits(f, 'watch.prompt_answered') == [] and audits(f, 'watch.prompt_unverified') == []
 
 
-def test_dangerous_rm_on_a_variable_is_held_for_a_human(wd):
+def test_dangerous_rm_on_a_variable_waits_for_a_human(wd):
     f = wd
     dispatch_one(f)
     f.mgr.screens[f.agent('worker-1')['pane']] = DIALOG_RM   # rm -rf "$OUT/"*: OUT may be empty
     f.v2.watchdog.tick(time.time())
-    held_for_the_user(f, 'worker-1', 'dangerous rm')
-    assert f.v2.bus.slot_state('worker-1')['status'] == 'uncertain'
-    f.v2.watchdog.tick(time.time() + 1)                         # held: the next tick presses nothing either
+    waits_for_the_user(f, 'worker-1', 'dangerous rm')
+    assert f.v2.bus.slot_state('worker-1')['status'] == 'received'
+    f.v2.watchdog.tick(time.time() + 1)                         # waiting: the next tick presses nothing either
     assert keys(f, 'worker-1') == []
 
 
 @pytest.mark.parametrize('target', ['build/tmp', '../worker-2/out', '/Users', '~/Documents'])
-def test_dangerous_rm_is_held_for_the_user_wherever_its_target_is(wd, target):
+def test_dangerous_rm_waits_for_the_user_wherever_its_target_is(wd, target):
     # build/tmp (a literal target inside the slot directory) used to be answered; deletes are now always
     # confirmed by the user (2026-10-14).
     f = wd
     dispatch_one(f)
     f.mgr.screens[f.agent('worker-1')['pane']] = DIALOG_RM_LITERAL.replace('build/tmp', target)
     f.v2.watchdog.tick(time.time())
-    held_for_the_user(f, 'worker-1', 'dangerous rm')
-    assert f.v2.bus.slot_state('worker-1')['status'] == 'uncertain'
-    f.v2.watchdog.tick(time.time() + 1)                         # held: the next tick presses nothing either
+    waits_for_the_user(f, 'worker-1', 'dangerous rm')
+    assert f.v2.bus.slot_state('worker-1')['status'] == 'received'
+    f.v2.watchdog.tick(time.time() + 1)                         # waiting: the next tick presses nothing either
     assert keys(f, 'worker-1') == []
 
 
@@ -576,12 +589,12 @@ def test_read_outside_inside_the_run_workspace_is_answered(wd):
     (READ.format('/Users/justin/Documents/projects/cmux-fleet/cmux_fleet/fleet.py'), 'outside the granted area'),
     ('Read outside the working directories?\n❯ 1. Yes', 'no path'),   # scope not on the screen
 ])
-def test_read_outside_the_run_or_without_a_path_is_held(wd, screen, reason):
+def test_read_outside_the_run_or_without_a_path_waits_for_a_human(wd, screen, reason):
     f = wd
     dispatch_one(f)
     f.mgr.screens[f.agent('worker-1')['pane']] = screen
     f.v2.watchdog.tick(time.time())
-    held_unpressed(f, 'worker-1', 'read_outside', reason)
+    waits_unpressed(f, 'worker-1', 'read_outside', reason)
 
 
 @pytest.mark.parametrize('screen,name,reason', [
@@ -589,12 +602,13 @@ def test_read_outside_the_run_or_without_a_path_is_held(wd, screen, reason):
     ('Trust this folder?\n› 1. Yes', 'trust_folder_legacy', 'no path'),
     (CLAUDE_TRUST_LIVE, 'trust_folder', 'outside the granted area'),     # the live capture names another directory
 ])
-def test_trust_of_a_foreign_or_unnamed_folder_is_held(wd, screen, name, reason):
+def test_trust_of_a_foreign_or_unnamed_folder_waits_for_a_human(wd, screen, name, reason):
     f = wd
     f.setf('worker-2', state='starting')
     f.mgr.screens[f.agent('worker-2')['pane']] = screen
     f.v2.watchdog.tick(time.time())
-    held_unpressed(f, 'worker-2', name, reason)
+    waits_unpressed(f, 'worker-2', name, reason, state='starting', scope='startup-g0')
+    assert f.v2.bus.slot_state('worker-2')['status'] == 'idle'   # no lease touched before READY
 
 
 def test_dialog_on_a_pane_outside_this_fleet_registry_is_not_answered(wd):
@@ -604,7 +618,173 @@ def test_dialog_on_a_pane_outside_this_fleet_registry_is_not_answered(wd):
     f.mgr.screens[pane] = read_in_run(f)
     f.mgr.owns = lambda p: False
     f.v2.watchdog.tick(time.time())
-    held_unpressed(f, 'worker-1', 'read_outside', 'registry')
+    waits_unpressed(f, 'worker-1', 'read_outside', 'registry')
+
+
+# ------------------------------------------------------------------ plan F: a dialog waits for a human, not a hold
+def mark_rm(f, slot='worker-1'):
+    dispatch_one(f)
+    f.mgr.screens[f.agent(slot)['pane']] = DIALOG_RM
+    f.v2.watchdog.tick(time.time())
+    waiting(f, slot)
+    return f.agent(slot)['prompt_wait']
+
+
+def move_transcript(f, slot):
+    path = Path(f.agent(slot)['transcript'])
+    later = float(f.agent(slot)['prompt_wait_at']) + 5
+    os.utime(path, (later, later))
+
+
+def test_prompt_wait_presses_nothing_while_the_dialog_stays(wd):
+    f = wd
+    mark_rm(f)
+    now = time.time()
+    for i in range(30):                                    # well past stall_timeout (600 s) and stall_grace
+        f.v2.watchdog.tick(now + 60 * i)
+    assert keys(f, 'worker-1') == [] and audits(f, 'watch.escape') == []
+    assert ('prompting', 'stalled') not in transitions(f, 'worker-1') and f.mgr.killed == []
+    assert len(audits(f, 'execution.prompt_wait')) == 1
+    f.mgr.screens[f.agent('worker-1')['pane']] = WORKING   # the dialog scrolled out, nobody answered yet
+    f.v2.watchdog.tick(now + 3600)
+    assert keys(f, 'worker-1') == [] and f.agent('worker-1')['prompt_wait']
+
+
+def test_prompt_wait_clears_when_the_transcript_moves(wd):
+    f = wd
+    mark_rm(f)
+    f.mgr.screens[f.agent('worker-1')['pane']] = WORKING
+    move_transcript(f, 'worker-1')                          # the human answered, the worker went on
+    f.v2.watchdog.tick(time.time() + 10)
+    assert f.agent('worker-1')['prompt_wait'] == '' and f.agent('worker-1')['watch_state'] == 'working'
+    assert audits(f, 'watch.prompt_cleared')[-1]['reason'] == 'activity'
+    f.mgr.screens[f.agent('worker-1')['pane']] = DIALOG_RM  # the model opens another dialog: wait again
+    f.v2.watchdog.tick(time.time() + 20)
+    assert len(audits(f, 'execution.prompt_wait')) == 2 and keys(f, 'worker-1') == []
+
+
+def test_answered_dialog_turn_settles_normally_and_the_report_reaches_the_supervisor(wd):
+    f = wd
+    mark_rm(f)
+    msg_id = f.v2.bus.slot_state('worker-1')['message_id']
+    f.mgr.screens[f.agent('worker-1')['pane']] = WORKING
+    move_transcript(f, 'worker-1')
+    f.v2.watchdog.tick(time.time() + 10)
+    assert answer_turn(f, 'worker-1', REPORT)['status'] == 'committed'
+    msg = f.v2.bus.message(msg_id)
+    assert msg['status'] == 'committed' and msg['outcome'] == 'completed'
+    assert audits(f, 'hold.released') == [] and audits(f, 'execution.held') == []
+    assert any(t.startswith('[worker-1 report]') for t in f.v2.pending_text('supervisor'))
+    f.resume(); f.pump()
+    assert typed(f, 'supervisor')[-1].startswith('[worker-1 report]')
+
+
+def test_answered_dialog_turn_settles_even_before_the_watchdog_sees_activity(wd):
+    f = wd
+    mark_rm(f)
+    assert answer_turn(f, 'worker-1', REPORT)['status'] == 'committed'   # B-4: the lease stayed received
+    f.v2.watchdog.tick(time.time() + 10)
+    assert f.agent('worker-1')['prompt_wait'] == '' and audits(f, 'watch.prompt_cleared')[-1]['reason'] == 'inactive'
+
+
+def test_resume_without_answering_keeps_the_slot_waiting(wd):
+    f = wd
+    mark_rm(f)
+    f.resume()
+    f.v2.watchdog.tick(time.time() + 10)
+    assert keys(f, 'worker-1') == [] and f.agent('worker-1')['prompt_wait'] and not f.paused()
+    assert len(audits(f, 'execution.prompt_wait')) == 1
+
+
+def test_prompt_wait_is_dropped_when_the_delivery_is_gone(wd):
+    f = wd
+    mark_rm(f)
+    f.v2.finish('blocked', 'supervisor gave up')            # the delivery is held now: hands off
+    f.v2.watchdog.tick(time.time() + 10)
+    assert f.agent('worker-1')['state'] == 'held' and f.agent('worker-1')['prompt_wait'] == ''
+    assert audits(f, 'watch.prompt_cleared')[-1]['reason'] == 'hands_off' and keys(f, 'worker-1') == []
+
+
+def test_prompt_wait_of_another_delivery_is_cleared_and_checked_afresh(wd):
+    f = wd
+    mark_rm(f)
+    f.setf('worker-1', prompt_wait='d-some-older-delivery')
+    f.mgr.screens[f.agent('worker-1')['pane']] = WORKING
+    f.v2.watchdog.tick(time.time() + 10)
+    assert f.agent('worker-1')['prompt_wait'] == '' and audits(f, 'watch.prompt_cleared')[-1]['reason'] == 'scope_changed'
+
+
+def test_starting_slot_trust_dialog_waits_for_a_human_and_ready_registers(wd):
+    f = wd
+    f.setf('worker-2', state='starting', startup_deadline=time.time() + 180)
+    f.mgr.screens[f.agent('worker-2')['pane']] = DIALOG_TRUST       # a folder that is not the slot's own
+    f.v2.watchdog.tick(time.time())
+    waiting(f, 'worker-2', state='starting', scope='startup-g0')
+    f.setf('worker-2', startup_deadline=time.time() - 1)           # past profile_ready_timeout
+    f.v2.tick()
+    assert f.agent('worker-2')['state'] == 'starting' and f.task().get('status') != 'blocked'
+    assert keys(f, 'worker-2') == []
+    f.mgr.screens[f.agent('worker-2')['pane']] = WORKING
+    assert answer_turn(f, 'worker-2', 'READY', startup=True)['status'] == 'ready'
+    assert f.agent('worker-2')['state'] == 'idle' and f.agent('worker-2')['runtime_ready'] == '1'
+    f.v2.watchdog.tick(time.time() + 10)
+    assert f.agent('worker-2')['prompt_wait'] == ''
+
+
+def test_unmarked_starting_slot_past_its_deadline_is_still_dead(wd):
+    f = wd
+    submit(f)
+    f.setf('worker-2', state='starting', startup_deadline=time.time() - 1)
+    f.v2.tick()
+    assert f.agent('worker-2')['state'] == 'dead' and f.task()['status'] == 'blocked'
+
+
+# ------------------------------------------------------------------ plan F' 8.1: delete classifier
+@pytest.mark.parametrize('screen', [
+    DIALOG_RM, DIALOG_RM_LITERAL, 'Bash command\n  rm -rf "$X"\nDo you want to proceed?\n❯ 1. Yes',
+    'Bash command\n  unlink /tmp/a\nDo you want to proceed?', 'Bash command\n  git clean -fd\nDo you want to proceed?',
+    'Bash command\n  psql -c "DROP TABLE users"\nDo you want to proceed?', '确认删除这些文件？\n❯ 1. Yes',
+    'Bash command\n  mv build/out.txt /tmp/elsewhere\nDo you want to proceed?',
+    'Rename src/a.py to src/b.py?\n❯ 1. Yes', 'Bash command\n  git reset --hard HEAD~1\nDo you want to proceed?',
+    'Bash command\n  git branch -D old\nDo you want to proceed?', 'Deleting 3 files. Do you want to proceed?',
+    '把旧目录移动到归档？\n❯ 1. Yes',
+])
+def test_delete_classifier_is_strict(screen):
+    table = watchdog.parse_table(watchdog.DEFAULT_TABLE.read_text())
+    assert watchdog.dialog_class(table, None, screen) == 'delete'
+
+
+@pytest.mark.parametrize('screen', [
+    READ.format('/Users/someone/notes.md'), DIALOG_TRUST, CLAUDE_TRUST_LIVE,
+    'Do you want to make this edit to report.md?\n❯ 1. Yes\n  2. No',
+])
+def test_non_delete_dialogs_are_other(screen):
+    table = watchdog.parse_table(watchdog.DEFAULT_TABLE.read_text())
+    assert watchdog.dialog_class(table, None, screen) == 'other'
+
+
+def test_unreadable_screen_is_not_classified():
+    table = watchdog.parse_table({})
+    assert watchdog.dialog_class(table, None, '') is None and watchdog.dialog_class(table, None, '\n  \n') is None
+    assert watchdog.dialog_class(table, {'name': 'dangerous_rm'}, '') == 'delete'
+
+
+def test_delete_markers_only_add_and_bad_ones_are_refused():
+    table = watchdog.parse_table({'delete_markers': ['obliterate']})
+    assert watchdog.dialog_class(table, None, 'Obliterate the cache?') == 'delete'
+    assert watchdog.dialog_class(table, None, 'rm -rf x') == 'delete'          # built-ins stay in force
+    for bad in (['', 'x'], 'rm', [3]):
+        with pytest.raises(ValueError, match='delete_markers'):
+            watchdog.parse_table({'delete_markers': bad})
+
+
+def test_whitelisted_dialog_showing_a_delete_is_never_pressed(wd):
+    f = wd
+    dispatch_one(f)
+    f.mgr.screens[f.agent('worker-1')['pane']] = 'Bash command\n  rm -rf build\n' + read_in_run(f)
+    f.v2.watchdog.tick(time.time())
+    waits_unpressed(f, 'worker-1', 'read_outside', 'delete')
+    assert audits(f, 'watch.prompt_unverified')[0]['dialog_class'] == 'delete'
 
 
 def test_live_claude_trust_dialog_wrapped_path_is_read_whole():
