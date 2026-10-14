@@ -320,6 +320,10 @@ def check(f, slot, task_id, workers, ready=True, named=None):
         if named['mode'] != 'service' or f.cfg.get('transport_version') != 2:
             return ('sub-fleet ' + task_id + ': clear_after_result needs mode: service and the typed '
                     'Redis v2 delivery path (transport_version 2)')
+    if named and named.get('worker_domains'):  # same rule as start --worker-domains, checked at up
+        problem = named_domains_problem(f.cfg.get('worker_kit'), named['worker_domains'])
+        if problem:
+            return 'sub-fleet ' + task_id + ': ' + problem
     if workers > lim['child_workers_max']:
         return 'child_workers_max ' + str(lim['child_workers_max']) + ': asked for ' + str(workers) + ' workers'
     live = active_children(f.run_dir)
@@ -503,6 +507,22 @@ def child_worker_cfg(parent, named):
     return cfg
 
 
+def named_domains_problem(worker_kit, domains):
+    """None when every entry ``worker_domains`` name is in the parent's kit domain table, else the reason."""
+    from cmux_fleet import kit as kitmod
+    if not worker_kit:
+        return 'worker_domains needs the parent fleet to run with --worker-kit (a domain kit)'
+    try:
+        kit = kitmod.Kit(worker_kit)
+    except (OSError, ValueError) as exc:
+        return 'worker_domains needs a domain kit; ' + str(worker_kit) + ' rejected: ' + str(exc)
+    unknown = [d for d in domains if d not in kit.domains]
+    if unknown:
+        return ('worker_domains not in the domain table of ' + str(worker_kit) + ': ' + ', '.join(unknown)
+                + ' (the table has: ' + ', '.join(kit.domains) + ')')
+    return None
+
+
 def child_config(f, slot, task_id, workers, rec_dir, sid, info, redis_cfg, name, named=None):
     fleet = _fleet()
     parent = child_worker_cfg(f.cfg, named) if named else f.cfg
@@ -523,6 +543,8 @@ def child_config(f, slot, task_id, workers, rec_dir, sid, info, redis_cfg, name,
                    supervisor_role=named['supervisor_role'],
                    named={'name': named['name'], 'autostart': named['autostart']})
         cfg.pop('roster_night', None)
+        if 'worker_domains' in named:  # the entry's floor replaces the parent's ([] = none); not written: inherited
+            cfg['worker_domains'] = list(named['worker_domains'])
     else:
         names = ['worker-' + str(i + 1) for i in range(workers)]
     cfg.update(run=str(rec_dir), workers=names, mode=mode,

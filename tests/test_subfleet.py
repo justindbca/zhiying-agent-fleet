@@ -1254,6 +1254,60 @@ def test_named_child_with_clear_and_typed_delivery_runs_with_its_own_switches(sv
         clear_after_result.validate(loose)
 
 
+def test_named_entry_worker_domains_is_validated(tmp_path):
+    """§29 d): worker_domains is the child's own --worker-domains floor: a list of names, [] allowed."""
+    (tmp_path / 'sup.md').write_text('x')
+    (tmp_path / 'child.yaml').write_text('workers:\n  - name: a\n')
+    base = 'workers:\n  - name: worker-1\n  - name: worker-2\n'
+    good = tmp_path / 'good.yaml'
+    good.write_text(base + 'subfleets:\n'
+                    '  - {name: mem, supervisor_slot: worker-1, supervisor_role: sup.md, roster: child.yaml,\n'
+                    '     worker_domains: []}\n'
+                    '  - {name: plain, supervisor_slot: worker-2, supervisor_role: sup.md, roster: child.yaml}\n')
+    mem, plain = roster.load_subfleets(good)
+    assert mem['worker_domains'] == [] and 'worker_domains' not in plain
+    bad = tmp_path / 'bad.yaml'
+    bad.write_text(base + 'subfleets:\n'
+                   '  - {name: mem, supervisor_slot: worker-1, supervisor_role: sup.md, roster: child.yaml,\n'
+                   '     worker_domains: futures}\n')
+    with pytest.raises(ValueError) as exc:
+        roster.load_entries(bad)
+    assert 'worker_domains must be a list of domain names' in str(exc.value)
+
+
+def domain_parent(t):
+    from test_kit import make_kit
+    t.f.cfg.update(worker_kit=str(make_kit(t.tmp / 'kit')), worker_domains=['us_options'])
+
+
+@pytest.mark.parametrize('extra, want', [('', ['us_options']), ('    worker_domains: []\n', []),
+                                         ('    worker_domains: [research_web]\n', ['research_web'])])
+def test_named_child_worker_domains_replaces_the_parents_floor_or_inherits_it(svc, extra, want):
+    """§29 d) (user 10-14): an entry's worker_domains replaces the parent's floor ([] = none, e.g. a
+    memory-extraction child that needs no trading skills); not written = the parent's, as before."""
+    t, f = svc, svc.f
+    domain_parent(t)
+    f.cfg['roster'] = str(write_roster(t, extra=extra))
+    f.roster_tick()
+    rid, rec, cf = bring_up(t)
+    assert result(f, rid)['status'] == 'ok'
+    assert fleet.load(Path(rec['run']) / 'config.json')['worker_domains'] == want
+    assert cf.floor_domains() == want
+
+
+def test_named_child_worker_domains_not_in_the_kit_is_rejected_by_program(svc):
+    t, f = svc, svc.f
+    domain_parent(t)
+    f.cfg['roster'] = str(write_roster(t, extra='    worker_domains: [nope]\n'))
+    f.roster_tick()
+    rid, answer = ask(t, 'up')
+    assert answer['status'] == 'accepted', answer
+    res = result(f, rid)
+    assert res['status'] == 'rejected' and res['reason'].startswith('program: '), res
+    assert 'worker_domains not in the domain table' in res['reason'] and 'nope' in res['reason']
+    assert not subfleet.active_children(f.run_dir)
+
+
 @pytest.mark.parametrize('switch', ['', 'advisor: off\n', 'advisor: on\n'])
 def test_named_child_roster_has_its_own_advisor_switch_default_off(svc, switch):
     """§29 c) (user 10-14): a sub-fleet roster may say advisor: on | off; not written = off. The parent's

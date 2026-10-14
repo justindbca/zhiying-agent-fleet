@@ -251,7 +251,7 @@ def write_advisor(path, on, workers=()):
 # ------------------------------------------------------------------ named sub-fleets (docs/design.md §29)
 SUBFLEET_KEYS = {'name', 'supervisor_slot', 'supervisor_role', 'autostart', 'mode', 'roster', 'claude',
                  'worker_model', 'timeouts', 'max_busy', 'drain_s', 'clear_after_result', 'clear_timeout',
-                 'claude_hook_delivery'}
+                 'claude_hook_delivery', 'worker_domains'}
 SUBFLEET_MODES = ('service', 'task')
 DRAIN_S = 600
 TIMEOUT_KEYS = {'stall': 'stall_timeout', 'request': 'request_timeout'}  # entry timeouts -> fleet config key
@@ -327,6 +327,12 @@ def subfleet_entries(value, base, workers):
                     bad.append(key + ' must be true or false')
                 else:
                     out[key] = item[key]
+        if 'worker_domains' in item:  # the child's own --worker-domains floor; [] = none (not written: the parent's)
+            wd = item['worker_domains']
+            if not isinstance(wd, list) or not all(isinstance(d, str) and d.strip() for d in wd):
+                bad.append('worker_domains must be a list of domain names ([] for none)')
+            else:
+                out['worker_domains'] = list(dict.fromkeys(d.strip() for d in wd))
         if 'clear_timeout' in item:
             if not _positive(item['clear_timeout']) or not math.isfinite(item['clear_timeout']):
                 bad.append('clear_timeout must be a positive number of seconds')
