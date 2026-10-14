@@ -62,8 +62,8 @@ def parse_entries(raw, base):
             continue
         errors += [where + ': ' + e for e in pi_errors(item)]
         name = item['name']
-        if not isinstance(name, str) or not re.fullmatch(NAME_RE, name) or name == 'supervisor':
-            errors.append(where + ': name must match ' + NAME_RE + ' and not be "supervisor" (no dots)')
+        if not isinstance(name, str) or not re.fullmatch(NAME_RE, name) or name in ('supervisor', 'advisor'):
+            errors.append(where + ': name must match ' + NAME_RE + ' and not be "supervisor" or "advisor" (no dots)')
             continue
         if name in workers:
             errors.append(where + ': duplicate worker name ' + name)

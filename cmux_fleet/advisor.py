@@ -21,6 +21,21 @@ VERDICTS = ('enough', 'enough_simple', 'not_enough', 'overkill', 'untested', 're
 TIMEOUT = 90
 ATTEMPTS = 2  # one retry, then the fallback sheet (§8)
 MODEL, EFFORT = 'fable', 'high'  # user boundary 2: Fable / high / official CLI, never pi
+# Resident advisor (docs/design.md §27, v2 task mode): one official Claude tab next to the supervisor.
+# It is a slot of the fleet (bus, hooks, watchdog, handoff) but never a worker: no dispatch, no report.
+SLOT = 'advisor'
+RESIDENT_NOTE = '''
+
+## Resident session (the fleet's advisor tab)
+
+You run as a resident session in the fleet's advisor tab instead of once per call. Your first turn: reply
+exactly READY. After that every message is one consultation from the daemon: a first line
+`[Advisor consultation <ticket>]`, then the input JSON object described above (it replaces stdin). Answer
+each consultation on its own input; earlier consultations in this session are history, not input. Reply with
+the one JSON object only. A `[Advisor correction <ticket>]` message says why the daemon refused your last
+sheet and repeats the input: reply again with one corrected sheet. Use no tool except Read, and only for a
+file the daemon names (a handoff note).
+'''
 
 
 class AdviceError(ValueError):
@@ -72,6 +87,18 @@ def argv(cfg, run_dir):
             '--setting-sources', '', '--strict-mcp-config', '--disable-slash-commands',
             '--settings', json.dumps({'autoMemoryEnabled': False}),
             '--system-prompt-file', str(Path(run_dir) / 'advisor.md'), '--output-format', 'json']
+
+
+def resident_argv(cfg, run_dir, settings):
+    """The resident advisor tab: argv() without -p / --output-format, only the Read tool (handoff notes
+    under <run>/handoffs readable without a permission dialog); ``settings`` is the generation's file with
+    the fleet Stop hook and autoMemoryEnabled false (one --settings only)."""
+    out = argv(cfg, run_dir)
+    out.remove('-p')
+    i = out.index('--output-format')
+    del out[i:i + 2]
+    out[out.index('--settings') + 1] = str(settings)
+    return out + ['--tools', 'Read', '--add-dir', str(Path(run_dir) / 'handoffs')]
 
 
 def run_claude(payload, *, cfg, run_dir, timeout=TIMEOUT):
