@@ -16,8 +16,8 @@ from pathlib import Path
 
 import redis
 
-from cmux_fleet import cli_pairs, contracts
-from cmux_fleet.message_bus import BusError, MessageBus, _json, _short, _request_id
+from cmux_fleet import clear_after_result, cli_pairs, contracts
+from cmux_fleet.message_bus import BusError, MessageBus, LUA_REBIND_CHECK, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
 from cmux_fleet import lifecycle_close, subfleet, tui_cards
 from cmux_fleet import watchdog
@@ -32,6 +32,7 @@ def v2_cli_problem(cfg):
 
 
 def validate_config(cfg):
+    clear_after_result.validate(cfg)
     version = cfg.get('transport_version', 1)
     if type(version) is not int or version not in (1, 2):
         raise ValueError('transport_version must be 1 or 2')
@@ -277,7 +278,7 @@ class Effects:
 
 # Preflight all expected key types before any effects. Applying marker is written
 # separately; unanticipated Redis script failure leaves a visible ambiguous intent.
-LUA_APPLY = """
+LUA_APPLY = LUA_REBIND_CHECK + """
 if redis.call('HGET', KEYS[1], 'phase') == 'applied' then return 'already' end
 if redis.call('HGET', KEYS[1], 'phase') ~= 'applying' then error('intent_not_applying') end
 local plan = cjson.decode(ARGV[1])
@@ -318,6 +319,15 @@ if type(plan.commit_gate) == 'table' then
   end
   local pending = redis.call('XPENDING', gate.inbox, gate.group, gate.stream_id, gate.stream_id, 1)
   if #pending ~= 1 or pending[1][2] ~= gate.consumer then error('settlement_not_pending') end
+end
+if type(plan.rebind_gate) == 'table' then
+  local g = plan.rebind_gate
+  rebindcheck(g.lease, g.inbox, g.group, g.run, g.slot, g.generation, g.old_session, g.fence)
+end
+if type(plan.stop_gate) == 'table' then
+  local g = plan.stop_gate
+  local pending = redis.call('XPENDING', g.inbox, g.group, g.stream_id, g.stream_id, 1)
+  if #pending ~= 1 or pending[1][2] ~= g.consumer then error('stopped_delivery_not_pending') end
 end
 for _, cmd in ipairs(plan.commands) do redis.call(unpack(cmd)) end
 redis.call('HSET', KEYS[1], 'phase', 'applied')
@@ -452,7 +462,8 @@ class RuntimeV2:
                     self.effects.command('XACK', self.events, self.group, event_stream_id)
                 plan = dict(commands=self.effects.commands,
                             authorization=authorization or self.context.get('authorization'),
-                            commit_gate=self.context.get('commit_gate'))
+                            commit_gate=self.context.get('commit_gate'), rebind_gate=self.context.get('rebind_gate'),
+                            stop_gate=self.context.get('stop_gate'))
             finally:
                 self.f.r = real
                 self.effects = None
@@ -556,6 +567,21 @@ class RuntimeV2:
                    correlation_id=ev.get('request_id', ''), message_id=delivery.get('message_id', ''),
                    delivery_id=delivery.get('delivery_id', ''), generation=ev.get('generation'),
                    level='error' if error_record else 'info', detail=ev)
+        if kind in ('cleared', 'stop_failure'):
+            if not self.clear_enabled(slot):
+                return  # switch off: audit only, including StopFailure
+            info = self.f.agent(slot)
+            if (ev.get('run_id') != self.bus.run_id
+                    or ev.get('generation') != int(info.get('generation', -1))):
+                self.audit('event.stale', slot=slot)
+                return
+            if kind == 'cleared':
+                self.cleared(slot, ev)
+            elif ev.get('thread') != info.get('thread'):
+                self.audit('event.stale_session', slot=slot)
+            else:
+                self.stop_failure(slot, ev)
+            return
         if kind in ('bridge_session', 'startup', 'availability', 'candidate', 'started', 'settled', 'bridge_fault',
                     'turn_ended'):
             info = self.f.agent(slot) if slot in self.f.names else {}
@@ -776,7 +802,9 @@ class RuntimeV2:
         problem = None
         if not isinstance(env, dict) or env.get('slot') != slot:
             problem = 'invalid delivery identity'
-        elif self.f.agent(slot).get('state') != 'held' or lease.get('status') not in ('uncertain', 'expired'):
+        elif self.f.agent(slot).get('clear_conflict') == '1':
+            problem = 'session changed during execution; resume must replace this runtime'
+        elif self.f.agent(slot).get('state') not in ('held', 'clearing') or lease.get('status') not in ('uncertain', 'expired'):
             problem = 'slot is not held'
         elif lease.get('current_delivery') != env.get('delivery_id') or lease.get('message_id') != env.get('message_id'):
             problem = 'not the held delivery'
@@ -795,6 +823,8 @@ class RuntimeV2:
             return
         self.f.setf(slot, state='idle', idle_confirmed=1, bridge_available=0, request='', watch_state='idle',
                     stall_escapes=0, watch_since=0)
+        if self.clear_enabled(slot):
+            self.begin_clear(slot, hook_pid=ev.get('hook_pid'))
         self.audit('hold.released', slot=slot, level='warn', message_id=env['message_id'],
                    delivery_id=env['delivery_id'], detail={'reason': 'held turn ended in its own session; '
                    'execution stopped, result not applied', 'paused': self.f.paused()})
@@ -818,10 +848,18 @@ class RuntimeV2:
             self.audit('settle.rejected', slot=slot, error=str(exc))
             return
         now = int(time.time()*1000)
+        if self.clear_enabled(slot):
+            self.context['clear_hook_pid'] = ev.get('hook_pid')
         if msg['status'] != 'received' or lease.get('status') != 'received':
             self.audit('settle.late', slot=slot, message_id=env['message_id'], detail=ev)
             return
         if now >= min(msg['deadline_at'], int(lease['lease_until'])):
+            if self.clear_enabled(slot) and not any(ev.get(k) for k in ('failed', 'aborted', 'unfinished')):
+                # This validated Stop proves execution ended, even if the public timeout
+                # won the race. Unlike an ordinary timeout, it is safe to drain the PEL.
+                self.stop_failure(slot, dict(ev, thread=env['session_id'],
+                                             error='deadline/lease expired before settlement validation'), status='timeout')
+                return
             self.hold(slot, 'deadline/lease expired before settlement validation', public_status='timeout')
             return
         self.context['authorization'] = {
@@ -949,6 +987,152 @@ class RuntimeV2:
                 if info.get('prev_label'):
                     self.f.setf(slot, prev_label='')
 
+    def clear_enabled(self, slot):
+        return slot in self.f.workers and clear_after_result.enabled(self.slot_cfg(slot), slot)
+
+    def begin_clear(self, slot, *, hook_pid=None):
+        """Redis-only gate; typing happens later in clear_tick, never inside a Stop hook."""
+        info = self.f.agent(slot)
+        self.f.setf(slot, state='clearing', idle_confirmed=0, bridge_available=0, clear_required=1,
+                    clear_phase='waiting', clear_deadline=time.time() + float(self.f.cfg.get('clear_timeout', 20)),
+                    clear_hook_pid=hook_pid or '', clear_token=digest(self.context['intent_id'] + ':' + slot),
+                    clear_old_thread=info.get('thread', ''), clear_idle_since=0)
+        self.audit('clear.waiting', slot=slot, generation=info.get('generation'), hook_pid=hook_pid)
+
+    def cleared(self, slot, ev):
+        """Prepare a same-generation rebind and metadata update in ONE replayable intent."""
+        info = self.f.agent(slot)
+        self.tui_session(slot, ev)
+        if ev.get('thread') == info.get('thread'):
+            self.audit('clear.duplicate', slot=slot)
+            return
+        if ev.get('old_thread') != info.get('thread') or ev.get('clear_token', '') != info.get('clear_token', ''):
+            # Multiple clears in the same generation can race: ordering alone cannot
+            # prove which new session the TUI now uses. Never deliver to either guess.
+            self.f.setf(slot, clear_required=1, clear_conflict=1)
+            self.hold(slot, 'conflicting same-generation clear notifications; resume required')
+            return
+        lease = self.f.r.hgetall(self.bus.lease_key(slot))
+        if lease.get('current_delivery'):
+            self.f.setf(slot, clear_required=1, clear_conflict=1)
+            self.hold(slot, 'SessionStart(clear) during an in-flight delivery; session binding unconfirmed')
+            return
+        if info.get('state') not in ('idle', 'clearing') or info.get('clear_conflict') == '1':
+            self.audit('clear.rejected', slot=slot, error='slot is not idle or clearing; resume required')
+            return
+        if info.get('state') == 'clearing' and time.time() >= float(info.get('clear_deadline') or 0):
+            self.hold(slot, 'clear confirmation deadline expired')
+            return
+        if (lease.get('status') != 'idle' or lease.get('session_id') != info.get('thread')
+                or lease.get('generation') != str(ev['generation'])
+                or self.bus.r.xpending(self.bus.inbox_key(slot), self.bus.slot_group(slot))['pending']):
+            self.f.setf(slot, clear_required=1, clear_conflict=1)
+            self.hold(slot, 'clear rebind requires matching idle lease and drained PEL')
+            return
+        fence = int(lease['fence'])
+        self.context['rebind_gate'] = dict(lease=self.bus.lease_key(slot), inbox=self.bus.inbox_key(slot),
+            group=self.bus.slot_group(slot), run=self.bus.run_id, slot=slot, generation=ev['generation'],
+            old_session=info['thread'], fence=fence)
+        self.context['authorization'] = {'fx:agent:' + slot: {
+            'thread': info['thread'], 'generation': str(ev['generation']), 'state': info['state']}}
+        self.effects.hset(self.bus.lease_key(slot), {'session_id': ev['thread'], 'fence': fence + 1})
+        self.f.setf(slot, thread=ev['thread'], transcript=ev['transcript'], ctx_used=0, ctx_window=0,
+                    state='clearing', clear_phase='confirmed', clear_required=1, clear_conflict=0,
+                    clear_hook_pid=ev.get('hook_pid') or '', clear_idle_since=0, idle_confirmed=0, bridge_available=0,
+                    clear_deadline=info.get('clear_deadline') if info['state'] == 'clearing'
+                        else time.time() + float(self.f.cfg.get('clear_timeout', 20)),
+                    watch_state='idle', stall_escapes=0, watch_since=0)
+        self.audit('slot_rebound', slot=slot, generation=ev['generation'], old_session=info['thread'],
+                   session_id=ev['thread'], fence=fence + 1)
+
+    def clear_tick(self, now):
+        """No busy TUI input: require hook process exit + two consecutive idle screen observations.
+
+        The second observation is a later daemon tick. Unknown/missing evidence times out
+        to hold. Reserve the paste durably before typing; restart never repeats it blindly.
+        SessionStart(clear) also has to return before the next business delivery is allowed.
+        """
+        for slot in self.f.workers:
+            info = self.f.agent(slot)
+            if not self.clear_enabled(slot) or info.get('state') != 'clearing':
+                continue
+            if now >= float(info.get('clear_deadline') or 0):
+                self.transaction('clear-timeout-' + uuid.uuid4().hex,
+                                 lambda slot=slot: self.hold(slot, 'clear confirmation deadline expired'))
+                continue
+            lease = self.bus.r.hgetall(self.bus.lease_key(slot))
+            if lease.get('current_delivery') or info.get('clear_phase') == 'pasted':
+                continue
+            if not clear_after_result.hook_exited(info.get('clear_hook_pid')):
+                self.f.setf(slot, clear_idle_since=0)
+                continue
+            pane = info.get('pane')
+            try:
+                idle = bool(pane) and self.f.mgr.get_pane_status(pane) is not None and clear_after_result.idle_prompt(
+                    self.f.mgr.capture_output(pane, lines=20))
+            except Exception as exc:
+                idle = False
+                self.audit('clear.capture_failed', slot=slot, error=str(exc)[:300])
+            if not idle:
+                self.f.setf(slot, clear_idle_since=0)
+                continue
+            since = float(info.get('clear_idle_since') or 0)
+            if not since or now - since < 0.25:
+                if not since:
+                    self.f.setf(slot, clear_idle_since=now)
+                continue
+            if info.get('clear_phase') == 'confirmed':
+                self.transaction('clear-ready-' + uuid.uuid4().hex, lambda slot=slot: self.finish_clear(slot))
+                continue
+            self.f.setf(slot, clear_phase='pasted', clear_idle_since=0)
+            try:
+                pasted = self.f.mgr.send_prompt_to_idle(pane, '/clear', bracketed=False)
+            except Exception as exc:
+                pasted = False
+                self.audit('clear.paste_failed', slot=slot, error=str(exc)[:300])
+            if not pasted:
+                self.transaction('clear-paste-failed-' + uuid.uuid4().hex,
+                                 lambda slot=slot: self.hold(slot, 'could not paste /clear; session unconfirmed'))
+            else:
+                self.audit('clear.pasted', slot=slot, generation=info.get('generation'))
+
+    def finish_clear(self, slot):
+        self.f.setf(slot, state='idle', idle_confirmed=1, bridge_available=0, request='',
+                    clear_required=0, clear_phase='', clear_token='', clear_hook_pid='', clear_idle_since=0)
+        self.audit('clear.ready', slot=slot)
+
+    def stop_failure(self, slot, ev, *, status='failed'):
+        """A CLI failure ends the turn: fail its bound request now, without wall/tool replay."""
+        from cmux_fleet.fleet import REQ
+        env = ev.get('delivery')
+        if not isinstance(env, dict) or env.get('slot') != slot or env.get('session_id') != ev.get('thread'):
+            self.audit('stop_failure.ignored', slot=slot, error='no matching delivery')
+            return
+        try:
+            msg, lease = self.authorization(env)
+        except (BusError, ValueError, KeyError) as exc:
+            self.audit('stop_failure.rejected', slot=slot, error=str(exc))
+            return
+        if (lease.get('status') not in ('received', 'uncertain', 'expired')
+                or msg['body'].get('purpose') != 'worker' or self.f.agent(slot).get('clear_conflict') == '1'):
+            self.audit('stop_failure.ignored', slot=slot, error='not an in-flight service worker request')
+            return
+        self.context['authorization'] = {self.bus.lease_key(slot): {
+            k: str(lease[k]) for k in ('current_delivery', 'generation', 'session_id', 'fence', 'status')}}
+        self.context['authorization'][self.bus.msg_key(env['message_id'])] = {
+            k: str(msg[k]) for k in IDENTITY if k != 'request_id'}
+        self.context['stop_gate'] = dict(inbox=self.bus.inbox_key(slot), group=self.bus.slot_group(slot),
+                                         stream_id=env['stream_id'], consumer=env['consumer'])
+        self.context.update(bound_slot=slot, bound_request=env['request_id'], bound_message=env['message_id'],
+                            bound_delivery=env['delivery_id'], clear_hook_pid=ev.get('hook_pid'))
+        error = str(ev.get('error') or 'Claude StopFailure')[:4000]
+        self.release(env, {'error': error}, 'failed')
+        if self.f.r.hgetall(REQ + env['request_id']):
+            self.publish(env['request_id'], status, worker=self.f.label(slot), error=error)
+        else:  # already publicly timed out; keep its terminal result, still clear after this turn ends
+            self.begin_clear(slot, hook_pid=ev.get('hook_pid'))
+        self.audit('stop_failure.failed', slot=slot, request_id=env['request_id'], error=error)
+
     def publish(self, rid, status, **fields):
         from cmux_fleet import fleet as legacy
         if self.effects is None:
@@ -981,6 +1165,12 @@ class RuntimeV2:
         for slot in self.f.workers:
             if self.f.label(slot) == fields.get('worker'):
                 self.ui(slot, card)
+                # Only deliveries which reached this worker need clearing. Queued-only
+                # timeouts must not disturb an unrelated active request on that slot.
+                info = self.f.agent(slot)
+                if (self.clear_enabled(slot) and (info.get('request') == rid
+                        or self.context.get('bound_slot') == slot and self.context.get('bound_request') == rid)):
+                    self.begin_clear(slot, hook_pid=self.context.get('clear_hook_pid'))
         self.audit('result', request_id=rid, slot=self.context.get('bound_slot') or self.f.resolve(fields.get('worker', 'supervisor')),
                    message_id=self.context.get('bound_message', ''), delivery_id=self.context.get('bound_delivery', ''),
                    level='info' if status=='ok' else 'error', detail={'public_result': rec, 'request': req})
@@ -1031,7 +1221,7 @@ class RuntimeV2:
                 env = self.bus.message(state['message_id'])
                 self.bus.mark_uncertain(slot, env, 'daemon restart; automatic execution replay forbidden')
                 self.f.setf(slot, state='held', bridge_available=0, idle_confirmed=0)
-            elif info.get('state') in ('starting', 'handoff', 'busy'):
+            elif info.get('state') in ('starting', 'handoff', 'busy', 'clearing'):
                 self.f.setf(slot, state='held', bridge_available=0, idle_confirmed=0)
         self.f.pause('same-run daemon restart recovered held; inspect sessions before resuming')
         self.audit('daemon.recovered', level='warn', execution_allowed=False)
@@ -1090,7 +1280,11 @@ class RuntimeV2:
         from cmux_fleet.fleet import RESUME_CLIS
         info = self.f.agent(slot)
         pane = info.get('pane')
+        lease = self.bus.r.hgetall(self.bus.lease_key(slot)) if self.clear_enabled(slot) else None
         return (tui_slot(self.slot_cfg(slot), slot) and info.get('runtime_ready') == '1' and not info.get('handoff_id')
+                and info.get('clear_required') != '1' and info.get('clear_conflict') != '1'
+                and (lease is None or (lease.get('session_id') == info.get('thread')
+                                      and lease.get('generation') == info.get('generation')))
                 and info.get('state') in ('idle', 'busy', 'held') and bool(pane)
                 and self.f.mgr.get_pane_status(pane) is not None and self.f.mgr.has_cli_process(pane, RESUME_CLIS))
 
@@ -1141,6 +1335,7 @@ class RuntimeV2:
                            snapshot=str(snapshot), source='resume', timed_out=False)
             label = (SUPERVISOR_LABEL if slot == 'supervisor' else slot) + '.' + str(generation + 1)
             self.f.setf(slot, generation=generation + 1, label=label, handoff_id='', retired_pane='',
+                        clear_required=0, clear_conflict=0, clear_phase='', clear_token='',
                         prev_label='' if slot == 'supervisor' else prev)
             if info.get('rescue_launch') or info.get('rescue_relay'):
                 # An advisor respawn cut off mid-handoff: the successor still starts with the sheet's
@@ -1272,8 +1467,16 @@ class RuntimeV2:
 
     def deliver(self, slot):
         from cmux_fleet.fleet import REQ
+        info = self.f.agent(slot)
+        if info.get('state') != 'idle' or info.get('clear_required') == '1':
+            return
         state = self.bus.r.hgetall(self.bus.lease_key(slot))
         if state.get('status') != 'idle':
+            return
+        if self.clear_enabled(slot) and (state.get('session_id') != info.get('thread')
+                or state.get('generation') != info.get('generation')):
+            self.transaction('clear-binding-' + uuid.uuid4().hex,
+                             lambda: self.hold(slot, 'worker session differs from its bus binding'))
             return
         mids = self.bus.pending(slot, 1)
         if not mids:
@@ -1462,6 +1665,7 @@ class RuntimeV2:
                         self.hold(slot, 'lease/delivery deadline expired; execution stop unconfirmed', public_status='timeout')
                     # Stalls are the watchdog's (docs/design.md §24): Escape ladder, then kill + next generation.
         self.transaction('tick-' + uuid.uuid4().hex, expire)
+        self.clear_tick(now)
         self.renew_tui()
         self.render_cards()
         self.watchdog.tick(now)  # screen / keys / kill / spawn: side effects, outside any Redis intent

@@ -26,6 +26,12 @@ TIER_MAP = Path.home() / 'Documents/projects/us-stock-option/config/cli_tier_map
 THREADS = dict(THREADS, **{'worker-2': '33333333-3333-3333-3333-333333333333'})
 
 
+@pytest.fixture(autouse=True)
+def isolated_claude_trust(tmp_path, monkeypatch):
+    # Fake CLI spawns still exercise trust_claude_dir; never write the operator's config.
+    monkeypatch.setattr(fleet, 'CLAUDE_JSON', tmp_path / 'claude.json')
+
+
 def make(tmp_path, spec=None, workers=('worker-1',), **cfg_extra):
     """A v1 fleet with every agent idle and (optionally) one task submitted."""
     run = tmp_path / 'run'
