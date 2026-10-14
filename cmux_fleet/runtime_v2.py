@@ -1002,7 +1002,12 @@ class RuntimeV2:
     def cleared(self, slot, ev):
         """Prepare a same-generation rebind and metadata update in ONE replayable intent."""
         info = self.f.agent(slot)
-        self.tui_session(slot, ev)
+        try:
+            self.tui_session(slot, ev)
+        except ValueError as exc:
+            self.f.setf(slot, clear_required=1, clear_conflict=1)
+            self.hold(slot, 'invalid clear session metadata: ' + str(exc))
+            return
         if ev.get('thread') == info.get('thread'):
             self.audit('clear.duplicate', slot=slot)
             return
@@ -1017,8 +1022,8 @@ class RuntimeV2:
             self.f.setf(slot, clear_required=1, clear_conflict=1)
             self.hold(slot, 'SessionStart(clear) during an in-flight delivery; session binding unconfirmed')
             return
-        if info.get('state') not in ('idle', 'clearing') or info.get('clear_conflict') == '1':
-            self.audit('clear.rejected', slot=slot, error='slot is not idle or clearing; resume required')
+        if info.get('state') not in ('idle', 'clearing', 'held'):
+            self.audit('clear.rejected', slot=slot, error='slot has another lifecycle owner; resume required')
             return
         if info.get('state') == 'clearing' and time.time() >= float(info.get('clear_deadline') or 0):
             self.hold(slot, 'clear confirmation deadline expired')
