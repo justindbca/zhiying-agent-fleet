@@ -12,9 +12,13 @@ class ProfileRuntimeError(ValueError):
     """A profile request is untrusted, ambiguous, or unsupported."""
 
 
+_CJK_STOP = "。，；：、！？）」』】》"
+
+
 def _marker(instruction: str, name: str) -> Optional[str]:
-    # Read the whole token: a malformed/overlong id must not match a valid prefix.
-    values = re.findall(r"\b" + re.escape(name) + r":[ \t]*([^\s]*)", instruction, re.IGNORECASE)
+    # Read the whole token: a malformed/overlong id must not match a valid prefix. A token ends at
+    # whitespace or CJK punctuation: "Recommended profile: x。" names x (incident: 。 kept -> blocked).
+    values = re.findall(r"\b" + re.escape(name) + r":[ \t]*([^\s" + _CJK_STOP + r"]*)", instruction, re.IGNORECASE)
     if not values:
         return None
     values = {value.rstrip(".,;") for value in values}

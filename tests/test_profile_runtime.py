@@ -49,6 +49,24 @@ def test_bad_markers_cannot_be_partially_matched(marker):
         parse_recommended_profile(marker)
 
 
+@pytest.mark.parametrize("marker", [
+    "Recommended profile: flashnext-coder。", "Recommended profile: flashnext-coder。请修测试",
+    "请按 Recommended profile: flashnext-coder，修测试", "Recommended profile: flashnext-coder；",
+    "（Recommended profile: flashnext-coder）",
+])
+def test_cjk_punctuation_ends_the_marker(marker, task):
+    # Incident: a Chinese 。 after the id kept the token invalid and blocked the task after 3 tries.
+    assert parse_recommended_profile(marker) == "flashnext-coder"
+    assert desired_profile("worker-1", marker, task) == "flashnext-coder"
+
+
+def test_cjk_punctuation_does_not_hide_a_malformed_id():
+    for marker in ("Recommended profile: flashnext-coder/unsafe。", "Recommended profile: Flashnext-coder。",
+                   "Recommended profile: flashnext-coder。\nRecommended profile: claude-reviewer"):
+        with pytest.raises(ProfileRuntimeError):
+            parse_recommended_profile(marker)
+
+
 @pytest.mark.parametrize("raw", ["not-json", "null", "[]", '{"assignments":null}',
                                   '{"assignments":[null]}', '{"assignments":[{}]}'])
 def test_malformed_assignments_fail_closed(raw):
