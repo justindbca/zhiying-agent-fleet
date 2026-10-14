@@ -2114,7 +2114,7 @@ class Fleet:
             trust_claude_dir(cwd)
         elif is_claude(cfg, name):
             (cwd / 'CLAUDE.md').write_text(scope)  # Claude Code reads CLAUDE.md, not AGENTS.md
-            install_kit(self.cfg.get('worker_kit'), cwd)
+            self.install_default_kit(cwd, scope)
             trust_claude_dir(cwd)
         elif not is_pi(cfg, name):
             trust_agent_dir(codex_home(self.cfg), cwd)
@@ -3821,12 +3821,41 @@ class Fleet:
         self.log('deliver', agent=name, text=text[:120])
 
     # -- advisor (roster advisor: on; advisor plan §3.1, pre-dispatch path)
+    def floor_domains(self):
+        """start --worker-domains: domains every Claude worker gets, advised or not (the advisor only adds)."""
+        return list(self.cfg.get('worker_domains') or [])
+
+    def drop_floor(self, raw):
+        """A sheet's domains without the pinned ones: a card whitelist never rejects a sheet for echoing them."""
+        floor = self.floor_domains()
+        if floor and isinstance(raw, dict) and isinstance(raw.get('domains'), list):
+            return dict(raw, domains=[d for d in raw['domains'] if d not in floor])
+        return raw
+
+    def install_default_kit(self, cwd, scope):
+        """The default (non-advised) layout: the old kit copy, plus the --worker-domains links and their rules
+        when the kit is a domain kit (a domain kit has no .claude/: without a floor only mcp.json is copied).
+        installed_domains stays '' (default layout)."""
+        install_kit(self.cfg.get('worker_kit'), cwd)
+        floor = self.floor_domains()
+        if not floor or not self.cfg.get('worker_kit'):
+            return
+        try:
+            kit = self.kit or kitmod.Kit(self.cfg['worker_kit'])
+        except (OSError, ValueError) as exc:
+            self.log('kit.floor_unavailable', level='error', domains=floor, error=str(exc)[:500])
+            return
+        floor = [d for d in floor if d in kit.domains]
+        kit.link_domains(cwd, floor)
+        (cwd / 'CLAUDE.md').write_text(kit.claude_md(scope, floor))
+
     def install_advised_kit(self, name, cwd, scope, record=True):
         """Advisor runs: Claude CLAUDE.md = role scope + project core + this generation's domain rules;
         cwd/.claude/{skills,agents} cleared, then the domains linked; full kit mcp.json. ``record``: write
         installed_domains (the slot's launch record); False for a held generation that has not started."""
         info = self.agent(name)
         domains = json.loads(info.get('advice_domains') or info.get('installed_domains') or '[]')
+        domains = list(dict.fromkeys(self.floor_domains() + domains))  # --worker-domains: the advisor only adds
         if self.kit is None and self.cfg.get('worker_kit'):  # off at daemon start: an inherited layout still needs it
             try:
                 self.kit = kitmod.Kit(self.cfg['worker_kit'])
@@ -3874,6 +3903,7 @@ class Fleet:
         catalog = self.kit.domains_catalog() if self.kit and cli == 'claude' else []
 
         def check(raw):
+            raw = self.drop_floor(raw)
             target = raw.get('model')
             wl = cards[target].kit_domains if target in cards else whitelist
             return advisor.validate(raw, cli=cli, models=models, current=current,
@@ -3901,7 +3931,8 @@ class Fleet:
         payload = advisor.build_input(
             kind=kind, goal=self.task().get('goal', ''), instruction=entry['instruction'], advise_note=entry.get('note', ''),
             slot={'name': name, 'cli': cli, 'generation': int(info.get('generation') or 0), 'model': ctx['model'],
-                  'effort': ctx['effort'], 'installed_domains': installed},
+                  'effort': ctx['effort'], 'installed_domains': installed,
+                  'pinned_domains': self.floor_domains() if cli == 'claude' else []},
             models=ctx['models'], matrix=ctx['matrix'], catalog=ctx['catalog'])
         view = json.dumps({k: payload[k] for k in ('goal', 'instruction', 'advise_note', 'slot')},
                           ensure_ascii=False)[:4000]
@@ -4448,7 +4479,7 @@ class Fleet:
             (cwd / 'AGENTS.md').write_text(scope)
             kitmod.Kit.clear(cwd)
             (cwd / 'CLAUDE.md').write_text(scope)
-            install_kit(self.cfg.get('worker_kit'), cwd)
+            self.install_default_kit(cwd, scope)
         except (OSError, ValueError) as exc:
             self.setf(name, advice_hold=0)
             self.block_profile(name, 'release without advisor failed: ' + str(exc), dead=True)
@@ -4567,6 +4598,7 @@ class Fleet:
 
         def view(o, models=False):
             out = {k: o[k] for k in ('name', 'cli', 'generation', 'model', 'effort', 'installed_domains')}
+            out['pinned_domains'] = self.floor_domains() if o['cli'] == 'claude' else []
             return dict(out, models=o['models']) if models else out
         last = json.loads(self.agent(name).get('advice_last') or '{}')
         payload = advisor.build_rescue_input(
@@ -4576,6 +4608,7 @@ class Fleet:
             matrix=matrix, catalog=catalog)
 
         def check_slot(target, raw):
+            raw = self.drop_floor(raw)
             o = opts[target or name]
             wl = (o['cards'][raw.get('model')].kit_domains if raw.get('model') in o['cards']
                   else o['cards'][o['model']].kit_domains if o['model'] in o['cards'] else None)
@@ -6046,6 +6079,7 @@ def start(args):
             kitmod.Kit(args.worker_kit)  # refuse a bad kit before provisioning, like a bad roster
         except (OSError, ValueError) as exc:
             raise SystemExit('--worker-kit rejected: ' + str(exc)) from exc
+    worker_domains = parse_worker_domains(getattr(args, 'worker_domains', None), args.worker_kit)
     if not cmux_available():
         raise SystemExit('run this inside a cmux terminal: cmux only accepts processes started in its windows')
     clis = {args.supervisor_cli, args.worker_cli} | profile_clis  # night cards need their CLI at start
@@ -6125,6 +6159,7 @@ def start(args):
            'compact_limit': args.compact_limit, 'chrome_script': args.chrome_script,
            'chrome_min_interval': args.chrome_min_interval, 'worker_cli': args.worker_cli,
            'worker_model': args.worker_model, 'worker_kit': args.worker_kit,
+           **({'worker_domains': worker_domains} if worker_domains else {}),
            'supervisor_model': args.supervisor_model,
            'claude': args.claude or shutil.which('claude'), 'claude_window': args.claude_window,
            'host': args.host.strip().lower() if args.host and args.host.strip() else None,
@@ -6182,6 +6217,26 @@ def night_cmd(cfg, state):
     except (OSError, ValueError) as exc:
         raise SystemExit('night ' + state + ' refused, nothing changed:\n' + str(exc)) from exc
     return dict(night.write_state(run, state == 'on'), roster=cfg['roster_night' if state == 'on' else 'roster'])
+
+
+def parse_worker_domains(value, worker_kit):
+    """start --worker-domains a,b: [] when not given; refused unless every name is in the kit's domain table."""
+    if value is None:
+        return []
+    names = list(dict.fromkeys(d.strip() for d in value.split(',') if d.strip()))
+    if not names:
+        raise SystemExit('--worker-domains is empty')
+    if not worker_kit:
+        raise SystemExit('--worker-domains needs --worker-kit (a domain kit with context_domains.yaml)')
+    try:
+        kit = kitmod.Kit(worker_kit)
+    except (OSError, ValueError) as exc:
+        raise SystemExit('--worker-domains needs a domain kit; --worker-kit rejected: ' + str(exc)) from exc
+    unknown = [d for d in names if d not in kit.domains]
+    if unknown:
+        raise SystemExit('--worker-domains not in the domain table of ' + str(worker_kit) + ': '
+                         + ', '.join(unknown) + ' (the table has: ' + ', '.join(kit.domains) + ')')
+    return names
 
 
 def advisor_switch(cfg, on):
@@ -6330,6 +6385,9 @@ def main(argv=None):
                         '<run>/roster.yaml). Online, the advisor (official Claude CLI, fable/high) is consulted before '
                         'every dispatch, picks worker model / effort / domains and authorizes the respawns its sheets '
                         'need. Default off; turn it on / off while running with `advisor on|off`')
+    s.add_argument('--worker-domains', help='claude workers: comma-separated domains of the --worker-kit domain table '
+                   'every Claude worker always gets (advisor sheets only add to them; with the advisor off they '
+                   'are linked into the default layout too)')
     s.add_argument('--worker-kit', help='claude workers: dir with .claude/{agents,skills} and mcp.json copied into each worker cwd')
     s.add_argument('--claude', help='claude binary (default: first on PATH)')
     s.add_argument('--claude-window', type=int, default=DEFAULTS['claude_window'], help='claude models not in the built-in 1M list ([1m]/opus/fable/sonnet): context window (§22)')

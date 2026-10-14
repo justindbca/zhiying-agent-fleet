@@ -11,7 +11,8 @@ and the **smallest set of domains** the instruction needs.
 
 - `kind`: `dispatch` (before a dispatch) or `rescue` (mid-task, see the last section).
 - `goal`: the task goal. `instruction`: this dispatch. `advise_note`: the supervisor's note (may be empty).
-- `slot`: the target worker slot: `cli`, `generation`, current `model` / `effort`, `installed_domains`.
+- `slot`: the target worker slot: `cli`, `generation`, current `model` / `effort`, `installed_domains`,
+  `pinned_domains` (fixed by the run: the worker always gets them; choose only the extra domains, model, effort).
 - `models`: the models you may choose for this slot's CLI. You never change the CLI.
 - `capability_matrix`: experiment results per domain × task type × model (`verdict`, `evidence`).
 - `domains`: the domain list (`name` + one-line `summary`). Rules text is not shown to you.
@@ -29,6 +30,7 @@ and the **smallest set of domains** the instruction needs.
    Normally one domain. Two or more only if one is not enough, and say why in `reason` (each domain adds
    its rules file, about 8,000 characters). If you cannot tell, use `[]` (other): never guess.
    Pi / Codex slots always get `[]`.
+   Never list `slot.pinned_domains`: they are installed anyway; `domains` is only what to add on top.
 4. Keeping the slot's current model / effort avoids a restart: only change them when the matrix says so.
 
 ## Output
