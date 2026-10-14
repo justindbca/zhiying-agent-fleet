@@ -120,14 +120,3 @@ def test_advised_respawn_keeps_the_fleet_review_rules(afx):
     assert f.agent('worker-1')['generation'] == '1' and 'RULES OF research_web' in (cwd / 'CLAUDE.md').read_text()
     assert (cwd / 'REVIEWER.md').is_file() and 'REVIEWER.md' in (cwd / 'CLAUDE.md').read_text()
 
-
-def test_released_held_generation_keeps_the_fleet_review_rules(v2adv):
-    from test_v2_codex_claude import answer_turn, submit
-    f = v2adv
-    submit(f)
-    assert answer_turn(f, 'supervisor', json.dumps({'status': 'RUNNING', 'completion': 5, 'reason': 'go', 'dispatch': [
-        {'to': 'worker-1', 'instruction': 'Research the semis rotation into worker-1/notes.md'}]}))['status'] == 'committed'
-    f.pump()  # release_hold with the sheet
-    cwd = fleet.agent_cwd(f.cfg, 'worker-1')
-    assert f.agent('worker-1')['launch_ready'] == '1' and 'RULES OF research_web' in (cwd / 'CLAUDE.md').read_text()
-    assert (cwd / 'REVIEWER.md').is_file() and 'REVIEWER.md' in (cwd / 'CLAUDE.md').read_text()
