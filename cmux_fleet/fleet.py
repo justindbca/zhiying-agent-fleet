@@ -2213,7 +2213,11 @@ class Fleet:
     def spawn_ready(self, name):
         # v2 + advisor online: a Claude worker waits behind the launch gate for its first sheet (no
         # default generation that the first dispatch would have to replace).
-        hold = bool(self.v2) and self.advisor_online() and name != 'supervisor' and is_claude(self.runtime_cfg(name), name)
+        # A named sub-fleet's supervisor_slot never waits: up / autostart need it idle and READY, and a sheet only
+        # comes with a delivery, which a supervisor slot never gets before its sub-fleet is up (10-14 Studio deadlock).
+        sub_supervisor = name in {e.get('supervisor_slot') for e in (self.cfg.get('subfleets') or [])}
+        hold = (bool(self.v2) and self.advisor_online() and name != 'supervisor' and not sub_supervisor
+                and is_claude(self.runtime_cfg(name), name))
         # The first generation is the one place the switch picks the layout; later ones replay the record.
         return self.spawn(name, 'You are fleet agent ' + name + '. Read AGENTS.md in the current directory first. '
                                 'There is no task yet: your final reply must be exactly READY.',

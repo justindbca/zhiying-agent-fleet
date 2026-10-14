@@ -780,3 +780,17 @@ def test_v2_held_first_generation_keeps_holding_while_the_model_is_full(v2adv2):
     assert two['advice_hold'] == '0' and two['launch_ready'] == '1' and two['capacity_wait'] == ''
     assert fleet.load(f.run_dir / 'runtime' / 'worker-2-g0.json')['worker_model'] == 'fable'
     assert len(f.advisor_runner.calls) == 2
+
+
+def test_v2_named_subfleet_supervisor_slot_is_not_held(private_redis_v2, tmp_path, monkeypatch):  # noqa: F811
+    """10-14 Studio: memx-ops / tgog-ops waited for a first sheet that never comes (a supervisor slot gets no
+    delivery before its sub-fleet is up), and the sub-fleet waits for them READY: both stuck in starting."""
+    gen = v2_advised(private_redis_v2, tmp_path, monkeypatch, ['memx-ops', 'worker-2'],
+                     subfleets=[{'name': 'memx', 'supervisor_slot': 'memx-ops'}])
+    f = next(gen)
+    try:
+        sub, plain = f.agent('memx-ops'), f.agent('worker-2')
+        assert sub['launch_ready'] == '1' and sub.get('advice_hold', '0') == '0'
+        assert plain['launch_ready'] == '0' and plain['advice_hold'] == '1'  # ordinary workers still wait
+    finally:
+        gen.close()
