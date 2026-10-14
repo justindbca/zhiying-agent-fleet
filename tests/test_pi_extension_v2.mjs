@@ -97,6 +97,10 @@ for (const version of ['1.1.0','1.2.0']) {
   const id=`m-replay-${version}`, before=records().filter(r=>r.kind==='settled').length, startedBefore=records().filter(r=>r.kind==='started').length;
   fixture({event:'delivery',message_id:id});
   await wait(()=>messages.at(-1)?.msg.details.message_id===id);
+  // The fix relies on this: while a delivery is active no human run can start on the slot.
+  const sent=messages.length;
+  assert.equal((await emit('input',{source:'interactive',text:'typed during delivery'})).action,'handled');
+  assert.equal(messages.length,sent);
   for (const e of run) {
     idle=e.idle ?? idle;
     if (e.hook==='before_agent_start') await emit('before_agent_start',{messageType:e.messageType,
