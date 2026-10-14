@@ -1914,10 +1914,10 @@ class RuntimeV2:
         lost = [m for m in self.lost_dispatches() if m.get('slot') == slot]  # read before clear_slot cancels them
         rids = [rid for rid in self.f.r.lrange(REQQ, 0, -1) if self.f.service
                 and self.f.r.hmget(REQ + rid, 'status', 'worker') == ['dispatched', slot]]
-        self.f.mgr.kill_pane(info['pane'])  # forgets the closed tab; its session is already gone
         if not resumed and not self.clear_slot(slot, False):
             self.transaction('lost-' + uuid.uuid4().hex, lambda: self.hold(slot, why + '; lease not released', pause=False))
             return True
+        self.f.mgr.kill_pane(info['pane'])  # forgets the closed tab (after the lease: a later check still has proof)
         prev = self.f.label(slot)
         try:
             resume = self.next_generation(slot, info, why)
