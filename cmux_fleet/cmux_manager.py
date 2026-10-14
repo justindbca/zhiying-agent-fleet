@@ -224,6 +224,8 @@ class CmuxSessionManager:
         "TabManager not available". Open one; an unreadable answer is let through as before."""
         def listed():
             p = _run('--json', '--id-format', 'uuids', 'list-windows')
+            if p.returncode == 0 and p.stdout.strip() == 'No windows':  # the plain answer seen on 0.64.25
+                return []
             try:
                 return json.loads(p.stdout) if p.returncode == 0 else None
             except ValueError:

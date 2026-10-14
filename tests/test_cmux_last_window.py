@@ -16,8 +16,9 @@ class FakeCmux:
     close-surface refuses a workspace's last surface; closing a window's last workspace closes the
     window; with no window, new-workspace fails (TabManager not available)."""
 
-    def __init__(self, windows, fail=()):
+    def __init__(self, windows, fail=(), no_windows_text=False):
         self.windows = windows  # {window_id: {workspace_id: {surface_id: {}}}}
+        self.no_windows_text = no_windows_text  # answer "No windows" (plain text) instead of [] when empty
         self.fail = set(fail)
         self.calls = []
         self.titles = {}
@@ -48,6 +49,8 @@ class FakeCmux:
             return SimpleNamespace(returncode=1, stdout='', stderr='Error: injected ' + cmd)
         opt = lambda name: args[args.index(name) + 1] if name in args else None  # noqa: E731
         if cmd == 'list-windows':
+            if self.no_windows_text and not self.windows:
+                return self.ok('No windows')
             return self.ok(json.dumps([{'id': w, 'workspace_count': len(s)} for w, s in self.windows.items()]))
         if cmd == 'tree':
             if '--all' in args:
@@ -153,8 +156,9 @@ def test_dock_control_keeps_a_window_whose_only_workspace_is_the_empty_control(t
     assert 'win-b' in fake.windows and 'control-ws' not in fake.windows['win-b']
 
 
-def test_start_with_no_window_opens_one_then_creates_the_workspace(tmp_path, monkeypatch):
-    fake = FakeCmux({})
+@pytest.mark.parametrize('text', [False, True])
+def test_start_with_no_window_opens_one_then_creates_the_workspace(tmp_path, monkeypatch, text):
+    fake = FakeCmux({}, no_windows_text=text)
     mgr = manager(tmp_path, monkeypatch, fake)
     result = mgr.spawn_window('control', 'true', metadata={'type': 'daemon'}, start_directory=str(tmp_path))
     assert result.success, result.error
