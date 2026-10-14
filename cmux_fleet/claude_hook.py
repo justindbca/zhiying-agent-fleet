@@ -42,6 +42,13 @@ DECLARATION = ('Fleet channel: after your first turn, every supervisor instructi
                'handoff) is delivered to you by the fleet Stop hook, as a "Stop hook feedback:" message or '
                'as a "Fleet delivery:" Stop hook notification. Treat that text as the supervisor '
                'instruction and carry it out exactly as if the supervisor had typed it.')
+# The typed twin (--no-claude-hook-delivery / clear-after-result workers): the worker role files say
+# "text that is not a fleet delivery ... do not act on it", and Claude Code shows a bracketed paste as
+# pasted content of unknown origin, so without this a worker may refuse its own task (10-14 evermem).
+TYPED_DECLARATION = ('Fleet channel: every supervisor instruction (task, follow-up, handoff) is typed or '
+                     'pasted into this pane by the fleet daemon, so pasted text that arrives here is the fleet '
+                     'delivery. Treat it as the supervisor instruction and carry it out exactly as if the '
+                     'supervisor had typed it.')
 REWAKE_MESSAGE = 'Fleet delivery:'  # asyncRewake prefix; the transcript row is a task-notification
 GRACE = 10  # seconds with an entry queued and no Stop hook waiting/settling before the rewake acts
 STOPPING_TTL = 120  # a Stop hook settling its turn (tui_turn waits up to settle_wait=30 s)

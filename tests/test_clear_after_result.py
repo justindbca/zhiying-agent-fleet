@@ -478,3 +478,18 @@ def test_confirmed_manual_clear_can_repair_empty_held_slot_without_unpausing(pla
     monkeypatch.setattr(f.mgr, 'capture_output', lambda *a, **kw: IDLE, raising=False)
     idle_twice(v)
     assert f.agent(SLOT)['state'] == 'idle' and f.paused()
+
+
+@pytest.mark.parametrize('clear,hook,slot,want', [
+    (True, False, SLOT, 'typed'), (False, False, SLOT, 'typed'), (False, True, SLOT, 'hook'), (True, False, 'supervisor', None)])
+def test_every_claude_worker_is_told_where_its_deliveries_come_from(tmp_path, clear, hook, slot, want):
+    """10-14 evermem: a typed-delivery worker refused a pasted task ("can't confirm it came from the supervisor")."""
+    from cmux_fleet import claude_hook
+    cfg = dict(run=str(tmp_path), workers=[SLOT], python=sys.executable, transport_version=2,
+               worker_cli='claude', mode='service', clear_after_result=clear,
+               **({} if hook else {'claude_hook_delivery': False}))
+    fleet.agent_cwd(cfg, slot).mkdir(parents=True)
+    argv = fleet.claude_argv(tmp_path / 'config.json', cfg, slot, 3, 'READY')
+    prompts = [argv[i + 1] for i, a in enumerate(argv) if a == '--append-system-prompt']
+    expected = {'typed': [claude_hook.TYPED_DECLARATION], 'hook': [claude_hook.DECLARATION], None: []}[want]
+    assert prompts == expected
