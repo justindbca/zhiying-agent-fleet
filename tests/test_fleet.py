@@ -547,9 +547,9 @@ def test_rotated_worker_gets_next_name_and_old_name_still_routes(fx):
     fx.pump(); fx.handle(turn('supervisor', decision())); fx.pump()
     fx.handle(turn('worker-1', 'Done: step one'))
     write_rollout(fx.sessions, THREADS['worker-1'], fleet.agent_cwd(fx.cfg, 'worker-1'), used=60000)
+    fx.cfg['handoff_timeout'] = 0  # idle past the ratio: rotates at this pump, before any new message (§32)
     fx.pump(); fx.handle(turn('supervisor', decision(dispatch=[
         {'to': 'worker-1', 'instruction': 'Write worker-1/map.md with five bullet points, at least 50 chars'}])))
-    fx.cfg['handoff_timeout'] = 0
     fx.pump()
     assert fx.agent('worker-1')['state'] == 'handoff'
     fx.tick()
@@ -1089,6 +1089,37 @@ def test_pause_stops_delivery_and_rotation_until_resume(sfx):
     sfx.handle({'kind': 'resume', 'request_id': 'p2'})
     sfx.pump()
     assert sfx.agent('exit')['state'] == 'handoff'  # the held rotation runs only after resume
+
+
+@pytest.mark.parametrize('delivered,state', [(1, 'handoff'), (0, 'idle')])
+def test_idle_over_ratio_rotates_without_waiting_for_a_message(sfx, delivered, state):
+    # design.md §32: an idle worker past its ratio rotates now, not at its next delivery
+    sfx.setf('exit', delivered=delivered)
+    write_rollout(sfx.sessions, SVC_THREADS['exit'], fleet.agent_cwd(sfx.cfg, 'exit'), used=90000)
+    sfx.pump()
+    assert sfx.r.llen('fx:inbox:exit') == 0 and sfx.agent('exit')['state'] == state
+
+
+def test_idle_rotation_is_checked_once_per_delivery(sfx):
+    seasoned(sfx, 'exit')
+    sfx.pump()  # under the ratio: checked and marked
+    write_rollout(sfx.sessions, SVC_THREADS['exit'], fleet.agent_cwd(sfx.cfg, 'exit'), used=90000)
+    sfx.pump()
+    assert sfx.agent('exit')['state'] == 'idle'  # same (generation, delivered): not read again
+    sfx.setf('exit', delivered=2)
+    sfx.pump()
+    assert sfx.agent('exit')['state'] == 'handoff'
+
+
+def test_routing_message_lists_worker_state_queue_request_and_role(sfx):
+    submit(sfx, req('r20', to='exit'))
+    sfx.pump()
+    submit(sfx, req('r21'))
+    sfx.pump()
+    text = last_to(sfx, 'supervisor')
+    assert 'Workers: exit, reentry' in text
+    assert '- exit: busy, has request r20, role: You judge exits. Propose only trail_dd.' in text
+    assert '- reentry: idle' in text and 'reentry: idle,' not in text
 
 
 def test_timeout_publishes_and_late_work_is_dropped(sfx):

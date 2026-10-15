@@ -3509,9 +3509,34 @@ class Fleet:
         else:
             self.queue('supervisor', '[Request ' + rid + '] A new request needs routing.'
                        + ('\nNote from the sender: ' + spec['instruction'] if spec.get('instruction') else '')
-                       + '\nWorkers: ' + ', '.join(self.labels()) + '\nPayload (JSON):\n'
+                       + '\nWorkers: ' + ', '.join(self.labels())
+                       + '\nWorker status now (state, queue, current request, role):\n' + self.worker_board()
+                       + '\nPayload (JSON):\n'
                        + json.dumps(spec['payload'], ensure_ascii=False, indent=1)
                        + '\nReply with the service decision JSON from AGENTS.md.')
+
+    def worker_board(self):
+        """One line per dispatchable worker for a service routing message (docs/design.md §32):
+        the supervisor picks an idle worker and the reviewer by role from this, not by guessing."""
+        current = {}
+        for rid in self.r.lrange(REQQ, 0, -1):
+            req = self.r.hgetall(REQ + rid)
+            if req.get('status') == 'dispatched' and req.get('worker'):
+                current.setdefault(req['worker'], []).append(rid)
+        roles = self.cfg.get('worker_roles') or {}
+        lines = []
+        for w in self.active_workers():
+            state, depth = self.agent(w).get('state') or 'unknown', self.inbox_depth(w)
+            line = '- ' + self.label(w) + ': ' + state + (', ' + str(depth) + ' queued' if depth else '')
+            if current.get(w):
+                line += ', has request ' + ', '.join(current[w])
+            role = (Path(roles[w]) if w in roles else
+                    Path(self.cfg['roles']).expanduser() / (w + '.md') if self.cfg.get('roles') else None)
+            if role and role.is_file():
+                first = next((x.strip('# ').strip() for x in role.read_text().splitlines() if x.strip()), '')
+                line += ', role: ' + first[:120]
+            lines.append(line)
+        return '\n'.join(lines)
 
     def assign(self, rid, slot, instruction=None):
         spec = json.loads(self.r.hget(REQ + rid, 'spec'))
@@ -3649,6 +3674,32 @@ class Fleet:
                 self.deliver(name)
                 if name in self.workers and self.agent(name).get('state') in ('busy', 'handoff'):
                     busy += 1
+            elif info.get('state') == 'idle' and not self.inbox_depth(name) and (name == 'supervisor' or name in self.workers):
+                self.idle_rotate(name)
+                if name in self.workers and self.agent(name).get('state') == 'handoff':
+                    busy += 1
+
+    def idle_rotate(self, name):
+        """Rotate an idle agent over its ratio as soon as its turn settles, not at its next delivery
+        (docs/design.md §32): a session that ends a long turn past the ratio and then gets nothing
+        would otherwise keep its full context until the CLI's own compaction. Checked once per
+        (generation, delivered), with the same guards as ``deliver``."""
+        info = self.agent(name)
+        mark = str(info.get('generation') or 0) + ':' + str(info.get('delivered') or 0)
+        if int(info.get('delivered') or 0) == 0 or info.get('idle_rotate_mark') == mark:
+            return  # a fresh session (READY only) is never rotated here; rotate.impossible stays deliver's
+        if name != 'supervisor' and name in self.profile_swaps():
+            return
+        if self.v2 and not runtime_v2.tui_slot(self.runtime_cfg(name), name) and info.get('bridge_available') != '1':
+            return  # not settled on the bus yet: look again next pump
+        self.setf(name, idle_rotate_mark=mark)
+        used, window = self.usage(name)
+        ratio = float(self.agent(name).get('handoff_ratio') or self.cfg['handoff_ratio'])
+        if subfleet.adopted(self.cfg, name, info.get('generation')) or not window or used < ratio * window:
+            return
+        if agent_cli(self.runtime_cfg(name), name) == 'codex' and active_children(info.get('thread'), self.sessions):
+            return  # deliver() defers it again at the next message
+        self.start_rotation(name, used, window)
 
     def handoff_limits(self, name):
         """(window or None = measured, ratio, source) for this agent's current runtime model."""

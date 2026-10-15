@@ -62,7 +62,7 @@ Fleet agents（一个工作区）
 
 ## 4. 交接与历史沿用原实现
 
-1. daemon 在空闲投递边界读取用量。
+1. daemon 在空闲投递边界读取用量（§32 起：回合结束、空闲且无待投消息时也读一次，不必等下一条消息）。
 2. 达到 `handoff_ratio` 后，请旧代填写三节交接草稿。
 3. 把模型内容并入机器骨架；模型未写或失败时用骨架，不因缺交接文本阻塞换代。
 4. 保存旧屏幕和交接单；在原 pane/tab 位置启动新一代。
@@ -515,7 +515,7 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 
 用户原话：「handoff 对于 worker 窗口要根据模型不同去设置不同配置，像 claude code 是 1M 上下文就不该频繁的 handoff」。此前 Claude 的窗口固定取 `--claude-window`（200,000），换代比例全局一个 `--handoff-ratio`，1M 的 opus worker 在 120k 就换代。本节只改阈值来源；换代流程（§4）、交接单、代数标识不变。
 
-- **判定**：投递前 `used >= ratio × window` 才换代（原规则）。`window`、`ratio` 各自独立解析，先命中者生效：
+- **判定**：投递前 `used >= ratio × window` 才换代（原规则；§32 起空闲无消息时也判一次）。`window`、`ratio` 各自独立解析，先命中者生效：
   1. roster 该 worker 条目的 `window` / `handoff_ratio`；
   2. roster 顶层 `handoff:` 表，键先 `<cli>:<model>`（模型串精确匹配）再 `<cli>`，值 `{window?, ratio?}`；
   3. `config.json` 的同名 `handoff:` 表（静态，启动时校验，不热载）；
@@ -732,3 +732,14 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - **安全**：标签程序以 fleet 用户身份运行，**名单即授权**——能改名单（kit 或 run 副本）的人就能让 fleet 跑任意命令、杀掉同命令行的进程。
 
 **验证**：`tests/test_roster_tabs.py`（名单解析与坏值拒收；匹配规则含框架 Python 存根；真进程：SIGTERM 清掉、忽略 SIGTERM 的被 SIGKILL、同程序不同参数不碰；只开一次、按序挂在 control 后、先关旧标签；清不掉不开；stop 关标签；`dock_tab` / `spawn_window` 登记）。**未做**：全套测试、真机 cmux、复核、合进在役分支、部署。
+
+## 32. service 派工看状态 + 空闲即换代（2026-10-16 用户新要求）
+
+用户 10-16 在本机全 FlashNext service fleet 上发现：监工派工不会自动挑空闲的 worker、复核找不到该找的 worker；某 worker 超过换代阈值却一直没换代。三处改动，协议、标识、换代流程（§4）不变。
+
+- **路由消息带工人状态**（`Fleet.worker_board`，接在 `route()` 原 `Workers:` 行后，原行保留）：每个可派 worker 一行 `- <label>: <state>[, N queued][, has request <id>…][, role: <角色文件首个非空行，≤120 字>]`。在途请求按 `fx:req:*` 的 `status=dispatched` + `worker` 反查（v1 / v2 通用）。状态是入队时的快照；监工提示词补一句「前一回合派过、尚未回报的 worker 算忙」。
+- **service 监工提示词**（`service_supervisor.md` / `_v2` / `_tui_v2` 同加两条禁令）：有空闲 worker 时不许把请求排到忙的 worker 后面，只有请求明确接续该 worker 自己未完成的请求才可以，并在 `reason` 写明；复核 / 验收请求有带 reviewer 角色的 worker 时不许派给别人，永不派给被复核工作的作者。角色由名单 `role` 文件给（§16），本节不加新名单字段。
+- **空闲即换代**（`Fleet.idle_rotate`，`pump()` 里空闲且信箱空的监工 / worker）：每个（代数, delivered）只读一次用量，过阈值即 `start_rotation`；与 `deliver()` 同样的守卫（profile 换卡中、v2 非 TUI 槽未 `bridge_available`、子 fleet 收编槽、Codex 原生子 agent 在跑）；刚起的会话（delivered=0）不在这里判，`rotate.impossible` 仍归投递时。受 `max_busy` 与暂停约束（handoff 计入忙）。顾问槽不走这条（§27 自管）。
+- **已知边界**：长回合中途仍不换代（只在回合之间），pi 自压缩仍是长回合保险（§4）；请求超时被 `held` 的槽迟到结算后仍是 `held`（`settle.late` 只记审计），不会空闲即换代，要人工 / 看门处理——10-16 的 85k 事故正是这一情形，本节不覆盖。
+
+**验证**：`tests/test_fleet.py` 新增空闲过阈值即换代（delivered 1 换、0 不换）、同（代数, delivered）只读一次、路由消息含状态 / 队列 / 在途请求 / 角色；`test_rotated_worker_gets_next_name_and_old_name_still_routes` 按新时序把 `handoff_timeout=0` 前移（换代提前到空闲那一拍）。
