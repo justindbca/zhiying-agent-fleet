@@ -1444,6 +1444,9 @@ def returning_rewake(t, monkeypatch):
     ``fleet.claude_rewake`` in a thread). Grace / stopping shortened; the rest is the real fallback."""
     from cmux_fleet import claude_hook
     monkeypatch.setattr(claude_hook, 'GRACE', 0)
+    # The rewake runs in-process, so its "Claude Code parent" is pytest's parent: a detached pytest
+    # (nohup ... &, ppid 1) reads as orphaned and the rewake quits at once. Pin a live-looking parent.
+    monkeypatch.setattr(fleet.os, 'getppid', lambda: 424242)
     f = t.f
     thread = t.threads[(str(f.run_dir), 'worker-1', 0)]
     raw = json.dumps({'session_id': thread, 'transcript_path': str(t.claude / (thread + '.jsonl'))})
