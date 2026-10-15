@@ -1,5 +1,11 @@
 """opencode launch/configuration helpers and wire checks (fourth worker CLI).
 
+Measured (worker-3 preflight, opencode 2.0.29): the plugin creates the session itself with an
+opencode-generated id (a self-made session id is refused by Zen), the TUI shows it with
+`--standalone --continue` on a fresh per-generation data dir, and the isolation that keeps only
+the fleet role in the session instructions is "full2": every XDG dir + OPENCODE_CONFIG_DIR +
+OPENCODE_TEST_HOME + OPENCODE_DISABLE_PROJECT_CONFIG, role in $OPENCODE_CONFIG_DIR/AGENTS.md.
+
 The free tier only works from inside the opencode process (a direct Zen call answers
 FreeTierError), so fleet runs the opencode TUI itself with an in-process plugin
 (opencode_plugin/) that talks JSONL to agent_bridge.py, exactly like the Pi extension.
@@ -24,8 +30,8 @@ DELETE_SHELL = ('rm *', 'rmdir *', 'unlink *', 'mv *', 'shred *', 'trash *', 'ri
                 'dd *')
 
 _FREE_TIER = re.compile(r'freetiererror|free tier can only be used', re.I)
-_RATE = re.compile(r'(?<!\d)429(?!\d)|rate[ -]?limit|too many requests', re.I)
-_UNAVAILABLE = re.compile(r'model unavailable|model not found|unknown model|no such model|model .{0,80}not available', re.I)
+_RATE = re.compile(r'rate[ -]?limit|too many requests|ratelimit', re.I)  # bare "429" in text is not used: token counts hit it
+_UNAVAILABLE = re.compile(r'provider\.no-route|model unavailable|model not found|unknown model|no such model', re.I)
 _ABORTED = re.compile(r'\baborted\b|\binterrupted\b|AbortError', re.I)
 
 
@@ -60,6 +66,37 @@ def window(cfg):
     return value
 
 
+INSTANCE_DIRS = ('cfg', 'xdgcfg', 'xdgstate', 'xdgcache', 'xdgdata', 'home')
+
+
+def instance_dir(cfg, name, generation):
+    """Per-generation opencode home: config, state, cache, data (its own opencode.db) and test home."""
+    return Path(cfg['run']) / 'opencode' / (name + '-g' + str(generation))
+
+
+def prepare_instance(cfg, name, generation, role_text):
+    """A fresh instance directory per generation (never reused: a new DB means --continue can only
+    pick this generation's session). The role is the only instruction file:
+    $OPENCODE_CONFIG_DIR/AGENTS.md. Never write AGENTS.md into the worker cwd (opencode would load
+    it as project / nested instructions)."""
+    if not isinstance(role_text, str) or not role_text.strip():
+        raise ValueError('opencode role instructions are required')
+    root = instance_dir(cfg, name, generation)
+    root.mkdir(parents=True, exist_ok=False)
+    for sub in INSTANCE_DIRS:
+        (root / sub).mkdir(mode=0o700)
+    (root / 'cfg' / 'AGENTS.md').write_text(role_text, encoding='utf-8')
+    return root
+
+
+def isolation_env(cfg, name, generation):
+    root = instance_dir(cfg, name, generation)
+    return {'XDG_CONFIG_HOME': str(root / 'xdgcfg'), 'XDG_STATE_HOME': str(root / 'xdgstate'),
+            'XDG_CACHE_HOME': str(root / 'xdgcache'), 'XDG_DATA_HOME': str(root / 'xdgdata'),
+            'OPENCODE_CONFIG_DIR': str(root / 'cfg'), 'OPENCODE_TEST_HOME': str(root / 'home'),
+            'OPENCODE_DISABLE_PROJECT_CONFIG': '1', 'OPENCODE_DISABLE_AUTOUPDATE': '1'}
+
+
 def session_dir(cfg, name, generation):
     """Per-generation directory where the plugin keeps its activity log `<session>.jsonl`.
     opencode stores sessions in its own database; this log is fleet's transcript (bridge
@@ -85,21 +122,28 @@ def config_content(cfg):
 
 
 def argv(cfg, name, generation, prompt, cwd, *, label):
-    """Interactive opencode TUI with its own private server (the plugin lives in this process).
-    The model is not an argv flag: OPENCODE_CONFIG_CONTENT sets it and the plugin checks it.
-    Session creation (plugin vs TUI) is pending the live test; `prompt` is the fleet startup message."""
+    """Interactive opencode TUI with its own private server; the plugin lives in this process,
+    creates the session and injects the startup message itself (CMUX_FLEET_OC_STARTUP), so the
+    prompt is not on argv. --continue shows the plugin's session (only one in the fresh DB)."""
     model(cfg)
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError('opencode startup prompt is required')
-    return [cfg.get('opencode') or 'opencode', '--standalone', str(cwd), '--prompt', prompt]
+    return [cfg.get('opencode') or 'opencode', '--standalone', '--continue', str(cwd)]
 
 
 def environment(cfg_path, cfg, name, generation, *, label=None, startup_prompt=None):
-    """Environment for the opencode process. The plugin spawns agent_bridge.py from
-    CMUX_FLEET_OC_BRIDGE. Home isolation variables are added once measured (never the whole
-    XDG_DATA_HOME: the model catalogue cache lives there)."""
+    """Environment for the opencode process: full2 isolation (prepare_instance first), the fleet
+    plugin and its bridge argv. startup_prompt is required: the plugin injects it and binds the
+    startup turn by the inbox id prompt() returns. The plugin waits (bounded, catalogue_wait_s)
+    until the locked model is in the fresh DB's model catalogue before the startup turn."""
     provider, ident = model(cfg)
-    env = {
+    if not isinstance(startup_prompt, str) or not startup_prompt.strip():
+        raise ValueError('opencode startup prompt is required')
+    wait = cfg.get('opencode_catalog_wait_s', 60)
+    if type(wait) is not int or not 1 <= wait <= 600:
+        raise ValueError('opencode_catalog_wait_s must be an integer 1-600')
+    env = dict(isolation_env(cfg, name, generation))
+    env.update({
         'OPENCODE_CONFIG_CONTENT': config_content(cfg),
         'CMUX_FLEET_OC_BRIDGE': json.dumps([cfg['python'], str(Path(__file__).with_name('agent_bridge.py')),
                                             str(cfg_path), name, str(generation)]),
@@ -108,11 +152,10 @@ def environment(cfg_path, cfg, name, generation, *, label=None, startup_prompt=N
         'CMUX_FLEET_OC_MODEL': provider + '/' + ident,
         'CMUX_FLEET_OC_WINDOW': str(window(cfg)),
         'CMUX_FLEET_OC_SESSION_DIR': str(session_dir(cfg, name, generation)),
-    }
-    if label:
-        env['CMUX_FLEET_OC_LABEL'] = label
-    if startup_prompt:
-        env['CMUX_FLEET_OC_STARTUP'] = startup_prompt  # lets the plugin bind the startup message by text
+        'CMUX_FLEET_OC_STARTUP': startup_prompt,
+        'CMUX_FLEET_OC_CATALOG_WAIT_S': str(wait),
+        'CMUX_FLEET_OC_LABEL': label or name,
+    })
     return env
 
 
@@ -160,13 +203,13 @@ def model_problem(cfg, info):
     return None
 
 
-def classify_error(text):
+def classify_error(text, status=None):
     """Error class for a failed turn. The plugin never retries or switches models on any of them;
     free-tier refusals and 429s are provider-side and reported apart from task failures."""
     text = str(text or '')
     if _FREE_TIER.search(text):
         return 'free_tier_rejected'
-    if _RATE.search(text):
+    if status == 429 or _RATE.search(text):
         return 'rate_limited'
     if _UNAVAILABLE.search(text):
         return 'model_unavailable'
@@ -175,6 +218,18 @@ def classify_error(text):
     if _ABORTED.search(text):
         return 'aborted'
     return 'other'
+
+
+def classify_failure(error):
+    """execution.failed data.error = {type, message, status, response: {body}} (measured:
+    provider.auth 403 with a FreeTierError body; provider.no-route "Model unavailable")."""
+    if not isinstance(error, dict):
+        return classify_error(error)
+    body = (error.get('response') or {}).get('body') if isinstance(error.get('response'), dict) else None
+    text = ' | '.join(str(x) for x in (error.get('type'), error.get('status'), error.get('message'), body)
+                      if x not in (None, ''))
+    status = error.get('status') if type(error.get('status')) is int else None
+    return classify_error(text, status)
 
 
 def permission_text(req):

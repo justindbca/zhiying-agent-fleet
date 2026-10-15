@@ -123,7 +123,7 @@ class AgentBridge:
             return self.event(kind, {'idle': data.get('idle') is True})
         if kind == 'permission':
             return self.permission(data)
-        if kind not in ('started', 'candidate', 'settled', 'reject_delivery'):
+        if kind not in ('started', 'candidate', 'settled', 'reject_delivery', 'hold'):
             raise ValueError('unsupported bridge command')
         with self.lock:
             env = self.active
@@ -131,7 +131,18 @@ class AgentBridge:
             raise ValueError('no active delivery; manual turns cannot publish fleet results')
         fields = {k: data[k] for k in ('candidates', 'failed', 'aborted', 'unfinished',
                                       'ctx_used', 'ctx_window', 'candidate', 'reason') if k in data}
+        if self.cli == 'opencode':  # durable opencode binding (inbox id prompt() returned, delivered ids)
+            fields.update({k: data[k] for k in ('oc_message_id', 'inbox') if k in data})
         fields['delivery'] = env
+        if kind == 'hold':
+            # opencode: the execution mixed this delivery with other input (or its id is unknown):
+            # outcome unattributable. Held and reported; never success, never re-sent.
+            if self.cli != 'opencode':
+                raise ValueError('hold comes from the opencode plugin only')
+            reason = str(data.get('reason') or 'opencode turn unattributable')[:1000]
+            self.bus.mark_uncertain(self.slot, env, reason)
+            self.faulted = True
+            return self.event('bridge_fault', {'reason': 'opencode hold: ' + reason})
         if kind == 'reject_delivery':
             self.bus.mark_uncertain(self.slot, env, data.get('reason') or 'Pi is busy; no injection')
             self.faulted = True
