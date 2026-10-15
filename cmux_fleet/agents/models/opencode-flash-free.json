@@ -1,0 +1,33 @@
+{
+  "id": "opencode-flash-free",
+  "display_name": "DeepSeek V4.1 Flash (OpenCode Zen free tier)",
+  "cli": "opencode",
+  "model": "opencode/deepseek-v4.1-flash-free",
+  "quota_pool": "opencode-free",
+  "hosts": null,
+  "domains": [
+    "fleet"
+  ],
+  "context_window": 200000,
+  "handoff_ratio": null,
+  "max_concurrent": 2,
+  "roles_allowed": [
+    "implementer",
+    "material",
+    "summarizer"
+  ],
+  "roles_denied": [
+    "supervisor",
+    "reviewer",
+    "final-writer"
+  ],
+  "judgement": "low-mid",
+  "night_ok": true,
+  "measured": null,
+  "evidence": "brief fleet-opencode-worker-20261016：免费档只能经 opencode 客户端调用（直调 Zen 返回 FreeTierError，10-16 实测）；deepseek-v4.1-flash-free 10-15 才开放免费（r/opencodeCLI redd.it/1x6fj3h），前身 v4-flash-free 8 月下架（anomalyco/opencode#43805），名单变动频繁，模型名只放配置；免费版上下文 200K（付费 1M）；并发高报 429（LINUX DO 反馈，数字未公布），未实测前 max_concurrent=2；推理在 OpenCode Zen 服务器上跑，账户 / 持仓 / 资金账号类任务不派（domains 只列 fleet）。judgement / roles 为初评，未做能力实测。",
+  "unverified": [
+    "max_concurrent",
+    "judgement",
+    "roles_allowed"
+  ]
+}

@@ -356,8 +356,8 @@ def check(f, slot, task_id, workers, ready=True, named=None):
     if problem:
         return problem
     cli = fleet.agent_cli(f.runtime_cfg(slot), slot)
-    if cli == 'pi':
-        return ('pi worker panes cannot be handed over: the Pi bridge is bound to this fleet\'s Redis '
+    if cli in ('pi', 'opencode'):
+        return (cli + ' worker panes cannot be handed over: the ' + cli + ' bridge is bound to this fleet\'s Redis '
                 'socket and never reconnects')
     if cli != 'claude' or not f.v2:
         return 'only official Claude Code worker panes of a v2 fleet can become sub-fleet supervisors'

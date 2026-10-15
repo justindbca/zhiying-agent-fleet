@@ -9,7 +9,7 @@ from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError
 from cmux_fleet.planner import build_dispatch_plan
 from cmux_fleet.router import route_task
 
-SEVEN = ['astra', 'fable', 'flashnext', 'haiku', 'opus', 'sol', 'sonnet']
+SEVEN = ['astra', 'fable', 'flashnext', 'haiku', 'opencode-flash-free', 'opus', 'sol', 'sonnet']  # + opencode free tier
 
 
 def test_default_registry_has_seven_model_cards_and_the_same_four_profiles():
@@ -154,3 +154,6 @@ def test_fields_without_an_outside_fact_are_marked_unverified():
     assert marked['flashnext'] == ('hosts', 'roles_allowed')
     assert registry.get('flashnext-coder').unverified == ('hosts', 'roles_allowed')  # inherited
     assert marked['opus'] is None
+    assert marked['opencode-flash-free'] == ('max_concurrent', 'judgement', 'roles_allowed')
+    oc = registry.model('opencode-flash-free')
+    assert (oc.cli, oc.context_window, oc.max_concurrent) == ('opencode', 200000, 2)  # free tier: 200K, concurrency untested

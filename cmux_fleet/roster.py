@@ -96,7 +96,7 @@ def parse_entries(raw, base):
     return workers, roles, profiles
 
 
-CLIS = ('claude', 'codex', 'pi')
+CLIS = ('claude', 'codex', 'pi', 'opencode')  # handoff table keys; opencode = worker-only CLI
 PI_KEYS = ('pi_model', 'pi_thinking')
 THINKING = ('off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')  # = pi_adapter.THINKING
 

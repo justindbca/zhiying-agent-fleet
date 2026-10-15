@@ -35,7 +35,7 @@ LINES = (('max_calls', 'calls'), ('max_rounds', 'rounds'), ('max_hours', 'hours'
          ('max_usd', 'usd'), ('max_week_pct', 'week_pct'))
 TURN_WALL_MAX = 400  # a turn text longer than this is a report, not a wall message
 DEFAULT_USD = {'day': 40, 'night': 10}  # master design v2 ★3 default: pool-a cash cap per scene (USD)
-MODEL_KEY = {'claude': 'worker_model', 'codex': 'codex_model', 'pi': 'pi_model'}  # launch override per CLI
+MODEL_KEY = {'claude': 'worker_model', 'codex': 'codex_model', 'pi': 'pi_model', 'opencode': 'opencode_model'}  # launch override per CLI
 WALL_RESUME = ('[Resumed after a usage wall] Your previous turn on this instruction was cut off by a usage wall '
                'before it reported. Files you already wrote stay. Check your directory first and continue from where '
                'it stopped; do not redo finished steps.\n\n')

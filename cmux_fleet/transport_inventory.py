@@ -44,6 +44,11 @@ def inventory():
                     configs.add(cfg)
                     process_rows.append({'pid': int(pid), 'ppid': int(ppid), 'kind': 'bridge',
                                          'config': str(cfg), 'slot': args[i+2]})
+        if args and Path(args[0]).name == 'opencode' and '--standalone' in args:
+            # opencode worker TUI (fleet plugin in-process); its bridge child is listed as kind 'bridge'
+            index = args.index('--standalone')
+            process_rows.append({'pid': int(pid), 'ppid': int(ppid), 'kind': 'opencode',
+                                 'cwd': args[index+1] if index+1 < len(args) else ''})
         if '--session-dir' in args:
             index = args.index('--session-dir')
             if index+1 < len(args) and '/pi-sessions/' in args[index+1]:

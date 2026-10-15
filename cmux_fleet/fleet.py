@@ -51,7 +51,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
 from cmux_fleet import advisor, brake, claude_hook, cli_pairs, codex_queue, contracts, handoff, history, kit as kitmod, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, named_subfleet, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, tabs, watchdog  # noqa: E402
-from cmux_fleet import clear_after_result
+from cmux_fleet import clear_after_result, opencode_adapter  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -100,7 +100,8 @@ KIT_FLEET_RE = r'[a-z][a-z0-9-]*'  # start --kit-fleet NAME: <worker kit>/fleets
 # (same <slot>.<generation> pattern as worker-1 -> worker-1.1). Redis keys and the cwd stay 'supervisor'.
 SUPERVISOR_LABEL = 'supervisor-1'
 RESULT_TTL = 7 * 86400
-RESUME_CLIS = ('codex', 'claude')  # CLIs whose live process proves a reattachable pane (cmux_manager._is_cli)
+RESUME_CLIS = ('codex', 'claude')  # CLIs whose live process proves a reattachable pane (cmux_manager._is_cli);
+# pi / opencode are never reattached: their bridge never reconnects after a Redis outage (next generation instead)
 # Sandboxed agents cannot drive the user's browser themselves (and must never be allowed
 # to kill it). If the operator supplies a broker script, the daemon runs these verbs for them.
 CHROME_VERBS = {'check', 'tabs', 'newtab', 'go', 'url', 'js'}
@@ -113,6 +114,12 @@ DEFAULTS = {'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 100000, 'stal
             'transport_version': 1, 'allow_development_v2': False, 'max_attempts': 2,
             'clear_after_result': False, 'clear_timeout': 20}
 CLAUDE_JSON = Path.home() / '.claude.json'
+# opencode workers: the free OpenCode Zen tier serves a 200K context (paid: 1M); the model name itself comes only
+# from config (--opencode-model). Concurrency of the free tier is untested: max_busy defaults to 2.
+OPENCODE_WINDOW = 200000
+OPENCODE_MAX_BUSY = 2
+OPENCODE_MIN_VERSION = (2, 0, 29)
+MODEL_KEYS = {'claude': 'worker_model', 'pi': 'pi_model', 'codex': 'codex_model', 'opencode': 'opencode_model'}
 CONTRACTS = 'fx:contracts'  # contract tasks only: one JSON state document (cmux_fleet/contracts.py)
 ESCALATIONS = 'fx:escalations'  # task mode: {task id: worker's split request / approval / delegation} (§20)
 ITEMS = 'fx:items'  # plain task mode: {dispatch id: {to, instruction}} for dispatch items that carry an id
@@ -252,7 +259,35 @@ def trust_agent_dir(home, cwd):
 def agent_cli(cfg, name):
     if name == ADVISOR:
         return 'claude'  # always the official Claude CLI, whatever --worker-cli the run has (§27)
-    return cfg.get('supervisor_cli' if name == 'supervisor' else 'worker_cli') or 'codex'
+    supervisor = name == 'supervisor'
+    # Unset = a config written before the CLI choice existed: the original Codex. Any other value must be a
+    # CLI this code knows; an unrecognised one is refused, never run as Codex (opencode brief 2026-10-16).
+    cli = cfg.get('supervisor_cli' if supervisor else 'worker_cli') or 'codex'
+    known = cli_pairs.CLIS if supervisor else cli_pairs.WORKER_CLIS
+    if cli not in known:
+        raise ValueError('unknown ' + ('supervisor' if supervisor else 'worker') + ' CLI ' + repr(cli) + ' for '
+                         + str(name) + ' (known: ' + ', '.join(known) + '); refusing rather than running it as codex')
+    return cli
+
+
+def opencode_start_problem(args, binary):
+    """Why `start` must refuse opencode workers, or None (binary / version / model / transport checked first)."""
+    if args.supervisor_cli == 'opencode':
+        return 'opencode runs only as a worker; pick pi, codex or claude for --supervisor-cli'
+    if args.transport_version != 2:
+        return 'opencode workers run only on transport v2 (in-process plugin + agent_bridge.py)'
+    if not args.opencode_model or '/' not in args.opencode_model.strip('/'):
+        return '--opencode-model provider/model is required for opencode workers (e.g. opencode/deepseek-v4.1-flash-free)'
+    if not args.opencode_window or args.opencode_window < 1:
+        return '--opencode-window must be a positive integer'
+    try:
+        found = subprocess.run([binary, '--version'], text=True, capture_output=True, timeout=15, check=True).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 'opencode --version failed: ' + str(exc)
+    match = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)', found.split()[-1] if found.split() else '')
+    if not match or tuple(map(int, match.groups())) < OPENCODE_MIN_VERSION:
+        return 'opencode >= ' + '.'.join(map(str, OPENCODE_MIN_VERSION)) + ' is required (v2 plugin API); found: ' + found
+    return None
 
 
 def agent_cfg(cfg, name):
@@ -266,6 +301,19 @@ def is_claude(cfg, name):
 
 def is_pi(cfg, name):
     return agent_cli(cfg, name) == 'pi'
+
+
+def is_opencode(cfg, name):
+    return agent_cli(cfg, name) == 'opencode'
+
+
+def is_codex(cfg, name):
+    return agent_cli(cfg, name) == 'codex'
+
+
+def is_bridge(cfg, name):
+    """pi and opencode run fleet's in-process bridge (agent_bridge.py), not an official TUI hook."""
+    return agent_cli(cfg, name) in ('pi', 'opencode')
 
 
 def trust_claude_dir(cwd):
@@ -353,7 +401,9 @@ def handoff_limits(cli, model, cfg, table=None, worker=None, card=None):
         if ratio is None and 'ratio' in entry:
             ratio, rsrc = float(entry['ratio']), where
     if window is None:
-        if cli != 'claude':
+        if cli == 'opencode':
+            window, wsrc = int(cfg.get('opencode_window') or OPENCODE_WINDOW), 'opencode window'
+        elif cli != 'claude':
             wsrc = 'measured'
         elif any(t in (model or '').lower() for t in CLAUDE_1M):
             window, wsrc = 1000000, 'built-in ' + (model or '')
@@ -1649,6 +1699,15 @@ def actor(cfg_path, name, prompt, generation=None):
         record.parent.mkdir(parents=True, exist_ok=True)
         record.write_text(json.dumps({'slot': name, 'label': info['label'], 'generation': generation,
                                       'argv': argv, 'at': time.time()}, ensure_ascii=False) + '\n')
+    elif is_opencode(cfg, name):
+        # opencode TUI with fleet's plugin in-process (it spawns agent_bridge.py, like the pi extension).
+        os.environ.update(opencode_adapter.environment(cfg_path, cfg, name, generation, label=info['label'],
+                                                       startup_prompt=prompt))  # the plugin binds by this text
+        argv = opencode_adapter.argv(cfg, name, generation, prompt, agent_cwd(cfg, name), label=info['label'])
+        record = Path(cfg['run']) / 'prompts' / (name + '-g' + str(generation) + '.argv.json')
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps({'slot': name, 'label': info['label'], 'generation': generation,
+                                      'argv': argv, 'at': time.time()}, ensure_ascii=False) + '\n')
     elif is_claude(cfg, name):
         # A daemon started from inside a Claude Code session must not pass its session markers on:
         # with CLAUDE_CODE_CHILD_SESSION set, Claude Code 2.1.280 saves no transcript, and the turn
@@ -1664,8 +1723,10 @@ def actor(cfg_path, name, prompt, generation=None):
         trust_claude_dir(agent_cwd(cfg, name))
         argv = claude_argv(cfg_path, cfg, name, generation, prompt, resume=info.get('resume_session')
                            if info.get('resume_generation') == str(generation) else None)
-    else:
+    elif is_codex(cfg, name):
         argv = actor_argv(cfg_path, cfg, name, generation, prompt)
+    else:  # agent_cli already refuses unknown CLIs; a new one must get its own branch here
+        raise ValueError('no launch path for ' + agent_cli(cfg, name))
     os.execvp(argv[0], argv)
 
 
@@ -2054,7 +2115,7 @@ class Fleet:
         role = 'supervisor' if name == 'supervisor' else 'worker'
         # v2 strips the [Request <id>] header (a transport id) before delivery and binds the id in
         # code, so an official-CLI service supervisor gets the JSON-text role without request ids.
-        variant = ('_v2' if self.v2 and is_pi(cfg, name) else
+        variant = ('_v2' if self.v2 and is_bridge(cfg, name) else
                    '_tui_v2' if self.v2 and self.service and role == 'supervisor' else '')
         scope = (HERE / 'agents' / (('service_' if self.service else '') + role + variant + '.md')).read_text()
         if launch.get('role_text') and launch['role_text'].strip() != scope.strip():
@@ -2074,7 +2135,7 @@ class Fleet:
                           'is broken. Browser actions go only through the broker command below, if enabled.')
         scope = scope.replace('{{SANDBOX_NOTICE}}', sandbox_notice if agent_cli(cfg, name) == 'codex'
                               else pi_adapter.UNSANDBOXED_SCOPE)
-        if is_pi(cfg, name):
+        if is_bridge(cfg, name):
             scope += '\n## Runtime permissions\n\n' + pi_adapter.UNSANDBOXED_SCOPE + '\n'
         return scope
 
@@ -2124,7 +2185,7 @@ class Fleet:
             (cwd / 'CLAUDE.md').write_text(scope)  # Claude Code reads CLAUDE.md, not AGENTS.md
             self.install_default_kit(cwd, scope)
             trust_claude_dir(cwd)
-        elif not is_pi(cfg, name):
+        elif is_codex(cfg, name):
             trust_agent_dir(codex_home(self.cfg), cwd)
         if codex_queue.unsettled(self.agent(name)):
             codex_queue.clear(self, name, 'respawn')  # audited; its token can never settle in the new session
@@ -2150,9 +2211,12 @@ class Fleet:
             output_file=str(self.run_dir / 'prompts' / (name + '-g' + str(generation) + '.terminal.log')),
             auto_close=False, metadata={'type': role, 'cli_type': agent_cli(cfg, name),
                       'profile': (cfg.get('pi_model') if is_pi(cfg, name) else
+                                  cfg.get('opencode_model') if is_opencode(cfg, name) else
                                   claude_model(cfg, name) if is_claude(cfg, name) else agent_profile(cfg, name))},
             env_vars=dict({'PATH': os.environ.get('PATH', '')}, **(
                 pi_adapter.environment(cfg_path, cfg, name, generation) if is_pi(cfg, name)
+                else opencode_adapter.environment(cfg_path, cfg, name, generation, label=self.label(name),
+                                                  startup_prompt=prompt) if is_opencode(cfg, name)
                 else dict({'CODEX_HOME': str(codex_home(self.cfg))}, **(CLAUDE_ENV if is_claude(cfg, name) else {})))),
             **subfleet.tmux_spawn_args(self.cfg, name, generation))
         if not result.success:
@@ -3654,7 +3718,7 @@ class Fleet:
         """(window or None = measured, ratio, source) for this agent's current runtime model."""
         cfg = self.runtime_cfg(name)
         cli = agent_cli(cfg, name)
-        model = cfg.get({'claude': 'worker_model', 'pi': 'pi_model'}.get(cli, 'codex_model')) or ''
+        model = cfg.get(MODEL_KEYS[cli]) or ''
         limits = handoff_limits(cli, str(model), self.cfg, self.handoff_table, self.worker_handoff.get(name),
                                 card=self.card_handoff_ratio(name))
         self.setf(name, handoff_window=limits[0] or 'measured', handoff_ratio=limits[1], handoff_source=limits[2])
@@ -3665,6 +3729,11 @@ class Fleet:
         if is_pi(self.runtime_cfg(name), name):
             info = self.agent(name)
             return int(info.get('ctx_used') or 0), override or int(info.get('ctx_window') or self.cfg['window'])
+        if is_opencode(self.runtime_cfg(name), name):
+            # Bridge-reported usage (assistant tokens); the window is the configured one (free tier 200K),
+            # never a model's self-reported size and never a Codex rollout.
+            info = self.agent(name)
+            return int(info.get('ctx_used') or 0), override or int(self.cfg.get('opencode_window') or OPENCODE_WINDOW)
         if is_claude(self.runtime_cfg(name), name):
             path = self.agent(name).get('transcript')
             if not path:
@@ -3672,6 +3741,8 @@ class Fleet:
             used, window = claude_transcript_usage(path, override)
             self.setf(name, ctx_used=used, ctx_window=window)
             return used, window
+        if not is_codex(self.runtime_cfg(name), name):
+            raise ValueError('no usage reader for ' + agent_cli(self.runtime_cfg(name), name))
         thread = self.agent(name).get('thread')
         paths = rollouts(thread, self.sessions) if thread else []
         if not paths:
@@ -5476,6 +5547,7 @@ class Fleet:
         cfg = self.runtime_cfg(name)
         cli = agent_cli(cfg, name)
         model = (cfg.get('pi_model') if cli == 'pi' else cfg.get('codex_model') if cli == 'codex'
+                 else cfg.get('opencode_model') if cli == 'opencode'
                  else cfg.get('supervisor_model') if name == 'supervisor' else cfg.get('worker_model')) or ''
         action = brake.wall_action(wall, cli, model)
         if action['action'] == 'downgrade' and name not in self.workers:
@@ -6183,8 +6255,9 @@ def start(args):
     codex = args.codex or shutil.which('codex')
     pi = args.pi or shutil.which('pi')
     redis_server = args.redis_server or shutil.which('redis-server')
+    opencode = args.opencode or shutil.which('opencode')
     binaries = {'codex': codex, 'pi': pi, 'claude': args.claude or shutil.which('claude'),
-                'redis-server': redis_server}
+                'opencode': opencode, 'redis-server': redis_server}
     missing = [n for n in sorted(clis | {'redis-server'}) if not binaries[n] or not shutil.which(binaries[n])]
     if missing:
         raise SystemExit('binaries not found: ' + ', '.join(missing) + ' (pass the corresponding binary flag)')
@@ -6206,6 +6279,10 @@ def start(args):
         match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)', version)
         if not match or tuple(map(int, match.groups())) < (1, 1, 0):
             raise SystemExit('pi >= 1.1.0 is required (agent_settled); found: ' + version)
+    if 'opencode' in clis:
+        problem = opencode_start_problem(args, opencode)
+        if problem:
+            raise SystemExit(problem)
     if getattr(args, 'name', None) is not None and not args.name.strip():
         raise SystemExit('--name must not be empty')
     titles = {'agents_title': 'Fleet ' + args.name.strip()} if getattr(args, 'name', None) else {}
@@ -6244,7 +6321,9 @@ def start(args):
     cfg = {'run': str(run), 'python': sys.executable, **redis_cfg,
            'cmux_state_dir': str(mgr.meta_path.parent),
            'fleet_home': str(HOME.expanduser().resolve()), 'cmux_bin': cmux_manager.CMUX,
-           'workers': workers, 'mode': args.mode, 'lifecycle': args.lifecycle, 'roles': args.roles, 'max_busy': args.max_busy,
+           'workers': workers, 'mode': args.mode, 'lifecycle': args.lifecycle, 'roles': args.roles,
+           'max_busy': OPENCODE_MAX_BUSY if args.max_busy is None and args.worker_cli == 'opencode'
+                       else DEFAULTS['max_busy'] if args.max_busy is None else args.max_busy,
            **({'budget': budget} if budget else {}),
            **({'brake_notify': shlex.split(args.brake_notify)} if getattr(args, 'brake_notify', None) else {}),
            'request_timeout': args.request_timeout, 'supervisor_profile': args.supervisor_profile,
@@ -6267,6 +6346,8 @@ def start(args):
            'claude': args.claude or shutil.which('claude'), 'claude_window': args.claude_window,
            'host': args.host.strip().lower() if args.host and args.host.strip() else None,
            'supervisor_cli': args.supervisor_cli, 'pi': pi, 'pi_model': args.pi_model,
+           **({'opencode': opencode, 'opencode_model': args.opencode_model, 'opencode_window': args.opencode_window}
+              if 'opencode' in clis else {}),
            'pi_thinking': args.pi_thinking, 'pi_models': args.pi_models, 'pi_thinkings': args.pi_thinkings, 'allow_unsandboxed_pi': args.allow_unsandboxed_pi,
            'pi_agent_dir': args.pi_agent_dir, 'allow_profile_live_switch': args.allow_profile_live_switch,
            'transport_version': args.transport_version, 'allow_development_v2': args.allow_development_v2,
@@ -6488,11 +6569,17 @@ def main(argv=None):
     s.add_argument('--compact-limit', type=int, help='codex model_auto_compact_token_limit (default: codex decides)')
     s.add_argument('--chrome-script', help='optional browser broker script run by the daemon for sandboxed agents')
     s.add_argument('--chrome-min-interval', type=float, default=DEFAULTS['chrome_min_interval'])
-    s.add_argument('--supervisor-cli', choices=('codex', 'pi', 'claude'), default=None,
+    s.add_argument('--supervisor-cli', choices=cli_pairs.CLIS, default=None,
                    help='CLI for the supervisor (default: cli_pairs.yaml default)')
     s.add_argument('--supervisor-model', default=DEFAULTS['supervisor_model'], help='claude supervisor: --model value')
-    s.add_argument('--worker-cli', choices=('codex', 'claude', 'pi'), default=None,
-                   help='CLI for workers (default: cli_pairs.yaml default)')
+    s.add_argument('--worker-cli', choices=cli_pairs.WORKER_CLIS, default=None,
+                   help='CLI for workers (default: cli_pairs.yaml default; opencode is worker-only)')
+    s.add_argument('--opencode', help='opencode binary (>= 2.0.29; default: first on PATH)')
+    s.add_argument('--opencode-model', default=None,
+                   help='opencode workers: provider/model, e.g. opencode/deepseek-v4.1-flash-free (required; no code '
+                   'default, the free list changes; never replaced by a paid model)')
+    s.add_argument('--opencode-window', type=int, default=OPENCODE_WINDOW,
+                   help='opencode workers: context window for the handoff check (default 200000 = free tier)')
     s.add_argument('--pi', help='pi binary (>= 1.1.0; default: first on PATH)')
     s.add_argument('--pi-model', help='explicit provider/model for every pi agent without its own model '
                    '(--supervisor-pi-model, roster pi_model); no implicit cloud fallback')
@@ -6548,8 +6635,9 @@ def main(argv=None):
     s.add_argument('--supervisor-profile', help='codex profile for a Codex supervisor (default: --profile); without '
                    '--supervisor-cli, fleet-astra maps to the pi supervisor on openai-codex/gpt-6-astra, others are refused')
     s.add_argument('--worker-profile', help='codex profile for codex workers (default: --profile)')
-    s.add_argument('--max-busy', type=int, default=DEFAULTS['max_busy'],
-                   help='at most this many workers working at once (0 = no limit)')
+    s.add_argument('--max-busy', type=int, default=None,
+                   help='at most this many workers working at once (0 = no limit; default 0, '
+                   'or 2 for opencode workers: free-tier concurrency is untested)')
     s.add_argument('--budget', help='service mode: budget card JSON, e.g. \'{"pool": "pool-a", "max_usd": 40, '
                    '"max_calls": 200}\' (tasks put "budget" in the task spec); the daemon pauses at any line')
     s.add_argument('--brake-notify', help='command run (no shell) with one message argument when the brake pauses '

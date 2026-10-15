@@ -5,6 +5,7 @@
 #   e.g. scripts/smoke_pair.sh pi claude task     (default pair: pi Astra supervisor + official Claude workers)
 #        SUPERVISOR_PI_MODEL=openai-codex/gpt-6-astra PI_MODEL=flashnext/... scripts/smoke_pair.sh pi pi task  (night pair)
 #        scripts/smoke_pair.sh codex claude service
+#        OPENCODE_MODEL=opencode/deepseek-v4.1-flash-free PI_MODEL=... scripts/smoke_pair.sh pi opencode task
 #
 # Run it inside a cmux terminal with the CLIs logged in. Environment (optional):
 #   PI_MODEL=provider/model  run-wide pi model (--pi-model): required for pi workers, and for a pi
@@ -13,6 +14,8 @@
 #   PI_THINKING=level        run-wide pi thinking (--pi-thinking)
 #   PI=/path/to/pi           pi binary (--pi; default: first on PATH, which inside cmux is its wrapper shim)
 #   CLAUDE=/path/to/claude   official Claude Code binary (--claude; a shell function/shim is not a binary)
+#   OPENCODE_MODEL=provider/model  opencode workers' model (--opencode-model): required, no default (free list changes)
+#   OPENCODE=/path/to/opencode     opencode binary (--opencode; >= 2.0.29)
 #   SMOKE_PROFILE=<codex profile>  supervisor/worker Codex profile (default: fleet's own default)
 #   SMOKE_TIMEOUT=900        seconds for READY + work
 #   SMOKE_KEEP=1             keep the temp dir for inspection (processes are still stopped)
@@ -92,6 +95,11 @@ if [ "$SUP" = pi ]; then
 fi
 [ -n "${PI:-}" ] && args+=(--pi "$PI")
 [ -n "${CLAUDE:-}" ] && args+=(--claude "$CLAUDE")
+if [ "$WRK" = opencode ]; then
+  : "${OPENCODE_MODEL:?OPENCODE_MODEL=provider/model is required for opencode workers (e.g. opencode/deepseek-v4.1-flash-free)}"
+  args+=(--opencode-model "$OPENCODE_MODEL")
+  [ -n "${OPENCODE:-}" ] && args+=(--opencode "$OPENCODE")
+fi
 [ -n "${SMOKE_PROFILE:-}" ] && args+=(--profile "$SMOKE_PROFILE")
 echo "smoke: $SUP+$WRK/$MODE in $TMP"
 if ! (cd "$TMP" && "$PY" "$FLEET" "${args[@]}"); then
@@ -225,8 +233,14 @@ for n in names:
                 elif row.get('type') == 'thinking_level_change':
                     seen['thinking'] = row.get('thinkingLevel')
         print('   evidence session %s model=%s thinking=%s' % (n, seen.get('model'), seen.get('thinking')))
+    if cli == 'opencode':
+        # The fleet plugin's activity log (= transcript) records the model each assistant turn ran on.
+        rows = [line for path in sorted((run / 'opencode-sessions' / n).glob('g*/*.jsonl'))
+                for line in path.read_text().splitlines() if '"model"' in line]
+        print('   evidence session %s opencode_model=%s last=%s' % (n, cfg.get('opencode_model'), rows[-1][:200] if rows else None))
     screen = mgr.capture_output(a.get('pane', ''), 60) if a.get('pane') else ''
-    model = (fleet.agent_cfg(cfg, n).get('pi_model') if cli == 'pi' else cfg.get('worker_model')) or ''
+    model = (fleet.agent_cfg(cfg, n).get('pi_model') if cli == 'pi' else cfg.get('opencode_model') if cli == 'opencode'
+             else cfg.get('worker_model')) or ''
     key = model.split('/')[-1][:24]  # the status line may truncate a long model id
     tail = [l.strip() for l in screen.splitlines() if key and key in l]
     print('   evidence screen %s model=%s line=%r' % (n, model, tail[-1][:160] if tail else None))

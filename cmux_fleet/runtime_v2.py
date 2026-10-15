@@ -17,6 +17,7 @@ from pathlib import Path
 import redis
 
 from cmux_fleet import advisor, claude_hook, clear_after_result, cli_pairs, contracts, tabs
+from cmux_fleet import opencode_adapter, pi_adapter
 from cmux_fleet.message_bus import BusError, MessageBus, LUA_REBIND_CHECK, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
 from cmux_fleet import codex_queue, lifecycle_close, named_subfleet, subfleet, tui_cards
@@ -36,6 +37,10 @@ def validate_config(cfg):
     version = cfg.get('transport_version', 1)
     if type(version) is not int or version not in (1, 2):
         raise ValueError('transport_version must be 1 or 2')
+    if cfg.get('supervisor_cli') == 'opencode':
+        raise ValueError('opencode runs only as a worker, never as the supervisor')
+    if cfg.get('worker_cli') == 'opencode' and version != 2:
+        raise ValueError('opencode workers run only on transport v2 (in-process plugin + agent_bridge.py)')
     if version == 2:
         problem = v2_cli_problem(cfg)
         if problem:
@@ -62,8 +67,21 @@ def tui_slot(cfg, slot):
     official Claude (docs/design.md §27)."""
     if slot == advisor.SLOT:
         return cfg.get('transport_version') == 2
-    return cfg.get('transport_version') == 2 and (
-        cfg.get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') or 'codex') != 'pi'
+    cli = cfg.get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') or 'codex'
+    if cli not in (cli_pairs.CLIS if slot == 'supervisor' else cli_pairs.WORKER_CLIS):
+        raise ValueError('unknown CLI ' + repr(cli) + ' for ' + str(slot) + '; refusing to treat it as an official TUI')
+    # pi and opencode run fleet's in-process bridge (agent_bridge.py); only Codex / Claude are official TUIs.
+    return cfg.get('transport_version') == 2 and cli in ('codex', 'claude')
+
+
+def bridge_event(cfg, slot, generation, ev):
+    """Validate a bridge session binding with the slot's own CLI adapter (pi or opencode)."""
+    cli = cfg.get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') or 'codex'
+    if cli == 'opencode':
+        return opencode_adapter.event(cfg, slot, generation, dict(ev, kind=opencode_adapter.KIND))
+    if cli == 'pi':
+        return pi_adapter.event(cfg, slot, generation, dict(ev, kind='pi_session'))
+    raise ValueError('bridge session from a ' + repr(cli) + ' slot: only pi / opencode slots run the bridge')
 
 
 TUI_REPORT_RETRIES = 2  # corrections for an official-CLI task worker report before blocking
@@ -615,7 +633,7 @@ class RuntimeV2:
                 if tui_slot(self.slot_cfg(slot), slot):
                     self.tui_session(slot, ev)
                 else:
-                    pi_adapter.event(self.f.cfg, slot, ev['generation'], dict(ev, kind='pi_session'))
+                    bridge_event(self.slot_cfg(slot), slot, ev['generation'], ev)
                 self.effects.hset(legacy.key('agent', slot), {'thread': ev['thread'],
                     'transcript': ev['transcript'], 'bridge_available': 0})
                 # Slot registration is completed by bridge only after this durable reply.

@@ -37,7 +37,7 @@ def default_model(cfg: Mapping, registry: AgentRegistry) -> Optional[str]:
     Pass ``for_agent(cfg, slot)`` for one slot: a pi worker may have its own pi_model (roster)."""
     cli = cfg.get('worker_cli') or 'codex'
     model = {'pi': cfg.get('pi_model'), 'claude': cfg.get('worker_model'),
-             'codex': cfg.get('codex_model')}.get(cli)
+             'codex': cfg.get('codex_model'), 'opencode': cfg.get('opencode_model')}.get(cli)
     if not model:
         return None
     matches = [m.id for m in registry.models if m.cli == cli and m.model == model]
