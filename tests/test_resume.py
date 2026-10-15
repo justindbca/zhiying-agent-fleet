@@ -36,6 +36,9 @@ class ResumeMgr(FakeMgr):
     def has_cli_process(self, pane, names=('codex',)):
         return pane in self.alive and pane not in self.no_cli
 
+    def tab_panes(self):
+        return {}
+
     def dock_control(self, pane):
         self.docked.append(pane)
         return True

@@ -121,6 +121,9 @@ class FakeMgr:
     def capture_to(self, pane, path):
         Path(path).write_text('screen of ' + pane)
 
+    def tab_panes(self):
+        return {}
+
     def arrange(self, sup, workers, url):
         self.arranged = (sup, list(workers), url)
         self.alive.add('history-pane')
