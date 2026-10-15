@@ -16,7 +16,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import redis
-from cmux_fleet import fleet, pi_adapter
+from cmux_fleet import fleet, opencode_adapter, pi_adapter
 from cmux_fleet.message_bus import BusError, _short
 from cmux_fleet.runtime_v2 import bus_for, dumps, post_event, validate_config, wait_reply
 
@@ -28,7 +28,11 @@ class AgentBridge:
             raise ValueError('bridge requires a configured v2 slot')
         if type(generation) is not int or generation < 0:
             raise ValueError('invalid bridge generation')
-        self.cfg, self.slot, self.generation = cfg, slot, generation
+        # Only in-process bridges: never fall back to Pi identity for another CLI.
+        cli = fleet.agent_cli(cfg, slot)
+        if cli not in ('pi', 'opencode'):
+            raise ValueError('no in-process bridge for CLI ' + repr(cli))
+        self.cfg, self.slot, self.generation, self.cli = cfg, slot, generation, cli
         self.r = fleet.connect(cfg)
         self.bus = bus_for(cfg, self.r)
         self.consumer = 'bridge-' + slot + '-g' + str(generation)
@@ -44,6 +48,7 @@ class AgentBridge:
         self.threads = []
         self.readers = [self.bus.blocking_client(1000) for _ in range(3)]
         self.ui_cursor = '0-0'
+        self.permissions = {}  # opencode request id -> class reported by this bridge
 
     def emit(self, payload):
         with self.write_lock:
@@ -51,7 +56,11 @@ class AgentBridge:
             self.output.flush()
 
     def metadata(self, data):
-        wire = pi_adapter.event(self.cfg, self.slot, self.generation, dict(data, kind='pi_session'))
+        if self.cli == 'opencode':
+            wire = opencode_adapter.event(self.cfg, self.slot, self.generation,
+                                          dict(data, kind=opencode_adapter.KIND))
+        else:
+            wire = pi_adapter.event(self.cfg, self.slot, self.generation, dict(data, kind='pi_session'))
         _short(wire['thread'], 'session_id')
         binding = (wire['thread'], wire['transcript'])
         if self.binding is not None and binding != self.binding:
@@ -112,6 +121,8 @@ class AgentBridge:
             else:
                 self.idle_event.clear()
             return self.event(kind, {'idle': data.get('idle') is True})
+        if kind == 'permission':
+            return self.permission(data)
         if kind not in ('started', 'candidate', 'settled', 'reject_delivery'):
             raise ValueError('unsupported bridge command')
         with self.lock:
@@ -137,6 +148,43 @@ class AgentBridge:
             else:
                 self.fault('settlement unconfirmed/held; no execution replay')
         return reply
+
+    def permission(self, data):
+        """opencode stopped on a permission request. Report it; never answer it here. The class is
+        recomputed on this side (the plugin's opinion can only make it stricter)."""
+        if self.cli != 'opencode':
+            raise ValueError('permission requests come from the opencode plugin only')
+        req = data.get('request')
+        if not isinstance(req, dict) or not isinstance(req.get('id'), str) or not req['id']:
+            raise ValueError('permission requires the opencode request id')
+        cls = opencode_adapter.permission_class(req)
+        if data.get('class') == 'delete':
+            cls = 'delete'
+        with self.lock:
+            env = self.active
+            self.permissions[req['id']] = cls
+        fields = {'request': {k: req[k] for k in ('id', 'permission', 'patterns', 'title', 'command', 'metadata')
+                              if k in req}, 'class': cls, 'session': self.binding[0]}
+        if env:
+            fields['delivery'] = env
+        return self.event('permission_request', fields)
+
+    def permission_card(self, card):
+        """A daemon ruling on a non-delete request reaches the plugin only when it names this
+        bridge's run / slot / generation / session and a request this bridge reported as 'other'.
+        Delete-class requests are the user's: no ruling is ever forwarded for them."""
+        rid = card.get('request_id')
+        with self.lock:
+            cls = self.permissions.get(rid)
+        if (card.get('run_id') != self.bus.run_id or card.get('slot') != self.slot
+                or card.get('generation') != self.generation or card.get('session_id') != self.binding[0]
+                or cls != 'other' or card.get('class') != 'other'
+                or card.get('decision') not in ('once', 'reject')):
+            return False
+        with self.lock:
+            self.permissions.pop(rid, None)
+        self.emit({'kind': 'permission_reply', 'request_id': rid, 'decision': card['decision']})
+        return True
 
     def fault(self, reason):
         with self.lock:
@@ -200,8 +248,15 @@ class AgentBridge:
                 rows = self.readers[1].xread({self.bus.prefix + ':ui:' + self.slot: self.ui_cursor}, count=100, block=1000)
                 for _, entries in rows:
                     for sid, fields in entries:
+                        card = json.loads(fields['data'])
+                        if isinstance(card, dict) and card.get('kind') == 'permission_reply':
+                            if not self.permission_card(card):
+                                self.emit({'kind': 'ui', 'stream_id': sid, 'event_id': fields['event_id'],
+                                           'card': {'render': '权限裁定未转交（身份或类别不符）'}})
+                            self.ui_cursor = sid
+                            continue
                         self.emit({'kind': 'ui', 'stream_id': sid, 'event_id': fields['event_id'],
-                                   'card': json.loads(fields['data'])})
+                                   'card': card})
                         self.ui_cursor = sid  # session branch entries provide replay dedup
         except (redis.RedisError, ValueError, OSError) as exc:
             self.fault(str(exc))
