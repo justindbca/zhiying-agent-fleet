@@ -87,7 +87,21 @@ export function permissionClass(req) {
   return DELETE_RE.some((re) => re.test(t)) ? "delete" : "other"
 }
 
-/** Context fill from usage tokens {input, output, reasoning, cache:{read, write}}; null when unreadable. */
+/** Model lock over one execution's steps: Map(assistantMessageID -> {model (step.started), cost (step.ended), ended}).
+ *  Empty map, a step without step.ended, another model, or a cost that is not a finite 0 -> problems. */
+export function stepProblems(locked, steps) {
+  if (!(steps instanceof Map) || steps.size === 0) return ["model_lock: no assistant step in this execution"]
+  const out = []
+  for (const [id, s] of steps) {
+    if (!s.ended) { out.push(`model_lock: step ${id} has no step.ended`); continue }
+    const p = modelProblem(locked, { model: s.model, cost: s.cost })
+    if (p) out.push(p + ` (step ${id})`)
+  }
+  return out
+}
+
+/** Context fill = opencode's own measure: input + output + reasoning + cache.read + cache.write of ONE step
+ *  (the last step.ended / last assistant message). Never pass session.usage.updated tokens (cumulative). */
 export function usageOf(tokens) {
   if (!tokens || typeof tokens !== "object") return null
   const n = (v) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0)

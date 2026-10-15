@@ -16,7 +16,7 @@ import { appendFileSync, mkdirSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { createInterface } from "node:readline"
 import { join } from "node:path"
-import { payload, classifyFailure, modelProblem, permissionClass, usageOf, turnMessages, catalogHas } from "./lib.js"
+import { payload, classifyFailure, modelProblem, permissionClass, usageOf, turnMessages, catalogHas, stepProblems } from "./lib.js"
 
 const env = process.env
 const COMMAND = JSON.parse(env.CMUX_FLEET_OC_BRIDGE || "[]")
@@ -128,7 +128,10 @@ export default {
         return hold(reason)
       }
       const outcome = type.split(".").pop()
-      const failure = outcome === "succeeded" ? null : classifyFailure(data?.error, outcome)
+      // interrupted (measured: {sessionID, reason:"user"}, Esc in the TUI) carries no error object.
+      const failure = outcome === "succeeded" ? null
+        : outcome === "interrupted" ? { cls: "aborted", text: "interrupted: " + (data?.reason ?? "unknown") }
+        : classifyFailure(data?.error, outcome)
       const msgs = await messagesOf(id)
       if (t.kind === "startup") {
         const text = (msgs?.assistants ?? []).map((m) => m.text).join("\n")
@@ -145,9 +148,15 @@ export default {
       let failed = !!failure
       if (failure) await send("candidate", { candidate: { tool: "model", error: failure.text, error_class: failure.cls } }).catch(fault)
       if (!failure) {
-        const problems = !msgs ? ["model_lock: session context unreadable"] : !msgs.assistants.length ? ["model_lock: no assistant message to check"]
-          : msgs.assistants.map((m) => modelProblem(MODEL, m)).filter(Boolean)
-        if (usageCost !== null && !(Number.isFinite(usageCost) && usageCost === 0)) problems.push(`cost_nonzero: usage.updated cost ${usageCost}`)
+        // Attribution: the assistant messages of this execution are its step.started/step.ended assistantMessageIDs
+        // (measured; context() messages have no parent). Every step: locked model (step.started) and cost 0 (step.ended).
+        // The context() assistants after our user message must be exactly those ids.
+        const problems = stepProblems(MODEL, e.steps)
+        const ctxIds = msgs ? msgs.assistants.map((m) => m.id).join(",") : null
+        if (!problems.length && ctxIds !== [...e.steps.keys()].join(",")) problems.push(`model_lock: step ids ${[...e.steps.keys()].join(",")} != context assistants ${ctxIds}`)
+        if (!problems.length) problems.push(...msgs.assistants.map((m) => modelProblem(MODEL, m)).filter(Boolean))
+        // Cumulative session cost (usage.updated) only as a non-zero alarm; never for context size.
+        if (usageCost !== null && !(Number.isFinite(usageCost) && usageCost === 0)) problems.push(`cost_nonzero: session usage cost ${usageCost}`)
         if (problems.length) {
           failed = true
           await send("candidate", { candidate: { tool: "model", error: problems[0], error_class: "model_lock" } }).catch(fault)
@@ -205,7 +214,7 @@ export default {
         const d = frame.delivery
         if (unhealthy || turn || exec || !ready) { sendSafe("reject_delivery", { reason: "opencode is occupied by a manual/other run" }); return }
         if (d.slot !== SLOT || d.session_id !== sid || d.generation !== GENERATION) { fault("delivery identity mismatch"); return }
-        candidates = []; usageCost = null
+        candidates = []
         turn = { kind: "delivery", env: d, text: d.body.text, inboxId: null, startedSent: false, settled: false }
         inject(turn).catch(() => {}) // a failed prompt is decided at execution end / by hold below
         turn.promise.catch((e) => { if (turn?.env === d && !exec) hold("delivery prompt failed: " + e) })
@@ -247,10 +256,15 @@ export default {
         if (!sid || d?.sessionID !== sid) { if (sid && type.includes("permission") && !d?.sessionID) await checkPermissions(d); continue }
         activity({ ev: type, seq: ev?.durable?.seq ?? null, inbox: d.inboxID ?? null })
         if (type === "session.usage.updated") {
-          const u = usageOf(d.tokens); if (u !== null) ctxUsed = u
-          if (turn?.kind === "delivery" && exec && turn.inboxId && exec.inbox.includes(turn.inboxId) && d.cost !== undefined) usageCost = typeof d.cost === "number" ? d.cost : NaN
+          // Session-cumulative (includes the title call): cost alarm only, never ctx_used.
+          if (d.cost !== undefined) usageCost = typeof d.cost === "number" ? d.cost : NaN
+        } else if (type === "session.step.started" || type === "session.step.ended") {
+          const step = exec && d.assistantMessageID ? (exec.steps.get(d.assistantMessageID) ?? {}) : null
+          if (step) exec.steps.set(d.assistantMessageID, { ...step, ...(type === "session.step.started" ? { model: d.model } : { cost: d.cost, ended: true }) })
+          // opencode's own context measure: the last step's five-term token sum.
+          if (type === "session.step.ended") { const u = usageOf(d.tokens); if (u !== null) ctxUsed = u }
         } else if (type === "session.execution.started") {
-          exec = { inbox: [] }
+          exec = { inbox: [], steps: new Map() }
           if (ready && !turn) sendSafe("availability", { idle: false })
         } else if (type === "session.inbox.delivered") {
           if (exec) { exec.inbox.push(d.inboxID); maybeStarted() } else activity({ delivered_outside_execution: d.inboxID })
