@@ -15,8 +15,9 @@ REQUIRED = [
     "P0 even when unsure",                      # real-money safety exception
     "after go-live, in what normal scenario it happens → wrong result",
     "file:line",
-    "Legacy", "Out of scope", "Ledger seen",
-    "From r2 on: review only the previous fix diff",
+    "Legacy", "Out of scope", "## 记录·不修",
+    "From r2 on: only run the failing tests / reproduction commands r1 attached",
+    "失败测试或复现命令",
     "PASS = zero P0 and zero P1",
     "## This round's issues",                   # report template
     "Use the base reply format (Done / Evidence / Not done / Blocked)",
