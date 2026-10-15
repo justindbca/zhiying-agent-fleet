@@ -4,7 +4,7 @@ Incident 2026-10-13: the codex-notype review ran to round 16. Now (1) dev_task's
 max_rounds 3 + on_cap stop_and_report: a FAIL verdict at round 3 stops the rounds and hands the open
 P0/P1 to the user in the result; (2) every fleet worker gets the fleet copy of the review rules
 (REVIEWER.md) and is told to follow it for review instructions; (3) the task supervisor prompts carry
-the narrowing principle (go live quickly, narrow each round, P2 deferred).
+the narrowing principle (go live quickly, round 2+ only reruns round-1 tests, P2 not written).
 """
 import json
 from pathlib import Path
@@ -76,6 +76,7 @@ def test_task_supervisor_prompts_carry_the_review_narrowing_rule():
     for name in ('supervisor.md', 'supervisor_v2.md'):
         text = (AGENTS / name).read_text()
         row = next(line for line in text.splitlines() if line.startswith('| Dispatch a review'))
-        for must in ('go live quickly', 'from round 2 only the previous fix diff', 'P2 items go on a deferred list',
-                     'at most 3 rounds', 'do not start round 4'):
+        for must in ('go live quickly', 'from round 2 only run the failing tests', '非阻断观察 ×N，未展开',
+                     'at most 3 rounds', 'do not start round 4', 'same as reviewer.md R4',
+                     'without a failing test or reproduction command does not count'):
             assert must in row, (name, must)
