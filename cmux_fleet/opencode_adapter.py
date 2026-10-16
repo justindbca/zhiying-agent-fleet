@@ -28,6 +28,7 @@ DELETE_SHELL = ('rm *', 'rmdir *', 'unlink *', 'mv *', 'shred *', 'trash *', 'ri
                 'git rm *', 'git mv *', 'git clean*', 'git reset --hard*', 'git checkout --*', 'git restore*',
                 'git branch -D*', 'git branch -d*', 'git push --force*', 'git push -f*', 'find * -delete*',
                 'dd *')
+_DELETE_PREFIXES = (' ', '/', '"', "'", '(', ')', ';', '&', '|', '`', '$', '{', '.', '-', '\t', '\n')
 
 _FREE_TIER = re.compile(r'freetiererror|free tier can only be used', re.I)
 _RATE = re.compile(r'rate[ -]?limit|too many requests|ratelimit', re.I)  # bare "429" in text is not used: token counts hit it
@@ -104,12 +105,37 @@ def session_dir(cfg, name, generation):
     return Path(cfg['run']) / 'opencode-sessions' / name / ('g' + str(generation))
 
 
+def delete_shell_patterns():
+    """Shell resource globs that must ask. opencode splits a shell call into sub-commands and checks
+    each one as a resource ("ls && rm x" -> ["ls", "rm x"], "(rm x)" -> ["rm x"]); "*" matches
+    anything, matching is case-sensitive (measured, worker-1 api-contract-supplement.md §8).
+    Every watchdog.DELETE_MARKERS word asks at the start of a resource or after a space, path,
+    quote, bracket, separator, "." or "-": "sudo rm x", "/bin/rm x", 'bash -c "rm x"',
+    "find . -delete", 'python3 -c "os.remove(...)"'. Lower and upper case. Other markers anywhere.
+    Strict on purpose: an extra question only reaches the user once more."""
+    from cmux_fleet import watchdog
+    markers = list(watchdog.DELETE_MARKERS) + ['git branch -D']
+    out = list(DELETE_SHELL)
+    for m in markers:
+        if re.fullmatch(r'[a-z0-9][a-z0-9 =\-]*', m, re.I):
+            for w in dict.fromkeys((m, m.upper())):
+                out.append(w)                                            # whole resource
+                out.extend(w + q + '*' for q in (' ', '\t', ';', '(', '"', "'"))   # command word ("mvn" is not "mv")
+                out.extend('*' + p + w + '*' for p in _DELETE_PREFIXES)  # inside: "x rm", ".rmtree(", "-delete" 
+        else:
+            out.append('*' + m + '*')
+    return list(dict.fromkeys(out))
+
+
 def permission_rules(cfg):
-    """opencode `permission` config: delete-class shell commands ask (held for the user),
-    everything else runs inside the agent directory as the run already allows. No global --auto."""
+    """opencode `permission` config (v1 shape, parsed into v2 rules in key order; the LAST matching
+    rule wins, nothing matching = ask). Only the `shell` key: opencode renames `bash` to `shell`, so
+    writing both would append a second "*": allow after the delete asks and undo them (measured
+    mapping, worker-3 preflight-supplement §2.1). Delete-class commands ask (held for the user);
+    everything else in the run directory is allowed. No global --auto."""
     shell = {'*': 'allow'}
-    shell.update({pattern: 'ask' for pattern in DELETE_SHELL})
-    return {'bash': shell, 'shell': shell, 'edit': 'allow', 'webfetch': 'allow',
+    shell.update({pattern: 'ask' for pattern in delete_shell_patterns()})
+    return {'shell': shell, 'edit': 'allow', 'webfetch': 'allow',
             'external_directory': 'ask', 'doom_loop': 'ask'}
 
 
