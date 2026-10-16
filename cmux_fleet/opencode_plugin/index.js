@@ -12,7 +12,7 @@
 // inbox id and that id is the one prompt() returned for it. Mixed with manual ids -> hold, reported,
 // never success, never re-sent. Executions without our id are manual and never settle.
 // The plugin never retries a model call, never switches models, never answers a delete permission.
-import { appendFileSync, mkdirSync } from "node:fs"
+import { appendFileSync, mkdirSync, readdirSync, realpathSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { createInterface } from "node:readline"
 import { join } from "node:path"
@@ -30,13 +30,26 @@ const STARTUP = env.CMUX_FLEET_OC_STARTUP || ""
 const TITLE = env.CMUX_FLEET_OC_LABEL || SLOT
 const CATALOG_WAIT_MS = 1000 * (Number(env.CMUX_FLEET_OC_CATALOG_WAIT_S) || 60)
 const PROMPT_WAIT_MS = 30000
+const LAUNCH_CWD = env.CMUX_FLEET_OC_LAUNCH_CWD || ""
+const real = (p) => { try { return realpathSync(p) } catch { return null } }
+/** Instruction files opencode would load from the launch tree (nested AGENTS.md); the tree must stay without them. */
+function launchInstructionFiles(dir, depth = 0, out = []) {
+  if (depth > 6 || out.length) return out
+  let entries = []
+  try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return out }
+  for (const e of entries) {
+    if (e.isFile() && /^(AGENTS|CLAUDE)\.md$/i.test(e.name)) out.push(join(dir, e.name))
+    else if (e.isDirectory()) launchInstructionFiles(join(dir, e.name), depth + 1, out)
+  }
+  return out
+}
 
 export default {
   id: "cmux-fleet.bridge",
   async setup(ctx) {
     if (!COMMAND.length || !COMMAND.every((p) => typeof p === "string")) throw new Error("Fleet opencode bridge command missing")
     if (COMMAND.at(-2) !== SLOT || Number(COMMAND.at(-1)) !== GENERATION) throw new Error("Fleet opencode slot/generation mismatch")
-    if (!MODEL.includes("/") || !SESSION_DIR || !STARTUP.trim()) throw new Error("Fleet opencode environment incomplete")
+    if (!MODEL.includes("/") || !SESSION_DIR || !STARTUP.trim() || !LAUNCH_CWD) throw new Error("Fleet opencode environment incomplete")
     mkdirSync(SESSION_DIR, { recursive: true })
     const [providerID, ...rest] = MODEL.split("/"); const modelID = rest.join("/")
 
@@ -327,6 +340,8 @@ export default {
           if (exec) { exec.inbox.push(d.inboxID); maybeStarted() } else activity({ delivered_outside_execution: d.inboxID })
         } else if (type.startsWith("session.execution.")) {
           await executionEnded(type, d)
+          const planted = launchInstructionFiles(LAUNCH_CWD)
+          if (planted.length && !unhealthy) await hold("layout: instruction file appeared in the launch cwd (opencode would load it as nested instructions): " + planted[0])
           await syncPermissions(type.split(".").pop())
         } else if (type === "permission.asked") {
           await checkPermissions(d)
@@ -349,6 +364,18 @@ export default {
       sid = s.id; activity({ bound: sid, title: TITLE })
       const ack = await send("init")
       if (ack?.status !== "registered") throw new Error(ack?.reason || "Fleet binding rejected")
+      // Layout (worker-3 isolation-layout-probe, supervisor 2026-10-16): opencode runs in the generation's EMPTY launch
+      // cwd; project / output directories are external. Any deviation -> explicit startup failure, no model turn.
+      const launch = real(LAUNCH_CWD)
+      let launchEntries = null
+      try { launchEntries = readdirSync(LAUNCH_CWD) } catch {}
+      const layoutProblem = !launch ? `launch cwd ${LAUNCH_CWD} missing`
+        : real(process.cwd()) !== launch ? `process cwd ${process.cwd()} is not the launch cwd ${LAUNCH_CWD}`
+        : real(s.location?.directory ?? "") !== launch ? `session directory ${s.location?.directory} is not the launch cwd ${LAUNCH_CWD}`
+        : launchEntries === null || launchEntries.length ? `launch cwd ${LAUNCH_CWD} is not empty: ${JSON.stringify(launchEntries)}`
+        : null
+      if (layoutProblem) { await startupFailed("layout: " + layoutProblem); return }
+      activity({ layout_ok: LAUNCH_CWD })
       const deadline = Date.now() + CATALOG_WAIT_MS
       let ok = false
       while (!ok && Date.now() < deadline && !unhealthy) {
