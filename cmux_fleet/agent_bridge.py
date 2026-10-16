@@ -123,6 +123,8 @@ class AgentBridge:
             return self.event(kind, {'idle': data.get('idle') is True})
         if kind == 'permission':
             return self.permission(data)
+        if kind in ('permission_resolved', 'permission_refused'):
+            return self.permission_state(kind, data)
         if kind not in ('started', 'candidate', 'settled', 'reject_delivery', 'hold'):
             raise ValueError('unsupported bridge command')
         with self.lock:
@@ -183,6 +185,32 @@ class AgentBridge:
             fields['delivery'] = env
         return self.event('permission_request', fields)
 
+    def permission_state(self, kind, data):
+        """opencode closed a reported request (permission.replied, or cleared without a reply when the
+        execution was interrupted / the instance stopped), or the plugin refused to forward a ruling
+        (e.g. a reject that would also decline an open user-held delete). Reported for the daemon's
+        held/escalation bookkeeping; a closed request id is never forwarded again."""
+        if self.cli != 'opencode':
+            raise ValueError('permission state comes from the opencode plugin only')
+        rid = data.get('request_id')
+        if not isinstance(rid, str) or not rid:
+            raise ValueError('permission state requires the opencode request id')
+        with self.lock:
+            cls = self.permissions.get(rid)
+            if kind == 'permission_resolved':
+                self.permissions.pop(rid, None)
+        if cls is None:  # not reported by this bridge (or already closed): nothing to tell the daemon
+            return {'status': 'ignored'}
+        cls = 'other' if cls == 'answered' else cls
+        fields = {'request_id': rid, 'class': cls, 'session': self.binding[0]}
+        if kind == 'permission_resolved':
+            reply = data.get('reply')
+            fields['reply'] = reply if reply in ('once', 'always', 'reject') else None
+            fields['reason'] = str(data.get('reason') or '')[:300]
+        else:
+            fields['reason'] = str(data.get('reason') or '')[:300]
+        return self.event(kind, fields)
+
     def permission_card(self, card):
         """A daemon ruling on a non-delete request reaches the plugin only when it names this
         bridge's run / slot / generation / session and a request this bridge reported as 'other'.
@@ -193,10 +221,10 @@ class AgentBridge:
         if (card.get('run_id') != self.bus.run_id or card.get('slot') != self.slot
                 or card.get('generation') != self.generation or card.get('session_id') != self.binding[0]
                 or cls != 'other' or card.get('class') != 'other'
-                or card.get('decision') not in ('once', 'reject')):
+                or type(card.get('decision')) is not str or card.get('decision') not in ('once', 'reject')):
             return False
         with self.lock:
-            self.permissions.pop(rid, None)
+            self.permissions[rid] = 'answered'   # never forwarded again; closed by permission_resolved
         self.emit({'kind': 'permission_reply', 'request_id': rid, 'decision': card['decision']})
         return True
 
