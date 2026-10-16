@@ -54,11 +54,12 @@ export function turnMessages(list, inboxId) {
   return { assistants }
 }
 
-/** true / false when ctx.model.list() output can be read, null when its shape is unknown. */
+/** ctx.model.list() returns {location, data: Model.Info[]} with {id, modelID, providerID, status, enabled, ...}
+ *  (measured, opencode 2.0.29). true / false when readable, null when the shape is unknown. Disabled = absent. */
 export function catalogHas(list, providerID, modelID) {
-  const items = Array.isArray(list) ? list : Array.isArray(list?.data) ? list.data : Array.isArray(list?.models) ? list.models : null
+  const items = Array.isArray(list) ? list : Array.isArray(list?.data) ? list.data : null
   if (!items) return null
-  return items.some((m) => (m?.providerID ?? m?.provider?.id ?? m?.provider) === providerID && (m?.id ?? m?.modelID) === modelID)
+  return items.some((m) => m?.providerID === providerID && (m?.id ?? m?.modelID) === modelID && m?.enabled !== false)
 }
 
 // Mirrors watchdog.DELETE_MARKERS (moves / renames count as deletes). Strict: unreadable = delete.
@@ -76,8 +77,9 @@ const DELETE_RE = DELETE_WORDS.map((w) => {
 })
 export function permissionText(req) {
   if (!req || typeof req !== "object") return ""
-  const parts = ["permission", "type", "title", "command"].map((k) => String(req[k] ?? ""))
-  for (const k of ["patterns", "pattern"]) { const v = req[k]; Array.isArray(v) ? parts.push(...v.map(String)) : parts.push(String(v ?? "")) }
+  // opencode 2.0.29 Permission.Request = {id, sessionID, action, resources[], metadata?, message?} (measured); older names kept.
+  const parts = ["action", "message", "permission", "type", "title", "command"].map((k) => String(req[k] ?? ""))
+  for (const k of ["resources", "patterns", "pattern"]) { const v = req[k]; Array.isArray(v) ? parts.push(...v.map(String)) : parts.push(String(v ?? "")) }
   if (req.metadata && typeof req.metadata === "object") for (const v of Object.values(req.metadata)) if (["string", "number"].includes(typeof v)) parts.push(String(v))
   return parts.filter(Boolean).join("\n")
 }
