@@ -46,7 +46,12 @@ export default {
     let turn = null               // fleet turn in flight: {kind: "startup"|"delivery", env?, text, promise, inboxId, startedSent, settled}
     let candidates = []
     let ctxUsed = null, usageCost = null, sequence = 0
-    const pending = new Map(), reported = new Map(), seenUi = new Set()
+    const pending = new Map(), seenUi = new Set()
+    // Permission state (measured, worker-1 api-contract-supplement.md §4/§8 + worker-3 preflight-supplement §2):
+    // asked -> open; permission.replied -> closed; an interrupt clears requests WITHOUT permission.replied, so every
+    // execution end re-syncs open requests against ctx.permission.list. `seenPerm` never shrinks: no id is reported twice.
+    const openPerm = new Map(), seenPerm = new Set()   // openPerm: request id -> {req, cls}
+    const DECISIONS = new Set(["once", "reject"])       // never "always" (it saves a project-wide grant), never any other string
 
     const transcript = () => join(SESSION_DIR, sid + ".jsonl")
     const activity = (o) => { if (sid) try { appendFileSync(transcript(), JSON.stringify({ t: Date.now(), ...o }) + "\n") } catch {} }
@@ -174,8 +179,24 @@ export default {
     }
 
     async function replyPermission(rid, decision) {
-      // Measured: payload {sessionID, requestID, decision: "once"|"always"|"reject", message?}; "always" is never sent.
+      // Measured: {sessionID, requestID, decision: "once"|"always"|"reject", message?}. opencode itself treats any
+      // decision other than "reject" as approval, so the whitelist here is the only guard.
+      if (typeof decision !== "string" || !DECISIONS.has(decision)) throw new Error("permission decision not allowed: " + JSON.stringify(decision))
       await ctx.permission.reply({ sessionID: sid, requestID: rid, decision })
+    }
+    function closePermission(rid, reply, reason) {
+      if (!openPerm.delete(rid)) return
+      activity({ permission_resolved: rid, reply, reason })
+      sendSafe("permission_resolved", { request_id: rid, reply, reason })
+    }
+    /** After an execution ends: requests no longer listed were cleared without permission.replied (interrupt). */
+    async function syncPermissions(outcome) {
+      if (!openPerm.size) return
+      let list
+      try { list = await ctx.permission.list({ sessionID: sid }) } catch (e) { activity({ permission_list_error: String(e) }); return }
+      if (!Array.isArray(list)) return
+      const live = new Set(list.map((r) => r?.id))
+      for (const rid of [...openPerm.keys()]) if (!live.has(rid)) closePermission(rid, null, "cleared without reply (execution " + outcome + ")")
     }
     async function checkPermissions(asked) {
       // Measured: event permission.asked carries the whole request {id:"per_...", sessionID, action, resources[], metadata?};
@@ -186,9 +207,9 @@ export default {
       if (asked && typeof asked === "object" && typeof asked.id === "string") items.push(asked)
       for (const req of items) {
         const rid = req?.id
-        if (typeof rid !== "string" || !rid || reported.has(rid) || req.sessionID !== sid) continue
+        if (typeof rid !== "string" || !rid || seenPerm.has(rid) || req.sessionID !== sid) continue
         const cls = permissionClass(req)
-        reported.set(rid, req); activity({ permission: rid, class: cls })
+        seenPerm.add(rid); openPerm.set(rid, { req, cls }); activity({ permission: rid, class: cls })
         sendSafe("permission", { request: { ...req, id: rid }, class: cls })
       }
     }
@@ -205,12 +226,18 @@ export default {
       } else if (frame.kind === "completed") {
         if (turn?.kind === "delivery" && turn.env.message_id === frame.message_id) { turn = null; candidates = []; idleNow() }
       } else if (frame.kind === "permission_reply") {
-        // Second gate: only a request this plugin reported, re-classified here as 'other'. Deletes never.
-        const req = reported.get(frame.request_id)
-        if (!req || permissionClass(req) !== "other" || !["once", "reject"].includes(frame.decision)) { activity({ permission_refused: frame.request_id }); return }
-        reported.delete(frame.request_id)
-        replyPermission(frame.request_id, frame.decision)
-          .then(() => activity({ permission_replied: frame.request_id, decision: frame.decision }))
+        // Second gate: only a still-open request this plugin reported, re-classified here as 'other'; decision strictly
+        // "once" | "reject". Deletes / moves / renames are the user's: never answered here.
+        const rid = frame.request_id, open = typeof rid === "string" ? openPerm.get(rid) : undefined
+        const refuse = (why) => { activity({ permission_refused: rid ?? null, why }); if (typeof rid === "string") sendSafe("permission_refused", { request_id: rid, reason: why }) }
+        if (!open) return refuse("not an open request of this session")
+        if (open.cls !== "other" || permissionClass(open.req) !== "other") return refuse("delete-class: held for the user")
+        if (typeof frame.decision !== "string" || !DECISIONS.has(frame.decision)) return refuse("decision not allowed: " + JSON.stringify(frame.decision))
+        // Measured: "reject" declines EVERY open request of the session, a user-held delete included. Not while one is open.
+        if (frame.decision === "reject" && [...openPerm.values()].some((o) => o.cls !== "other"))
+          return refuse("reject would also decline an open delete-class request held for the user")
+        replyPermission(rid, frame.decision)
+          .then(() => activity({ permission_replied: rid, decision: frame.decision }))
           .catch((e) => activity({ permission_reply_error: String(e) }))
       } else if (frame.kind === "delivery" && frame.delivery) {
         const d = frame.delivery
@@ -271,11 +298,12 @@ export default {
           if (exec) { exec.inbox.push(d.inboxID); maybeStarted() } else activity({ delivered_outside_execution: d.inboxID })
         } else if (type.startsWith("session.execution.")) {
           await executionEnded(type, d)
+          await syncPermissions(type.split(".").pop())
         } else if (type === "permission.asked") {
           await checkPermissions(d)
         } else if (type === "permission.replied") {
           // {sessionID, requestID, reply} (measured). Answered (by the TUI user or by us): never report it as a request.
-          activity({ permission_resolved: d.requestID, reply: d.reply }); reported.delete(d.requestID)
+          closePermission(d.requestID, typeof d.reply === "string" ? d.reply : null, "replied")
         }
       }
     })().catch((e) => fault("event stream: " + e))
