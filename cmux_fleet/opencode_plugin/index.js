@@ -184,11 +184,20 @@ export default {
       if (typeof decision !== "string" || !DECISIONS.has(decision)) throw new Error("permission decision not allowed: " + JSON.stringify(decision))
       await ctx.permission.reply({ sessionID: sid, requestID: rid, decision })
     }
-    function closePermission(rid, reply, reason) {
-      if (!openPerm.delete(rid)) return
-      activity({ permission_resolved: rid, reply, reason })
-      sendSafe("permission_resolved", { request_id: rid, reply, reason })
+    // Who closed a request. opencode itself only ever REJECTS on its own (instance shutdown, the session-wide cascade
+    // of a reject) and an interrupt clears requests with no reply at all, so neither is ever reported as a user decision:
+    //   "fleet"        this plugin sent that reply (a supervisor ruling on a non-delete request)
+    //   "tui_user"     once/always that fleet did not send: only a person in the TUI approves
+    //   "unattributed" reject that fleet did not send: the user in the TUI OR opencode (shutdown / cascade)
+    //   "none"         cleared without any reply (interrupt) or still open when this instance shut down
+    const fleetReplies = new Map()                       // request id -> decision this plugin sent
+    function closePermission(rid, reply, reason, decidedBy) {
+      if (!openPerm.delete(rid)) return Promise.resolve()
+      activity({ permission_resolved: rid, reply, reason, decided_by: decidedBy })
+      return sendSafe("permission_resolved", { request_id: rid, reply, reason, decided_by: decidedBy })
     }
+    const repliedBy = (rid, reply) => fleetReplies.get(rid) === reply ? "fleet"
+      : reply === "once" || reply === "always" ? "tui_user" : "unattributed"
     /** After an execution ends: requests no longer listed were cleared without permission.replied (interrupt). */
     async function syncPermissions(outcome) {
       if (!openPerm.size) return
@@ -196,13 +205,13 @@ export default {
       try { list = await ctx.permission.list({ sessionID: sid }) } catch (e) { activity({ permission_list_error: String(e) }); return }
       if (!Array.isArray(list)) return
       const live = new Set(list.map((r) => r?.id))
-      for (const rid of [...openPerm.keys()]) if (!live.has(rid)) closePermission(rid, null, "cleared without reply (execution " + outcome + ")")
+      for (const rid of [...openPerm.keys()]) if (!live.has(rid)) closePermission(rid, null, "cleared without reply (execution " + outcome + ")", "none")
     }
-    async function checkPermissions(asked) {
+    async function checkPermissions(asked, listed) {
       // Measured: event permission.asked carries the whole request {id:"per_...", sessionID, action, resources[], metadata?};
       // ctx.permission.list({sessionID}) returns the pending requests as an array. Each new request is reported once.
-      let list = []
-      try { list = await ctx.permission.list({ sessionID: sid }) } catch (e) { activity({ permission_list_error: String(e) }) }
+      let list = listed
+      if (!Array.isArray(list)) try { list = await ctx.permission.list({ sessionID: sid }) } catch (e) { activity({ permission_list_error: String(e) }) }
       const items = Array.isArray(list) ? [...list] : []
       if (asked && typeof asked === "object" && typeof asked.id === "string") items.push(asked)
       for (const req of items) {
@@ -212,6 +221,38 @@ export default {
         seenPerm.add(rid); openPerm.set(rid, { req, cls }); activity({ permission: rid, class: cls })
         sendSafe("permission", { request: { ...req, id: rid }, class: cls })
       }
+    }
+
+    let rulings = Promise.resolve()
+    /** A supervisor ruling (permission_reply frame, identity already checked by the bridge). Second gate here: a
+     *  still-open request this plugin reported, re-classified 'other'; decision exactly "once" | "reject".
+     *  Deletes / moves / renames are the user's and are never answered by fleet. */
+    async function applyRuling(frame) {
+      const rid = frame.request_id, open = typeof rid === "string" ? openPerm.get(rid) : undefined
+      const refuse = (why, held) => {
+        activity({ permission_refused: rid ?? null, why, held_for_user: !!held })
+        if (typeof rid === "string") return sendSafe("permission_refused", { request_id: rid, reason: why, held_for_user: !!held })
+      }
+      if (!open) return refuse("not an open request of this session")
+      if (open.cls !== "other" || permissionClass(open.req) !== "other") return refuse("delete/move/rename request: held for the user, never answered by fleet", true)
+      if (typeof frame.decision !== "string" || !DECISIONS.has(frame.decision)) return refuse("decision not allowed: " + JSON.stringify(frame.decision))
+      if (frame.decision === "reject") {
+        // Measured: reject declines EVERY pending request of the session. Decide on opencode's CURRENT pending list
+        // (a delete may be pending whose permission.asked this plugin has not processed yet), classified by
+        // action/resources; local deletes count too. No list -> no reject.
+        let list
+        try { list = await ctx.permission.list({ sessionID: sid }) } catch (e) { list = e }
+        if (!Array.isArray(list)) return refuse("reject not sent: pending permission list unavailable (" + String(list) + "); request left pending for a person", true)
+        await checkPermissions(null, list)               // report pending requests not seen yet (asked race)
+        if (!list.some((r) => r?.id === rid)) return refuse("request no longer pending")
+        const held = list.filter((r) => r?.id !== rid && permissionClass(r) !== "other").map((r) => r.id)
+          .concat([...openPerm].filter(([id, o]) => id !== rid && o.cls !== "other").map(([id]) => id))
+        if (held.length) return refuse("reject not sent: it would also decline pending delete/move/rename request(s) "
+          + JSON.stringify([...new Set(held)]) + " held for the user; this request stays pending until they are resolved", true)
+      }
+      fleetReplies.set(rid, frame.decision)
+      try { await replyPermission(rid, frame.decision); activity({ permission_replied: rid, decision: frame.decision }) }
+      catch (e) { fleetReplies.delete(rid); activity({ permission_reply_error: String(e) }) }
     }
 
     function handle(frame) {
@@ -226,19 +267,7 @@ export default {
       } else if (frame.kind === "completed") {
         if (turn?.kind === "delivery" && turn.env.message_id === frame.message_id) { turn = null; candidates = []; idleNow() }
       } else if (frame.kind === "permission_reply") {
-        // Second gate: only a still-open request this plugin reported, re-classified here as 'other'; decision strictly
-        // "once" | "reject". Deletes / moves / renames are the user's: never answered here.
-        const rid = frame.request_id, open = typeof rid === "string" ? openPerm.get(rid) : undefined
-        const refuse = (why) => { activity({ permission_refused: rid ?? null, why }); if (typeof rid === "string") sendSafe("permission_refused", { request_id: rid, reason: why }) }
-        if (!open) return refuse("not an open request of this session")
-        if (open.cls !== "other" || permissionClass(open.req) !== "other") return refuse("delete-class: held for the user")
-        if (typeof frame.decision !== "string" || !DECISIONS.has(frame.decision)) return refuse("decision not allowed: " + JSON.stringify(frame.decision))
-        // Measured: "reject" declines EVERY open request of the session, a user-held delete included. Not while one is open.
-        if (frame.decision === "reject" && [...openPerm.values()].some((o) => o.cls !== "other"))
-          return refuse("reject would also decline an open delete-class request held for the user")
-        replyPermission(rid, frame.decision)
-          .then(() => activity({ permission_replied: rid, decision: frame.decision }))
-          .catch((e) => activity({ permission_reply_error: String(e) }))
+        rulings = rulings.then(() => applyRuling(frame)).catch((e) => activity({ permission_ruling_error: String(e) })) // one at a time
       } else if (frame.kind === "delivery" && frame.delivery) {
         const d = frame.delivery
         if (unhealthy || turn || exec || !ready) { sendSafe("reject_delivery", { reason: "opencode is occupied by a manual/other run" }); return }
@@ -303,7 +332,8 @@ export default {
           await checkPermissions(d)
         } else if (type === "permission.replied") {
           // {sessionID, requestID, reply} (measured). Answered (by the TUI user or by us): never report it as a request.
-          closePermission(d.requestID, typeof d.reply === "string" ? d.reply : null, "replied")
+          const reply = typeof d.reply === "string" ? d.reply : null
+          closePermission(d.requestID, reply, "replied", repliedBy(d.requestID, reply))
         }
       }
     })().catch((e) => fault("event stream: " + e))
@@ -338,6 +368,10 @@ export default {
 
     return async () => {
       if (shutdown) return
+      // Still-open requests end with this instance (opencode auto-rejects them at shutdown): reported as cleared,
+      // never as anyone's decision. Bounded wait so shutdown is not held up.
+      const closing = [...openPerm.keys()].map((rid) => closePermission(rid, null, "instance shutdown: request ended with the opencode instance", "none"))
+      await Promise.race([Promise.allSettled(closing), new Promise((r) => setTimeout(r, 2000))])
       ac.abort()
       try { child.stdin.end(JSON.stringify({ kind: "shutdown", call_id: "shutdown" }) + "\n") } catch {}
       shutdown = true
