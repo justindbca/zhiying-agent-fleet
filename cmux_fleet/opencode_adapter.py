@@ -14,6 +14,7 @@ No model endpoint, credential or model name is embedded here: the model is confi
 """
 import json
 import math
+import os
 from pathlib import Path
 import re
 
@@ -75,18 +76,71 @@ def instance_dir(cfg, name, generation):
     return Path(cfg['run']) / 'opencode' / (name + '-g' + str(generation))
 
 
-def prepare_instance(cfg, name, generation, role_text):
+def launch_cwd(cfg, name, generation):
+    """The opencode process cwd and argv directory: a fresh EMPTY directory per generation, outside
+    every project / output directory (worker-3 isolation-layout-probe, supervisor 2026-10-16).
+    opencode's Read loads nested AGENTS.md only for files inside this directory tree; project files
+    are external directories, for which Read skips that loading (source fact of 2.0.29, not a
+    documented guarantee: re-run the nested-AGENTS regression after any opencode upgrade).
+    This stops automatic instruction injection only; it is not a shell sandbox."""
+    return instance_dir(cfg, name, generation) / 'launch'
+
+
+def trusted_dirs(cfg, name, generation, task_dir):
+    """Exact directories opencode may use without asking (external_directory allow): this slot's
+    task directory plus the run's configured roots `opencode_trusted_dirs` (absolute paths, e.g. the
+    run's shared output root, the task's project checkout). Everything else asks. Never global:
+    '/', the home directory, wildcards, relative paths and any directory that contains, or lies
+    inside, the launch cwd are refused."""
+    launch = launch_cwd(cfg, name, generation).resolve()
+    extra = cfg.get('opencode_trusted_dirs', [])
+    if not isinstance(extra, list) or not all(isinstance(x, str) for x in extra):
+        raise ValueError('opencode_trusted_dirs must be a list of absolute paths')
+    out = []
+    for raw in [str(task_dir)] + extra:
+        if not raw or not Path(raw).is_absolute() or any(c in raw for c in '*?[]{}'):
+            raise ValueError('opencode trusted directory must be an absolute path without wildcards: ' + repr(raw))
+        path = Path(raw).resolve()
+        if path == Path(path.anchor) or path == Path.home().resolve():
+            raise ValueError('opencode trusted directory too broad: ' + str(path))
+        if path == launch or launch.is_relative_to(path) or path.is_relative_to(launch):
+            raise ValueError('opencode trusted directory overlaps the launch cwd: ' + str(path))
+        for form in (os.path.normpath(raw), str(path)):  # as given and symlink-resolved (/tmp -> /private/tmp)
+            if form not in out:
+                out.append(form)
+    return out
+
+
+def layout_instructions(task_dir, trusted):
+    """Fleet's layout section, written FIRST into $OPENCODE_CONFIG_DIR/AGENTS.md."""
+    lines = ['# Fleet layout (opencode worker) - read first', '',
+             '- Your real task directory is `' + str(task_dir) + '`. Every relative path in the instructions below '
+             '(`./<file>`, "your directory", "current directory") means a path inside it; write outputs there with '
+             'absolute paths.',
+             '- The process working directory is an empty launch directory owned by fleet. Do not create, edit or '
+             'read files there.',
+             '- For shell commands set `workdir` to the task / project directory or start with `cd <absolute dir> &&`. '
+             'For git always name the repository: `git -C <absolute project dir> ...`; do not rely on built-in '
+             'VCS / worktree shortcuts (they point at the launch directory).',
+             '- Directories you may use without asking: ' + ', '.join('`' + d + '`' for d in trusted) + '. Any other '
+             'directory asks for permission first.', '']
+    return '\n'.join(lines) + '\n'
+
+
+def prepare_instance(cfg, name, generation, role_text, *, task_dir):
     """A fresh instance directory per generation (never reused: a new DB means --continue can only
-    pick this generation's session). The role is the only instruction file:
-    $OPENCODE_CONFIG_DIR/AGENTS.md. Never write AGENTS.md into the worker cwd (opencode would load
-    it as project / nested instructions)."""
+    pick this generation's session), with its empty launch cwd. The role is the only instruction
+    file: $OPENCODE_CONFIG_DIR/AGENTS.md = fleet layout section + role_text. Never write AGENTS.md
+    into the launch cwd or the task directory tree the worker reads as its cwd."""
     if not isinstance(role_text, str) or not role_text.strip():
         raise ValueError('opencode role instructions are required')
+    trusted = trusted_dirs(cfg, name, generation, task_dir)
     root = instance_dir(cfg, name, generation)
     root.mkdir(parents=True, exist_ok=False)
-    for sub in INSTANCE_DIRS:
+    for sub in INSTANCE_DIRS + ('launch',):
         (root / sub).mkdir(mode=0o700)
-    (root / 'cfg' / 'AGENTS.md').write_text(role_text, encoding='utf-8')
+    (root / 'cfg' / 'AGENTS.md').write_text(layout_instructions(Path(trusted[0]), trusted) + '\n' + role_text,
+                                            encoding='utf-8')
     return root
 
 
@@ -127,42 +181,56 @@ def delete_shell_patterns():
     return list(dict.fromkeys(out))
 
 
-def permission_rules(cfg):
+def permission_rules(cfg, trusted=()):
     """opencode `permission` config (v1 shape, parsed into v2 rules in key order; the LAST matching
     rule wins, nothing matching = ask). Only the `shell` key: opencode renames `bash` to `shell`, so
     writing both would append a second "*": allow after the delete asks and undo them (measured
     mapping, worker-3 preflight-supplement §2.1). Delete-class commands ask (held for the user);
-    everything else in the run directory is allowed. No global --auto."""
+    everything else is allowed. No global --auto.
+    external_directory: "*" ask FIRST (the built-in build agent starts with *:*:allow), then allow only
+    the exact trusted directories and their trees (`<dir>/*` covers subdirectories, measured)."""
     shell = {'*': 'allow'}
     shell.update({pattern: 'ask' for pattern in delete_shell_patterns()})
+    external = {'*': 'ask'}
+    for d in trusted:
+        external[d] = 'allow'
+        external[d.rstrip('/') + '/*'] = 'allow'
     return {'shell': shell, 'edit': 'allow', 'webfetch': 'allow',
-            'external_directory': 'ask', 'doom_loop': 'ask'}
+            'external_directory': external, 'doom_loop': 'ask'}
 
 
-def config_content(cfg):
+def config_content(cfg, trusted=()):
     """OPENCODE_CONFIG_CONTENT: only the fleet plugin, the locked model, permission rules."""
     provider, ident = model(cfg)
     return json.dumps({'plugin': [str(PLUGIN_DIR)], 'model': provider + '/' + ident,
-                       'autoupdate': False, 'share': 'disabled', 'permission': permission_rules(cfg)},
+                       'autoupdate': False, 'share': 'disabled', 'permission': permission_rules(cfg, trusted)},
                       ensure_ascii=False)
 
 
 def argv(cfg, name, generation, prompt, cwd, *, label):
     """Interactive opencode TUI with its own private server; the plugin lives in this process,
     creates the session and injects the startup message itself (CMUX_FLEET_OC_STARTUP), so the
-    prompt is not on argv. --continue shows the plugin's session (only one in the fresh DB)."""
+    prompt is not on argv. --continue shows the plugin's session (only one in the fresh DB).
+    `cwd` is the slot's TASK directory (checked against the layout); opencode itself runs in the
+    generation's empty launch_cwd(), which must also be the process cwd (the plugin verifies it)."""
     model(cfg)
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError('opencode startup prompt is required')
-    return [cfg.get('opencode') or 'opencode', '--standalone', '--continue', str(cwd)]
+    trusted_dirs(cfg, name, generation, cwd)
+    return [cfg.get('opencode') or 'opencode', '--standalone', '--continue', str(launch_cwd(cfg, name, generation))]
 
 
-def environment(cfg_path, cfg, name, generation, *, label=None, startup_prompt=None):
+def environment(cfg_path, cfg, name, generation, *, label=None, startup_prompt=None, task_dir=None):
     """Environment for the opencode process: full2 isolation (prepare_instance first), the fleet
     plugin and its bridge argv. startup_prompt is required: the plugin injects it and binds the
     startup turn by the inbox id prompt() returns. The plugin waits (bounded, catalogue_wait_s)
-    until the locked model is in the fresh DB's model catalogue before the startup turn."""
+    until the locked model is in the fresh DB's model catalogue before the startup turn.
+    task_dir (required) = the slot's task directory; with opencode_trusted_dirs it sets the
+    external_directory allow list."""
     provider, ident = model(cfg)
+    if task_dir is None:
+        raise ValueError('opencode task_dir is required (external_directory allow list)')
+    trusted = trusted_dirs(cfg, name, generation, task_dir)
     if not isinstance(startup_prompt, str) or not startup_prompt.strip():
         raise ValueError('opencode startup prompt is required')
     wait = cfg.get('opencode_catalog_wait_s', 60)
@@ -170,7 +238,8 @@ def environment(cfg_path, cfg, name, generation, *, label=None, startup_prompt=N
         raise ValueError('opencode_catalog_wait_s must be an integer 1-600')
     env = dict(isolation_env(cfg, name, generation))
     env.update({
-        'OPENCODE_CONFIG_CONTENT': config_content(cfg),
+        'OPENCODE_CONFIG_CONTENT': config_content(cfg, trusted),
+        'CMUX_FLEET_OC_LAUNCH_CWD': str(launch_cwd(cfg, name, generation)),
         'CMUX_FLEET_OC_BRIDGE': json.dumps([cfg['python'], str(Path(__file__).with_name('agent_bridge.py')),
                                             str(cfg_path), name, str(generation)]),
         'CMUX_FLEET_OC_SLOT': name, 'CMUX_FLEET_OC_GEN': str(generation),
