@@ -637,7 +637,7 @@ class RuntimeV2:
                 self.stop_failure(slot, ev)
             return
         if kind in ('bridge_session', 'startup', 'availability', 'candidate', 'started', 'settled', 'bridge_fault',
-                    'turn_ended', 'permission_request'):
+                    'turn_ended', 'permission_request', 'permission_resolved', 'permission_refused'):
             info = self.f.agent(slot) if slot in self.f.names else {}
             if (not info or ev.get('run_id') != self.bus.run_id
                     or ev.get('generation') != int(info.get('generation', -1))):
@@ -704,6 +704,8 @@ class RuntimeV2:
                 self.release_held(slot, ev)
             elif kind == 'permission_request':
                 self.permission_request(slot, ev, info)
+            elif kind in ('permission_resolved', 'permission_refused'):
+                self.permission_state(slot, kind, ev, info)
             elif kind == 'started':
                 try:
                     env = ev['delivery']
@@ -1183,6 +1185,71 @@ class RuntimeV2:
                'keys_approve': [], 'keys_reject': [], 'channel': 'permission_reply', 'request_id': rid}
         self.prompt_escalate(slot, rec, what)
         self.f.setf(slot, prompt_channel='opencode')
+
+    def permission_state(self, slot, kind, ev, info):
+        """opencode: a reported permission request ended (permission_resolved) or the plugin did not send a
+        ruling (permission_refused); run / slot / generation / session already matched in handle. Only
+        decided_by 'tui_user' is a user's decision; 'unattributed' (opencode's own reject: shutdown, cascade)
+        and 'none' (cleared by an interrupt / instance end) are never the user's nor the supervisor's.
+        permission_refused with held_for_user: the request is still pending in opencode and now only the user
+        answers it (prompt_wait route=user); the ruling is never re-sent."""
+        from cmux_fleet import fleet as legacy
+        rid = ev.get('request_id')
+        if not legacy.is_opencode(self.slot_cfg(slot), slot) or not isinstance(rid, str) or not rid:
+            self.audit('permission.rejected', slot=slot, level='warn', error='not an opencode permission state')
+            return
+        reason = str(ev.get('reason') or '')[:300]
+        cls = 'other' if ev.get('class') == 'other' else 'delete'
+        pending = json.loads(info.get('oc_permission') or 'null') or {}
+        label = self.f.label(slot)
+        if kind == 'permission_resolved':
+            decided = ev.get('decided_by')
+            decided = decided if decided in ('fleet', 'tui_user', 'unattributed', 'none') else 'unattributed'
+            reply = ev.get('reply') if ev.get('reply') in ('once', 'always', 'reject') else None
+            waiting = pending.get('request_id') == rid
+            self.audit('opencode.permission_resolved', slot=slot, level='info', detail={
+                'request_id': rid, 'class': cls, 'reply': reply, 'decided_by': decided, 'reason': reason,
+                'user_decision': decided == 'tui_user', 'closed_wait': waiting})
+            if not waiting:  # e.g. the fleet's own ruling (permission_answer cleared it) or a manual-turn request
+                return
+            esc = self.f.escalation_state()
+            key = legacy.DIALOG_KEY + slot + ':g' + str(info.get('generation') or 0)
+            if (esc.get(key) or {}).get('request_id') == rid:
+                esc.pop(key)
+                self.f.save_escalations(esc)
+            self.f.setf(slot, prompt_wait='', prompt_wait_at=0, prompt_route='', prompt_channel='', oc_permission='')
+            who = {'tui_user': '用户在 opencode 窗口里回答（' + str(reply) + '）',
+                   'fleet': '程序按监工裁定回答（' + str(reply) + '）',
+                   'unattributed': 'opencode 自行拒绝（实例关闭或连带拒绝），不是用户决定',
+                   'none': '随执行中断 / 实例结束清除、无人回答，不是用户决定'}[decided]
+            card = routing_card(label + ' 的 opencode 权限请求 ' + rid + ' 已结束：' + who + '（' + reason[:200]
+                                + '）。', kind='notice', slot=label, severity='info' if decided == 'tui_user' else 'warn')
+            card['metadata']['event_id'] = 'ui-ocperm-end-' + digest(slot + ':' + rid)[:32]
+            self.ui(slot, card)
+            self.ui('supervisor', card)
+            return
+        held = ev.get('held_for_user') is True
+        self.audit('opencode.permission_refused', slot=slot, level='warn', detail={
+            'request_id': rid, 'class': cls, 'reason': reason, 'held_for_user': held})
+        card = routing_card(label + ' 的 opencode 权限请求 ' + rid + ' 程序未代答：' + reason[:200]
+                            + ('；请求仍挂起，只能由用户在该 opencode 窗口里批准或拒绝。' if held else '。'),
+                            kind='notice', slot=label, severity='warn')
+        card['metadata']['event_id'] = 'ui-ocperm-refused-' + digest(slot + ':' + rid + ':' + reason)[:32]
+        self.ui(slot, card)
+        self.ui('supervisor', card)
+        if not held:
+            return
+        generation = int(info.get('generation') or 0)
+        lease = self.bus.r.hgetall(self.bus.lease_key(slot))
+        current = lease.get('current_delivery') if lease.get('status') == 'received' else ''
+        scope = current or ('startup-g' + str(generation) if info.get('state') == 'starting' else '')
+        if not scope:  # a manual turn: the human at the pane is the one asked
+            return
+        screen = pending.get('screen', '') if pending.get('request_id') == rid else ''
+        self.f.setf(slot, oc_permission=dumps({'request_id': rid, 'class': cls, 'generation': generation,
+                    'session_id': info.get('thread', ''), 'scope': scope, 'screen': screen}), prompt_channel='opencode')
+        self.prompt_wait(slot, scope, 'opencode permission ruling not sent (' + reason + '); only the user answers, '
+                         'nothing re-sent', screen or '(see the permission request record)', kind=cls)
 
     def clear_enabled(self, slot):
         return slot in self.f.workers and clear_after_result.enabled(self.slot_cfg(slot), slot)
