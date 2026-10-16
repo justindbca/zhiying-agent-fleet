@@ -240,20 +240,4 @@ def test_unverified_opencode_pair_needs_the_smoke_lifecycle(tmp_path, monkeypatc
         fleet.main(args + ['--opencode-model', MODEL])
 
 
-# ---------------------------------------------------------------- 2-4: daemon side of the plugin contract
-PENDING = 'daemon handling of opencode bridge events lands after worker-1 forwards the plugin interface'
-
-
-@pytest.mark.skip(reason=PENDING)
-def test_manual_turn_and_foreign_delivery_id_do_not_settle():
-    pass
-
-
-@pytest.mark.skip(reason=PENDING)
-def test_model_lock_mismatch_or_nonzero_cost_fails_the_delivery_without_switching_model():
-    pass
-
-
-@pytest.mark.skip(reason=PENDING)
-def test_delete_permission_request_goes_to_the_user_only():
-    pass
+# 2-4 (daemon side of the plugin contract: delivery binding, model lock, permission routing): tests/test_opencode_daemon.py

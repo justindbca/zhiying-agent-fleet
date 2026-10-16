@@ -2171,7 +2171,13 @@ class Fleet:
                      version=cfg.get('codex_version') or '', fallback='typed')
         role = 'supervisor' if name == 'supervisor' else 'worker'
         scope = self.role_scope(name, cfg, launch)
-        (cwd / 'AGENTS.md').write_text(scope)
+        if is_opencode(cfg, name):
+            # The role lives only in this generation's fresh instance dir ($OPENCODE_CONFIG_DIR/AGENTS.md):
+            # an AGENTS.md / CLAUDE.md in the cwd would be loaded as project / nested instructions.
+            opencode_adapter.prepare_instance(cfg, name, generation, scope)
+            prompt = prompt.replace(' Read AGENTS.md in the current directory first.', '').replace(' Read AGENTS.md first.', '')
+        else:
+            (cwd / 'AGENTS.md').write_text(scope)
         if role == 'worker':
             (cwd / 'REVIEWER.md').write_text((HERE / 'agents' / 'reviewer.md').read_text())
         if is_claude(cfg, name) and advised:
@@ -2914,12 +2920,44 @@ class Fleet:
         after re-checking identity, the screen digest and the delete classifier (no side effect here)."""
         esc = self.escalation_state()
         rec = esc[task_id]
+        if rec.get('channel') == 'permission_reply':
+            return self.permission_answer(task_id, rec, answer)
         rec.update(status='answered', decision=answer['decision'], note=answer.get('note', '').strip(),
                    answered_at=time.time())
         self.save_escalations(esc)
         self.log('dialog.answered', task=task_id, decision=answer['decision'])
         if self.v2:
             self.v2.audit('dialog.answered', slot=rec['slot'], level='info', task=task_id, decision=answer['decision'])
+
+    def permission_answer(self, task_id, rec, answer):
+        """opencode: the supervisor's ruling on a non-delete permission request goes to the slot's bridge as
+        one permission_reply UI card naming this run / slot / generation / session / request (the bridge
+        forwards it only if every field matches what it reported). No key is pressed. A request whose slot
+        moved on (generation, session or delivery changed) is dropped and nothing is sent."""
+        esc = self.escalation_state()
+        esc.pop(task_id, None)
+        self.save_escalations(esc)
+        slot = rec['slot']
+        info = self.agent(slot)
+        lease = self.r.hgetall(self.v2.bus.lease_key(slot)) if self.v2 else {}
+        pending = json.loads(info.get('oc_permission') or 'null') or {}
+        scope = lease.get('current_delivery') if lease.get('status') == 'received' else 'startup-g' + str(info.get('generation', '0'))
+        if (not self.v2 or str(info.get('generation', '')) != rec['generation'] or info.get('thread', '') != rec['session_id']
+                or pending.get('request_id') != rec['request_id'] or scope != rec['scope']):
+            self.log('dialog.stale_answer', task=task_id, decision=answer['decision'])
+            if self.v2:
+                self.v2.audit('dialog.stale', slot=slot, level='info', reason='identity', task=task_id)
+            return
+        decision = 'once' if answer['decision'] == 'approve' else 'reject'
+        card = {'kind': 'permission_reply', 'run_id': self.v2.bus.run_id, 'slot': slot,
+                'generation': int(rec['generation']), 'session_id': rec['session_id'], 'request_id': rec['request_id'],
+                'class': 'other', 'decision': decision,
+                'metadata': {'event_id': 'ui-ocreply-' + hashlib.sha256((slot + ':' + rec['request_id']).encode()).hexdigest()[:32]}}
+        self.v2.ui(slot, card)
+        self.setf(slot, prompt_wait='', prompt_wait_at=0, prompt_route='', prompt_channel='', oc_permission='')
+        self.log('dialog.answered', task=task_id, decision=answer['decision'])
+        self.v2.audit('opencode.permission_reply', slot=slot, level='info', task=task_id, decision=decision,
+                      request_id=rec['request_id'], note=answer.get('note', '').strip())
 
     def blocked_ruling(self, t, state, task_id, rec, answer):
         """Plan F' 8.4: the supervisor's ruling goes to the worker as an instruction (contract task: under its row)."""
