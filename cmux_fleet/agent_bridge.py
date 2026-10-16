@@ -203,12 +203,16 @@ class AgentBridge:
             return {'status': 'ignored'}
         cls = 'other' if cls == 'answered' else cls
         fields = {'request_id': rid, 'class': cls, 'session': self.binding[0]}
+        fields['reason'] = str(data.get('reason') or '')[:300]
         if kind == 'permission_resolved':
             reply = data.get('reply')
             fields['reply'] = reply if reply in ('once', 'always', 'reject') else None
-            fields['reason'] = str(data.get('reason') or '')[:300]
+            # Who decided. opencode only rejects on its own (shutdown, session-wide cascade) and an interrupt clears
+            # with no reply: 'unattributed' / 'none' are never a user decision. Unknown values degrade to 'unattributed'.
+            decided = data.get('decided_by')
+            fields['decided_by'] = decided if decided in ('fleet', 'tui_user', 'unattributed', 'none') else 'unattributed'
         else:
-            fields['reason'] = str(data.get('reason') or '')[:300]
+            fields['held_for_user'] = data.get('held_for_user') is True
         return self.event(kind, fields)
 
     def permission_card(self, card):
