@@ -174,8 +174,11 @@ class AgentBridge:
         with self.lock:
             env = self.active
             self.permissions[req['id']] = cls
-        fields = {'request': {k: req[k] for k in ('id', 'permission', 'patterns', 'title', 'command', 'metadata')
-                              if k in req}, 'class': cls, 'session': self.binding[0]}
+        # opencode 2.0.29 Permission.Request = {id, sessionID, action, resources[], save?, metadata?, source?, message?}
+        # (measured, worker-1 api-contract-supplement.md); the older names stay for safety.
+        keep = ('id', 'sessionID', 'action', 'resources', 'message', 'source', 'metadata', 'permission', 'patterns',
+                'title', 'command')
+        fields = {'request': {k: req[k] for k in keep if k in req}, 'class': cls, 'session': self.binding[0]}
         if env:
             fields['delivery'] = env
         return self.event('permission_request', fields)
