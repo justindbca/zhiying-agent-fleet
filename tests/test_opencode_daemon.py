@@ -122,7 +122,7 @@ def test_spawn_writes_the_role_only_into_the_fresh_instance_dir_and_injects_its_
     assert 'Read AGENTS.md' not in prompt and env['CMUX_FLEET_OC_STARTUP'] == prompt
     assert json.loads(env['OPENCODE_CONFIG_CONTENT'])['model'] == MODEL
     with pytest.raises(FileExistsError):  # a generation's instance dir is never reused
-        opencode_adapter.prepare_instance(f.cfg, 'worker-1', 0, 'role')
+        opencode_adapter.prepare_instance(f.cfg, 'worker-1', 0, 'role', task_dir=cwd)
 
 
 def test_opencode_bridge_session_with_a_pi_style_identity_is_rejected(private_redis_v2, tmp_path):
@@ -369,6 +369,150 @@ def test_supervisor_routed_permission_wait_is_not_cleared_by_activity(ofx):
     f.v2.watchdog.tick(later)
     assert fleet.DIALOG_KEY + 'worker-1:g0' in f.escalation_state() and not f.mgr.keys
     assert f.agent('worker-1')['prompt_route'] == 'supervisor'
+
+
+# ---------------------------------------------------------------- permission_resolved / permission_refused (§12.4)
+def pstate(f, kind, rid, slot='worker-1', **fields):
+    """A bridge permission state event; fields override the matched identity (agent / run / generation / thread)."""
+    ev = dict(session(f, slot), kind=kind, request_id=rid, session=f.agent(slot)['thread'])
+    ev.update(fields)
+    event(f, ev)
+
+
+def audits(f, name):
+    return [json.loads(row.get('detail') or '{}') for _, row in f.r.xrange(f.v2.bus.audit_key) if row.get('event') == name]
+
+
+def waiting_on(f, env, rid, slot='worker-1'):
+    info = f.agent(slot)
+    return info['prompt_wait'] == env['delivery_id'] and json.loads(info['oc_permission'])['request_id'] == rid
+
+
+@pytest.mark.parametrize('field, value', [('generation', 7), ('run_id', 'run-other'), ('thread', 'ses_otherSession1')])
+def test_a_permission_state_with_another_identity_changes_nothing(ofx, field, value):
+    f = ofx
+    env = req(f)
+    permission(f, env, 'per_id', 'ls -la', 'other')
+    key = fleet.DIALOG_KEY + 'worker-1:g0'
+    for kind in ('permission_resolved', 'permission_refused'):
+        pstate(f, kind, 'per_id', **{field: value, 'class': 'other', 'reply': 'once', 'decided_by': 'tui_user',
+                                     'held_for_user': True, 'reason': 'x'})
+    assert waiting_on(f, env, 'per_id') and f.agent('worker-1')['prompt_route'] == 'supervisor'
+    assert f.escalation_state()[key]['request_id'] == 'per_id' and not replies(f)
+    assert not audits(f, 'opencode.permission_resolved') and not audits(f, 'opencode.permission_refused')
+
+
+def test_a_resolved_from_another_slot_never_closes_this_slots_wait(ofx):
+    f = ofx
+    env = req(f)
+    permission(f, env, 'per_same', 'ls -la', 'other')
+    pstate(f, 'permission_resolved', 'per_same', slot='worker-2', reply='once', decided_by='tui_user', reason='replied')
+    assert waiting_on(f, env, 'per_same') and fleet.DIALOG_KEY + 'worker-1:g0' in f.escalation_state()
+    assert [d['closed_wait'] for d in audits(f, 'opencode.permission_resolved')] == [False]
+
+
+def test_permission_states_from_a_pi_slot_are_rejected(ofx):
+    f = ofx
+    for kind in ('permission_resolved', 'permission_refused'):
+        pstate(f, kind, 'per_pi', slot='supervisor', reply='once', decided_by='tui_user', held_for_user=True, reason='x')
+    assert not audits(f, 'opencode.permission_resolved') and not audits(f, 'opencode.permission_refused')
+    assert len(audits(f, 'permission.rejected')) == 2
+
+
+@pytest.mark.parametrize('decided_by, recorded, user', [
+    ('tui_user', 'tui_user', True), ('fleet', 'fleet', False), ('unattributed', 'unattributed', False),
+    ('none', 'none', False), ('bogus', 'unattributed', False), (None, 'unattributed', False)])
+def test_resolved_records_who_decided_and_only_tui_user_is_the_users_decision(ofx, decided_by, recorded, user):
+    f = ofx
+    env = req(f)
+    permission(f, env, 'per_who', 'rm -rf build', 'delete')
+    fields = {'class': 'delete', 'reply': 'reject', 'reason': 'replied'}
+    if decided_by is not None:
+        fields['decided_by'] = decided_by
+    pstate(f, 'permission_resolved', 'per_who', **fields)
+    (detail,) = audits(f, 'opencode.permission_resolved')
+    assert (detail['request_id'], detail['decided_by'], detail['user_decision'], detail['closed_wait']) == (
+        'per_who', recorded, user, True)
+    info = f.agent('worker-1')
+    assert info['prompt_wait'] == '' and info['prompt_route'] == '' and info['oc_permission'] == ''
+    assert not replies(f) and f.v2.bus.message(env['message_id'])['status'] == 'received'  # the turn goes on
+
+
+def test_resolved_normalises_an_unknown_reply_to_none(ofx):
+    f = ofx
+    env = req(f)
+    permission(f, env, 'per_rep', 'rm x', 'delete')
+    pstate(f, 'permission_resolved', 'per_rep', reply='yes please', decided_by='tui_user', reason='replied')
+    assert audits(f, 'opencode.permission_resolved')[0]['reply'] is None
+
+
+def test_resolved_for_another_request_keeps_the_wait_and_the_escalation(ofx):
+    f = ofx
+    env = req(f)
+    permission(f, env, 'per_keep', 'ls -la', 'other')
+    key = fleet.DIALOG_KEY + 'worker-1:g0'
+    pstate(f, 'permission_resolved', 'per_gone', reply='once', decided_by='tui_user', reason='replied')
+    assert waiting_on(f, env, 'per_keep') and f.agent('worker-1')['prompt_route'] == 'supervisor'
+    assert f.escalation_state()[key]['request_id'] == 'per_keep' and not replies(f)
+    (detail,) = audits(f, 'opencode.permission_resolved')
+    assert detail['request_id'] == 'per_gone' and detail['closed_wait'] is False
+
+
+def test_resolved_for_another_request_keeps_a_users_delete_wait_paused(ofx):
+    f = ofx
+    env = req(f)
+    permission(f, env, 'per_del', 'rm -rf build', 'delete')
+    pstate(f, 'permission_resolved', 'per_other', reply=None, decided_by='none', reason='cleared')
+    assert waiting_on(f, env, 'per_del') and f.agent('worker-1')['prompt_route'] == 'user' and f.paused()
+
+
+def test_tui_user_answer_closes_the_supervisor_escalation_and_sends_no_ruling(ofx):
+    f = ofx
+    env = req(f)
+    permission(f, env, 'per_tui', 'ls -la', 'other')
+    key = fleet.DIALOG_KEY + 'worker-1:g0'
+    pstate(f, 'permission_resolved', 'per_tui', reply='once', decided_by='tui_user', reason='replied')
+    assert key not in f.escalation_state() and f.agent('worker-1')['prompt_wait'] == ''  # no ruling left to give
+    assert not replies(f) and audits(f, 'opencode.permission_resolved')[0]['user_decision'] is True
+
+
+def test_refused_held_for_user_keeps_the_request_with_the_user_and_resends_nothing(ofx):
+    f = ofx
+    env = req(f)
+    permission(f, env, 'per_held', 'pytest -q', 'other')
+    f.dialog_answer(fleet.DIALOG_KEY + 'worker-1:g0', {'decision': 'reject'})
+    assert f.agent('worker-1')['prompt_wait'] == ''
+    pstate(f, 'permission_refused', 'per_held', **{'class': 'other', 'held_for_user': True,
+           'reason': 'reject not sent: it would also decline pending delete request(s) [per_rm]'})
+    info = f.agent('worker-1')
+    assert waiting_on(f, env, 'per_held') and info['prompt_route'] == 'user' and info['prompt_channel'] == 'opencode'
+    assert f.paused() and [c['decision'] for c in replies(f)] == ['reject']  # the one ruling, never re-sent
+    (detail,) = audits(f, 'opencode.permission_refused')
+    assert detail['request_id'] == 'per_held' and detail['held_for_user'] is True
+    pstate(f, 'permission_resolved', 'per_held', reply='reject', decided_by='tui_user', reason='replied')
+    assert f.agent('worker-1')['prompt_wait'] == '' and [c['decision'] for c in replies(f)] == ['reject']
+
+
+@pytest.mark.parametrize('held', ['yes', 1, 'true', None])
+def test_refused_without_a_boolean_true_held_for_user_is_a_notice_only(ofx, held):
+    f = ofx
+    env = req(f)
+    permission(f, env, 'per_note', 'cat a', 'other')
+    f.dialog_answer(fleet.DIALOG_KEY + 'worker-1:g0', {'decision': 'approve'})
+    fields = {'class': 'other', 'reason': 'request no longer pending'}
+    if held is not None:
+        fields['held_for_user'] = held
+    pstate(f, 'permission_refused', 'per_note', **fields)
+    assert f.agent('worker-1')['prompt_wait'] == '' and not f.paused()
+    assert audits(f, 'opencode.permission_refused')[0]['held_for_user'] is False
+
+
+def test_refused_held_for_user_in_a_manual_turn_waits_on_nothing(ofx):
+    f = ofx
+    permission(f, None, 'per_man', 'ls', 'other')
+    pstate(f, 'permission_refused', 'per_man', held_for_user=True, reason='x')
+    assert f.agent('worker-1').get('prompt_wait', '') == '' and not f.paused()
+    assert audits(f, 'opencode.permission_refused')[0]['held_for_user'] is True
 
 
 # ---------------------------------------------------------------- strict cost == 0 (finite number) model lock

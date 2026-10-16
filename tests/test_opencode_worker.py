@@ -6,6 +6,8 @@ never run as Codex, opencode is worker-only and v2-only, the four pair rows star
 200K window drives the handoff check, and `start` takes the model name only from configuration.
 """
 import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -87,9 +89,13 @@ def test_actor_execs_the_opencode_adapter_argv_never_codex(tmp_path, monkeypatch
     monkeypatch.setattr(fleet, 'actor_argv', lambda *a, **k: pytest.fail('opencode must never take the Codex argv'))
     monkeypatch.setattr(fleet.os, 'execvp', lambda exe, argv: calls.update(exe=exe, argv=argv))
     monkeypatch.setattr(fleet.os, 'environ', {})
+    launch = opencode_adapter.launch_cwd(cfg, 'worker-1', 0)
+    launch.mkdir(parents=True)  # spawn's prepare_instance creates it before the actor runs
     fleet.actor(tmp_path / 'config.json', 'worker-1', 'start', generation=0)
     assert calls['argv'][:2] == ['opencode', '--standalone']
-    assert calls['env_kw'] == {'label': 'worker-1', 'startup_prompt': 'start'}  # the plugin binds the startup turn by it
+    # the plugin binds the startup turn by startup_prompt; task_dir sets the external_directory allow list
+    assert calls['env_kw'] == {'label': 'worker-1', 'startup_prompt': 'start', 'task_dir': tmp_path}
+    assert Path(os.getcwd()).resolve() == launch.resolve()  # opencode runs in the empty launch cwd, not the task dir
     assert json.loads((tmp_path / 'prompts' / 'worker-1-g0.argv.json').read_text())['argv'] == calls['argv']
 
 

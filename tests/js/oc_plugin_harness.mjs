@@ -1,6 +1,6 @@
 // Drives cmux_fleet/opencode_plugin/index.js with a fake opencode ctx. argv: <plugin index.js> <scenario>.
 // Prints {frames: [...bridge frames...]} as JSON. Scenarios: manual_first, mixed_startup.
-import { readFileSync, existsSync, mkdtempSync } from "node:fs"
+import { readFileSync, existsSync, mkdtempSync, mkdirSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, dirname } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -8,13 +8,16 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 const [plugin, scenario] = process.argv.slice(2)
 const dir = mkdtempSync(join(tmpdir(), "ocharness-"))
 const log = join(dir, "frames.jsonl")
+const launch = join(dir, "launch")  // the generation's empty launch cwd: process cwd and session directory
+mkdirSync(launch)
+process.chdir(launch)
 const MODEL = "opencode/deepseek-v4.1-flash-free"
 Object.assign(process.env, {
   OC_FAKE_LOG: log,
   CMUX_FLEET_OC_BRIDGE: JSON.stringify([process.execPath, join(dirname(fileURLToPath(import.meta.url)), "oc_fake_bridge.mjs"), "cfg.json", "worker-1", "0"]),
   CMUX_FLEET_OC_SLOT: "worker-1", CMUX_FLEET_OC_GEN: "0", CMUX_FLEET_OC_MODE: "task", CMUX_FLEET_OC_MODEL: MODEL,
   CMUX_FLEET_OC_WINDOW: "200000", CMUX_FLEET_OC_SESSION_DIR: join(dir, "sessions"), CMUX_FLEET_OC_STARTUP: "Reply READY only.",
-  CMUX_FLEET_OC_CATALOG_WAIT_S: "2", CMUX_FLEET_OC_LABEL: "worker-1",
+  CMUX_FLEET_OC_CATALOG_WAIT_S: "2", CMUX_FLEET_OC_LABEL: "worker-1", CMUX_FLEET_OC_LAUNCH_CWD: launch,
 })
 const SID = "ses_harness01"
 const queue = [], waiters = []
@@ -29,7 +32,7 @@ const contextList = [
 ]
 const ctx = {
   session: {
-    create: async () => ({ id: SID }),
+    create: async () => ({ id: SID, location: { directory: launch } }),
     prompt: async () => { prompted++; return { id: "msg_startup" } },
     context: async () => contextList,
   },
