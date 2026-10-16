@@ -233,11 +233,12 @@ def classify_failure(error):
 
 
 def permission_text(req):
-    """All text of a permission request that may name what it does (tool, patterns, command)."""
+    """All text of a permission request that may name what it does. opencode 2.0.29 requests are
+    {id, sessionID, action, resources[], metadata?, message?} (measured); older names kept."""
     if not isinstance(req, dict):
         return ''
-    parts = [str(req.get(k) or '') for k in ('permission', 'type', 'title', 'command')]
-    for key in ('patterns', 'pattern'):
+    parts = [str(req.get(k) or '') for k in ('action', 'message', 'permission', 'type', 'title', 'command')]
+    for key in ('resources', 'patterns', 'pattern'):
         value = req.get(key)
         parts.extend(str(x) for x in value) if isinstance(value, list) else parts.append(str(value or ''))
     meta = req.get('metadata')
