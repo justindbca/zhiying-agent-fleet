@@ -1702,8 +1702,12 @@ def actor(cfg_path, name, prompt, generation=None):
     elif is_opencode(cfg, name):
         # opencode TUI with fleet's plugin in-process (it spawns agent_bridge.py, like the pi extension).
         os.environ.update(opencode_adapter.environment(cfg_path, cfg, name, generation, label=info['label'],
-                                                       startup_prompt=prompt))  # the plugin binds by this text
+                                                       startup_prompt=prompt,  # the plugin binds by this text
+                                                       task_dir=agent_cwd(cfg, name)))
         argv = opencode_adapter.argv(cfg, name, generation, prompt, agent_cwd(cfg, name), label=info['label'])
+        # Process cwd = this generation's empty launch dir (the plugin checks it before the startup turn);
+        # the task dir stays outside the launch tree, so its files are never loaded as nested instructions.
+        os.chdir(opencode_adapter.launch_cwd(cfg, name, generation))
         record = Path(cfg['run']) / 'prompts' / (name + '-g' + str(generation) + '.argv.json')
         record.parent.mkdir(parents=True, exist_ok=True)
         record.write_text(json.dumps({'slot': name, 'label': info['label'], 'generation': generation,
@@ -2174,7 +2178,7 @@ class Fleet:
         if is_opencode(cfg, name):
             # The role lives only in this generation's fresh instance dir ($OPENCODE_CONFIG_DIR/AGENTS.md):
             # an AGENTS.md / CLAUDE.md in the cwd would be loaded as project / nested instructions.
-            opencode_adapter.prepare_instance(cfg, name, generation, scope)
+            opencode_adapter.prepare_instance(cfg, name, generation, scope, task_dir=cwd)
             prompt = prompt.replace(' Read AGENTS.md in the current directory first.', '').replace(' Read AGENTS.md first.', '')
         else:
             (cwd / 'AGENTS.md').write_text(scope)
@@ -2211,7 +2215,8 @@ class Fleet:
         prompt_file.parent.mkdir(parents=True, exist_ok=True)
         prompt_file.write_text(prompt)
         result = self.mgr.spawn_interactive_cli(
-            window_name='fx-' + self.cfg.get('tab_prefix', '') + self.label(name), prompt_file=str(prompt_file), start_directory=str(cwd),
+            window_name='fx-' + self.cfg.get('tab_prefix', '') + self.label(name), prompt_file=str(prompt_file),
+            start_directory=str(opencode_adapter.launch_cwd(cfg, name, generation) if is_opencode(cfg, name) else cwd),
             cli_command=shlex.join([self.cfg['python'], str(Path(__file__).resolve()), 'actor', str(cfg_path), name,
                                     '--generation', str(generation)]),
             output_file=str(self.run_dir / 'prompts' / (name + '-g' + str(generation) + '.terminal.log')),
@@ -2222,7 +2227,7 @@ class Fleet:
             env_vars=dict({'PATH': os.environ.get('PATH', '')}, **(
                 pi_adapter.environment(cfg_path, cfg, name, generation) if is_pi(cfg, name)
                 else opencode_adapter.environment(cfg_path, cfg, name, generation, label=self.label(name),
-                                                  startup_prompt=prompt) if is_opencode(cfg, name)
+                                                  startup_prompt=prompt, task_dir=cwd) if is_opencode(cfg, name)
                 else dict({'CODEX_HOME': str(codex_home(self.cfg))}, **(CLAUDE_ENV if is_claude(cfg, name) else {})))),
             **subfleet.tmux_spawn_args(self.cfg, name, generation))
         if not result.success:
