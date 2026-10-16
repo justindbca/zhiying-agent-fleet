@@ -46,7 +46,6 @@ export default {
     let turn = null               // fleet turn in flight: {kind: "startup"|"delivery", env?, text, promise, inboxId, startedSent, settled}
     let candidates = []
     let ctxUsed = null, usageCost = null, sequence = 0
-    let catalogSeen = false
     const pending = new Map(), reported = new Map(), seenUi = new Set()
 
     const transcript = () => join(SESSION_DIR, sid + ".jsonl")
@@ -89,7 +88,9 @@ export default {
           if (!r || typeof r.id !== "string" || !r.id) throw new Error("prompt returned no inbox id")
           t.inboxId = r.id
           activity({ bind: tag, inbox_id: r.id, message_id: t.env?.message_id ?? null })
-          try { Promise.resolve(ctx.storage?.set?.("fleet-binding-" + tag, { inbox_id: r.id, message_id: t.env?.message_id ?? null })).catch(() => {}) } catch {} // storage API not yet measured; activity log + started event are the durable record
+          // ctx.storage = this plugin's namespace of the instance DB's kv table (measured: JSON values, survives a
+          // restart of the same instance). Extra copy only; the activity log + started/settled audit are the record.
+          ctx.storage.set("fleet-binding:" + tag, { inbox_id: r.id, message_id: t.env?.message_id ?? null, session: sid }).catch((e) => activity({ storage_error: String(e) }))
           maybeStarted()
           return r.id
         })
@@ -173,18 +174,19 @@ export default {
     }
 
     async function replyPermission(rid, decision) {
-      // PENDING worker-3 retest: argument shape of ctx.permission.reply.
-      await ctx.permission.reply({ sessionID: sid, requestID: rid, id: rid, reply: decision })
+      // Measured: payload {sessionID, requestID, decision: "once"|"always"|"reject", message?}; "always" is never sent.
+      await ctx.permission.reply({ sessionID: sid, requestID: rid, decision })
     }
-    async function checkPermissions(evp) {
-      // PENDING worker-3 retest: event names / ctx.permission.list signature. Each new request is reported once.
+    async function checkPermissions(asked) {
+      // Measured: event permission.asked carries the whole request {id:"per_...", sessionID, action, resources[], metadata?};
+      // ctx.permission.list({sessionID}) returns the pending requests as an array. Each new request is reported once.
       let list = []
-      try { list = await ctx.permission.list({ sessionID: sid }) } catch { list = [] }
-      const items = Array.isArray(list) ? [...list] : [...(list?.data ?? [])]
-      if (evp && typeof evp === "object" && (evp.id || evp.requestID)) items.push(evp)
+      try { list = await ctx.permission.list({ sessionID: sid }) } catch (e) { activity({ permission_list_error: String(e) }) }
+      const items = Array.isArray(list) ? [...list] : []
+      if (asked && typeof asked === "object" && typeof asked.id === "string") items.push(asked)
       for (const req of items) {
-        const rid = req?.id ?? req?.requestID
-        if (!rid || reported.has(rid) || (req.sessionID && req.sessionID !== sid)) continue
+        const rid = req?.id
+        if (typeof rid !== "string" || !rid || reported.has(rid) || req.sessionID !== sid) continue
         const cls = permissionClass(req)
         reported.set(rid, req); activity({ permission: rid, class: cls })
         sendSafe("permission", { request: { ...req, id: rid }, class: cls })
@@ -252,8 +254,7 @@ export default {
     ;(async () => {
       for await (const ev of ctx.event.subscribe({ signal: ac.signal })) {
         const type = String(ev?.type || ""), d = payload(ev)
-        if (type === "models-dev.refreshed") catalogSeen = true
-        if (!sid || d?.sessionID !== sid) { if (sid && type.includes("permission") && !d?.sessionID) await checkPermissions(d); continue }
+        if (!sid || d?.sessionID !== sid) continue
         activity({ ev: type, seq: ev?.durable?.seq ?? null, inbox: d.inboxID ?? null })
         if (type === "session.usage.updated") {
           // Session-cumulative (includes the title call): cost alarm only, never ctx_used.
@@ -270,13 +271,20 @@ export default {
           if (exec) { exec.inbox.push(d.inboxID); maybeStarted() } else activity({ delivered_outside_execution: d.inboxID })
         } else if (type.startsWith("session.execution.")) {
           await executionEnded(type, d)
-        } else if (type.includes("permission")) {
+        } else if (type === "permission.asked") {
           await checkPermissions(d)
+        } else if (type === "permission.replied") {
+          // {sessionID, requestID, reply} (measured). Answered (by the TUI user or by us): never report it as a request.
+          activity({ permission_resolved: d.requestID, reply: d.reply }); reported.delete(d.requestID)
         }
       }
     })().catch((e) => fault("event stream: " + e))
 
     // Boot: own session (opencode-generated id) -> bridge init -> wait for the model catalogue -> startup turn.
+    // Measured: on a fresh instance DB the model.list snapshot at setup is the bundled one (no deepseek-v4.1-flash-free);
+    // the model appears after models-dev.refreshed (~0.5 s). On a reused DB no refresh event may come at all,
+    // so only polling model.list decides; an unreadable shape keeps waiting and fails at the deadline.
+    // The event stream is live (no replay); subscribe() just before session.create saw session.created 8/8.
     ;(async () => {
       const s = await ctx.session.create({ title: TITLE, model: { providerID, id: modelID } })
       if (!s || typeof s.id !== "string") throw new Error("session.create returned no id")
@@ -287,8 +295,8 @@ export default {
       let ok = false
       while (!ok && Date.now() < deadline && !unhealthy) {
         let listed = null
-        try { listed = catalogHas(await ctx.model.list(), providerID, modelID) } catch { listed = null }
-        ok = listed === true || (listed === null && catalogSeen)
+        try { listed = catalogHas(await ctx.model.list(), providerID, modelID) } catch (e) { listed = null; activity({ model_list_error: String(e) }) }
+        ok = listed === true
         if (!ok) await new Promise((r) => setTimeout(r, 500))
       }
       if (!ok) { await startupFailed(`model ${MODEL} not available in the opencode catalogue within ${CATALOG_WAIT_MS / 1000}s`); return }
