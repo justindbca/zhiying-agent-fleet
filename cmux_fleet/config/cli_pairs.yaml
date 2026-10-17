@@ -60,3 +60,17 @@ pairs:
      notes: "adopted sub-fleet supervisor (cfg adopt, design.md §19) is allowed in code without smoke"}
   - {supervisor_cli: codex, worker_cli: codex, mode: task, status: unverified, adapter_missing: [], verified_by: null,
      reason: "transport v2 Codex workers are unvalidated (supported: all-Pi, or Codex supervisor + Claude workers)"}
+# opencode workers (brief fleet-opencode-worker-20261016): the free OpenCode Zen model runs only inside the
+# opencode client (`opencode --standalone`, fleet plugin + agent_bridge.py); opencode is never a supervisor.
+# The model name comes from config (--opencode-model), never from code. Free tier: 200K window, concurrency
+# untested (default max_busy 2). Unverified until scripts/smoke_pair.sh <sup> opencode <mode> passes 4/4.
+  - {supervisor_cli: pi, worker_cli: opencode, mode: task, status: unverified, adapter_missing: [], verified_by: null,
+     reason: "transport v2 pi supervisor + opencode workers is unverified until a real smoke (scripts/smoke_pair.sh pi opencode task)"}
+  - {supervisor_cli: pi, worker_cli: opencode, mode: service, status: verified, adapter_missing: [],
+     verified_by: "real smoke scripts/smoke_pair.sh pi opencode service: fleet-20261017-092035-71528818 2026-10-17 @b49eb2e8 feat/opencode-worker worktree, 4/4 checks PASS; P1-01 TUI-session fix @704d2173 checked by real-TUI regression T4/T3 13/13 + repro GREEN (smoke not re-run)",
+     reason: "transport v2 pi supervisor + opencode workers: verified by a real smoke (scripts/smoke_pair.sh pi opencode service, see verified_by); shown only if this row is set back to unverified"}
+  - {supervisor_cli: codex, worker_cli: opencode, mode: task, status: verified, adapter_missing: [],
+     verified_by: "real smoke scripts/smoke_pair.sh codex opencode task: fleet-20261017-091736-e572f3cb 2026-10-17 @b49eb2e8 feat/opencode-worker worktree, 4/4 checks PASS; P1-01 TUI-session fix @704d2173 checked by real-TUI regression T4/T3 13/13 + repro GREEN (smoke not re-run)",
+     reason: "transport v2 Codex supervisor + opencode workers: verified by a real smoke (scripts/smoke_pair.sh codex opencode task, see verified_by); shown only if this row is set back to unverified"}
+  - {supervisor_cli: codex, worker_cli: opencode, mode: service, status: unverified, adapter_missing: [], verified_by: null,
+     reason: "transport v2 Codex supervisor + opencode workers is unverified until a real smoke (scripts/smoke_pair.sh codex opencode service)"}

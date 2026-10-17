@@ -9,7 +9,10 @@ from pathlib import Path
 import yaml
 
 DEFAULT_PATH = Path(__file__).resolve().parent / 'config' / 'cli_pairs.yaml'
-CLIS = ('pi', 'codex', 'claude')
+CLIS = ('pi', 'codex', 'claude')  # supervisor CLIs
+# opencode runs only as a worker (free OpenCode Zen model through the opencode client itself; brief
+# fleet-opencode-worker-20261016): never a supervisor, so it is not in CLIS.
+WORKER_CLIS = CLIS + ('opencode',)
 MODES = ('task', 'service')
 STATUSES = ('verified', 'unverified', 'forbidden')
 SUPPORTED = '(supported: all-Pi, or Codex supervisor + Claude workers)'
@@ -46,7 +49,7 @@ class PairTable:
         self.rows = {}
         for row in data.get('pairs') or []:
             key = (row.get('supervisor_cli'), row.get('worker_cli'), row.get('mode'))
-            if key[0] not in CLIS or key[1] not in CLIS or key[2] not in MODES:
+            if key[0] not in CLIS or key[1] not in WORKER_CLIS or key[2] not in MODES:
                 raise ValueError(f'{path}: bad cli pair row {key}')
             if row.get('status') not in STATUSES:
                 raise ValueError(f'{path}: {key} status must be one of {STATUSES}')
@@ -80,6 +83,12 @@ def legacy_supervisor_profile(profile):
 
 
 def _unlisted_reason(sup, wrk, mode):
+    if sup not in CLIS:
+        return f'unknown supervisor CLI {sup!r}: the supervisor runs one of {", ".join(CLIS)} (opencode is worker-only)'
+    if wrk not in WORKER_CLIS:
+        return f'unknown worker CLI {wrk!r}: workers run one of {", ".join(WORKER_CLIS)}'
+    if wrk == 'opencode':
+        return f'transport v2 {sup} supervisor + opencode workers in {mode} mode is not in the cli pair table'
     if sup == 'claude':
         return f'transport v2 has no Claude supervisor adapter {SUPPORTED}'
     if (sup, wrk) == ('codex', 'codex'):

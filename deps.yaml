@@ -9,6 +9,7 @@ programs:
   codex: {cmd: [codex, --version], min: "0.162.0", why: "codex queue delivery needs turn_attribution in the rollout"}
   claude: {cmd: [claude, --version], min: "2.1.280", why: "Claude workers: Stop / StopFailure hook delivery"}
   pi: {cmd: [pi, --version], min: "1.2.0", why: "pi supervisor / FlashNext workers"}
+  opencode: {cmd: [opencode, --version], min: "2.0.29", why: "opencode workers: v2 plugin API (setup ctx.tool/event/session/permission), --standalone"}
   cmux: {cmd: [cmux, --version], min: "0.65.0", why: "paste-buffer --bracketed (0.64.25 ignores it: multi-line pastes lose Enter)"}
   node: {cmd: [node, --version], min: "22.0.0", why: "pi runtime"}
   tmux: {cmd: [tmux, -V], min: "3.6", why: "named sub-fleet: one session shown in two tabs"}

@@ -16,7 +16,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import redis
-from cmux_fleet import fleet, pi_adapter
+from cmux_fleet import fleet, opencode_adapter, pi_adapter
 from cmux_fleet.message_bus import BusError, _short
 from cmux_fleet.runtime_v2 import bus_for, dumps, post_event, validate_config, wait_reply
 
@@ -28,7 +28,11 @@ class AgentBridge:
             raise ValueError('bridge requires a configured v2 slot')
         if type(generation) is not int or generation < 0:
             raise ValueError('invalid bridge generation')
-        self.cfg, self.slot, self.generation = cfg, slot, generation
+        # Only in-process bridges: never fall back to Pi identity for another CLI.
+        cli = fleet.agent_cli(cfg, slot)
+        if cli not in ('pi', 'opencode'):
+            raise ValueError('no in-process bridge for CLI ' + repr(cli))
+        self.cfg, self.slot, self.generation, self.cli = cfg, slot, generation, cli
         self.r = fleet.connect(cfg)
         self.bus = bus_for(cfg, self.r)
         self.consumer = 'bridge-' + slot + '-g' + str(generation)
@@ -44,6 +48,7 @@ class AgentBridge:
         self.threads = []
         self.readers = [self.bus.blocking_client(1000) for _ in range(3)]
         self.ui_cursor = '0-0'
+        self.permissions = {}  # opencode request id -> class reported by this bridge
 
     def emit(self, payload):
         with self.write_lock:
@@ -51,7 +56,11 @@ class AgentBridge:
             self.output.flush()
 
     def metadata(self, data):
-        wire = pi_adapter.event(self.cfg, self.slot, self.generation, dict(data, kind='pi_session'))
+        if self.cli == 'opencode':
+            wire = opencode_adapter.event(self.cfg, self.slot, self.generation,
+                                          dict(data, kind=opencode_adapter.KIND))
+        else:
+            wire = pi_adapter.event(self.cfg, self.slot, self.generation, dict(data, kind='pi_session'))
         _short(wire['thread'], 'session_id')
         binding = (wire['thread'], wire['transcript'])
         if self.binding is not None and binding != self.binding:
@@ -112,7 +121,11 @@ class AgentBridge:
             else:
                 self.idle_event.clear()
             return self.event(kind, {'idle': data.get('idle') is True})
-        if kind not in ('started', 'candidate', 'settled', 'reject_delivery'):
+        if kind == 'permission':
+            return self.permission(data)
+        if kind in ('permission_resolved', 'permission_refused'):
+            return self.permission_state(kind, data)
+        if kind not in ('started', 'candidate', 'settled', 'reject_delivery', 'hold'):
             raise ValueError('unsupported bridge command')
         with self.lock:
             env = self.active
@@ -120,7 +133,18 @@ class AgentBridge:
             raise ValueError('no active delivery; manual turns cannot publish fleet results')
         fields = {k: data[k] for k in ('candidates', 'failed', 'aborted', 'unfinished',
                                       'ctx_used', 'ctx_window', 'candidate', 'reason') if k in data}
+        if self.cli == 'opencode':  # durable opencode binding (inbox id prompt() returned, delivered ids)
+            fields.update({k: data[k] for k in ('oc_message_id', 'inbox') if k in data})
         fields['delivery'] = env
+        if kind == 'hold':
+            # opencode: the execution mixed this delivery with other input (or its id is unknown):
+            # outcome unattributable. Held and reported; never success, never re-sent.
+            if self.cli != 'opencode':
+                raise ValueError('hold comes from the opencode plugin only')
+            reason = str(data.get('reason') or 'opencode turn unattributable')[:1000]
+            self.bus.mark_uncertain(self.slot, env, reason)
+            self.faulted = True
+            return self.event('bridge_fault', {'reason': 'opencode hold: ' + reason})
         if kind == 'reject_delivery':
             self.bus.mark_uncertain(self.slot, env, data.get('reason') or 'Pi is busy; no injection')
             self.faulted = True
@@ -137,6 +161,76 @@ class AgentBridge:
             else:
                 self.fault('settlement unconfirmed/held; no execution replay')
         return reply
+
+    def permission(self, data):
+        """opencode stopped on a permission request. Report it; never answer it here. The class is
+        recomputed on this side (the plugin's opinion can only make it stricter)."""
+        if self.cli != 'opencode':
+            raise ValueError('permission requests come from the opencode plugin only')
+        req = data.get('request')
+        if not isinstance(req, dict) or not isinstance(req.get('id'), str) or not req['id']:
+            raise ValueError('permission requires the opencode request id')
+        cls = opencode_adapter.permission_class(req)
+        if data.get('class') == 'delete':
+            cls = 'delete'
+        with self.lock:
+            env = self.active
+            self.permissions[req['id']] = cls
+        # opencode 2.0.29 Permission.Request = {id, sessionID, action, resources[], save?, metadata?, source?, message?}
+        # (measured, worker-1 api-contract-supplement.md); the older names stay for safety.
+        keep = ('id', 'sessionID', 'action', 'resources', 'message', 'source', 'metadata', 'permission', 'patterns',
+                'title', 'command')
+        fields = {'request': {k: req[k] for k in keep if k in req}, 'class': cls, 'session': self.binding[0]}
+        if env:
+            fields['delivery'] = env
+        return self.event('permission_request', fields)
+
+    def permission_state(self, kind, data):
+        """opencode closed a reported request (permission.replied, or cleared without a reply when the
+        execution was interrupted / the instance stopped), or the plugin refused to forward a ruling
+        (e.g. a reject that would also decline an open user-held delete). Reported for the daemon's
+        held/escalation bookkeeping; a closed request id is never forwarded again."""
+        if self.cli != 'opencode':
+            raise ValueError('permission state comes from the opencode plugin only')
+        rid = data.get('request_id')
+        if not isinstance(rid, str) or not rid:
+            raise ValueError('permission state requires the opencode request id')
+        with self.lock:
+            cls = self.permissions.get(rid)
+            if kind == 'permission_resolved':
+                self.permissions.pop(rid, None)
+        if cls is None:  # not reported by this bridge (or already closed): nothing to tell the daemon
+            return {'status': 'ignored'}
+        cls = 'other' if cls == 'answered' else cls
+        fields = {'request_id': rid, 'class': cls, 'session': self.binding[0]}
+        fields['reason'] = str(data.get('reason') or '')[:300]
+        if kind == 'permission_resolved':
+            reply = data.get('reply')
+            fields['reply'] = reply if reply in ('once', 'always', 'reject') else None
+            # Who decided. opencode only rejects on its own (shutdown, session-wide cascade) and an interrupt clears
+            # with no reply: 'unattributed' / 'none' are never a user decision. Unknown values degrade to 'unattributed'.
+            decided = data.get('decided_by')
+            fields['decided_by'] = decided if decided in ('fleet', 'tui_user', 'unattributed', 'none') else 'unattributed'
+        else:
+            fields['held_for_user'] = data.get('held_for_user') is True
+        return self.event(kind, fields)
+
+    def permission_card(self, card):
+        """A daemon ruling on a non-delete request reaches the plugin only when it names this
+        bridge's run / slot / generation / session and a request this bridge reported as 'other'.
+        Delete-class requests are the user's: no ruling is ever forwarded for them."""
+        rid = card.get('request_id')
+        with self.lock:
+            cls = self.permissions.get(rid)
+        if (card.get('run_id') != self.bus.run_id or card.get('slot') != self.slot
+                or card.get('generation') != self.generation or card.get('session_id') != self.binding[0]
+                or cls != 'other' or card.get('class') != 'other'
+                or type(card.get('decision')) is not str or card.get('decision') not in ('once', 'reject')):
+            return False
+        with self.lock:
+            self.permissions[rid] = 'answered'   # never forwarded again; closed by permission_resolved
+        self.emit({'kind': 'permission_reply', 'request_id': rid, 'decision': card['decision']})
+        return True
 
     def fault(self, reason):
         with self.lock:
@@ -200,8 +294,15 @@ class AgentBridge:
                 rows = self.readers[1].xread({self.bus.prefix + ':ui:' + self.slot: self.ui_cursor}, count=100, block=1000)
                 for _, entries in rows:
                     for sid, fields in entries:
+                        card = json.loads(fields['data'])
+                        if isinstance(card, dict) and card.get('kind') == 'permission_reply':
+                            if not self.permission_card(card):
+                                self.emit({'kind': 'ui', 'stream_id': sid, 'event_id': fields['event_id'],
+                                           'card': {'render': '权限裁定未转交（身份或类别不符）'}})
+                            self.ui_cursor = sid
+                            continue
                         self.emit({'kind': 'ui', 'stream_id': sid, 'event_id': fields['event_id'],
-                                   'card': json.loads(fields['data'])})
+                                   'card': card})
                         self.ui_cursor = sid  # session branch entries provide replay dedup
         except (redis.RedisError, ValueError, OSError) as exc:
             self.fault(str(exc))

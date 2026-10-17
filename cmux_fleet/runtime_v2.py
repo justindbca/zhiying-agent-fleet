@@ -17,6 +17,7 @@ from pathlib import Path
 import redis
 
 from cmux_fleet import advisor, claude_hook, clear_after_result, cli_pairs, contracts, tabs
+from cmux_fleet import opencode_adapter, pi_adapter
 from cmux_fleet.message_bus import BusError, MessageBus, LUA_REBIND_CHECK, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
 from cmux_fleet import codex_queue, lifecycle_close, named_subfleet, subfleet, tui_cards
@@ -36,6 +37,10 @@ def validate_config(cfg):
     version = cfg.get('transport_version', 1)
     if type(version) is not int or version not in (1, 2):
         raise ValueError('transport_version must be 1 or 2')
+    if cfg.get('supervisor_cli') == 'opencode':
+        raise ValueError('opencode runs only as a worker, never as the supervisor')
+    if cfg.get('worker_cli') == 'opencode' and version != 2:
+        raise ValueError('opencode workers run only on transport v2 (in-process plugin + agent_bridge.py)')
     if version == 2:
         problem = v2_cli_problem(cfg)
         if problem:
@@ -62,8 +67,38 @@ def tui_slot(cfg, slot):
     official Claude (docs/design.md §27)."""
     if slot == advisor.SLOT:
         return cfg.get('transport_version') == 2
-    return cfg.get('transport_version') == 2 and (
-        cfg.get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') or 'codex') != 'pi'
+    cli = cfg.get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') or 'codex'
+    if cli not in (cli_pairs.CLIS if slot == 'supervisor' else cli_pairs.WORKER_CLIS):
+        raise ValueError('unknown CLI ' + repr(cli) + ' for ' + str(slot) + '; refusing to treat it as an official TUI')
+    # pi and opencode run fleet's in-process bridge (agent_bridge.py); only Codex / Claude are official TUIs.
+    return cfg.get('transport_version') == 2 and cli in ('codex', 'claude')
+
+
+def bridge_event(cfg, slot, generation, ev):
+    """Validate a bridge session binding with the slot's own CLI adapter (pi or opencode)."""
+    cli = cfg.get('supervisor_cli' if slot == 'supervisor' else 'worker_cli') or 'codex'
+    if cli == 'opencode':
+        return opencode_adapter.event(cfg, slot, generation, dict(ev, kind=opencode_adapter.KIND))
+    if cli == 'pi':
+        return pi_adapter.event(cfg, slot, generation, dict(ev, kind='pi_session'))
+    raise ValueError('bridge session from a ' + repr(cli) + ' slot: only pi / opencode slots run the bridge')
+
+
+# opencode provider-side refusals (adapter error_class): reported each by name, committed, dispatch paused;
+# never a task failure, never re-sent, never another model. model_lock is a failure (opencode_refused).
+OPENCODE_REFUSALS = ('free_tier_rejected', 'rate_limited', 'model_unavailable')
+OPENCODE_REFUSALS_TEXT = {'free_tier_rejected': '供应方拒绝（FreeTierError，免费档不受理）',
+                          'rate_limited': '供应方限流（429）', 'model_unavailable': '模型下线 / 不可用'}
+
+
+def startup_problem(ev):
+    """One line for an opencode startup that did not settle with READY (failed / aborted / other text)."""
+    error = str(ev.get('error') or '').strip()
+    if error:
+        return (str(ev.get('error_class') or opencode_adapter.classify_error(error)) + ': ' + error)[:500]
+    if ev.get('aborted'):
+        return 'aborted'
+    return 'reply was not READY: ' + repr(str(ev.get('text') or '')[:200])
 
 
 TUI_REPORT_RETRIES = 2  # corrections for an official-CLI task worker report before blocking
@@ -602,7 +637,7 @@ class RuntimeV2:
                 self.stop_failure(slot, ev)
             return
         if kind in ('bridge_session', 'startup', 'availability', 'candidate', 'started', 'settled', 'bridge_fault',
-                    'turn_ended'):
+                    'turn_ended', 'permission_request', 'permission_resolved', 'permission_refused'):
             info = self.f.agent(slot) if slot in self.f.names else {}
             if (not info or ev.get('run_id') != self.bus.run_id
                     or ev.get('generation') != int(info.get('generation', -1))):
@@ -615,7 +650,7 @@ class RuntimeV2:
                 if tui_slot(self.slot_cfg(slot), slot):
                     self.tui_session(slot, ev)
                 else:
-                    pi_adapter.event(self.f.cfg, slot, ev['generation'], dict(ev, kind='pi_session'))
+                    bridge_event(self.slot_cfg(slot), slot, ev['generation'], ev)
                 self.effects.hset(legacy.key('agent', slot), {'thread': ev['thread'],
                     'transcript': ev['transcript'], 'bridge_available': 0})
                 # Slot registration is completed by bridge only after this durable reply.
@@ -638,7 +673,8 @@ class RuntimeV2:
                     self.f.notify_later(walled)
                     self.reply(ev, {'status': 'rejected', 'reason': 'usage wall at startup: slot walled, fleet paused'})
                 elif (not text_ok and info.get('launch_ready', '1') == '1' and not ev.get('failed')
-                        and not ev.get('aborted') and not nudged):
+                        and not ev.get('aborted') and not nudged and not legacy.is_opencode(self.slot_cfg(slot), slot)):
+                    # opencode: no correction typed (supervisor ruling 2026-10-16); a wrong startup fails below.
                     # One correction per READY ask (keyed by its deadline), then block as before.
                     self.f.setf(slot, startup_nudged=info.get('startup_deadline', ''))
                     self.startup_nudges.add(slot)
@@ -649,6 +685,9 @@ class RuntimeV2:
                     self.f.setf(slot, state='dead', runtime_ready=0, bridge_available=0)
                     if slot == advisor.SLOT:  # §27: restarted in place by advisor_tick, never blocks the task
                         self.audit('advisor.startup_failed', slot=slot, level='error')
+                    elif legacy.is_opencode(self.slot_cfg(slot), slot):
+                        self.f.finish('blocked', slot + ': opencode startup failed before READY ('
+                                      + startup_problem(ev) + '); not retried, model unchanged')
                     else:
                         self.f.finish('blocked', slot + ': startup failed before READY')
                     self.reply(ev, {'status': 'rejected', 'reason': 'startup did not settle with READY'})
@@ -663,6 +702,10 @@ class RuntimeV2:
                 self.hold(slot, ev.get('reason', 'bridge disconnected'))
             elif kind == 'turn_ended':
                 self.release_held(slot, ev)
+            elif kind == 'permission_request':
+                self.permission_request(slot, ev, info)
+            elif kind in ('permission_resolved', 'permission_refused'):
+                self.permission_state(slot, kind, ev, info)
             elif kind == 'started':
                 try:
                     env = ev['delivery']
@@ -671,6 +714,15 @@ class RuntimeV2:
                         'started_at': int(time.time()*1000), 'execution_phase': 'running'})
                 except (ValueError, KeyError, BusError) as exc:
                     self.audit('started.rejected', slot=slot, error=str(exc))
+            elif (kind == 'candidate' and error_record and candidate.get('tool') == 'model'
+                    and legacy.is_opencode(self.slot_cfg(slot), slot)):
+                # opencode: the plugin's classified model error for this delivery (settled then carries only
+                # fleet_result candidates); opencode_refused reads it back by delivery id. Never a wall.
+                if delivery.get('delivery_id') and candidate.get('error_class') in OPENCODE_REFUSALS + ('model_lock',):
+                    pending = json.loads(self.f.agent(slot).get('oc_error') or 'null') or {}
+                    if pending.get('delivery_id') != delivery['delivery_id'] or candidate['error_class'] == 'model_lock':
+                        self.f.setf(slot, oc_error=dumps({'delivery_id': delivery['delivery_id'],
+                                    'error_class': candidate['error_class'], 'error': str(candidate.get('error') or '')[:1000]}))
             elif kind == 'candidate' and error_record and candidate.get('tool') == 'model':
                 # Pi model error (stopReason error): remember a wall for this delivery; its settled
                 # (failed) event then ends as a wall instead of an unconfirmed hold.
@@ -911,6 +963,9 @@ class RuntimeV2:
             return
         if purpose != 'handoff' and self.wall_settle(slot, ev, env, msg):
             return
+        if (purpose != 'handoff' and ev.get('failed') is True and ev.get('aborted') is not True and not ev.get('unfinished')
+                and legacy.is_opencode(self.slot_cfg(slot), slot) and self.opencode_refused(slot, ev, env, msg)):
+            return
         if ev.get('aborted') is not False or ev.get('failed') is not False or ev.get('unfinished'):
             self.hold(slot, 'aborted/error/unfinished settlement; execution stop unconfirmed', public_status='failed')
             return
@@ -1032,6 +1087,169 @@ class RuntimeV2:
                 self.f.report(slot, dumps(value), info.get('prev_label'))
                 if info.get('prev_label'):
                     self.f.setf(slot, prev_label='')
+
+    def opencode_refused(self, slot, ev, env, msg):
+        """opencode: the execution ended (the plugin settles only at its end) on a classified model error.
+        Provider refusals (FreeTierError / 429 / model unavailable) commit the delivery as that outcome, pause
+        dispatch and say which one; never a task failure, never re-sent, never another model. model_lock
+        (paid model or cost != 0) commits as failed and fails the task / request. False: not ours (hold)."""
+        from cmux_fleet import fleet as legacy
+        errors = [c for c in ev.get('candidates') or [] if isinstance(c, dict) and c.get('tool') == 'model'
+                  and c.get('error_class') in OPENCODE_REFUSALS + ('model_lock',)]
+        pending = json.loads(self.f.agent(slot).get('oc_error') or 'null') or {}
+        if pending.get('delivery_id') == env['delivery_id']:
+            errors.append({'tool': 'model', 'error_class': pending['error_class'], 'error': pending.get('error', '')})
+        if not errors:
+            return False
+        self.f.setf(slot, oc_error='')
+        cls = 'model_lock' if any(c['error_class'] == 'model_lock' for c in errors) else errors[0]['error_class']
+        text = str(next(c for c in errors if c['error_class'] == cls).get('error') or cls)[:1000]
+        label, title = self.f.label(slot), OPENCODE_REFUSALS_TEXT.get(cls, '模型锁失败')
+        self.release(env, {'opencode_error': cls, 'error': text}, 'failed' if cls == 'model_lock' else cls)
+        self.audit('opencode.' + cls, slot=slot, message_id=env['message_id'], delivery_id=env['delivery_id'],
+                   request_id=env['request_id'], level='error', error=text,
+                   detail={'requeued': False, 'model_changed': False, 'task_failed': cls == 'model_lock'})
+        reason = label + ' opencode ' + cls + ': ' + text
+        if self.f.service:
+            self.publish(env['request_id'], 'failed' if cls == 'model_lock' else 'blocked', worker=label,
+                         error=title + '：' + text, opencode_error=cls)
+        elif cls == 'model_lock':
+            self.f.finish('blocked', slot + ': opencode model_lock: ' + text)
+        if cls != 'model_lock' or self.f.service:
+            card = routing_card(label + ' ' + title + '（' + text[:300] + '）。该条结果未采用、未重投、未换模型，'
+                                '已暂停派工，等人决定。', kind='notice', slot=label, severity='warn')
+            card['metadata']['event_id'] = 'ui-oc-' + cls + '-' + env['message_id']
+            self.ui(slot, card)
+            self.ui('supervisor', card)
+            self.f.pause(reason)
+        return True
+
+    def permission_request(self, slot, ev, info):
+        """opencode stopped on a permission request (bridge event: run / slot / generation / session already
+        matched in handle). delete class -> the user only (prompt_wait route=user, screen saved; no ruling is
+        ever sent for it). other -> fx:escalations['dialog:<slot>:g<N>'] for the supervisor; its ruling goes
+        back as one permission_reply UI card (Fleet.dialog_answer), never as a key."""
+        from cmux_fleet import fleet as legacy
+        req = ev.get('request') if isinstance(ev.get('request'), dict) else {}
+        rid = req.get('id')
+        if not legacy.is_opencode(self.slot_cfg(slot), slot) or not isinstance(rid, str) or not rid:
+            self.audit('permission.rejected', slot=slot, level='warn', error='not an opencode permission request')
+            return
+        cls = 'other' if ev.get('class') == 'other' and opencode_adapter.permission_class(req) == 'other' else 'delete'
+        generation = int(info.get('generation') or 0)
+        lease = self.bus.r.hgetall(self.bus.lease_key(slot))
+        delivery = ev.get('delivery') if isinstance(ev.get('delivery'), dict) else {}
+        current = lease.get('current_delivery') if lease.get('status') == 'received' else ''
+        if delivery and delivery.get('delivery_id') != current:
+            cls = 'delete'  # bound to a delivery that is not the in-flight one: only the user can tell
+        scope = current or ('startup-g' + str(generation) if info.get('state') == 'starting' else '')
+        what = opencode_adapter.permission_text(req)[:2000] or '(no text)'
+        label = self.f.label(slot)
+        path = Path(self.f.cfg['run']) / 'screens' / (slot + '-g' + str(generation) + '-permission-'
+                                                       + re.sub(r'[^A-Za-z0-9_-]', '_', rid)[:64] + '.txt')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        screen = ''
+        try:
+            read = getattr(self.f.mgr, 'capture_output', None)
+            screen = (read(info['pane'], 200) or '') if read and info.get('pane') else ''
+        except Exception as exc:  # the request text below is the record; a pane read is extra
+            screen = '(pane capture failed: ' + str(exc)[:200] + ')'
+        path.write_text('run ' + self.bus.run_id + ' / ' + label + ' (' + slot + ') / g' + str(generation)
+                        + ' / session ' + info.get('thread', '') + ' / request ' + rid + ' / class ' + cls
+                        + '\n' + what + '\n\n[screen]\n' + screen + '\n', encoding='utf-8')
+        record = {'request_id': rid, 'class': cls, 'generation': generation, 'session_id': info.get('thread', ''),
+                  'scope': scope, 'screen': str(path)}
+        self.audit('opencode.permission_request', slot=slot, level='warn', detail=dict(record, text=what))
+        if not scope:  # a manual turn: the human at the pane is the one asked; nothing waits on the fleet
+            card = routing_card(label + ' 手动回合停在权限确认（' + what[:200] + '），由窗口前的人回答；记录见 '
+                                + str(path) + '。', kind='notice', slot=label, severity='warn')
+            card['metadata']['event_id'] = 'ui-ocperm-' + digest(slot + ':' + rid)[:32]
+            self.ui(slot, card)
+            return
+        self.f.setf(slot, oc_permission=dumps(record), prompt_channel='opencode')
+        away = self.watchdog.supervisor_away() if cls == 'other' else ''
+        if cls == 'delete' or away:
+            reason = ('opencode permission ' + ('(delete class)' if cls == 'delete' else '(supervisor away: '
+                      + away + ')') + ': ' + what[:300] + '; only the user answers, nothing sent')
+            self.prompt_wait(slot, scope, reason, str(path), kind=cls)
+            card = routing_card('fleet ' + self.bus.run_id + ' / ' + label + ' 要' + ('删除 / 移动' if cls == 'delete'
+                                else '执行') + '：' + what[:300] + '。只能由用户在该 opencode 窗口里批准或拒绝，'
+                                '程序不代答。', kind='notice', slot=label, severity='warn')
+            card['metadata']['event_id'] = 'ui-ocperm-' + digest(slot + ':' + rid)[:32]
+            self.ui(slot, card)
+            self.ui('supervisor', card)
+            return
+        rec = {'kind': 'dialog', 'slot': slot, 'generation': str(generation), 'session_id': info.get('thread', ''),
+               'scope': scope, 'delivery_id': current, 'prompt': 'opencode permission ' + str(req.get('permission')
+               or '')[:60], 'screen': str(path), 'digest': hashlib.sha256(what.encode()).hexdigest()[:16],
+               'keys_approve': [], 'keys_reject': [], 'channel': 'permission_reply', 'request_id': rid}
+        self.prompt_escalate(slot, rec, what)
+        self.f.setf(slot, prompt_channel='opencode')
+
+    def permission_state(self, slot, kind, ev, info):
+        """opencode: a reported permission request ended (permission_resolved) or the plugin did not send a
+        ruling (permission_refused); run / slot / generation / session already matched in handle. Only
+        decided_by 'tui_user' is a user's decision; 'unattributed' (opencode's own reject: shutdown, cascade)
+        and 'none' (cleared by an interrupt / instance end) are never the user's nor the supervisor's.
+        permission_refused with held_for_user: the request is still pending in opencode and now only the user
+        answers it (prompt_wait route=user); the ruling is never re-sent."""
+        from cmux_fleet import fleet as legacy
+        rid = ev.get('request_id')
+        if not legacy.is_opencode(self.slot_cfg(slot), slot) or not isinstance(rid, str) or not rid:
+            self.audit('permission.rejected', slot=slot, level='warn', error='not an opencode permission state')
+            return
+        reason = str(ev.get('reason') or '')[:300]
+        cls = 'other' if ev.get('class') == 'other' else 'delete'
+        pending = json.loads(info.get('oc_permission') or 'null') or {}
+        label = self.f.label(slot)
+        if kind == 'permission_resolved':
+            decided = ev.get('decided_by')
+            decided = decided if decided in ('fleet', 'tui_user', 'unattributed', 'none') else 'unattributed'
+            reply = ev.get('reply') if ev.get('reply') in ('once', 'always', 'reject') else None
+            waiting = pending.get('request_id') == rid
+            self.audit('opencode.permission_resolved', slot=slot, level='info', detail={
+                'request_id': rid, 'class': cls, 'reply': reply, 'decided_by': decided, 'reason': reason,
+                'user_decision': decided == 'tui_user', 'closed_wait': waiting})
+            if not waiting:  # e.g. the fleet's own ruling (permission_answer cleared it) or a manual-turn request
+                return
+            esc = self.f.escalation_state()
+            key = legacy.DIALOG_KEY + slot + ':g' + str(info.get('generation') or 0)
+            if (esc.get(key) or {}).get('request_id') == rid:
+                esc.pop(key)
+                self.f.save_escalations(esc)
+            self.f.setf(slot, prompt_wait='', prompt_wait_at=0, prompt_route='', prompt_channel='', oc_permission='')
+            who = {'tui_user': '用户在 opencode 窗口里回答（' + str(reply) + '）',
+                   'fleet': '程序按监工裁定回答（' + str(reply) + '）',
+                   'unattributed': 'opencode 自行拒绝（实例关闭或连带拒绝），不是用户决定',
+                   'none': '随执行中断 / 实例结束清除、无人回答，不是用户决定'}[decided]
+            card = routing_card(label + ' 的 opencode 权限请求 ' + rid + ' 已结束：' + who + '（' + reason[:200]
+                                + '）。', kind='notice', slot=label, severity='info' if decided == 'tui_user' else 'warn')
+            card['metadata']['event_id'] = 'ui-ocperm-end-' + digest(slot + ':' + rid)[:32]
+            self.ui(slot, card)
+            self.ui('supervisor', card)
+            return
+        held = ev.get('held_for_user') is True
+        self.audit('opencode.permission_refused', slot=slot, level='warn', detail={
+            'request_id': rid, 'class': cls, 'reason': reason, 'held_for_user': held})
+        card = routing_card(label + ' 的 opencode 权限请求 ' + rid + ' 程序未代答：' + reason[:200]
+                            + ('；请求仍挂起，只能由用户在该 opencode 窗口里批准或拒绝。' if held else '。'),
+                            kind='notice', slot=label, severity='warn')
+        card['metadata']['event_id'] = 'ui-ocperm-refused-' + digest(slot + ':' + rid + ':' + reason)[:32]
+        self.ui(slot, card)
+        self.ui('supervisor', card)
+        if not held:
+            return
+        generation = int(info.get('generation') or 0)
+        lease = self.bus.r.hgetall(self.bus.lease_key(slot))
+        current = lease.get('current_delivery') if lease.get('status') == 'received' else ''
+        scope = current or ('startup-g' + str(generation) if info.get('state') == 'starting' else '')
+        if not scope:  # a manual turn: the human at the pane is the one asked
+            return
+        screen = pending.get('screen', '') if pending.get('request_id') == rid else ''
+        self.f.setf(slot, oc_permission=dumps({'request_id': rid, 'class': cls, 'generation': generation,
+                    'session_id': info.get('thread', ''), 'scope': scope, 'screen': screen}), prompt_channel='opencode')
+        self.prompt_wait(slot, scope, 'opencode permission ruling not sent (' + reason + '); only the user answers, '
+                         'nothing re-sent', screen or '(see the permission request record)', kind=cls)
 
     def clear_enabled(self, slot):
         return slot in self.f.workers and clear_after_result.enabled(self.slot_cfg(slot), slot)
@@ -1288,13 +1506,22 @@ class RuntimeV2:
         self.f.setf(slot, prompt_wait=rec['scope'], prompt_wait_at=time.time(), prompt_route='supervisor',
                     prompt_digest=rec['digest'], watch_state='prompting')
         keys = ', '.join(rec['keys_approve']) if rec['keys_approve'] else 'no key (it will go to the user)'
-        text = ('[dialog] ' + label + ' is stopped at a confirmation dialog (' + rec['prompt'] + '); the program '
-                'classified it as not a delete / move. Last ' + str(len(tail.splitlines())) + ' screen lines:\n'
-                + tail + '\n[end of screen]\nAnswer in your next JSON: "escalations": [{"task": "' + key + '", '
-                '"decision": "approve" | "reject", "note": "<optional>"}]. approve = the program presses ' + keys
-                + ' for it; reject = the program presses Escape. Do not dispatch to ' + label + ' in this reply. If '
-                'you think it deletes or moves anything, or only the user can decide, answer reject and say why in '
-                'reason.\n\nReply with the JSON format from AGENTS.md.')
+        if rec.get('channel') == 'permission_reply':  # opencode: the ruling is a permission reply, not a key
+            text = ('[dialog] ' + label + ' (opencode) asks permission (' + rec['prompt'] + '); the program '
+                    'classified it as not a delete / move. Request:\n' + tail + '\n[end of request]\nAnswer in your '
+                    'next JSON: "escalations": [{"task": "' + key + '", "decision": "approve" | "reject", "note": '
+                    '"<optional>"}]. approve = the program allows this one request once; reject = the program '
+                    'rejects it. Do not dispatch to ' + label + ' in this reply. If you think it deletes or moves '
+                    'anything, or only the user can decide, answer reject and say why in reason.\n\nReply with the '
+                    'JSON format from AGENTS.md.')
+        else:
+            text = ('[dialog] ' + label + ' is stopped at a confirmation dialog (' + rec['prompt'] + '); the program '
+                    'classified it as not a delete / move. Last ' + str(len(tail.splitlines())) + ' screen lines:\n'
+                    + tail + '\n[end of screen]\nAnswer in your next JSON: "escalations": [{"task": "' + key + '", '
+                    '"decision": "approve" | "reject", "note": "<optional>"}]. approve = the program presses ' + keys
+                    + ' for it; reject = the program presses Escape. Do not dispatch to ' + label + ' in this reply. If '
+                    'you think it deletes or moves anything, or only the user can decide, answer reject and say why in '
+                    'reason.\n\nReply with the JSON format from AGENTS.md.')
         if self.f.service:
             # Bound to the worker's request (kind followup: delivered even if that request ends meanwhile).
             mid = self.queue('supervisor', text, request_id=self.f.agent(slot).get('request') or 'notice', kind='followup')

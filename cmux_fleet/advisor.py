@@ -55,7 +55,8 @@ def load_matrix(path=MATRIX):
 def runtime_model(cfg, cli):
     if cli == 'claude':
         return cfg.get('worker_model') or 'sonnet'
-    return (cfg.get('pi_model') if cli == 'pi' else cfg.get('codex_model')) or ''
+    return {'pi': cfg.get('pi_model'), 'opencode': cfg.get('opencode_model'),
+            'codex': cfg.get('codex_model')}.get(cli) or ''
 
 
 def runtime_effort(cfg, cli):

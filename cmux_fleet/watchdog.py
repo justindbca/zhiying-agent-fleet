@@ -424,6 +424,13 @@ class Watchdog:
                 if info['prompt_wait'] != scope:  # that delivery settled, a new one / generation came
                     self.drop_dialog(slot, info, 'identity')
                     self.clear_prompt_wait(slot, 'scope_changed')
+                elif info.get('prompt_channel') == 'opencode':
+                    # opencode permission request: answered only by a permission_reply card (supervisor) or by
+                    # the user in the pane. The activity log moves on any plugin event, so it never clears the
+                    # wait; no screen read, no stall ladder, not a single key until the delivery settles.
+                    if info.get('prompt_route') == 'supervisor':
+                        self.supervised(slot, info, lease, scope, table, now, activity=False)
+                    continue
                 elif info.get('prompt_route') == 'supervisor':
                     if self.supervised(slot, info, lease, scope, table, now):
                         continue
@@ -501,21 +508,24 @@ class Watchdog:
                                 kind='delete' if why == 'reclassified_delete' else 'other')
         self.rt.transaction('watch-dialog-' + uuid.uuid4().hex, act)
 
-    def supervised(self, slot, info, lease, scope, table, now):
-        """One tick of a dialog waiting for the supervisor. True: done with this slot this tick."""
+    def supervised(self, slot, info, lease, scope, table, now, activity=True):
+        """One tick of a dialog waiting for the supervisor. True: done with this slot this tick.
+        ``activity=False`` (opencode permission): transcript activity is not an answer."""
         key = self.dialog_key(slot, info)
         esc = self.f.escalation_state()
         rec = esc.get(key)
         if rec is None or rec.get('scope') != scope:  # e.g. a new task cleared fx:escalations
             self.to_user(slot, info, scope, rec, 'record_gone', 'dialog escalation record gone; handed to the user')
             return True
-        if self.f.last_activity(info) > float(info.get('prompt_wait_at') or 0):
+        if activity and self.f.last_activity(info) > float(info.get('prompt_wait_at') or 0):
             # A human answered in the pane meanwhile: nothing to press any more.
             self.drop_dialog(slot, info, 'activity')
             self.clear_prompt_wait(slot, 'activity')
             self.set_state(slot, info, 'working')
             return False
         if rec.get('status') == 'answered':
+            if rec.get('channel') == 'permission_reply':  # answered by Fleet.permission_answer, never by keys
+                return True
             return self.answer_dialog(slot, info, scope, key, rec, table)
         away = self.supervisor_away()
         if away and away != 'dispatch is paused':
@@ -586,7 +596,7 @@ class Watchdog:
 
     def clear_prompt_wait(self, slot, reason):
         info = self.f.agent(slot)
-        self.f.setf(slot, prompt_wait='', prompt_wait_at=0, prompt_route='')
+        self.f.setf(slot, prompt_wait='', prompt_wait_at=0, prompt_route='', prompt_channel='', oc_permission='')
         self.audit('watch.prompt_cleared', slot=slot, level='info', reason=reason, scope=info.get('prompt_wait', ''))
 
     def wait_for_user(self, slot, scope, reason, path, kind):

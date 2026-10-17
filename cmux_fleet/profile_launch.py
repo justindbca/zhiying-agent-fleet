@@ -6,7 +6,7 @@ from cmux_fleet.profile_runtime import ProfileRuntimeError
 
 
 def resolve_launch(card, registry, cfg, extras=None):
-    if card.cli not in ('pi', 'claude', 'codex'):
+    if card.cli not in ('pi', 'claude', 'codex', 'opencode'):
         raise ProfileRuntimeError('unsupported profile CLI: ' + card.cli)
     if card.profile and card.cli != 'codex':
         raise ProfileRuntimeError('profile launch field is supported only by Codex; use model for ' + card.cli)
@@ -17,6 +17,11 @@ def resolve_launch(card, registry, cfg, extras=None):
             raise ProfileRuntimeError('pi profile requires a model or configured pi_model')
     elif card.cli == 'claude':
         overrides['worker_model'] = card.model or cfg.get('worker_model') or 'sonnet'
+    elif card.cli == 'opencode':
+        # The model name comes from configuration (card or --opencode-model), never a code default.
+        overrides['opencode_model'] = card.model or cfg.get('opencode_model')
+        if not overrides['opencode_model']:
+            raise ProfileRuntimeError('opencode profile requires a model or configured opencode_model')
     else:
         profile = card.profile or cfg.get('worker_profile') or cfg.get('profile') or 'fleet'
         if not re.fullmatch(r'[A-Za-z0-9_-]+', profile):
