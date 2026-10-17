@@ -210,8 +210,8 @@ def config_content(cfg, trusted=()):
 def argv(cfg, name, generation, prompt, cwd, *, label):
     """Interactive opencode TUI with its own private server; the plugin lives in this process,
     creates the session and injects the startup message itself (CMUX_FLEET_OC_STARTUP), so the
-    prompt is not on argv. --continue shows the plugin's session (only one in the fresh DB; the plugin
-    creates it before its setup() returns, else the TUI opens on the home screen: P1-01).
+    prompt is not on argv. The plugin directory's TUI half (tui.js) opens the plugin's session by id;
+    --continue only picks the newest session that exists when the TUI starts (P1-01).
     `cwd` is the slot's TASK directory (checked against the layout); opencode itself runs in the
     generation's empty launch_cwd(), which must also be the process cwd (the plugin verifies it)."""
     model(cfg)

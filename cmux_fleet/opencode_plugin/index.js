@@ -4,9 +4,9 @@
 //
 // Measured on opencode 2.0.29 (worker-3 preflight, 2026-10-15):
 // - setup() creates the session with an opencode-generated id (a self-made session id is refused by
-//   Zen with FreeTierError). The TUI shows it only because it starts with --continue on a fresh data dir AND
-//   the session already exists when setup() returns: created afterwards (2.0.30, E2E C3/C4) the tab stayed
-//   on the home screen and a typed line opened a second session. So setup() awaits session.create.
+//   Zen with FreeTierError). The TUI half tui.js (same directory, loaded by the TUI) opens it by id from the
+//   {bound} line of the activity log: --continue alone left the 2.0.30 tab on the home screen and a typed line
+//   opened a second session (E2E C3/C4/R3/R4, P1-01), even with session.create awaited in setup().
 // - execution events carry only sessionID. The only exact link is the id ctx.session.prompt returns
 //   (the inbox id) and the ordered session.inbox.delivered{inboxID} events inside one execution.
 //   One execution drains the whole inbox, so a manual message can share an execution with ours.
@@ -360,7 +360,7 @@ export default {
     // the model appears after models-dev.refreshed (~0.5 s). On a reused DB no refresh event may come at all,
     // so only polling model.list decides; an unreadable shape keeps waiting and fails at the deadline.
     // The event stream is live (no replay); subscribe() just before session.create saw session.created 8/8.
-    // The session is created BEFORE setup() returns, so the TUI's --continue opens it (P1-01); the rest stays detached.
+    // The session is created before setup() returns; its {bound} line is what tui.js opens in the TUI (P1-01).
     let s = null, createError = null
     try {
       s = await ctx.session.create({ title: TITLE, model: { providerID, id: modelID } })

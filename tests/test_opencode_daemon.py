@@ -561,12 +561,33 @@ def test_plugin_fails_a_startup_mixed_with_manual_input_and_types_no_correction(
 
 
 def test_plugin_creates_its_session_before_setup_returns():
-    # P1-01: the TUI (--standalone --continue) opens the session that exists when the plugin's setup() returns;
-    # created later (2.0.30 E2E C3/C4) the tab stayed on the home screen and a typed line opened a second session.
+    # The session exists when setup() returns. Not the P1-01 fix on its own: with it the 2.0.30 tab still stayed on
+    # the home screen (E2E R3/R4); the TUI half below opens the session.
     out = harness('setup_waits_for_session')
     assert out['create_called'] is True and out['returned_before_create'] is False and out['bound_at_return'] is True
     (startup,) = [f for f in out['frames'] if f['kind'] == 'startup']
     assert startup['text'] == 'READY' and startup['failed'] is False
+
+
+def test_tui_half_opens_the_session_the_server_half_bound():
+    # P1-01: opencode 2.0.30's --continue lists the newest session once at TUI start; the plugin's session is not
+    # there yet, the tab stayed on the home screen and a typed line opened a second session (E2E C3/C4/R3/R4).
+    # tui.js (the TUI loads it from the plugin directory) opens the bound session by id, once it is bound.
+    out = harness('tui_shows_bound_session')
+    assert out['tui_present'] is True and out['tui_id'] == 'cmux-fleet.bridge.tui'
+    assert out['navigations_before_create'] == 0
+    assert out['navigations'] == [{'type': 'session', 'sessionID': 'ses_harness01'}]
+    (startup,) = [f for f in out['frames'] if f['kind'] == 'startup']
+    assert startup['text'] == 'READY' and startup['failed'] is False
+
+
+def test_opencode_config_loads_the_plugin_directory_with_its_tui_half():
+    # opencode 2.0.30 resolves a local plugin DIRECTORY's entrypoints as <dir>/server|<dir>/index (server) and
+    # <dir>/tui (TUI); a file entry is server-only. So the config names the directory, which has both halves.
+    plugins = json.loads(opencode_adapter.config_content({'opencode_model': 'opencode/deepseek-v4.1-flash-free'}))['plugin']
+    assert plugins == [str(opencode_adapter.PLUGIN_DIR)] and Path(plugins[0]).is_dir()
+    assert (Path(plugins[0]) / 'index.js').is_file() and (Path(plugins[0]) / 'tui.js').is_file()
+    assert not (Path(plugins[0]) / 'server.js').exists()  # would replace index.js as the server entrypoint
 
 
 def test_daemon_keeps_a_starting_opencode_slot_starting_on_manual_activity(private_redis_v2, tmp_path):
