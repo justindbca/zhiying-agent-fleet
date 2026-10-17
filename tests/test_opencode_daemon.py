@@ -560,6 +560,15 @@ def test_plugin_fails_a_startup_mixed_with_manual_input_and_types_no_correction(
     assert startup['failed'] is True and 'mixed fleet msg_startup with other input' in startup['error']
 
 
+def test_plugin_creates_its_session_before_setup_returns():
+    # P1-01: the TUI (--standalone --continue) opens the session that exists when the plugin's setup() returns;
+    # created later (2.0.30 E2E C3/C4) the tab stayed on the home screen and a typed line opened a second session.
+    out = harness('setup_waits_for_session')
+    assert out['create_called'] is True and out['returned_before_create'] is False and out['bound_at_return'] is True
+    (startup,) = [f for f in out['frames'] if f['kind'] == 'startup']
+    assert startup['text'] == 'READY' and startup['failed'] is False
+
+
 def test_daemon_keeps_a_starting_opencode_slot_starting_on_manual_activity(private_redis_v2, tmp_path):
     f = boot(private_redis_v2, tmp_path, ready=False)
     try:

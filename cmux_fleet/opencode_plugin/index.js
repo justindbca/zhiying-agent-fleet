@@ -4,7 +4,9 @@
 //
 // Measured on opencode 2.0.29 (worker-3 preflight, 2026-10-15):
 // - setup() creates the session with an opencode-generated id (a self-made session id is refused by
-//   Zen with FreeTierError); the TUI shows it because it starts with --continue on a fresh data dir.
+//   Zen with FreeTierError). The TUI shows it only because it starts with --continue on a fresh data dir AND
+//   the session already exists when setup() returns: created afterwards (2.0.30, E2E C3/C4) the tab stayed
+//   on the home screen and a typed line opened a second session. So setup() awaits session.create.
 // - execution events carry only sessionID. The only exact link is the id ctx.session.prompt returns
 //   (the inbox id) and the ordered session.inbox.delivered{inboxID} events inside one execution.
 //   One execution drains the whole inbox, so a manual message can share an execution with ours.
@@ -358,10 +360,15 @@ export default {
     // the model appears after models-dev.refreshed (~0.5 s). On a reused DB no refresh event may come at all,
     // so only polling model.list decides; an unreadable shape keeps waiting and fails at the deadline.
     // The event stream is live (no replay); subscribe() just before session.create saw session.created 8/8.
-    ;(async () => {
-      const s = await ctx.session.create({ title: TITLE, model: { providerID, id: modelID } })
+    // The session is created BEFORE setup() returns, so the TUI's --continue opens it (P1-01); the rest stays detached.
+    let s = null, createError = null
+    try {
+      s = await ctx.session.create({ title: TITLE, model: { providerID, id: modelID } })
       if (!s || typeof s.id !== "string") throw new Error("session.create returned no id")
       sid = s.id; activity({ bound: sid, title: TITLE })
+    } catch (e) { createError = e }
+    ;(async () => {
+      if (createError) throw createError
       const ack = await send("init")
       if (ack?.status !== "registered") throw new Error(ack?.reason || "Fleet binding rejected")
       // Layout (worker-3 isolation-layout-probe, supervisor 2026-10-16): opencode runs in the generation's EMPTY launch

@@ -1,5 +1,5 @@
 // Drives cmux_fleet/opencode_plugin/index.js with a fake opencode ctx. argv: <plugin index.js> <scenario>.
-// Prints {frames: [...bridge frames...]} as JSON. Scenarios: manual_first, mixed_startup.
+// Prints {frames: [...bridge frames...]} as JSON. Scenarios: manual_first, mixed_startup, setup_waits_for_session.
 import { readFileSync, existsSync, mkdtempSync, mkdirSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, dirname } from "node:path"
@@ -46,20 +46,41 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const frames = () => existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []
 const until = async (pred, ms = 3000) => { const end = Date.now() + ms; while (Date.now() < end) { if (pred()) return true; await sleep(20) } return false }
 
+// setup_waits_for_session: session.create resolves only when released; setup() must not return before it (P1-01:
+// the TUI's --continue opens the session that exists when setup() returns).
+let release = null
+if (scenario === "setup_waits_for_session") {
+  const create = ctx.session.create
+  ctx.session.create = (...a) => new Promise((r) => { release = () => r(create(...a)) })
+}
+const sessionLog = () => { const p = join(dir, "sessions", SID + ".jsonl"); return existsSync(p) ? readFileSync(p, "utf8") : "" }
 const mod = await import(pathToFileURL(plugin).href)
-const dispose = await mod.default.setup(ctx)
+let setupReturned = false, boundAtReturn = null
+const setupP = mod.default.setup(ctx).then((d) => { setupReturned = true; boundAtReturn = sessionLog().includes('"bound":"' + SID + '"'); return d })
+const early = {}
+if (scenario === "setup_waits_for_session") {
+  early.create_called = await until(() => release !== null)
+  await sleep(300)
+  early.returned_before_create = setupReturned
+  if (release) release()
+}
+const dispose = await setupP
 await until(() => prompted > 0)
 const step = (id) => {
   push("session.step.started", { assistantMessageID: id, model: { providerID: "opencode", id: "deepseek-v4.1-flash-free" } })
   push("session.step.ended", { assistantMessageID: id, cost: 0, tokens: { input: 10, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } })
 }
-const out = { prompted }
+const out = { prompted, ...early, bound_at_return: boundAtReturn }
 if (scenario === "manual_first") {
   // A human types before the startup message is taken: that execution delivers only the manual id.
   push("session.execution.started", {}); push("session.inbox.delivered", { inboxID: "msg_manual" }); step("a_manual")
   push("session.execution.succeeded", {})
   await sleep(300)
   out.after_manual = frames().map((f) => f.kind)
+  push("session.execution.started", {}); push("session.inbox.delivered", { inboxID: "msg_startup" }); step("a_ready")
+  push("session.execution.succeeded", {})
+  await until(() => frames().some((f) => f.kind === "startup"))
+} else if (scenario === "setup_waits_for_session") {
   push("session.execution.started", {}); push("session.inbox.delivered", { inboxID: "msg_startup" }); step("a_ready")
   push("session.execution.succeeded", {})
   await until(() => frames().some((f) => f.kind === "startup"))
