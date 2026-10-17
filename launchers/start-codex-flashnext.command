@@ -19,7 +19,12 @@ case "${1:-}" in
 esac
 
 # Do not inherit the calling pi session's PI_MODEL or the cloud Codex default.
-export PI_MODEL="flashnext/Qwen3.8-Flash-Next-Uncensored-oQ4e-100K-MTP"
+# Model id comes from the flashnext provider in models.json, so swapping the
+# served model only needs one edit there (the old hardcoded oQ4e id went stale).
+PI_MODELS_JSON="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/models.json"
+FLASHNEXT_ID="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["providers"]["flashnext"]["models"][0]["id"])' "$PI_MODELS_JSON" 2>/dev/null || true)"
+[ -n "$FLASHNEXT_ID" ] || { echo "ERROR: $PI_MODELS_JSON 里没有 flashnext provider 的模型" >&2; exit 1; }
+export PI_MODEL="flashnext/$FLASHNEXT_ID"
 export PI_THINKING=off
 
 # Keep --continue/--resume separate from cloud-model sessions.
