@@ -100,15 +100,23 @@ def test_actor_execs_the_opencode_adapter_argv_never_codex(tmp_path, monkeypatch
 
 
 # ---------------------------------------------------------------- registration tables
-def test_four_opencode_pair_rows_start_unverified_and_smoke_only():
+def test_opencode_pair_rows_are_verified_only_where_a_real_smoke_passed():
     table = cli_pairs.load_pairs()
     rows = {k: v for k, v in table.rows.items() if k[1] == 'opencode'}
     assert sorted(rows) == [('codex', 'opencode', 'service'), ('codex', 'opencode', 'task'),
                             ('pi', 'opencode', 'service'), ('pi', 'opencode', 'task')]
+    smoked = {('codex', 'opencode', 'task'), ('pi', 'opencode', 'service')}  # S1 / S2 real smokes, 4/4
     for (sup, wrk, mode), row in rows.items():
-        assert row['status'] == 'unverified' and row['verified_by'] is None and row['adapter_missing'] == []
+        assert row['adapter_missing'] == []
         cfg = {'supervisor_cli': sup, 'worker_cli': wrk, 'mode': mode}
-        assert 'only with --lifecycle smoke' in cli_pairs.pair_problem(cfg)
+        if (sup, wrk, mode) in smoked:
+            assert row['status'] == 'verified' and row['verified_by']
+            assert f'scripts/smoke_pair.sh {sup} opencode {mode}: ' in row['verified_by']
+            assert '4/4 checks PASS' in row['verified_by']
+            assert cli_pairs.pair_problem(cfg) is None  # runs without --lifecycle smoke
+        else:
+            assert row['status'] == 'unverified' and row['verified_by'] is None
+            assert 'only with --lifecycle smoke' in cli_pairs.pair_problem(cfg)
         assert cli_pairs.pair_problem(dict(cfg, lifecycle='smoke')) is None
     assert table.lookup('claude', 'opencode', 'task') is None  # not listed -> refused
     assert cli_pairs.pair_problem({'supervisor_cli': 'claude', 'worker_cli': 'opencode', 'mode': 'task'})
