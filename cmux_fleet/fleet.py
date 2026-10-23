@@ -6107,8 +6107,8 @@ def resume(run, args):
             except (OSError, ValueError) as exc:
                 raise SystemExit('--worker-kit rejected: ' + str(exc)) from exc
         try:
-            for path in advisor_rosters(cfg):
-                roster.write_advisor(path, True, cfg['workers'])
+            for roster_file_path in advisor_rosters(cfg):  # not `path`: that is config.json, saved below
+                roster.write_advisor(roster_file_path, True, cfg['workers'])
         except (OSError, ValueError) as exc:
             raise SystemExit('--advisor: roster not written: ' + str(exc)) from exc
     if not cmux_available():
