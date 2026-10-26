@@ -1,4 +1,6 @@
-# cmux-fleet
+# zhiying-agent-fleet
+
+The CLI command and Python package keep the name `cmux-fleet` / `cmux_fleet` (the fleet runs on [cmux](https://cmux.dev)).
 
 One **supervisor** and N **worker** sessions (new Redis-v2 runs: Pi; legacy v1: Codex/Pi/Claude Code), each in its
 own [cmux](https://cmux.dev) tab, coordinated by a small daemon. The supervisor only judges and
@@ -8,7 +10,6 @@ written handoff note, so a task can run for hours across many model sessions.
 [中文说明](README.zh-CN.md) · [Design baseline / 已确认设计基线](docs/design.md)
 
 The design baseline preserves the original supervisor/worker roles, naming, handoff and protocols.
-See the [2026-10-12 local integration review](reports/full-local-merge-20261012.md) for the current scope and validation.
 **Local integration is not production deployment or Redis-v2 runtime acceptance.**
 
 ```
@@ -71,7 +72,7 @@ What the daemon enforces, independently of what the models claim:
 ## Install
 
 ```bash
-git clone https://github.com/<you>/cmux-fleet && cd cmux-fleet
+git clone https://github.com/justindbca/zhiying-agent-fleet && cd zhiying-agent-fleet
 pip install -e .
 ```
 
@@ -503,8 +504,7 @@ reader; it never ACKs work. Control failure does not determine scheduler commit.
 **This is a development integration, not production acceptance.** The local merge candidate passed
 the full regression suite, independent real-Redis race probes and installed Pi SDK/TUI contracts.
 An earlier frozen candidate passed a real Redis + Fleet + Pi/FlashNext TUI smoke on owned PTYs
-(cmux layout simulated); the final error-audit rerun was refused by the model server's memory guard. See the
-[Redis mailbox integration report](reports/redis-mailbox-merge-20261012/validation.md).
+(cmux layout simulated); the final error-audit rerun was refused by the model server's memory guard.
 Prepared effect intents can replay; ambiguous Redis script failures hold the run for inspection.
 Full crash/slow-UI coverage, 1000-message end-to-end accounting, performance, capacity/AOF and
 mixed-CLI validation remain gates. V2 browser-broker execution currently rejects explicitly.

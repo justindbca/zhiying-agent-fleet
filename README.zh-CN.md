@@ -1,4 +1,6 @@
-# cmux-fleet
+# zhiying-agent-fleet
+
+命令行与 Python 包仍叫 `cmux-fleet` / `cmux_fleet`（fleet 跑在 [cmux](https://cmux.dev) 上）。
 
 一个**监工**（supervisor）加 N 个**执行**（worker），新 Redis-v2 run 使用 Pi；旧 v1 支持 Codex、Pi 和官方 Claude Code CLI
 交互会话，各占一个 [cmux](https://cmux.dev) 标签，由一个小 daemon 协调。监工只判断、只派活；worker 只执行。
@@ -6,7 +8,7 @@
 
 [English](README.md) · **[已确认设计基线](docs/design.md)**
 
-先读设计基线再修改；它固定原角色分工、标识、布局、交接和协议。当前范围与验证见 [2026-10-12 本地集成复核](reports/full-local-merge-20261012.md)。**本地合并不等于生产部署，也不等于 Redis v2 运行链已验收。**
+先读设计基线再修改；它固定原角色分工、标识、布局、交接和协议。**本地合并不等于生产部署，也不等于 Redis v2 运行链已验收。**
 
 ## 为什么这样做
 
@@ -36,7 +38,7 @@ daemon 独立于模型的自述做这几件事：
 ## 安装
 
 ```bash
-git clone https://github.com/<you>/cmux-fleet && cd cmux-fleet
+git clone https://github.com/justindbca/zhiying-agent-fleet && cd zhiying-agent-fleet
 pip install -e .
 ```
 
@@ -187,7 +189,7 @@ timeout/中止/通信失联保留槽位和 PEL，未确认停止不重新派活�
 显式 v2 stop 确认各 runtime 退役后才关 Redis。AOF everysec 仍有约 1 秒主机崩溃丢失窗口。`logs --config ... --request ... --json --follow` 为只读详情导出。
 
 **这不是生产验收。** 本地集成候选已通过完整回归、真实 Redis 竞态探针与已安装 Pi 的 SDK/TUI 合同。
-早一版冻结候选已通过真实 Redis + Fleet + Pi/FlashNext TUI 输入闭环（独立 PTY，cmux 布局模拟）；追加错误审计后的复测被模型后端内存保护拒绝启动。见[Redis 信箱集成记录](reports/redis-mailbox-merge-20261012/validation.md)。
+早一版冻结候选已通过真实 Redis + Fleet + Pi/FlashNext TUI 输入闭环（独立 PTY，cmux 布局模拟）；追加错误审计后的复测被模型后端内存保护拒绝启动。
 完整 crash/慢 UI/1000 条整链对账、性能、AOF/容量和混合 CLI 仍待验收，development gate 保留。
 可运行的隔离测试命令见英文 README 的 Redis v2 章节；v2 browser broker 尚未接入并明确拒绝。
 

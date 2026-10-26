@@ -3,9 +3,9 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cmux-fleet"
+name = "zhiying-agent-fleet"
 version = "0.1.0"
-description = "Supervisor + N worker Codex agents in cmux tabs, coordinated by a daemon over a private Redis socket, with automatic context handoff."
+description = "Supervisor + N worker coding agents (Codex / Pi / Claude Code / opencode) in cmux tabs, coordinated by a daemon over a private Redis socket, with automatic context handoff."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
