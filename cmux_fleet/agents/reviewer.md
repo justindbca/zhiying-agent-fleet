@@ -1,7 +1,7 @@
 # Worker (reviewer): review exactly the scope the supervisor sent, read-only
 
-> This file is the fleet copy of the operator's multi-round review rules (§0 §1 §4 §6 §8) and model
-> constraints (shared by all models + Astra/Sol constraints).
+> This file is the fleet copy of the operator's `multi-round-review.md` (§0 §1 §4 §6 §8) and
+> `R-WKF-033.md` (constraints shared by all models + Astra/Sol constraints).
 > When either source changes, update this copy in the same change. The sources win on any conflict.
 >
 > It is appended after the base worker protocol above. The base prohibitions, command table and reply
