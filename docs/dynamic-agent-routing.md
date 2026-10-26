@@ -1,6 +1,6 @@
 # Dynamic agent routing phases 1–5
 
-Dynamic routing extends the existing supervisor/worker/daemon architecture. The registry, deterministic router, planner, assignment metadata, original FIFO queues, task/service protocols and private Redis remain in place. Phase 5 adds explicitly opted-in runtime respawn at an idle delivery boundary. Metadata-only behavior remains the default. Redis transport v2 in design §11 is separate: its foundation modules exist, but runtime wiring is not implemented. The [2026-10-12 local integration review](../reports/full-local-merge-20261012.md) supersedes historical review/merge status below, not the outstanding real TUI/deployment gates.
+Dynamic routing extends the existing supervisor/worker/daemon architecture. The registry, deterministic router, planner, assignment metadata, original FIFO queues, task/service protocols and private Redis remain in place. Phase 5 adds explicitly opted-in runtime respawn at an idle delivery boundary. Metadata-only behavior remains the default. Redis transport v2 in design §11 is separate: its foundation modules exist, but runtime wiring is not implemented.
 
 ## Cards and planning
 
@@ -136,7 +136,7 @@ The following isolated two-worker dev deployment command was attempted:
 CMUX_FLEET_HOME=/tmp/cmux-fleet-phase5-dev CMUX_FLEET_STATE=/tmp/cmux-fleet-phase5-dev/state python3 -m cmux_fleet.fleet start --workers 2 --supervisor-cli pi --worker-cli pi --pi-model flashnext/Qwen3.8-Flash-Next-Uncensored-oQ4e-100K-MTP --allow-unsandboxed-pi --allow-profile-live-switch --runs-dir /tmp/cmux-fleet-phase5-dev/runs --codex-home /tmp/cmux-fleet-phase5-dev/codex-home
 ```
 
-It exited **1**, before provisioning: `run this inside a cmux terminal: cmux only accepts processes started in its windows`. Direct read-only `cmux ping` returned `Failed to connect to socket at /Users/justin/.local/state/cmux/cmux.sock (Operation not permitted, errno 1)`. Installed CLI discovery succeeded; Pi reported `1.1.0`.
+It exited **1**, before provisioning: `run this inside a cmux terminal: cmux only accepts processes started in its windows`. Direct read-only `cmux ping` returned `Failed to connect to socket at ~/.local/state/cmux/cmux.sock (Operation not permitted, errno 1)`. Installed CLI discovery succeeded; Pi reported `1.1.0`.
 
 Closest existing integration fallback, with temporary private Redis and fake cmux:
 

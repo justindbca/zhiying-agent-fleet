@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install one cmux-fleet release on the target machine (references: us-stock-option references/cmux-fleet.md §7.1).
+# Install one cmux-fleet release on the target machine.
 #   scripts/install_release.sh <sha> <tarball from `git archive <sha>`> [--test] [--activate]
 # Steps: unpack into $RELEASES/<sha> (never overwrite an existing release) -> .venv with the pinned packages
 # -> deps.yaml check (fail = stop) -> optional full test suite (fail = stop) -> private Redis runtime

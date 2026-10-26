@@ -8,7 +8,16 @@ import sys
 import pytest
 
 
-PI_ROOT = Path('/Users/justin/.local/share/fnm/node-versions/v22.22.0/installation/lib/node_modules/@earendil-works/pi-coding-agent')
+def _pi_root():
+    """The globally installed Pi package: $CMUX_FLEET_PI_ROOT, else <node prefix>/lib/node_modules/..."""
+    if os.environ.get('CMUX_FLEET_PI_ROOT'):
+        return Path(os.environ['CMUX_FLEET_PI_ROOT'])
+    node = shutil.which('node')
+    prefix = Path(node).resolve().parents[1] if node else Path('/nonexistent')
+    return prefix / 'lib/node_modules/@earendil-works/pi-coding-agent'
+
+
+PI_ROOT = _pi_root()
 
 
 def test_actual_v2_extension_contract(tmp_path):

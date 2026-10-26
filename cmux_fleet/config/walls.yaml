@@ -1,5 +1,5 @@
 # Wall table (one table for the whole fleet; brake.py reads it, the watchdog only "sees").
-# Absorbs us-stock-option config/cli_tier_map.yaml (same_cli_downgrade / aliases / default) and
+# Absorbs the operator's cli_tier_map.yaml (same_cli_downgrade / aliases / default) and
 # the wall regexes of OpenClaw multi_agent_daemon.py (_RATE_LIMIT_PATTERNS, _MODEL_POOL_WALL_PATTERNS).
 # MAD keeps its own copy: change the CLI wall wording in both together (generic patterns: see below).
 #

@@ -1,7 +1,7 @@
 # Worker (reviewer): review exactly the scope the supervisor sent, read-only
 
-> This file is the fleet copy of `us-stock-option/references/multi-round-review.md` (§0 §1 §4 §6 §8) and
-> `us-stock-option/.claude/rules-lib/R-WKF-033.md` (constraints shared by all models + Astra/Sol constraints).
+> This file is the fleet copy of the operator's multi-round review rules (§0 §1 §4 §6 §8) and model
+> constraints (shared by all models + Astra/Sol constraints).
 > When either source changes, update this copy in the same change. The sources win on any conflict.
 >
 > It is appended after the base worker protocol above. The base prohibitions, command table and reply
@@ -82,7 +82,7 @@ One per line, or "none".
 One per line, or "none".
 ```
 
-Format check: the orchestrator runs `scripts/review/check_report.py` (in the us-stock-option repo; not shipped into worker directories) on the report when it receives it. P0/P1 rows without a failing test or repro command do not count.
+Format check: the orchestrator runs `scripts/review/check_report.py` (in the operator's project; not shipped into worker directories) on the report when it receives it. P0/P1 rows without a failing test or repro command do not count.
 
 ## R5. Final reply
 

@@ -2,8 +2,8 @@
 
 > 用户确认日期：2026-10-10。本文固定设计约束，不是某次演示的临时配置。
 > 历史实现基础：`0c43b9c`；Pi/profile 增量来自 `feat/pi-agents`，Redis v2 基础模块已单独进入本地 `main@5f973d5`。
-> **开发验证通过不等于已复核、已合并或已生产部署。** 旧实现验证状态见 §10；当前本地集成范围与复核见 [2026-10-12 报告](../reports/full-local-merge-20261012.md)。
-> **2026-10-11 新要求：Redis 阻塞通信 + control 详情显示。** 目标设计见 §11 与[完整 v2 方案](../../us-stock-option/reports/cmux-fleet-redis-control-design-v2-20261011.md)。§11 明确覆盖下文旧文件投递/机械结果转述要求；**v2 基础模块与 all-Pi daemon/bridge/control 已有集成候选，真实 Redis/SDK/TUI 的局部闭环已验证；完整验收仍未完成，见 §14**，不能把模块合并说成运行代码已升级。
+> **开发验证通过不等于已复核、已合并或已生产部署。** 旧实现验证状态见 §10。
+> **2026-10-11 新要求：Redis 阻塞通信 + control 详情显示。** 目标设计见 §11。§11 明确覆盖下文旧文件投递/机械结果转述要求；**v2 基础模块与 all-Pi daemon/bridge/control 已有集成候选，真实 Redis/SDK/TUI 的局部闭环已验证；完整验收仍未完成，见 §14**，不能把模块合并说成运行代码已升级。
 
 ## 1. 延续原设计，不另造框架
 
@@ -15,7 +15,7 @@
 - pi 是另一种 agent CLI 适配，不取代 daemon，不增加第二套派活或记忆/交接系统。
 - 原 task/service 模式、命令行入口、请求/结果协议、worker 别名路由继续保留。
 
-设计来源：原 cmux-fleet README/在役代码；业务侧原始设计 `us-stock-option/tasks/plans/tgog-d-order-fable-v1-20261010.md` §17/17.1；用户后续关于同页布局、代数标识、官方 Claude CLI、control/history 同栏和手工派活的明确要求。
+设计来源：原 cmux-fleet README/在役代码；业务侧原始需求（未随仓库公开）；用户后续关于同页布局、代数标识、官方 Claude CLI、control/history 同栏和手工派活的明确要求。
 
 **本轮不是重设计。不得借换 CLI 擅改上述分工，也不得把临时验收角色或参数变成默认设计。**
 
@@ -155,7 +155,7 @@ Fleet agents（一个工作区）
 
 ## 8. 配置与运行边界
 
-- 常规用法见 [README](../README.md)；本机/Studio/macmini 路径和在役版本以外部项目 `references/cmux-fleet.md` 为准，不在本设计写死机器路径。
+- 常规用法见 [README](../README.md)；各机器路径和在役版本由部署方的运行手册维护，不在本设计写死机器路径。
 - 每台机器当前实现只维护一套 fleet registry；本地验证不要与已有 fleet 抢窗口/登记。
 - 本机验证只能处理测试或授权的普通开发工作，不把“本机跑通”理解为授权跨机器运行交易职责。
 - 不重启/替换其他机器在役服务，不自动部署。文档修改不授权生产操作。
@@ -199,18 +199,13 @@ Fleet agents（一个工作区）
 | 独立复核 | 此前 Fable 额度不足、Opus 超时，无完整复核结论 |
 | 合并/生产部署 | 未完成，不能由开发演示状态推定已上线 |
 
-外部项目 `us-stock-option` 的证据文件：
-- `reports/cmux-fleet-pi-validation.md`：早期完整窗口/交接测试（历史 checker/1% 实例，不是当前配置）。
-- `reports/cmux-fleet-pi-ui-fixes-20261010.md`：命名、输入闭环及 ID 修正；control 最初同 supervisor 栏，后被下一条确认覆盖。
-- `reports/cmux-fleet-control-history-20261010.md`：最新 control/history 同栏确认。
-- `reports/cmux-fleet-pi-naming/operator-ok.json`：真实手工输入闭环结果。
-- `references/cmux-fleet.md`：本地运行手册与当前配置入口。
+上表的真机证据文件（窗口/交接测试、命名与输入闭环、control/history 同栏确认）保存在部署方项目中，未随仓库公开。
 
 以后修改先对照本文；用户新要求须明确记录替代了哪条约束，再修改实现与回归。不能只改演示、只改截图，或把旧报告的临时状态当作新设计。
 
 ## 11. Redis 通信与分层显示 v2（2026-10-11 新要求，开发接线待验收）
 
-完整实施方案：[Redis 阻塞通信与分层显示](../../us-stock-option/reports/cmux-fleet-redis-control-design-v2-20261011.md)。本节为目标约束，不是上线声明。
+本节为目标约束，不是上线声明。
 
 ### 替代关系
 
@@ -375,7 +370,7 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - 本机 `python3 -m pytest -q tests`：**243 passed**，包含双重 opt-in、busy/handoff 边界、READY gate、旧代/重复投递、失败清理、三种 CLI 参数/回调与角色映射、Pi supervisor operator-input 桥回归。使用 fake Redis/cmux/CLI，不称为真实 TUI 或混合模型验收。
 - 两 worker 隔离 dev start 已尝试：当前沙箱不能连接 cmux socket，`Operation not permitted (errno 1)`，start 在 provisioning 前退出。
 - 进一步运行 `tests/pi_smoke.py`：临时私有 Redis 因 `Failed opening Unix socket: bind: Operation not permitted` 退出；未到 Pi/model 或 live switch。测试子进程/临时目录已清理，没有替换已有 fleet。
-- 完整命令、结果与待验收边界见 [dynamic-agent-routing.md](dynamic-agent-routing.md#dev-validation-2026-10-11)。**上述为 Phase 5 当时的历史状态：代码/模拟回归已完成；真实 dev 部署与 supervisor TUI smoke 受环境限制未通过；当时未独立复核、未合并、未生产部署。** 后续本地集成复核见 [2026-10-12 报告](../reports/full-local-merge-20261012.md)，不替代真实 TUI/生产验收。
+- 完整命令、结果与待验收边界见 [dynamic-agent-routing.md](dynamic-agent-routing.md#dev-validation-2026-10-11)。**上述为 Phase 5 当时的历史状态：代码/模拟回归已完成；真实 dev 部署与 supervisor TUI smoke 受环境限制未通过；当时未独立复核、未合并、未生产部署。**
 
 ## 13. Redis 项目内运行目录（用户新要求）
 
@@ -394,7 +389,7 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 
 ## 14. Redis 信箱本地集成验证（2026-10-12）
 
-用户要求合并 Redis 信箱功能。本轮冻结框架候选后重跑完整回归、真实 Redis 竞态探针、已安装 Pi SDK/TUI 合同，以及真实 Redis + Fleet + Pi/FlashNext 的 supervisor TUI 输入闭环；详情与文件哈希见[集成报告](../reports/redis-mailbox-merge-20261012/validation.md)。
+用户要求合并 Redis 信箱功能。本轮冻结框架候选后重跑完整回归、真实 Redis 竞态探针、已安装 Pi SDK/TUI 合同，以及真实 Redis + Fleet + Pi/FlashNext 的 supervisor TUI 输入闭环。
 
 这更新 §11 原始交付记录中的环境受限状态，不改变运行协议或撤销门槛。新启动默认且仅允许 Redis v2，仍需 `--allow-development-v2` 显式许可和 all-Pi（2026-10-12 起另放行 Codex 监工 + 官方 Claude worker 的 task 模式，见 §11 对应小节）；旧 v1 配置仅保留读取、收束与 stop 兼容，不热改。这落实用户将通信改入 Redis 的要求，不把新启动默认为文件信箱。真实模型验证使用独立 PTY，cmux 布局仍为模拟；单独的真实 cmux 布局测试不等于 v2 全链已获生产验收。完整崩溃/慢 UI/1000 条整链、性能/AOF/容量和混合 CLI 仍待验收。
 
@@ -549,7 +544,7 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - 池读数来自额度调度员的 `~/.cmux-fleet/quota.json`（config `quota_file` 可改）：`{"pools": {"pool-a": {"cash_used_usd", "at"}, "pool-b": {"week_used_pct", "at"}}}`。缺失 / 读不出 / 超过 1 小时 = unknown：显示在 `brake.json`，**不触发**。
 - 到线：pause（不投递、不轮换，全部可续）+ 审计 `brake.tripped` + `<run>/brake.json` + 可选 `brake_notify` argv（`start --brake-notify`，无 shell）。v2 下判定在一个事务里做，通知在事务外。
 - 续跑：`cmux-fleet resume` 在预算线仍越线时被拒（不论暂停记录最后是谁写的：后来的墙、F 的 hold 改写暂停原因都不解锁），须 `resume --raise LIMIT=VALUE`（不能改池）；墙引起的暂停可直接 resume。新任务开新卡时清掉上一张卡的刹车暂停（操作员手动 pause 不清）。
-- 墙表一张：账号级墙（只认 Claude / Codex CLI 自身的 usage / weekly / session limit 文案；通用的 `rate limited` / `429 Too Many Requests` / `quota exceeded` 不算墙——第三方工具 Tavily / reddit / WebFetch 会报这些字，worker 报告贴进监工屏也会带上，EF 复核 r1 P1-01）→ 换边或停，fleet 内即停（pause）；分池墙（"You've reached your Fable limit"、`/usage-credits`）→ 同 CLI 降一档（`same_cli_downgrade`，吸收自 us-stock-option `config/cli_tier_map.yaml`），没有下一档也停。来源：卡住（超 `stall_timeout`）时的屏幕尾部（v1 在 `on_stall`，v2 在 `Fleet.tick` 的刹车事务里、早于 v2 hold）；v1 另看短回合文本（≤400 字，长报告不判墙）。另有三路不等 `stall_timeout`：① 启动回的不是 READY 而是墙 → 槽位 `walled`（不判死、不 blocked）+ 可续暂停，账号级墙在 resume 后按原 launch 重起下一代；② v2 官方 CLI 的短回复（≤400 字，`tui_turn` 带 `wall_text`）与 Pi 的模型错误事件（`candidate {tool: model, error}`）→ 投递以 `walled` 提交（结果不采用、不转监工），原指令带「[Resumed after a usage wall]」只重投一次（重放的 settled 命中 `settle.late`）；③ 看门墙闸（见下）。分池墙在 worker 槽**实际执行**同 CLI 降一档：空闲边界由 `wall_tick` 用 `wall_rotate` 起下一代（launch 覆盖模型键，交接骨架、存屏、tab 原位、杀旧 tab、v2 `confirm_retired`），新一代 READY 后只解除墙自己的暂停（`fx:brake.paused_by` 比对；F hold / 操作员 pause / 预算越线一律保持暂停）；槽位已被别的换卡（B 夜间 / live profile）改过 → 降档作废（`brake.downgrade_superseded`）。监工槽与账号级墙只停不降档。
+- 墙表一张：账号级墙（只认 Claude / Codex CLI 自身的 usage / weekly / session limit 文案；通用的 `rate limited` / `429 Too Many Requests` / `quota exceeded` 不算墙——第三方工具 Tavily / reddit / WebFetch 会报这些字，worker 报告贴进监工屏也会带上，EF 复核 r1 P1-01）→ 换边或停，fleet 内即停（pause）；分池墙（"You've reached your Fable limit"、`/usage-credits`）→ 同 CLI 降一档（`same_cli_downgrade`，吸收自部署方的 `cli_tier_map.yaml`），没有下一档也停。来源：卡住（超 `stall_timeout`）时的屏幕尾部（v1 在 `on_stall`，v2 在 `Fleet.tick` 的刹车事务里、早于 v2 hold）；v1 另看短回合文本（≤400 字，长报告不判墙）。另有三路不等 `stall_timeout`：① 启动回的不是 READY 而是墙 → 槽位 `walled`（不判死、不 blocked）+ 可续暂停，账号级墙在 resume 后按原 launch 重起下一代；② v2 官方 CLI 的短回复（≤400 字，`tui_turn` 带 `wall_text`）与 Pi 的模型错误事件（`candidate {tool: model, error}`）→ 投递以 `walled` 提交（结果不采用、不转监工），原指令带「[Resumed after a usage wall]」只重投一次（重放的 settled 命中 `settle.late`）；③ 看门墙闸（见下）。分池墙在 worker 槽**实际执行**同 CLI 降一档：空闲边界由 `wall_tick` 用 `wall_rotate` 起下一代（launch 覆盖模型键，交接骨架、存屏、tab 原位、杀旧 tab、v2 `confirm_retired`），新一代 READY 后只解除墙自己的暂停（`fx:brake.paused_by` 比对；F hold / 操作员 pause / 预算越线一律保持暂停）；槽位已被别的换卡（B 夜间 / live profile）改过 → 降档作废（`brake.downgrade_superseded`）。监工槽与账号级墙只停不降档。
 - v1 task 的 `pause` 现在也会停投递（原来只对 service / v2 生效）。
 
 ### E 先于 F：看门的墙闸（`Fleet.wall_gate`）
@@ -675,7 +670,7 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - **StopFailure**：仅同 run / generation / session 的在途 service worker 投递可终结。保留 delivery / fence / PEL consumer 校验，立即公布 failed 及 hook 错误文本、ACK 该投递，不排重试、不走墙的重投分支；然后走同一 clear 闸门。已有公开 timeout 时不覆盖结果，只收束执行并清空。旧代、旧 session、重复、无在途失败只有审计。
 - **其他生命周期**：换代只在清空完成后的 idle 边界重新评估，clearing 期间拒绝 start_rotation；idle reclaim 不回收 clearing，service idle-stop 也把 clearing 算作活动。watchdog 对 clearing hands-off，由 clear deadline 接管，不按 Escape、不走 frozen 换代阶梯。§24 held-slot exit 保留完整身份校验，结束后先 clearing；手工 clear 导致绑定冲突的 held 不允许借旧回调放行。普通 daemon restart 保持 held/paused；显式 `--resume` 对清空未完成、换绑确认中或绑定冲突的槽走原下一代 respawn、确认旧窗格退役与 READY 闸，不接回可能已换 session 的旧窗格。
 
-**验证**：新增 78 项（effect-plan / 输入闸 / 真实 Redis 集成）。Studio 真机（Claude Code + Haiku 5.5，3 worker，冻结目录）：非括号粘贴 `/clear` 执行、SessionStart(source=clear) 带新 session、清空后 Stop 照常；端到端 24 条真实提示词 23 ok（1 条模型输出格式 invalid，与清空无关），串内容 0，clear.pasted / slot_rebound / clear.ready 各 24、每 worker 8；修空闲判定（会话名印在上框线）之前的一轮实走了「确认超时 → hold → fleet 暂停」。复核 Opus r1 PASS（Fable 额度用尽改派），P2 五条见 `us-stock-option/tasks/plans/clear-after-result-review-opus-r1-20261014.md`。2026-10-14 并入 integ/fleet-20261014（+ 钩子通道互斥）：`python3 -m pytest -q tests` 1650 passed 2 skipped；干净 PATH 1647 passed 5 skipped（多出 3 个 = 无 node 的 pi 合同测试）；互斥 + 启动记录用例 7 条在 `tests/test_clear_after_result.py`。复核待做。
+**验证**：新增 78 项（effect-plan / 输入闸 / 真实 Redis 集成）。Studio 真机（Claude Code + Haiku 5.5，3 worker，冻结目录）：非括号粘贴 `/clear` 执行、SessionStart(source=clear) 带新 session、清空后 Stop 照常；端到端 24 条真实提示词 23 ok（1 条模型输出格式 invalid，与清空无关），串内容 0，clear.pasted / slot_rebound / clear.ready 各 24、每 worker 8；修空闲判定（会话名印在上框线）之前的一轮实走了「确认超时 → hold → fleet 暂停」。复核 Opus r1 PASS（Fable 额度用尽改派）。2026-10-14 并入 integ/fleet-20261014（+ 钩子通道互斥）：`python3 -m pytest -q tests` 1650 passed 2 skipped；干净 PATH 1647 passed 5 skipped（多出 3 个 = 无 node 的 pi 合同测试）；互斥 + 启动记录用例 7 条在 `tests/test_clear_after_result.py`。复核待做。
 
 ## 29. 具名子 fleet：名单声明、外部起停、service 子 fleet（2026-10-14 用户新要求；feat/named-subfleet 合在 deploy/cmux-fleet 1027f4f8 之上，未上线）
 

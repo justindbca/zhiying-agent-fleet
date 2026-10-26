@@ -131,7 +131,7 @@ def resolve_start(lifecycle, mode=None, path=None):
 
 
 def _clock_module():
-    """global_clock (us-stock-option scripts/common), from $CMUX_FLEET_GLOBAL_CLOCK or sys.path."""
+    """The operator's global_clock module (``is_trading_day(market, date)``), from $CMUX_FLEET_GLOBAL_CLOCK or sys.path."""
     location = os.environ.get(CLOCK_ENV)
     if location:
         p = Path(location).expanduser()

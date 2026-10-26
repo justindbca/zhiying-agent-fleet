@@ -1,4 +1,4 @@
-# Lifecycle modes (docs: us-stock-option tasks/plans/cmux-fleet-lifecycle-modes-20261013.md §4).
+# Lifecycle modes (docs/design.md).
 # A lifecycle decides what "done" means and how a run is closed after done / blocked / timeout.
 # `start --lifecycle <mode>` is required; `base` maps it onto the transport mode (cfg['mode']:
 # task | service). The daemon re-reads this file when its mtime changes (no restart needed).

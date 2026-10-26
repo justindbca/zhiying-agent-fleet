@@ -6,4 +6,4 @@ Codex/Pi startup `.command` files related to cmux-fleet-pi live here.
 - `start-pi-codex-dangerous-full.command` — open a cmux workspace running Pi with the OpenAI Codex provider.
 - `start-codex-flashnext.command` — start local FlashNext through Pi using the `flashnext/...` model.
 
-`us-stock-option` may keep only thin compatibility wrappers that `exec` these files. Do not put fleet launcher logic back into the trading repository.
+Projects that use the fleet may keep only thin compatibility wrappers that `exec` these files. Do not put fleet launcher logic back into those projects.

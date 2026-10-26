@@ -1,19 +1,21 @@
 #!/bin/bash
 # Start Flash Next in pi; keep this filename for existing desktop shortcuts.
 # Provider configuration: ~/.pi/agent/models.json (flashnext, OpenAI chat API).
-# The old Codex/tmux launcher is preserved beside this file for rollback.
+# The old Codex/tmux launcher (rollback) is taken from $CMUX_FLEET_LEGACY_LAUNCHER.
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-LEGACY="/Users/justin/Documents/projects/us-stock-option/start-codex-flashnext.command.bak-before-pi"
+LEGACY="${CMUX_FLEET_LEGACY_LAUNCHER:-}"
 
 # Existing pair/long-task commands still belong to the Codex orchestrator.
 case "${1:-}" in
   reset-all|new-task|--long)
+    [ -n "$LEGACY" ] || { echo "set CMUX_FLEET_LEGACY_LAUNCHER to the old Codex/tmux launcher" >&2; exit 2; }
     exec /bin/bash "$LEGACY" "$@"
     ;;
   --legacy-codex)
     shift
+    [ -n "$LEGACY" ] || { echo "set CMUX_FLEET_LEGACY_LAUNCHER to the old Codex/tmux launcher" >&2; exit 2; }
     exec /bin/bash "$LEGACY" "$@"
     ;;
 esac

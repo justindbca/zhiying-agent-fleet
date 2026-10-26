@@ -38,7 +38,7 @@ description: "把复杂任务拆成可派发的子任务，并交给 cmux-fleet 
 在项目根目录执行：
 
 ```bash
-rg -n "<用户任务关键词>|fleet|cmux-fleet|subagent|Task" memory/ references/ ~/.claude/projects/*us-stock-option*/memory/MEMORY.md .claude/skills .agents/skills 2>/dev/null || true
+rg -n "<用户任务关键词>|fleet|cmux-fleet|subagent|Task" memory/ references/ .claude/skills .agents/skills 2>/dev/null || true
 ```
 
 如当前环境有 EverMemOS MCP，先按项目规则查：
@@ -264,5 +264,5 @@ $PLAN_DIR/validation.md
 - **worker prompt 不自包含**：不允许。必须包含背景、路径、输出格式和禁令。
 - **让 worker 写生产配置/下单/重启服务**：不允许。worker 只做分析、提案、只读验证。
 - **多次 `date +%s` 造成路径不一致**：统一一次性生成 `RUN_ID` / `PLAN_DIR` 后复用。
-- **在 macmini 再起一套 fleet**：不允许。macmini 可能已有板块轮动 fleet；先 status，必要时报告等待。
+- **在已有在役 fleet 的机器上再起一套 fleet**：不允许。目标机可能已有定时 fleet 在跑；先 status，必要时报告等待。
 - **把内容质量交给 daemon 验收**：不允许。daemon 只做字面验收，主会话必须二次读文件。

@@ -2,7 +2,7 @@
 
 Before changing this project, read `docs/design.md` completely. It is the confirmed design baseline; README files are usage summaries, and historical test reports do not override it.
 
-All cmux-fleet, Fleet agents, Pi fleet adapter, fleet skills, examples, tests, documentation, and related Codex/Pi startup `.command` launchers belong in this repository/worktree: `/Users/justin/Documents/projects/cmux-fleet-pi`. Keep launchers under `launchers/`. Do not implement fleet framework or launcher changes inside `/Users/justin/Documents/projects/us-stock-option`; that repository may only call this project or keep thin compatibility wrappers, usage notes, and reports.
+All cmux-fleet, Fleet agents, Pi fleet adapter, fleet skills, examples, tests, documentation, and related Codex/Pi startup `.command` launchers belong in this repository. Keep launchers under `launchers/`. Projects that use the fleet may only call it or keep thin compatibility wrappers, usage notes, and reports; do not implement fleet framework or launcher changes there.
 
 - Extend the existing supervisor/worker/daemon architecture; do not introduce a second dispatcher or replace the task/service protocols without an explicit user decision.
 - Preserve slot/generation identities: `supervisor-1` -> `supervisor-1.1`, `worker-1` -> `worker-1.1`. Reuse the existing label in the CLI session, UI, routing and history.
