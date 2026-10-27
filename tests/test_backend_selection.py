@@ -47,6 +47,7 @@ def test_no_flag_follows_design_5(monkeypatch):
     monkeypatch.setattr(base, 'unavailable_reason', lambda name: None)
     assert fleet.resolve_backend(None, platform='darwin') == ('cmux', None)
     monkeypatch.setattr(base, 'unavailable_reason', lambda name: 'no cmux' if name == 'cmux' else None)
+    monkeypatch.setattr(base, 'cmux_installed', lambda: False)  # a Mac with cmux installed stays on cmux
     assert fleet.resolve_backend(None, platform='darwin') == ('wezterm', None)  # WezTerm is usable
     assert fleet.resolve_backend(None, platform='linux') == ('wezterm', None)  # Linux never probes cmux
 

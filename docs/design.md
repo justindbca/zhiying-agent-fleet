@@ -767,9 +767,9 @@ fleet 只通过 `fleet.manager_for(cfg)` 造出的那一个对象碰终端（原
 
 ### 33.3 选择与继承
 
-- `start --backend cmux|wezterm`；不给时：`sys.platform == 'darwin'` 且 cmux 可用 → cmux，否则 wezterm。显式选的后端在这台机器上不可用 → 启前拒开并说明缺什么（`fleet.resolve_backend`，`start` 里在 provisioning 之前）。
-- 选中值写进 run 的 `config.json` 的 `backend`；`manager_for` 只读它，daemon / actor / `--resume` / 子 fleet（子 config 由父 config 复制）一律跟随，不再各自判断。**没有 `backend` 键的旧 config（本次之前起的 run）按 cmux 处理**，等价于原行为。
-- 自动选择在 macOS 上不会把 run 推到 WezTerm：WezTerm 后端不可用（未装或未合入）时答案退回 cmux，报的仍是原来那条「run this inside a cmux terminal」类信息。
+- `start --backend cmux|wezterm`；不给时：`sys.platform == 'darwin'` 且**装了** cmux（`CMUX_BIN` / cmux.app 路径或 PATH 上有 `cmux`，`backends.base.cmux_installed`）→ cmux，cmux 不应答（ssh / Terminal.app）就照旧拒开、报「run this inside a cmux terminal」，**绝不悄悄改用 wezterm**；只有非 macOS 或 Mac 上没装 cmux 才默认 wezterm（2026-10-28 核心复核收紧）。显式选的后端在这台机器上不可用 → 启前拒开并说明缺什么（`fleet.resolve_backend`，`start` 里在 provisioning 之前）。
+- 选中值写进 run 的 `config.json` 的 `backend`；`--resume` 对没有 `backend` 键的老 run 直接按 cmux 判（`resolve_backend(cfg.get('backend') or 'cmux')`），不重新走缺省规则；`manager_for` 只读它，daemon / actor / `--resume` / 子 fleet（子 config 由父 config 复制）一律跟随，不再各自判断。**没有 `backend` 键的旧 config（本次之前起的 run）按 cmux 处理**，等价于原行为。
+- 自动选择在 macOS 上不会把 run 推到 WezTerm：装了 cmux 一律 cmux；没装 cmux 而 WezTerm 后端也不可用（未装或未合入）时答案仍退回 cmux，报的仍是原来那条「run this inside a cmux terminal」类信息。`scripts/check_deps.py::pick_backend` 同一规则（darwin 上 `cmux --version` 跑得通即 cmux）。
 - `fleet.yaml` 不加块：后端是一次运行的选择，不是表。
 
 ### 33.4 版面降级（WezTerm）
@@ -777,6 +777,7 @@ fleet 只通过 `fleet.manager_for(cfg)` 造出的那一个对象碰终端（原
 - cmux 版面（§2）：监工左上、右侧 worker 标签、左下 history/control 标签，依赖「分屏里再分标签」。WezTerm 没有这层：**一个窗口；第 1 个标签 = 监工（左）+ control（右下分屏）；每个 worker 一个标签**；`tab_into` / `dock_*` / `place_*` 降级为「放进对应标签 / 无操作并返回 True」，不报错；`arrange()` 在 `supports_browser = False` 时排好 worker、把 control 放进第 1 个标签（右下分屏，由 WezTerm 后端自己实现）后返回 `None`。
 - 版面与历史是 fleet 仅有的两处读能力位的地方（`Fleet.announce_history_page()` / `subfleet.follow_jump()` 看 `supports_browser`）；其余调用路径一律走原接口，cmux 后端除 `available()` / `supports_browser` / `nested_tabs` 外与搬家前逐行一致。
 - 历史页：`supports_browser = False` 时不建浏览器格；`Fleet.announce_history_page()` 在 control 里打印 `<run>/history.html` 路径，并在有图形环境时用一次系统打开（macOS `open` / Linux `xdg-open`，没有就只打印）；`refresh_history()` 只在有浏览器格时 `reload_browser`；`subfleet.follow_jump()` 在没有页面时直接返回（也不再每拍调 cmux）。cmux 这些分支全部保持原调用不变。
+- **已知限制：WezTerm 不支持子 fleet**（2026-10-28 复核）。子 fleet 靠把父 fleet 的活 pane 交给子 fleet 的登记表（`release` / `adopt`、tmux 视图）；WezTerm 每个 run 一个私有 mux server，子 fleet 看不到也接不走父 fleet 的 pane。所以 `backend: wezterm` 下所有子 fleet 入口一律拒开、给同一句原因（`subfleet.backend_problem`）：`subfleet.check`（拆分子任务 / `subfleet spawn` / 具名子 fleet up / 升级审批）、子 daemon 的 `start_adopted`（直接 blocked）、`start` / `--resume` 带 `subfleets:` 的 roster、roster 热加载出现 `subfleets:`（整份拒收、旧 roster 照旧）。cmux 路径不变。要用子 fleet 就 `--backend cmux`；跨 server 交接的方案另开一条线定。
 
 ### 33.5 平台小改
 
