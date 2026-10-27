@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -32,14 +33,25 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture
-def live(tmp_path):
+def short_root():
+    """pytest's per-test tmp path plus ``/wezterm/<token>/mux.sock`` is over sockaddr_un on macOS, and the
+    backend refuses a long socket (no /tmp fallback); the runtime dir therefore lives under mkdtemp."""
+    return Path(tempfile.mkdtemp(prefix='wzit-')).resolve()
+
+
+@pytest.fixture
+def live(short_root):
     """A started private mux server in its own HOME; stopped by the pid the backend recorded."""
     os.environ.pop('WEZTERM_UNIX_SOCKET', None)  # never inherit a socket that leads to the user's server
-    m = wz.WezTermSessionManager('wz-it', state_dir=tmp_path / 'rt')
+    m = wz.WezTermSessionManager('wz-it', state_dir=short_root / 'rt')
     try:
-        assert m.get_or_create_session() is True, 'private mux server did not come up'
+        assert m.get_or_create_session() is True, 'private mux server did not come up: ' + m.last_error
         yield m
     finally:
+        # Even when the assertion above fails, a server may have come up: adopt its recorded pid so the
+        # teardown stops it instead of leaking it (`end_mux_server` only ever signals our own pid).
+        if m.mux_pid is None and m.runtime_root:
+            m.mux_pid = m._server_pid()
         m.end_mux_server()
 
 
@@ -69,7 +81,7 @@ def test_private_server_is_isolated_from_the_operators_wezterm(live):
 
 def test_spawn_send_get_list_kill_roundtrip(live, tmp_path):
     """The full §4.2 path on a real server: spawn a window, type, read it back, list it, kill it."""
-    res = live.spawn_window('supervisor', 'exec /bin/sh -c "echo READY-$((6*7)); exec /bin/cat"',
+    res = live.spawn_window('supervisor', '/bin/sh -c "echo READY-$((6*7)); exec /bin/cat"',
                             start_directory=str(tmp_path))
     assert res.success, res.error
     pane = res.pane_id
@@ -113,7 +125,7 @@ def test_send_key_controls_reach_a_real_foreground_program(live, tmp_path):
         '    out.write(b)\n'
         '    if b"\\x03" in b: break\n'
         'termios.tcsetattr(fd,termios.TCSADRAIN,old)\n' % str(log))
-    res = live.spawn_window('keyrec', 'exec %s %s' % (sys.executable, script), start_directory=str(tmp_path))
+    res = live.spawn_window('keyrec', '%s %s' % (sys.executable, script), start_directory=str(tmp_path))
     assert res.success, res.error
     pane = res.pane_id
     try:
@@ -129,16 +141,21 @@ def test_send_key_controls_reach_a_real_foreground_program(live, tmp_path):
 
 def test_two_private_servers_coexist_on_one_machine(live, tmp_path):
     """§4.1 head-of-risk, through the code: a second run's server lives beside the first, both usable."""
-    other = wz.WezTermSessionManager('wz-it2', state_dir=tmp_path / 'rt2')
+    other = wz.WezTermSessionManager('wz-it2', state_dir=Path(live.runtime_root).parent.parent / 'rt2')
     try:
         assert other.get_or_create_session() is True
         assert other.mux_socket != live.mux_socket and other.mux_pid != live.mux_pid
-        first = live.spawn_window('a', 'exec /bin/sleep 60', start_directory=str(tmp_path))
-        second = other.spawn_window('b', 'exec /bin/sleep 60', start_directory=str(tmp_path))
+        first = live.spawn_window('a', '/bin/sleep 60', start_directory=str(tmp_path))
+        second = other.spawn_window('b', '/bin/sleep 60', start_directory=str(tmp_path))
         assert first.success and second.success
-        for m, pane in ((live, first.pane_id), (other, second.pane_id)):
+        # Each server numbers its panes from 0, so the same id can exist in both: what proves isolation
+        # is that each manager only answers for panes in *its own* workspace (fleet-wz-it / fleet-wz-it2).
+        assert live.mux_workspace != other.mux_workspace
+        for m, pane, foreign in ((live, first.pane_id, other), (other, second.pane_id, live)):
             assert m.owns(pane) is True
-            assert pane not in [str(p['pane_id']) for p in (other if m is live else live)._list()]
+            rows = {r['pane_id']: r for r in m._list()}
+            assert rows[int(pane)]['workspace'] == m.mux_workspace
+            assert m.mux_workspace not in [r['workspace'] for r in foreign._list()]
         live.kill_pane(first.pane_id)
         other.kill_pane(second.pane_id)
     finally:
@@ -146,10 +163,10 @@ def test_two_private_servers_coexist_on_one_machine(live, tmp_path):
 
 
 def test_arrange_on_a_real_server_keeps_one_window(live, tmp_path):
-    sup = live.spawn_window('supervisor', 'exec /bin/sleep 60', start_directory=str(tmp_path))
-    w1 = live.spawn_window('worker-1', 'exec /bin/sleep 60', start_directory=str(tmp_path))
-    w2 = live.spawn_window('worker-2', 'exec /bin/sleep 60', start_directory=str(tmp_path))
-    ctl = live.spawn_window('control', 'exec /bin/sleep 60', metadata={'type': 'daemon'},
+    sup = live.spawn_window('supervisor', '/bin/sleep 60', start_directory=str(tmp_path))
+    w1 = live.spawn_window('worker-1', '/bin/sleep 60', start_directory=str(tmp_path))
+    w2 = live.spawn_window('worker-2', '/bin/sleep 60', start_directory=str(tmp_path))
+    ctl = live.spawn_window('control', '/bin/sleep 60', metadata={'type': 'daemon'},
                             start_directory=str(tmp_path))
     assert all(r.success for r in (sup, w1, w2, ctl))
     try:

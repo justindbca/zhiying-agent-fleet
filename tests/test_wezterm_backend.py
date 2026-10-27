@@ -10,6 +10,7 @@ fake "server" process writes, which is how ``close`` knows to stop only that pid
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -35,7 +36,10 @@ def fake_cli(tmp_path, monkeypatch):
     monkeypatch.setenv('FAKE_WZ_STATE', str(state))
     monkeypatch.setenv('PATH', str(bin_dir) + os.pathsep + os.environ.get('PATH', ''))
     monkeypatch.delenv('WEZTERM_UNIX_SOCKET', raising=False)
-    return {'bin': bin_dir, 'state': state, 'root': tmp_path / 'runtime'}
+    # pytest's per-test tmp path plus ``/wezterm/<token>/mux.sock`` can exceed macOS sockaddr_un; the
+    # backend refuses that (no /tmp fallback, design §4.1), so the fake runtime dir stays short.
+    short = Path(tempfile.mkdtemp(prefix='wz-')).resolve()
+    return {'bin': bin_dir, 'state': state, 'root': short / 'rt', 'short': short}
 
 
 def argv_log(fake_cli):
@@ -53,10 +57,26 @@ def panes(fake_cli):
     return [p['pane_id'] for p in cli_state(fake_cli)['panes'].values()]
 
 
+def pane_rows(fake_cli):
+    """{pane_id: row} of the fake server's view, with the tab's own fields merged in (as ``list`` shows)."""
+    state = cli_state(fake_cli)
+    out = {}
+    for pane in state['panes'].values():
+        tab = state['tabs'].get(str(pane['tab_id']), {})
+        row = dict(pane)
+        row['workspace'] = tab.get('workspace', '')
+        row['tab_title'] = tab.get('title', '')
+        out[pane['pane_id']] = row
+    return out
+
+
 @pytest.fixture
 def mgr(fake_cli, monkeypatch):
     """A started session manager on the fake CLI: a fake mux server then ``get_or_create_session``."""
-    monkeypatch.setattr(wz, '_spawn_mux_server', lambda self: _fake_server(fake_cli, self))
+    def fake_server(self):
+        return _fake_server(fake_cli, self)
+
+    monkeypatch.setattr(wz.WezTermSessionManager, '_spawn_mux_server', fake_server)
     m = wz.WezTermSessionManager('wz-test', state_dir=fake_cli['root'])
     assert m.get_or_create_session() is True
     return m
@@ -64,6 +84,7 @@ def mgr(fake_cli, monkeypatch):
 
 def _fake_server(fake_cli, m):
     """Stand-in for ``wezterm-mux-server --daemonize``: write the socket + pid files the real one leaves."""
+    m.prepare_runtime()
     socket = Path(m.mux_socket)
     socket.parent.mkdir(parents=True, exist_ok=True)
     socket.write_text('fake-mux-socket')
@@ -75,7 +96,7 @@ def _fake_server(fake_cli, m):
 def test_available_needs_both_binaries(fake_cli, monkeypatch):
     monkeypatch.setattr(wz, 'WEZTERM_BIN', None)
     monkeypatch.setattr(wz, 'MUX_BIN', None)
-    monkeypatch.setenv('PATH', str(fake_cli['bin']) + os.pathsep + os.environ.get('PATH', ''))
+    monkeypatch.setenv('PATH', str(fake_cli['bin']))  # only our fakes: no /opt/homebrew/wezterm
     assert wz.WezTermSessionManager.available() is True
     (fake_cli['bin'] / 'wezterm-mux-server').unlink()
     monkeypatch.setattr(wz, 'MUX_BIN', None)
@@ -87,7 +108,7 @@ def test_available_rejects_a_too_old_wezterm(fake_cli, monkeypatch):
     monkeypatch.setattr(wz, 'WEZTERM_BIN', None)
     monkeypatch.setattr(wz, 'MUX_BIN', None)
     monkeypatch.setenv('FAKE_WZ_VERSION', 'wezterm 20230712-072601-f4abf8fd')
-    monkeypatch.setenv('PATH', str(fake_cli['bin']) + os.pathsep + os.environ.get('PATH', ''))
+    monkeypatch.setenv('PATH', str(fake_cli['bin']))
     assert wz.WezTermSessionManager.available() is False
     assert '20240203' in (wz.availability_problem() or '')
 
@@ -95,7 +116,7 @@ def test_available_rejects_a_too_old_wezterm(fake_cli, monkeypatch):
 def test_available_parses_the_dependency_floor(fake_cli, monkeypatch):
     monkeypatch.setattr(wz, 'WEZTERM_BIN', None)
     monkeypatch.setattr(wz, 'MUX_BIN', None)
-    monkeypatch.setenv('PATH', str(fake_cli['bin']) + os.pathsep + os.environ.get('PATH', ''))
+    monkeypatch.setenv('PATH', str(fake_cli['bin']))
     monkeypatch.setenv('FAKE_WZ_VERSION', 'wezterm 20240203-110809-5046fc22')
     assert wz.WezTermSessionManager.available() is True
 
@@ -109,15 +130,18 @@ def test_private_server_gets_its_own_home_and_short_socket(fake_cli, monkeypatch
     """The probe showed the pid lock lives in $HOME/.local/share/wezterm: each run needs its own HOME."""
     seen = {}
 
+    m = wz.WezTermSessionManager('wz-home', state_dir=fake_cli['root'])
+    m.prepare_runtime()
+
     def run(cmd, **kw):
         seen['cmd'] = cmd
         seen['env'] = kw.get('env') or {}
         from types import SimpleNamespace
+        Path(m.mux_socket).write_text('fake-mux-socket')  # what the daemonized server leaves behind
+        Path(m.mux_pid_file).write_text(str(os.getpid()))
         return SimpleNamespace(returncode=0, stdout='', stderr='')
 
     monkeypatch.setattr(wz.subprocess, 'run', run)
-    monkeypatch.setattr(wz, '_spawn_mux_server', lambda self: _fake_server(fake_cli, self))
-    m = wz.WezTermSessionManager('wz-home', state_dir=fake_cli['root'])
     m._start_mux_server()
     home = Path(seen['env']['HOME'])
     assert home == Path(m.mux_home).resolve()
@@ -147,11 +171,15 @@ def test_every_cli_call_is_pinned_to_the_private_socket_and_no_auto_start(mgr, f
 
 def test_close_kills_only_the_recorded_pid(mgr, fake_cli, monkeypatch):
     killed = []
-    monkeypatch.setattr(wz, '_pid_alive', lambda pid: pid == int(Path(mgr.mux_pid_file).read_text()))
+    recorded = int(Path(mgr.mux_pid_file).read_text())
+    mgr.mux_pid = recorded  # as _start_mux_server records it
+    monkeypatch.setattr(wz, '_pid_alive', lambda pid: pid == recorded)
     monkeypatch.setattr(wz.os, 'kill', lambda pid, sig: killed.append((pid, sig)))
     assert mgr.close_all() is True
-    assert killed == [(os.getpid(), wz.signal.SIGTERM)]
-    assert mgr.mux_pid_file is None or not Path(getattr(mgr, 'mux_pid_file', '')).exists()
+    # SIGTERM first, then SIGKILL only because this stub never lets the pid die.
+    assert killed[0] == (recorded, wz.signal.SIGTERM)
+    assert {pid for pid, _ in killed} == {recorded}, 'no pid but the recorded one may be signalled'
+    assert mgr.mux_pid is None
 
 
 def test_close_never_kills_a_pid_it_did_not_start(mgr, monkeypatch):
@@ -173,7 +201,7 @@ def test_spawn_window_opens_a_window_in_the_run_workspace(mgr, fake_cli):
                 or 'spawn' in c['argv'])
     assert call['argv'].count('--new-window') == 1
     assert mgr.mux_workspace in call['argv']
-    row = {p['pane_id']: p for p in cli_state(fake_cli)['panes']}[int(res.pane_id)]
+    row = pane_rows(fake_cli)[int(res.pane_id)]
     assert row['workspace'] == mgr.mux_workspace
     assert mgr.owns(res.pane_id) is True
 
@@ -183,10 +211,11 @@ def test_spawn_runs_the_command_through_a_launcher_script(mgr, fake_cli):
     res = mgr.spawn_window('worker-2', 'exec /bin/echo hi', start_directory='/tmp')
     assert res.success
     call = next(c for c in argv_log(fake_cli) if 'spawn' in c['argv'])
-    cmd = call['argv'][call['argv'].index('--') + 1:]
-    assert cmd[0] == 'exec /bin/bash' or cmd[:2] == ['/bin/bash', '-lc'] or '/bin/bash' in ' '.join(cmd)
-    args = ' '.join(call['argv'])
-    assert 'echo hi' in args or Path(call['argv'][-1]).exists()
+    # ``bash -lc "<launcher>"`` where the launcher script carries cd + the caller's command.
+    assert call['argv'][-3:-1] == ['bash', '-lc']
+    launcher = Path(call['argv'][-1].split('/bin/bash ', 1)[1].strip("'"))
+    assert launcher.exists() and 'echo hi' in launcher.read_text()
+    assert 'cd /tmp' in launcher.read_text()
 
 
 def test_same_window_new_tab_uses_pane_id(mgr, fake_cli):
@@ -196,7 +225,7 @@ def test_same_window_new_tab_uses_pane_id(mgr, fake_cli):
     call = [c for c in argv_log(fake_cli) if 'spawn' in c['argv']][-1]
     assert '--pane-id' in call['argv']
     assert '--new-window' not in call['argv']
-    rows = {p['pane_id']: p for p in cli_state(fake_cli)['panes']}
+    rows = pane_rows(fake_cli)
     assert rows[int(sup.pane_id)]['window_id'] == rows[int(wk.pane_id)]['window_id']
     assert rows[int(sup.pane_id)]['tab_id'] != rows[int(wk.pane_id)]['tab_id']
 
@@ -205,7 +234,7 @@ def test_split_pane_right_and_bottom(mgr, fake_cli):
     sup = mgr.spawn_window('supervisor', 'sleep 60', start_directory='/tmp')
     peer = mgr.spawn_window('worker-1', 'sleep 60', start_directory='/tmp')
     assert mgr.place_right_of(peer.pane_id, sup.pane_id) is True
-    rows = {p['pane_id']: p for p in cli_state(fake_cli)['panes']}
+    rows = pane_rows(fake_cli)
     assert rows[int(peer.pane_id)]['left_col'] > rows[int(sup.pane_id)]['left_col']
     call = [c for c in argv_log(fake_cli) if 'split-pane' in c['argv']][-1]
     assert '--right' in call['argv'] and '--percent' in call['argv']
@@ -218,7 +247,7 @@ def test_split_pane_right_and_bottom(mgr, fake_cli):
 def test_rename_sets_the_tab_title(mgr, fake_cli):
     sup = mgr.spawn_window('supervisor', 'sleep 60', start_directory='/tmp')
     mgr.rename(sup.pane_id, 'supervisor-1')
-    rows = {p['pane_id']: p for p in cli_state(fake_cli)['panes']}
+    rows = pane_rows(fake_cli)
     assert rows[int(sup.pane_id)]['tab_title'] == 'supervisor-1'
     call = [c for c in argv_log(fake_cli) if 'set-tab-title' in c['argv']][-1]
     assert call['argv'][-1] == 'supervisor-1'
@@ -308,7 +337,7 @@ def test_focus_activates_the_pane(mgr, fake_cli):
     sup = mgr.spawn_window('supervisor', 'sleep 60', start_directory='/tmp')
     wk = mgr.spawn_window('worker-1', 'sleep 60', start_directory='/tmp')
     assert mgr.focus(sup.pane_id) is True
-    rows = {p['pane_id']: p for p in cli_state(fake_cli)['panes']}
+    rows = pane_rows(fake_cli)
     assert rows[int(sup.pane_id)]['is_active'] is True and rows[int(wk.pane_id)]['is_active'] is False
 
 
@@ -318,8 +347,12 @@ def test_process_state_queries_use_the_pane_tty(mgr, fake_cli, monkeypatch):
     tty = mgr.get_pane_status(sup.pane_id).metadata['tty_name']
     calls = []
 
+    real_run = wz.subprocess.run
+
     def run(cmd, **kw):
         from types import SimpleNamespace
+        if cmd[0] != 'ps':  # only the process query is stubbed; `wezterm cli` still hits the fake CLI
+            return real_run(cmd, **kw)
         calls.append(cmd)
         if '-o' in cmd and 'comm=' in cmd:
             return SimpleNamespace(returncode=0, stdout='/bin/sleep\n/usr/local/bin/codex\n', stderr='')
@@ -353,7 +386,7 @@ def test_arrange_puts_workers_in_their_own_tabs(mgr, fake_cli):
     w2 = mgr.spawn_window('worker-2', 'sleep 60', start_directory='/tmp')
     ctl = mgr.spawn_window('control', 'sleep 60', metadata={'type': 'daemon'}, start_directory='/tmp')
     assert mgr.arrange(sup.pane_id, [w1.pane_id, w2.pane_id], 'file:///history.html') is None
-    rows = {p['pane_id']: p for p in cli_state(fake_cli)['panes']}
+    rows = pane_rows(fake_cli)
     sup_row = rows[int(sup.pane_id)]
     assert rows[int(w1.pane_id)]['tab_id'] != sup_row['tab_id']
     assert rows[int(w2.pane_id)]['tab_id'] != sup_row['tab_id']
@@ -371,7 +404,7 @@ def test_tab_into_degrades_to_the_target_tab(mgr, fake_cli):
     sup = mgr.spawn_window('supervisor', 'sleep 60', start_directory='/tmp')
     wk = mgr.spawn_window('worker-1', 'sleep 60', start_directory='/tmp')
     assert mgr.tab_into(wk.pane_id, sup.pane_id) is True
-    rows = {p['pane_id']: p for p in cli_state(fake_cli)['panes']}
+    rows = pane_rows(fake_cli)
     assert rows[int(wk.pane_id)]['tab_id'] == rows[int(sup.pane_id)]['tab_id']
 
 
@@ -401,7 +434,10 @@ def test_session_exists_and_close_all(mgr, fake_cli):
 
 # -- failure paths ---------------------------------------------------------------------------------------
 def test_spawn_failure_is_reported_not_swallowed(fake_cli, monkeypatch):
-    monkeypatch.setattr(wz, '_spawn_mux_server', lambda self: _fake_server(fake_cli, self))
+    def fake_server(self):
+        return _fake_server(fake_cli, self)
+
+    monkeypatch.setattr(wz.WezTermSessionManager, '_spawn_mux_server', fake_server)
     monkeypatch.setenv('FAKE_WZ_FAIL', 'spawn')
     m = wz.WezTermSessionManager('wz-fail', state_dir=fake_cli['root'])
     assert m.get_or_create_session() is True
