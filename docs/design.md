@@ -754,7 +754,7 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 
 fleet 只通过 `fleet.manager_for(cfg)` 造出的那一个对象碰终端（原 `fleet.py:210`）。该对象的公开方法就是后端接口，写在 `cmux_fleet/backends/base.py`：
 
-- `METHODS`：40 个方法的清单（会话 `available` / `session_exists` / `get_or_create_session` / `claim_run` / `workspace_id` / `select_workspace` / `keep_windows_open` / `owns` / `close_all`；开窗 `spawn_window` / `spawn_window_raise` / `spawn_interactive_cli`；读写 `send_prompt_to_idle` / `send_key` / `capture_output` / `capture_to`；状态 `get_pane_status` / `has_cli_process` / `process_states` / `process_cpu`；标签焦点 `rename` / `focus` / `kill_pane`；布局 `arrange` / `dock_control_alone` / `dock_tab` / `dock_control` / `place_right_of` / `place_after` / `tab_into` / `tab_panes`；浏览器格 `browser_goto` / `browser_url` / `reload_browser`；移交 `release` / `adopt`；tmux 视图 `tmux_view_info` / `attach_view` / `tmux_session_alive` / `reattach_client` / `detach_view`），签名与 `CmuxSessionManager` 完全一致。
+- `METHODS`：39 个方法的清单（会话 `available` / `session_exists` / `get_or_create_session` / `claim_run` / `workspace_id` / `select_workspace` / `keep_windows_open` / `owns` / `close_all`；开窗 `spawn_window` / `spawn_interactive_cli`；读写 `send_prompt_to_idle` / `send_key` / `capture_output` / `capture_to`；状态 `get_pane_status` / `has_cli_process` / `process_states` / `process_cpu`；标签焦点 `rename` / `focus` / `kill_pane`；布局 `arrange` / `dock_tab` / `dock_control` / `place_right_of` / `place_after` / `tab_into` / `tab_panes`；浏览器格 `browser_goto` / `browser_url` / `reload_browser`；移交 `release` / `adopt`；tmux 视图 `tmux_view_info` / `attach_view` / `tmux_session_alive` / `reattach_client` / `detach_view`），签名与 `CmuxSessionManager` 完全一致。
 - `TerminalBackend`（`typing.Protocol`）是同一清单的类型视图；`Capabilities(browser, nested_tabs)` 与类属性 `supports_browser` / `nested_tabs` 是 fleet 唯一看的能力位。
 - 构造器统一 `(session_name, agents_title, control_title, state_dir=None)`；`backends.build(name, session, **extra)` 惰性 import 对应模块。
 - 两个后端各自的可用性：`available()`（类方法/静态方法，cmux 就是 `cmux_available()`）、`unavailable_reason(name)`（cmux 由 `cmux_available()` 决定，WezTerm 报缺哪个程序/版本）。
@@ -774,7 +774,8 @@ fleet 只通过 `fleet.manager_for(cfg)` 造出的那一个对象碰终端（原
 
 ### 33.4 版面降级（WezTerm）
 
-- cmux 版面（§2）：监工左上、右侧 worker 标签、左下 history/control 标签，依赖「分屏里再分标签」。WezTerm 没有这层：**一个窗口；第 1 个标签 = 监工（左）+ control（右下分屏）；每个 worker 一个标签**；`tab_into` / `dock_*` / `place_*` 降级为「放进对应标签 / 无操作并返回 True」，不报错；`arrange()` 在 `supports_browser = False` 时排好 worker 后调 `dock_control_alone()` 并返回 `None`。
+- cmux 版面（§2）：监工左上、右侧 worker 标签、左下 history/control 标签，依赖「分屏里再分标签」。WezTerm 没有这层：**一个窗口；第 1 个标签 = 监工（左）+ control（右下分屏）；每个 worker 一个标签**；`tab_into` / `dock_*` / `place_*` 降级为「放进对应标签 / 无操作并返回 True」，不报错；`arrange()` 在 `supports_browser = False` 时排好 worker、把 control 放进第 1 个标签（右下分屏，由 WezTerm 后端自己实现）后返回 `None`。
+- 版面与历史是 fleet 仅有的两处读能力位的地方（`Fleet.announce_history_page()` / `subfleet.follow_jump()` 看 `supports_browser`）；其余调用路径一律走原接口，cmux 后端除 `available()` / `supports_browser` / `nested_tabs` 外与搬家前逐行一致。
 - 历史页：`supports_browser = False` 时不建浏览器格；`Fleet.announce_history_page()` 在 control 里打印 `<run>/history.html` 路径，并在有图形环境时用一次系统打开（macOS `open` / Linux `xdg-open`，没有就只打印）；`refresh_history()` 只在有浏览器格时 `reload_browser`；`subfleet.follow_jump()` 在没有页面时直接返回（也不再每拍调 cmux）。cmux 这些分支全部保持原调用不变。
 
 ### 33.5 平台小改

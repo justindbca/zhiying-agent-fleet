@@ -436,14 +436,6 @@ class CmuxSessionManager:
         self.rename(sid, window_name)
         return SpawnResult(success=True, pane_id=sid, window_name=window_name)
 
-    def spawn_window_raise(self, window_name: str, command: str, metadata: Optional[Dict[str, str]] = None,
-                           start_directory: Optional[str] = None) -> SpawnResult:
-        """``spawn_window`` for a backend that cannot type a command into a shell (WezTerm): it runs
-        ``command`` at the moment it opens the tab. cmux is the opposite (its ``--command`` is typed by
-        the login shell once the prompt is up, docs above) and keeps ``spawn_window``; fleet calls this
-        one for control windows (the daemon) and takes the refusal of a backend that lacks it."""
-        return SpawnResult(success=False, error='backend cannot start a command without a shell (use spawn_window)')
-
     # -- companion tabs (roster ``tabs:``, docs/design.md §31) -------------------
     def tab_panes(self) -> Dict[str, str]:
         """{surface id: tab name} of the companion tabs this registry owns that cmux still shows."""
@@ -809,10 +801,6 @@ class CmuxSessionManager:
         on the right (worker-1, worker-2, ... in order).
 
         Returns the history browser surface (None if it could not be created).
-
-        A backend without a browser surface (``supports_browser`` false, design §4.3) has no history
-        tab to return: workers are still put side by side / as tabs, the URL is not opened anywhere and
-        ``None`` tells fleet the page is not on screen (it prints the path instead).
         """
         ws = self._where(supervisor)
         if not ws:
@@ -821,7 +809,7 @@ class CmuxSessionManager:
         # is not ours to reuse or remove; refuse rather than nesting into its layout.
         live = self._surfaces(ws)
         histories = [(sid, info) for sid, info in self._meta()['surfaces'].items()
-                     if info.get('type') == 'history' and sid in live] if self.supports_browser else []
+                     if info.get('type') == 'history' and sid in live]
         if len(histories) > 1 or any(info.get('url') != history_url for _, info in histories):
             return None
         if any(self._where(w) != ws for w in workers):
@@ -834,9 +822,6 @@ class CmuxSessionManager:
                 first = w
             elif not self.tab_into(w, first, before=False):
                 return None
-        if not self.supports_browser:  # no history tab: control keeps its own workspace
-            self.dock_control_alone()
-            return None
         pane = self._surfaces(ws)[supervisor]['pane_id']
         if histories:
             sid = histories[0][0]
@@ -857,11 +842,6 @@ class CmuxSessionManager:
         self.dock_control(sid)
         _run('focus-panel', '--workspace', ws, '--panel', supervisor)
         return sid
-
-    def dock_control_alone(self) -> int:
-        """Degraded layout (design §4.3): control docks after the agents instead of after the history
-        tab, which this backend does not have. Returns the number of control panes moved."""
-        raise NotImplementedError('backend declares no browser but cannot dock control without one')
 
     def reload_browser(self, surface: str) -> bool:
         return bool(self._where(surface)) and _run('browser', '--surface', surface, 'reload').returncode == 0
