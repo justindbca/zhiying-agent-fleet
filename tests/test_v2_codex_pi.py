@@ -147,15 +147,24 @@ def test_mixed_stale_duplicate_and_manual_turns_rejected(codex_pi):
     assert f.r.llen(f.v2.bus.pending_key('supervisor')) == 1     # one report follow-up only
 
 
-def test_invalid_pi_report_blocks_without_tui_retries(codex_pi):
+def test_invalid_pi_report_gets_corrections_then_blocks(codex_pi):
+    """G1: a malformed pi report is corrected like an official CLI's, not a whole-task BLOCKED at once."""
     f = codex_pi
     submit(f)
     answer_turn(f, 'supervisor', decision(['worker-1']))
     f.pump()
     env = receive(f, 'worker-1')
-    settle(f, 'worker-1', env, {'done': 'prose'})
+    for attempt in range(1, runtime_v2.TUI_REPORT_RETRIES + 1):
+        settle(f, 'worker-1', env, {'done': 'prose'})
+        assert f.v2.bus.message(env['message_id'])['outcome'] == 'failed'  # never a fake success
+        assert f.task()['status'] == 'running' and not f.paused()
+        assert f.agent('worker-1')['report_retries'] == str(attempt)
+        assert f.r.llen(f.v2.bus.pending_key('supervisor')) == 0  # no bogus report
+        f.pump()  # the correction goes through the normal delivery path
+        env = receive(f, 'worker-1')
+        assert 'Call fleet_result exactly once' in env['body']['text'] and 'Do not redo the work' in env['body']['text']
+    settle(f, 'worker-1', env, {'done': 'still prose'})
     assert f.task()['status'] == 'blocked'
-    assert f.agent('worker-1').get('report_retries', '0') in ('', '0')
 
 
 def test_service_request_routed_by_codex_result_card_rendered_off_model(codex_pi_service):

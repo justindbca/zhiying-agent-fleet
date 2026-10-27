@@ -102,7 +102,7 @@ def startup_problem(ev):
     return 'reply was not READY: ' + repr(str(ev.get('text') or '')[:200])
 
 
-TUI_REPORT_RETRIES = 2  # corrections for an official-CLI task worker report before blocking
+TUI_REPORT_RETRIES = 2  # corrections for a task worker's malformed report (any CLI) before blocking the task
 
 # Bridge faults that only echo a hold the daemon (or the delivery itself) already decided: not a lost link.
 # Any other bridge fault (its own Redis error, child crash, lease not renewed) means the link is gone and
@@ -1227,17 +1227,22 @@ class RuntimeV2:
                 return
             self.release(env, value, 'failed' if error else 'completed')
             retries = int(info.get('report_retries') or 0)
-            if error and tui_slot(self.slot_cfg(slot), slot) and retries < TUI_REPORT_RETRIES:
-                # Official CLIs report in free text (no fleet_result tool). Like the
-                # supervisor's correction path, ask this worker to resend through the
-                # normal FIFO delivery (new delivery/fence, same generation); never
-                # invent done/evidence. Repeated failure still blocks the task.
+            if error and retries < TUI_REPORT_RETRIES:
+                # A malformed report is this worker's correctable mistake, not the task's failure (G1, design
+                # §4 回收): like the supervisor's correction path, ask it to resend through the normal FIFO
+                # delivery (new delivery/fence, same generation); never invent done/evidence, never hold the
+                # other slots. Repeated failure still blocks the task.
                 self.f.setf(slot, report_retries=retries + 1)
                 self.audit('candidate.invalid', slot=slot, error=error, level='warn',
                            detail={'retry': retries + 1, 'limit': TUI_REPORT_RETRIES})
-                self.f.queue(slot, 'Your last report is not in the AGENTS.md reply format (' + error
-                             + '). Do not redo the work. Resend only the report, one heading per line: '
-                             'Done: / Evidence: / Not done: / Blocked: (each heading followed by a colon).')
+                if tui_slot(self.slot_cfg(slot), slot):  # official CLIs report in free text (no fleet_result tool)
+                    self.f.queue(slot, 'Your last report is not in the AGENTS.md reply format (' + error
+                                 + '). Do not redo the work. Resend only the report, one heading per line: '
+                                 'Done: / Evidence: / Not done: / Blocked: (each heading followed by a colon).')
+                else:
+                    self.f.queue(slot, 'Your last turn ended without a valid fleet_result (' + error + '). Do not '
+                                 'redo the work. Call fleet_result exactly once, as your only final tool call, with '
+                                 'done / evidence / not_done / blocked for the instruction you just finished.')
             elif error:
                 self.f.finish('blocked', slot + ': ' + error)
             else:
