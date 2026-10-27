@@ -299,6 +299,18 @@ def tree_agents(run):
 
 
 # ------------------------------------------------------------------ limits / refusal reasons
+def backend_problem(cfg):
+    """None when this run's terminal backend can host sub-fleets, else the one refusal (design §33.4).
+
+    A sub-fleet hands a live pane from the parent's registry to the child's (release / adopt, tmux views).
+    WezTerm runs one private mux server per run, so a child fleet cannot see or take the parent's panes."""
+    if _fleet().run_backend(cfg) != 'wezterm':
+        return None
+    return ('sub-fleets are not supported on the wezterm backend: each run has its own private mux server, '
+            'so a child fleet cannot take over a pane of its parent (docs/design.md §33.4); '
+            'start this fleet with --backend cmux to use sub-fleets')
+
+
 def check(f, slot, task_id, workers, ready=True, named=None):
     """None when this sub-fleet may start now, else the reason (refusals are enforced by program).
 
@@ -307,6 +319,9 @@ def check(f, slot, task_id, workers, ready=True, named=None):
     ``named``: a roster ``subfleets:`` entry (§29): ``task_id`` is its name; the M<n> id, depth and
     max_attempts rules (made for split tasks) do not apply, its workers run the entry's model."""
     fleet = _fleet()
+    problem = backend_problem(f.cfg)
+    if problem:
+        return problem
     lim = limits(f.cfg)
     if not named and not valid_child_id(f.cfg.get('task_id'), task_id):
         want = (f.cfg['task_id'] + '.<n>') if f.cfg.get('task_id') else 'M<n>'
@@ -691,6 +706,7 @@ def spawn_child(f, slot, task_id, goal, workers, output=None, proposal=None, lau
     path = list(f.cfg.get('title_path') or [name]) + [slot, task_id]
     ws_title = title(path)
     child_mgr = fleet.manager_for({'session': session_name(task_id), 'cmux_state_dir': f.cfg.get('cmux_state_dir'),
+                                   'backend': f.cfg.get('backend'),  # the child runs on the parent's backend
                                    'agents_title': ws_title, 'control_title': 'Fleet control · ' + task_id})
     if child_mgr.session_exists():
         raise Refused('tabs of an earlier sub-fleet ' + task_id + ' are still open; close them first')
@@ -758,8 +774,8 @@ def rollback(f, rec_dir, rec, released, cfg):
     fleet = _fleet()
     if cfg and cfg.get('redis_socket'):
         shutdown_redis(cfg)
-    fleet.manager_for({'session': session_name(rec['task_id']), 'cmux_state_dir': f.cfg.get('cmux_state_dir')}
-                      ).release(rec['pane'])
+    fleet.manager_for({'session': session_name(rec['task_id']), 'cmux_state_dir': f.cfg.get('cmux_state_dir'),
+                       'backend': f.cfg.get('backend')}).release(rec['pane'])
     if released is not None and not rec.get('view'):
         f.mgr._tag(rec['pane'], **{k: v for k, v in released.items() if isinstance(v, str)})
     f.setf(rec['slot'], state='idle', pane=rec['pane'], delegated_pane='', delegated_task='', delegate_cfg='')
@@ -804,6 +820,9 @@ def adopted(cfg, slot='supervisor', generation=None):
 
 def start_adopted(f):
     """Child daemon first boot: spawn the workers, take over the delegated pane top-left, ask for READY."""
+    problem = backend_problem(f.cfg)
+    if problem:  # a child config inherits the parent's backend: nothing to adopt across mux servers
+        return f.finish('blocked', problem)
     fleet = _fleet()
     from cmux_fleet import history
     adopt = f.cfg['adopt']

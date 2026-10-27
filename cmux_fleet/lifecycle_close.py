@@ -360,10 +360,15 @@ def ownership_problem(meta, run):
 def all_gone(mgr, meta, wait=10.0):
     """Re-check after close_all reported a failure: on real cmux the last surface of a workspace can
     linger a few seconds after its process tree is killed (and closing it closes the workspace, so the
-    later close-workspace finds nothing). Closed only when no surface of ours is live any more."""
+    later close-workspace finds nothing). Closed only when no surface of ours is live any more.
+
+    Asked through the backend interface (``session_exists``): on cmux that is exactly "a live surface in
+    the registry's agents or control workspace" (close_all never drops those two keys, so ``meta`` and
+    the registry name the same workspaces); on WezTerm it is "our private mux server still lists a pane"."""
+    _ = meta
     deadline = time.monotonic() + wait
     while True:
-        live = [ws for ws in (meta.get('workspace'), meta.get('control_workspace')) if ws and mgr._surfaces(ws)]
+        live = mgr.session_exists()
         if not live or time.monotonic() >= deadline:
             return not live
         time.sleep(.5)

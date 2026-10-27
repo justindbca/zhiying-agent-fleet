@@ -430,6 +430,9 @@ class Registry:
     def _surfaces(self, ws):
         return {} if self.ok or ws is None else {'s1': {}}
 
+    def session_exists(self):  # cmux's definition, over this fake's surfaces
+        return any(self._surfaces(self.meta.get(k)) for k in ('workspace', 'control_workspace'))
+
 
 def test_closer_only_closes_a_registry_owned_by_this_run(tmp_path):
     run = tmp_path / 'run'

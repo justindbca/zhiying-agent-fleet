@@ -5453,6 +5453,8 @@ class Fleet:
             workers, roles, profiles = roster.parse_entries(raw, Path(path).parent)
             table, per_worker = roster.handoff(raw)
             subfleets = roster.subfleets(raw, Path(path).parent)  # §29 (exempt from the used-name rule)
+            if subfleets and subfleet.backend_problem(self.cfg):  # §33.4: none on WezTerm; keep the old roster
+                raise ValueError(subfleet.backend_problem(self.cfg))
             # A slot name used earlier in this run still has Redis state and a workspace.
             used = [n + ': name was already used in this run (agent state or workspace exists); pick a new name'
                     for n in workers if n not in self.workers
@@ -6194,7 +6196,13 @@ class Fleet:
                         self.finish('blocked', name + ' tab was closed')
 
     def run(self):
-        self.mgr.get_or_create_session()
+        if not self.mgr.get_or_create_session() and run_backend(self.cfg) != 'cmux':
+            # No session, no fleet: stop with the backend's reason (Redis and the run stay for --resume).
+            # cmux is left as it was: its session is a `cmux ping`, and a daemon running inside a cmux tab
+            # has always carried on past a missed ping (workspaces are created on the first spawn).
+            why = getattr(self.mgr, 'last_error', '') or 'no reason given'
+            self.log('backend.session_failed', backend=run_backend(self.cfg), reason=why)
+            raise SystemExit('backend ' + run_backend(self.cfg) + ' could not create its session: ' + why)
         if self.v2:
             return self.v2.run()
         self.start_all()
@@ -6399,9 +6407,11 @@ def resume(run, args):
     if live_run:  # an idempotent --resume: nothing to do, and nothing to probe
         print('this run still has a live daemon; nothing to resume:', run)
         return True
-    backend, why = resolve_backend(cfg.get('backend'))
+    # A config without `backend` (a run started before the choice existed) is a cmux run: never re-decided
+    # here, so a resume where cmux does not answer is refused as before instead of moving the run to WezTerm.
+    backend, why = resolve_backend(cfg.get('backend') or 'cmux')
     if why:  # refused before anything is provisioned: Redis stays as it is
-        raise SystemExit('cannot resume ' + str(run) + ': backend ' + str(cfg.get('backend'))
+        raise SystemExit('cannot resume ' + str(run) + ': backend ' + str(backend)
                          + ' is not usable here: ' + why)
     cfg['backend'] = backend
     if args.max_attempts is not None:
@@ -6427,6 +6437,8 @@ def resume(run, args):
             raise SystemExit('--advisor: roster not written: ' + str(exc)) from exc
     if not live_run and not backends_check(backend):  # a live daemon keeps its own backend running
         raise SystemExit(unavailable_text(backend))
+    if cfg.get('subfleets') and subfleet.backend_problem(cfg):
+        raise SystemExit('cannot resume ' + str(run) + ': ' + subfleet.backend_problem(cfg))
     sweep_orphan_redis(keep=run)
     try:
         r = connect(cfg)  # only the daemon died: its Redis is still up
@@ -6465,8 +6477,8 @@ def resume(run, args):
     command = [cfg['python'], str(Path(__file__).resolve()), 'daemon', str(path), '--resume']
     command = keep_awake_prefix() + command  # keep_awake_prefix: caffeinate / systemd-inhibit / nothing
     result = mgr.spawn_window('control', shlex.join(command), metadata={'type': 'daemon'}, start_directory=str(run))
-    if not result.success:
-        raise SystemExit(result.error)  # Redis stays up: start --resume can be retried
+    if not result.success:  # Redis stays up: start --resume can be retried
+        raise SystemExit(result.error or 'backend ' + backend + ': the daemon tab could not be opened')
     save(LATEST, dict(cfg, config=str(path)))
     print('fleet resumed (' + cfg.get('mode', 'task') + ' mode). Run directory:', run)
     return True
@@ -6655,10 +6667,14 @@ def start(args):
             raise SystemExit('--worker-kit rejected: ' + str(exc)) from exc
     worker_domains = parse_worker_domains(getattr(args, 'worker_domains', None), args.worker_kit)
     backend, why = resolve_backend(getattr(args, 'backend', None))
-    if why:  # an explicit --backend that this machine cannot run: refuse before provisioning
+    if why:  # the chosen backend cannot run here: refuse before provisioning
+        if getattr(args, 'backend', None) is None:  # the default (cmux on a Mac with cmux): its own reason
+            raise SystemExit(why)
         raise SystemExit('--backend ' + str(args.backend) + ' cannot run here: ' + why)
     if not backends_check(backend):
         raise SystemExit(unavailable_text(backend))
+    if roster_path and roster.load_subfleets(roster_path) and subfleet.backend_problem({'backend': backend}):
+        raise SystemExit('--roster ' + str(roster_path) + ' rejected:\n' + subfleet.backend_problem({'backend': backend}))
     clis = {args.supervisor_cli, args.worker_cli} | profile_clis  # night cards need their CLI at start
     codex = args.codex or shutil.which('codex')
     pi = args.pi or shutil.which('pi')
@@ -6790,7 +6806,7 @@ def start(args):
     result = mgr.spawn_window('control', shlex.join(command), metadata={'type': 'daemon'}, start_directory=str(run))
     if not result.success:
         connect(cfg).shutdown()
-        raise SystemExit(result.error)
+        raise SystemExit(result.error or 'backend ' + backend + ': the daemon tab could not be opened')
     if hasattr(mgr, 'claim_run'):
         mgr.claim_run(str(run))  # the lifecycle closer only closes a registry tagged with this run
     save(LATEST, dict(cfg, config=str(run / 'config.json')))

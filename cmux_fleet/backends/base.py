@@ -159,20 +159,30 @@ def unavailable_reason(name: str) -> Optional[str]:
     return availability_problem()
 
 
-def default_backend(platform: Optional[str] = None) -> str:
-    """No ``--backend``: cmux on macOS when cmux is usable, otherwise WezTerm (design §5).
+def cmux_installed() -> bool:
+    """A cmux binary is on this machine (``CMUX_BIN`` / the cmux.app path, or ``cmux`` on PATH).
+    Installed is not usable: whether it answers is ``unavailable_reason('cmux')``'s question."""
+    import shutil
+    from cmux_fleet.backends import cmux
+    return bool(shutil.which(str(cmux.CMUX)) or shutil.which('cmux'))
 
-    Refusing cmux on macOS never *widens* what a fleet runs on: while the WezTerm backend is unusable
-    too, the answer falls through to the cmux probe, which then reports its own reason -- the message
-    a fleet got before the choice existed.
+
+def default_backend(platform: Optional[str] = None) -> str:
+    """No ``--backend``: cmux on a Mac with cmux installed, otherwise WezTerm (design §5).
+
+    A Mac with cmux installed always gets cmux, usable or not (ssh / Terminal.app, where cmux does not
+    answer): ``check_backend`` then refuses with cmux's own "run this inside a cmux terminal" -- the
+    message a fleet got before the choice existed -- and the run never silently becomes a WezTerm run.
+    WezTerm is the default only off macOS or where cmux is not installed; even then, while the WezTerm
+    backend is unusable too, the answer stays cmux so the cmux reason is what gets reported.
     """
     platform = sys.platform if platform is None else platform
     if platform == 'darwin':
         try:
-            if unavailable_reason('cmux') is None:
+            if cmux_installed():
                 return 'cmux'
-        except Exception:  # a broken cmux binary is a reason for WezTerm, never a crash
-            pass
+        except Exception:  # cannot tell: stay on cmux (its probe reports why it cannot run)
+            return 'cmux'
         try:
             if unavailable_reason('wezterm') is not None:
                 return 'cmux'

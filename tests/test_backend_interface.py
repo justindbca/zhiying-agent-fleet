@@ -115,12 +115,18 @@ def test_names_are_normalized():
 
 
 def test_default_backend_on_macos_prefers_cmux(monkeypatch):
+    monkeypatch.setattr(base, 'cmux_installed', lambda: True)
     monkeypatch.setattr(base, 'unavailable_reason', lambda name: None)
     assert base.default_backend('darwin') == 'cmux'
-    # no cmux and no usable WezTerm either: fall through to cmux, whose own probe then reports why
+    # cmux installed but not answering (ssh / Terminal.app), WezTerm usable: still cmux, refused by its probe
+    monkeypatch.setattr(base, 'unavailable_reason',
+                        lambda name: 'no cmux here' if name == 'cmux' else None)
+    assert base.default_backend('darwin') == 'cmux'
+    # no cmux installed and no usable WezTerm either: fall through to cmux, whose own probe then reports why
+    monkeypatch.setattr(base, 'cmux_installed', lambda: False)
     monkeypatch.setattr(base, 'unavailable_reason', lambda name: 'no cmux here')
     assert base.default_backend('darwin') == 'cmux'
-    # no cmux, WezTerm usable: WezTerm
+    # no cmux installed, WezTerm usable: WezTerm
     monkeypatch.setattr(base, 'unavailable_reason',
                         lambda name: 'no cmux here' if name == 'cmux' else None)
     assert base.default_backend('darwin') == 'wezterm'
@@ -128,9 +134,9 @@ def test_default_backend_on_macos_prefers_cmux(monkeypatch):
 
 
 def test_default_backend_survives_a_broken_cmux(monkeypatch):
-    monkeypatch.setattr(base, 'unavailable_reason', lambda name: None if name == 'wezterm'
-                        else (_ for _ in ()).throw(OSError('cmux binary exploded')))
-    assert base.default_backend('darwin') == 'wezterm'
+    monkeypatch.setattr(base, 'cmux_installed', lambda: (_ for _ in ()).throw(OSError('cmux binary exploded')))
+    monkeypatch.setattr(base, 'unavailable_reason', lambda name: None)
+    assert base.default_backend('darwin') == 'cmux'  # cannot tell: stay on cmux, never crash
 
 
 def test_check_backend_refuses_an_unusable_one(monkeypatch):
