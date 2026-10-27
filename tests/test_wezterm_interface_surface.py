@@ -5,9 +5,7 @@ checklist and is owned as a shared file: this branch does not edit it, and it ca
 exemption either. The supervisor's ruling ("``spawn_window_raise`` / ``dock_control_alone`` are cmux's
 business, not the public protocol") is checked here instead, in a file that only concerns WezTerm.
 
-The stale ``METHODS`` entries and the matching cmux changes are impl-base's to drop; until then the
-shared checklist's two completeness tests legitimately fail on this branch and that is their signal,
-not something this file papers over.
+Base withdrew both names from ``METHODS`` (173bbad1), so the shared checklist and this file agree.
 """
 import sys
 from pathlib import Path
