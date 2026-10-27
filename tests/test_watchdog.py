@@ -9,11 +9,13 @@ from pathlib import Path
 import time
 
 import pytest
+import yaml
 
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
 from test_v2_codex_claude import answer_turn, decision, dispatch_one, drive, mixed, submit, typed  # noqa: F401
 import hook_sim
 from cmux_fleet import runtime_v2, subfleet, watchdog
+from cmux_fleet import fleet_config
 
 DIALOG_RM = ('Bash command\n  rm -rf "$OUT/"*\n\nDangerous rm on possibly-empty variable\n'
              'Do you want to proceed?\n❯ 1. Yes\n  2. No, and tell Claude what to do differently (esc)')
@@ -106,7 +108,7 @@ def test_classify_five_states(change, state):
 
 
 def test_default_prompt_table_matches_the_three_known_dialogs_only():
-    table = watchdog.parse_table(watchdog.DEFAULT_TABLE.read_text())
+    table = watchdog.parse_table(fleet_config.block('watchdog_prompts'))
     assert [p['name'] for p in table['prompts']] == ['read_outside', 'trust_folder', 'trust_folder_legacy']
     # Deletes are the user's call (2026-10-14): a dangerous-rm dialog is never whitelisted, only an unknown marker.
     assert watchdog.match_prompt(table, DIALOG_RM) == (None, 'dangerous rm')
@@ -870,14 +872,14 @@ def test_a_delete_appearing_before_the_press_goes_to_the_user(wd):
 def test_reclassified_delete_on_the_same_screen_goes_to_the_user(wd, tmp_path):
     f = wd
     table = tmp_path / 'prompts.yaml'
-    table.write_text(watchdog.DEFAULT_TABLE.read_text())
+    table.write_text(yaml.safe_dump(fleet_config.block('watchdog_prompts')))
     f.cfg['prompt_table'] = str(table)
     f.v2.watchdog = watchdog.Watchdog(f.v2)
     dispatch_one(f)
     f.mgr.screens[f.agent('worker-1')['pane']] = READ_FAR
     f.v2.watchdog.tick(time.time())
     rule(f, 'approve')
-    table.write_text(watchdog.DEFAULT_TABLE.read_text().replace('delete_markers: []', 'delete_markers: ["today"]'))
+    table.write_text(yaml.safe_dump(fleet_config.block('watchdog_prompts')).replace('delete_markers: []', 'delete_markers: ["today"]'))
     f.v2.watchdog.tick(time.time() + 1)
     assert keys(f, 'worker-1') == [] and f.paused() and audits(f, 'dialog.reclassified_delete')
     assert f.agent('worker-1')['prompt_route'] == 'user' and DIALOG_KEY not in escalations(f)
@@ -1024,7 +1026,7 @@ def test_dialog_escalation_timeout_is_validated():
     '把旧目录移动到归档？\n❯ 1. Yes',
 ])
 def test_delete_classifier_is_strict(screen):
-    table = watchdog.parse_table(watchdog.DEFAULT_TABLE.read_text())
+    table = watchdog.parse_table(fleet_config.block('watchdog_prompts'))
     assert watchdog.dialog_class(table, None, screen) == 'delete'
 
 
@@ -1033,7 +1035,7 @@ def test_delete_classifier_is_strict(screen):
     'Do you want to make this edit to report.md?\n❯ 1. Yes\n  2. No',
 ])
 def test_non_delete_dialogs_are_other(screen):
-    table = watchdog.parse_table(watchdog.DEFAULT_TABLE.read_text())
+    table = watchdog.parse_table(fleet_config.block('watchdog_prompts'))
     assert watchdog.dialog_class(table, None, screen) == 'other'
 
 
@@ -1062,7 +1064,7 @@ def test_whitelisted_dialog_showing_a_delete_is_never_pressed(wd):
 
 
 def test_live_claude_trust_dialog_wrapped_path_is_read_whole():
-    table = watchdog.parse_table(watchdog.DEFAULT_TABLE.read_text())
+    table = watchdog.parse_table(fleet_config.block('watchdog_prompts'))
     entry = watchdog.match_prompt(table, CLAUDE_TRUST_LIVE)[0]
     assert watchdog.authorize(entry, CLAUDE_TRUST_LIVE, 25, CLAUDE_TRUST_LIVE_CWD, '/nowhere')[0] is True
     assert watchdog.authorize(entry, CLAUDE_TRUST_LIVE, 25, CLAUDE_TRUST_LIVE_CWD + '-other', '/nowhere')[0] is False

@@ -3,7 +3,7 @@
 Agent profile ids describe capabilities and launch preferences.  They are not fleet
 slot ids: assigning ``flashnext-coder`` to ``worker-1`` must not rename the slot.
 
-Model cards (``<registry>/models/*.json``, docs/design.md §12) carry the per-model
+Model cards (the ``models`` block of config/fleet.yaml, or ``<registry>/models/*.json``; docs/design.md §12) carry the per-model
 assessment: quota pool, hosts, context window, handoff ratio, concurrency, roles,
 judgement, night use, measured values.  They are data, never routing candidates; a
 profile card links one with ``model_card`` and inherits every field it leaves unset.
@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
+from cmux_fleet import fleet_config
 
 CARD_SUFFIXES = (".json", ".yaml", ".yml")
 MODELS_SUBDIR = "models"
@@ -106,14 +107,13 @@ class ModelCard:
         return data
 
 
-def _default_directory() -> Path:
-    """Prefer a checkout-level agents directory, then packaged agent data."""
-    for directory in (PROJECT_DIR / "agents", PACKAGE_DIR / "agents"):
-        if directory.is_dir() and any(
-                path.is_file() and path.suffix.lower() in CARD_SUFFIXES
-                for path in directory.iterdir()):
-            return directory
-    return PACKAGE_DIR / "agents"
+def _default_directory() -> Optional[Path]:
+    """A checkout-level agents directory with card files, else None (cards from fleet.yaml)."""
+    directory = PROJECT_DIR / "agents"
+    if directory.is_dir() and any(
+            path.is_file() and path.suffix.lower() in CARD_SUFFIXES for path in directory.iterdir()):
+        return directory
+    return None
 
 
 def _read_card(path: Path) -> Mapping[str, Any]:
@@ -303,9 +303,42 @@ class AgentRegistry:
     """A deterministic, side-effect-free collection of validated agent cards."""
 
     def __init__(self, directory: Optional[Union[str, Path]] = None):
-        self.directory = Path(directory).expanduser() if directory is not None else _default_directory()
-        self._models = self._load_models(self.directory / MODELS_SUBDIR)
-        self._cards = self._load(self.directory, self._models)
+        """``directory``: per-file cards (``*.json`` / ``*.yaml`` + ``models/``); None: the ``models`` and
+        ``profiles`` blocks of fleet.yaml, with role files from the packaged ``agents/`` directory."""
+        found = Path(directory).expanduser() if directory is not None else _default_directory()
+        if found is None or found.resolve() == (PACKAGE_DIR / "agents").resolve():  # a task stores the dir it routed with
+            self.directory = PACKAGE_DIR / "agents"
+            self._models = self._block_models()
+            self._cards = self._block_cards(self._models)
+        else:
+            self.directory = found
+            self._models = self._load_models(self.directory / MODELS_SUBDIR)
+            self._cards = self._load(self.directory, self._models)
+
+    @staticmethod
+    def _block(name: str) -> Dict[str, Mapping[str, Any]]:
+        data = fleet_config.block(name) or {}
+        if not isinstance(data, dict):
+            raise AgentRegistryError("%s: block %s must map card ids to cards" % (fleet_config.source(), name))
+        for key, card in data.items():
+            if not isinstance(card, dict) or card.get("id") != key:
+                raise AgentRegistryError("%s: %s.%s must be a card whose id is %s" % (fleet_config.source(), name, key, key))
+        return data
+
+    @classmethod
+    def _block_models(cls) -> Dict[str, ModelCard]:
+        return dict(sorted((key, _model_from_data(data, Path("fleet.yaml#models." + key)))
+                           for key, data in cls._block("models").items()))
+
+    @classmethod
+    def _block_cards(cls, models: Mapping[str, ModelCard]) -> Tuple[AgentCard, ...]:
+        cards = []
+        for key, data in cls._block("profiles").items():
+            path = Path("fleet.yaml#profiles." + key)
+            cards.append(_inherit(_card_from_data(data, path), models, path))
+        if not cards:
+            raise AgentRegistryError("%s: block profiles has no cards" % fleet_config.source())
+        return tuple(sorted(cards, key=lambda card: card.id))
 
     @staticmethod
     def _paths(directory: Path) -> List[Path]:

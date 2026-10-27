@@ -8,7 +8,7 @@
 # --live must run inside a cmux terminal and uses real models (Claude subscription; Pi needs
 # PI_MODEL=provider/model). It uses an isolated CMUX_FLEET_HOME / CMUX_FLEET_STATE under
 # $SMOKE_DIR, requires the --lifecycle start flag (feature D) for these unverified pairs, and
-# always runs `stop` at exit. Passing it is the evidence for flipping cli_pairs.yaml to verified
+# always runs `stop` at exit. Passing it is the evidence for flipping fleet.yaml#cli_pairs to verified
 # (a human edits status/verified_by). Env: SUPERVISOR_MODEL (default opus), WORKER_MODEL
 # (default sonnet), PI_MODEL, SMOKE_TIMEOUT seconds (default 900), CLAUDE / PI binaries.
 set -euo pipefail
@@ -82,7 +82,7 @@ EOF
   if find "$run" \( -name .inbox -o -name 'msg-*.md' \) | grep -q .; then
     echo "FAIL: message files exist (v2 must not use the file mailbox)" >&2; exit 1
   fi
-  echo "PASS: claude+$worker task smoke completed; record the run id and date in cli_pairs.yaml verified_by"
+  echo "PASS: claude+$worker task smoke completed; record the run id and date in fleet.yaml#cli_pairs verified_by"
 }
 
 case "${1:-}" in

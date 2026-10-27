@@ -13,6 +13,7 @@ from test_fleet import THREADS, FakeMgr, FakeRedis, decision, turn, write_rollou
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
 from test_runtime_v2 import fx, receive, req, session, settle, event  # noqa: F401  (fx: real-Redis v2 fleet)
 from cmux_fleet import brake, fleet, runtime_v2
+from cmux_fleet import fleet_config
 
 REAL_FABLE_WALL = ("⎿  You've reached your Fable limit. Run /usage-credits to continue "
                    "or switch models with /model.")
@@ -34,13 +35,13 @@ def isolated_claude_trust(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def pools_file(tmp_path, monkeypatch):
-    """The operator's private pools file, as config/pools.example.yaml describes it."""
-    path = tmp_path / 'pools.yaml'
+    """The operator's private fleet.yaml with an accounts block (format: the comment in config/fleet.yaml)."""
+    path = tmp_path / 'fleet.yaml'
     path.write_text('accounts:\n'
                     '  - {id: pool-a, aliases: [old-a], meter: usd_equiv}\n'
                     '  - {id: pool-b, meter: week_pct}\n'
                     '  - {id: pool-c, meter: usd_equiv, caps: {day_usd: 25, night_usd: 5}}\n')
-    monkeypatch.setenv(brake.POOLS_ENV, str(path))
+    monkeypatch.setenv(fleet_config.USER_ENV, str(path))
     return path
 
 
@@ -800,16 +801,12 @@ def test_pool_names_come_from_the_pools_file(pools_file, tmp_path, monkeypatch):
     assert brake.pool_reading({'pools': {'pool-a': {'cash_used_usd': 7, 'at': now}}}, 'old-a', now) == 7.0
     assert brake.effective({'pool': 'pool-c'}) == {'pool': 'pool-c', 'max_usd': 25}  # the pool's own caps
     assert brake.effective({'pool': 'pool-c'}, night=True)['max_usd'] == 5
-    monkeypatch.setenv(brake.POOLS_ENV, str(tmp_path / 'missing.yaml'))
+    monkeypatch.setenv(fleet_config.USER_ENV, str(tmp_path / 'missing.yaml'))
     with pytest.raises(ValueError, match='is not an account id or alias'):
         brake.validate_budget({'pool': 'pool-a'})
     assert brake.validate_budget({'max_calls': 2}) == {'max_calls': 2}  # no pool: no pools file needed
     dup = tmp_path / 'dup.yaml'
-    dup.write_text('accounts:\n  - {id: a, aliases: [b]}\n  - {id: b}\n')
+    dup.write_text('accounts:\n  - {id: a, aliases: [b]}\n  - {id: b}\n')  # an explicit file: blocks format
     with pytest.raises(ValueError, match='used twice'):
         brake.pool_accounts(dup)
 
-
-def test_shipped_example_pools_file_loads():
-    accounts = brake.pool_accounts(Path(brake.__file__).parent / 'config' / 'pools.example.yaml')
-    assert accounts['pool-a']['meter'] == 'usd_equiv' and accounts['pool-b']['meter'] == 'week_pct'

@@ -6659,15 +6659,15 @@ def main(argv=None):
                    help='transport v2: Escape presses for a stalled agent; all of them leaving the screen '
                         'unchanged means frozen')
     s.add_argument('--prompt-table', help='transport v2: watchdog dialog whitelist YAML (hot-reloaded; default '
-                                          'cmux_fleet/config/watchdog_prompts.yaml)')
+                                          'config/fleet.yaml#watchdog_prompts)')
     s.add_argument('--compact-limit', type=int, help='codex model_auto_compact_token_limit (default: codex decides)')
     s.add_argument('--chrome-script', help='optional browser broker script run by the daemon for sandboxed agents')
     s.add_argument('--chrome-min-interval', type=float, default=DEFAULTS['chrome_min_interval'])
     s.add_argument('--supervisor-cli', choices=cli_pairs.CLIS, default=None,
-                   help='CLI for the supervisor (default: cli_pairs.yaml default)')
+                   help='CLI for the supervisor (default: fleet.yaml#cli_pairs default)')
     s.add_argument('--supervisor-model', default=DEFAULTS['supervisor_model'], help='claude supervisor: --model value')
     s.add_argument('--worker-cli', choices=cli_pairs.WORKER_CLIS, default=None,
-                   help='CLI for workers (default: cli_pairs.yaml default; opencode is worker-only)')
+                   help='CLI for workers (default: fleet.yaml#cli_pairs default; opencode is worker-only)')
     s.add_argument('--opencode', help='opencode binary (>= 2.0.29; default: first on PATH)')
     s.add_argument('--opencode-model', default=None,
                    help='opencode workers: provider/model, e.g. opencode/deepseek-v4.1-flash-free (required; no code '
@@ -6678,14 +6678,14 @@ def main(argv=None):
     s.add_argument('--pi-model', help='explicit provider/model for every pi agent without its own model '
                    '(--supervisor-pi-model, roster pi_model); no implicit cloud fallback')
     s.add_argument('--supervisor-pi-model', default=None,
-                   help='pi supervisor: provider/model (default: --pi-model if given, else cli_pairs.yaml '
+                   help='pi supervisor: provider/model (default: --pi-model if given, else fleet.yaml#cli_pairs '
                         'default.supervisor_pi_model when the supervisor CLI comes from the default)')
     s.add_argument('--supervisor-pi-thinking', choices=pi_adapter.THINKING, default=None,
-                   help='pi supervisor: thinking level (default: --pi-thinking if given, else cli_pairs.yaml '
+                   help='pi supervisor: thinking level (default: --pi-thinking if given, else fleet.yaml#cli_pairs '
                         'default.supervisor_pi_thinking when the supervisor CLI comes from the default, else off)')
     s.add_argument('--pi-thinking', choices=pi_adapter.THINKING, default=None,
                    help='pi thinking level for every pi agent without its own (default: off; an explicit value '
-                        'also beats cli_pairs.yaml default.supervisor_pi_thinking)')
+                        'also beats fleet.yaml#cli_pairs default.supervisor_pi_thinking)')
     s.add_argument('--pi-agent-dir', default=os.environ.get('PI_CODING_AGENT_DIR') or str(Path.home() / '.pi/agent'),
                    help='source of auth.json/models.json only, linked into a fresh per-run pi home')
     s.add_argument('--allow-unsandboxed-pi', action='store_true',
@@ -6705,13 +6705,13 @@ def main(argv=None):
     s.add_argument('--claude', help='claude binary (default: first on PATH)')
     s.add_argument('--claude-window', type=int, default=DEFAULTS['claude_window'], help='claude models not in the built-in 1M list ([1m]/opus/fable/sonnet): context window (§22)')
     s.add_argument('--worker-idle-reclaim-min', metavar='MIN|off', type=reclaim_minutes,
-                   help='service: this run\'s idle-worker reclaim in minutes, or off (default: fleet_modes.yaml)')
+                   help='service: this run\'s idle-worker reclaim in minutes, or off (default: fleet.yaml#lifecycle_modes)')
     s.add_argument('--clear-after-result', action='store_true', help='clear Claude service worker context after every terminal result')
     s.add_argument('--clear-timeout', type=float, default=20, help='seconds to confirm context clear (default: 20)')
     s.add_argument('--no-claude-hook-delivery', dest='claude_hook_delivery', action='store_false',
                    help='Claude workers: typed delivery instead of the Stop-hook channel (required by --clear-after-result)')
     s.add_argument('--lifecycle', metavar='MODE',
-                   help='required: ' + ' | '.join(lifecycle.MODE_NAMES) + ' (config/fleet_modes.yaml); '
+                   help='required: ' + ' | '.join(lifecycle.MODE_NAMES) + ' (config/fleet.yaml#lifecycle_modes); '
                         'decides what done means, how the run is closed, and --mode')
     s.add_argument('--host', default=None,
                    help='this machine for agent-card hosts (e.g. studio); unset = cards are not filtered by host')
@@ -6733,7 +6733,7 @@ def main(argv=None):
                    help='at most this many workers working at once (0 = no limit; default 0, '
                    'or 2 for opencode workers: free-tier concurrency is untested)')
     s.add_argument('--budget', help='service mode: budget card JSON, e.g. \'{"pool": "pool-a", "max_usd": 40, '
-                   '"max_calls": 200}\' (pool ids: $CMUX_FLEET_POOLS or ~/.cmux-fleet/pools.yaml; tasks put "budget" '
+                   '"max_calls": 200}\' (pool ids: $CMUX_FLEET_CONFIG or ~/.cmux-fleet/fleet.yaml; tasks put "budget" '
                    'in the task spec); the daemon pauses at any line')
     s.add_argument('--brake-notify', help='command run (no shell) with one message argument when the brake pauses '
                    'the fleet, e.g. "/usr/local/bin/tg-send --chat ops"')

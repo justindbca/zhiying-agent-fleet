@@ -10,30 +10,29 @@ Budget card (task spec ``budget`` or service config ``budget``)::
      "max_hours": 6,       # soft line (pause); the task ``hours`` stays the hard budget_exhausted
      "max_busy": 2}        # concurrency cap for workers (tighter of this and --max-busy)
 
-Pools (accounts) live in the operator's private pools file, never in this repository:
-``$CMUX_FLEET_POOLS`` or ``~/.cmux-fleet/pools.yaml`` (format: config/pools.example.yaml). Each account
+Pools (accounts) are the ``accounts`` block of the operator's private fleet.yaml, never this repository
+(``$CMUX_FLEET_CONFIG`` or ``~/.cmux-fleet/fleet.yaml``; format: the comment above ``accounts`` in
+config/fleet.yaml). Each account
 has an ``id``, optional ``aliases``, a ``meter`` (usd_equiv | week_pct | calls | none) and optional ``caps``.
 
 At a line the daemon pauses (stop delivering and rotating, keep everything resumable) and
 notifies. Pool numbers come from ``quota.json`` (the quota treasurer, design v1 batch 1.7);
-missing, unreadable or stale means ``unknown``: shown, never trips. Walls (config/walls.yaml):
+missing, unreadable or stale means ``unknown``: shown, never trips. Walls (the walls block of fleet.yaml):
 account-level -> switch side or stop; per-model pool -> same CLI one tier down.
 
 Pure functions; fleet.py keeps the counters in Redis and calls these.
 """
 import json
 import math
-import os
 import re
 import time
 from pathlib import Path
 
+from cmux_fleet import fleet_config
+
 HERE = Path(__file__).resolve().parent
-WALLS = HERE / 'config' / 'walls.yaml'
 QUOTA_FILE = Path.home() / '.cmux-fleet' / 'quota.json'
 QUOTA_STALE = 3600  # seconds: an older pool reading is unknown
-POOLS_ENV = 'CMUX_FLEET_POOLS'
-POOLS_FILE = Path.home() / '.cmux-fleet' / 'pools.yaml'
 METER_LINE = {'usd_equiv': ('max_usd', 'cash_used_usd'), 'week_pct': ('max_week_pct', 'week_used_pct')}
 INT_LIMITS = ('max_calls', 'max_rounds', 'max_busy')
 NUM_LIMITS = ('max_usd', 'max_week_pct', 'max_hours')
@@ -52,30 +51,25 @@ GATE_TAIL = 25  # screen lines the watchdog wall gate reads (same bottom-of-scre
 _POOLS = {}
 
 
-def pools_path(path=None):
-    return Path(path or os.environ.get(POOLS_ENV) or POOLS_FILE).expanduser()
-
-
 def pool_accounts(path=None):
-    """{id or alias: account} from the pools file, cached by mtime; {} when the file is missing."""
-    path = pools_path(path)
+    """{id or alias: account} from the accounts block (fleet.yaml + the private file), cached by stamp."""
     try:
-        stamp = path.stat().st_mtime_ns
+        stamp = fleet_config.stamp(path)
     except OSError:
         return {}
     cached = _POOLS.get(str(path))
     if cached and cached[0] == stamp:
         return cached[1]
-    import yaml
     out = {}
-    for acct in (yaml.safe_load(path.read_text()) or {}).get('accounts') or []:
+    source = fleet_config.source(path)
+    for acct in fleet_config.block('accounts', path) or []:
         if not isinstance(acct, dict) or not acct.get('id'):
-            raise ValueError(str(path) + ': every account needs an id')
+            raise ValueError(source + ': every account needs an id')
         if acct.get('meter', 'none') not in tuple(METER_LINE) + ('calls', 'none'):
-            raise ValueError(str(path) + ': account ' + acct['id'] + ' meter must be usd_equiv / week_pct / calls / none')
+            raise ValueError(source + ': account ' + acct['id'] + ' meter must be usd_equiv / week_pct / calls / none')
         for name in [acct['id']] + list(acct.get('aliases') or []):
             if name in out:
-                raise ValueError(str(path) + ': pool name ' + name + ' is used twice')
+                raise ValueError(source + ': pool name ' + name + ' is used twice')
             out[name] = acct
     _POOLS[str(path)] = (stamp, out)
     return out
@@ -102,7 +96,7 @@ def validate_budget(raw):
         raise ValueError('budget may only have ' + ' / '.join(known) + ' (got ' + ', '.join(unknown) + ')')
     pool = raw.get('pool')
     if pool is not None and pool_account(pool) is None:
-        raise ValueError('budget pool ' + str(pool) + ' is not an account id or alias in ' + str(pools_path()))
+        raise ValueError('budget pool ' + str(pool) + ' is not an account id or alias in the accounts block of ' + fleet_config.source())
     for k in INT_LIMITS:
         if k in raw and (type(raw[k]) is not int or raw[k] < 1):
             raise ValueError('budget ' + k + ' must be a positive integer')
@@ -204,14 +198,12 @@ _TABLE = {}
 
 
 def wall_table(path=None):
-    """walls.yaml compiled, cached by mtime."""
-    path = Path(path or WALLS)
-    stamp = path.stat().st_mtime_ns
+    """The walls block compiled, cached by stamp."""
+    stamp = fleet_config.stamp(path)
     cached = _TABLE.get(str(path))
     if cached and cached[0] == stamp:
         return cached[1]
-    import yaml
-    raw = yaml.safe_load(path.read_text()) or {}
+    raw = fleet_config.block('walls', path) or {}
     table = {'account': [re.compile(p, re.I) for p in raw.get('account') or []],
              'model_pool': [re.compile(p, re.I) for p in raw.get('model_pool') or []],
              'same_cli_downgrade': dict(raw.get('same_cli_downgrade') or {}),

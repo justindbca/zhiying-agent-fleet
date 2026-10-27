@@ -1,5 +1,5 @@
 """Lifecycle closing (lifecycle design §2–§3, master design v2 §4.11/§4.14): what the daemon does once a
-run is done, stuck or out of time, per the mode table (config/fleet_modes.yaml, re-read every tick).
+run is done, stuck or out of time, per the mode table (config/fleet.yaml#lifecycle_modes, re-read every tick).
 
 * task modes, terminal state:
   - ``completed``: dev_task first passes the trusted-Python gate (lifecycle_deliver); review_loop needs a

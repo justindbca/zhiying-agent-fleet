@@ -4,8 +4,10 @@ import shutil
 from datetime import date
 
 import pytest
+import yaml
 
 from cmux_fleet import cmux_manager, fleet, lifecycle, runtime_v2
+from cmux_fleet import fleet_config
 from test_pi import mock_start
 
 
@@ -24,7 +26,7 @@ def with_lifecycle(args, name):
 @pytest.fixture
 def table(tmp_path):
     path = tmp_path / 'fleet_modes.yaml'
-    shutil.copy(lifecycle.DEFAULT_PATH, path)
+    path.write_text(fleet_config.SHIPPED.read_text())
     return path
 
 
@@ -161,7 +163,7 @@ def test_current_pair_rules_still_read_mode_from_lifecycle_base(monkeypatch, tmp
     # service. A x D integration: codex+claude/service is verified now, so a stub table forbids it.
     import yaml
     from cmux_fleet import cli_pairs
-    table = yaml.safe_load(cli_pairs.DEFAULT_PATH.read_text())
+    table = fleet_config.block('cli_pairs')
     for item in table['pairs']:
         if (item['supervisor_cli'], item['worker_cli'], item['mode']) == ('codex', 'claude', 'service'):
             item.update(status='forbidden', reason='service base reached the pair table')

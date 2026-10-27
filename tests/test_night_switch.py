@@ -101,7 +101,7 @@ def test_todays_matrix_refuses_a_flashnext_night_under_codex_claude(tmp_path, pa
     with pytest.raises(ValueError, match='mixed Pi/'):
         night.check_rosters(cfg, day, other)
     from cmux_fleet import cli_pairs
-    monkeypatch.setattr(cli_pairs, 'DEFAULT_PATH', Path(cli_pairs.__file__).parent / 'config' / 'cli_pairs.yaml')
+    monkeypatch.setattr(cli_pairs, 'DEFAULT_PATH', None)
     night.check_rosters(cfg, day, other)  # A's packaged table (codex+pi/task verified) admits the night pair
 
 

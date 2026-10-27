@@ -25,6 +25,7 @@ from test_runtime_v2 import event, receive, session, settle
 from test_v2_codex_claude import answer_turn, no_message_files, typed
 from test_v2_codex_pi import pi_ready
 from cmux_fleet import claude_hook, cli_pairs, cmux_manager, codex_queue, fleet, pi_adapter, runtime_v2
+from cmux_fleet import fleet_config
 
 ASTRA = 'openai-codex/gpt-6-astra'
 FLASH = 'flashnext/Qwen3.8-Flash-Next-Uncensored-oQ4e-100K-MTP'
@@ -741,7 +742,7 @@ S1A_TRUST = (
 
 def test_trust_dialog_reads_only_its_own_box_not_the_shell_exec_line_above():
     from cmux_fleet import watchdog
-    table = watchdog.parse_table(watchdog.DEFAULT_TABLE.read_text())
+    table = watchdog.parse_table(fleet_config.block('watchdog_prompts'))
     own = S1A_RUN + '/workspace/worker-1'
     screen = S1A_TRUST.format(path=own)
     entry = watchdog.match_prompt(table, screen)[0]

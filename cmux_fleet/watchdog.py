@@ -27,10 +27,10 @@ import time
 import uuid
 from pathlib import Path
 
-from cmux_fleet import advisor
+from cmux_fleet import advisor, fleet_config
 
 STATES = ('idle', 'working', 'stalled', 'frozen', 'prompting')
-DEFAULT_TABLE = Path(__file__).resolve().parent / 'config' / 'watchdog_prompts.yaml'
+DEFAULT_TABLE = None  # None = the watchdog_prompts block of fleet.yaml; a path = that file (blocks or a bare table)
 KEYS = frozenset(('Enter', 'Escape', 'Tab', 'Up', 'Down', 'Left', 'Right', 'Space',
                   'y', 'n', '1', '2', '3'))
 # How an answered dialog's concrete operation is proven to be inside an authorisation the run already has.
@@ -62,7 +62,7 @@ def setting(cfg, name):
 # ---------------------------------------------------------------- delete classifier (plan F' 8.1)
 # A dialog that may lose data is the user's call, always: never answered by the program or the supervisor.
 # Strict on purpose: a non-delete dialog misread as a delete only asks the user once more; the reverse is
-# not allowed. So this list only grows (watchdog_prompts.yaml `delete_markers:` adds, nothing removes), and
+# not allowed. So this list only grows (fleet.yaml#watchdog_prompts `delete_markers:` adds, nothing removes), and
 # a move / rename (mv) counts as a delete (user, 2026-10-14).
 DELETE_MARKERS = [
     'rm', 'rmdir', 'unlink', 'del', 'delete', 'remove', 'rimraf', 'shred', 'trash', 'purge', 'wipe', 'erase',
@@ -158,29 +158,28 @@ def parse_table(raw):
 class TableCache:
     """Hot reload by (mtime, size). A bad edit keeps the previous table and is audited once."""
 
-    def __init__(self, path):
-        self.path = Path(path)
+    def __init__(self, path=None):
+        self.path = Path(path) if path else None
         self.stamp = None
         self.table = None
 
     def get(self, audit):
         try:
-            st = self.path.stat()
-            stamp = (st.st_mtime_ns, st.st_size)
+            stamp = fleet_config.stamp(self.path)
         except OSError as exc:
             stamp = ('missing', str(exc))
         if stamp == self.stamp and self.table is not None:
             return self.table
         self.stamp = stamp
         try:
-            table = parse_table(self.path.read_text(encoding='utf-8'))
+            table = parse_table(fleet_config.block('watchdog_prompts', self.path))
         except (OSError, ValueError) as exc:
-            audit('watch.table_rejected', level='error', error=str(exc)[:500], path=str(self.path))
+            audit('watch.table_rejected', level='error', error=str(exc)[:500], path=fleet_config.source(self.path))
             if self.table is None:
                 self.table = parse_table({})  # nothing whitelisted: every dialog is held
             return self.table
         if self.table is not None:
-            audit('watch.table_reloaded', level='info', path=str(self.path),
+            audit('watch.table_reloaded', level='info', path=fleet_config.source(self.path),
                   prompts=[p['name'] for p in table['prompts']])
         self.table = table
         return table

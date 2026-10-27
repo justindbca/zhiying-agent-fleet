@@ -20,6 +20,13 @@ import pytest
 import test_fleet  # first: puts the checkout on sys.path
 import hook_sim  # noqa: E402
 from cmux_fleet import codex_queue, fleet  # noqa: E402
+from cmux_fleet import fleet_config  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def no_private_config(monkeypatch, tmp_path_factory):
+    """The operator's ~/.cmux-fleet/fleet.yaml never leaks into a test; a test sets its own."""
+    monkeypatch.setenv(fleet_config.USER_ENV, str(tmp_path_factory.getbasetemp() / 'no-private-fleet.yaml'))
 
 
 @pytest.fixture(autouse=True)

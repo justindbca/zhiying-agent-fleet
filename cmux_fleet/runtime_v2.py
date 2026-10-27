@@ -17,7 +17,7 @@ from pathlib import Path
 import redis
 
 from cmux_fleet import advisor, claude_hook, clear_after_result, cli_pairs, contracts, tabs
-from cmux_fleet import opencode_adapter, pi_adapter
+from cmux_fleet import fleet_config, opencode_adapter, pi_adapter
 from cmux_fleet.message_bus import BusError, MessageBus, LUA_REBIND_CHECK, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
 from cmux_fleet import codex_queue, lifecycle_close, named_subfleet, subfleet, tui_cards
@@ -27,7 +27,7 @@ from cmux_fleet import watchdog
 def v2_cli_problem(cfg):
     """None when this supervisor/worker CLI pair and mode may run transport v2.
 
-    Decided by the pair table config/cli_pairs.yaml (see cli_pairs.pair_problem); a pair
+    Decided by the pair table config/fleet.yaml#cli_pairs (see cli_pairs.pair_problem); a pair
     it refuses is never silently replaced by another CLI/model or the old file mailbox."""
     return cli_pairs.pair_problem(cfg)
 
@@ -53,7 +53,7 @@ def validate_config(cfg):
             raise ValueError('dialog_escalation_timeout must be at least 60 seconds')
         if cfg.get('prompt_table'):
             try:
-                watchdog.parse_table(Path(cfg['prompt_table']).read_text(encoding='utf-8'))
+                watchdog.parse_table(fleet_config.block('watchdog_prompts', cfg['prompt_table']))
             except OSError as exc:
                 raise ValueError('cannot read --prompt-table: ' + str(exc))
     return version

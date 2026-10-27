@@ -1,4 +1,4 @@
-"""Lifecycle modes: what "done" means for a run and how it is closed (config/fleet_modes.yaml).
+"""Lifecycle modes: what "done" means for a run and how it is closed (config/fleet.yaml#lifecycle_modes).
 
 A lifecycle (``start --lifecycle <mode>``) is orthogonal to the transport mode. Its ``base`` maps it
 onto ``cfg['mode']`` (task | service), which everything below the daemon keeps reading unchanged;
@@ -15,9 +15,11 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+from cmux_fleet import fleet_config
+
 MODE_NAMES = ('service', 'dev_task', 'program', 'scheduled', 'review_loop', 'smoke')
 BASE_MODES = ('task', 'service')
-DEFAULT_PATH = Path(__file__).resolve().parent / 'config' / 'fleet_modes.yaml'
+DEFAULT_PATH = None  # None = the lifecycle_modes block of fleet.yaml; a path = that file (blocks or a bare table)
 CLOCK_ENV = 'CMUX_FLEET_GLOBAL_CLOCK'  # path to global_clock.py (or its directory)
 
 _lock = threading.Lock()
@@ -27,49 +29,49 @@ _cache = {}  # resolved path -> (mtime_ns, table)
 def _validate(table):
     """Raise ValueError unless ``table`` is a usable mode table."""
     if not isinstance(table, dict) or table.get('version') != 1:
-        raise ValueError('fleet_modes.yaml: version must be 1')
+        raise ValueError('fleet.yaml#lifecycle_modes: version must be 1')
     modes = table.get('modes')
     if not isinstance(modes, dict):
-        raise ValueError('fleet_modes.yaml: modes must be a mapping')
+        raise ValueError('fleet.yaml#lifecycle_modes: modes must be a mapping')
     missing = [m for m in MODE_NAMES if m not in modes]
     unknown = sorted(set(modes) - set(MODE_NAMES))
     if missing or unknown:
-        raise ValueError('fleet_modes.yaml: modes must be exactly ' + ', '.join(MODE_NAMES)
+        raise ValueError('fleet.yaml#lifecycle_modes: modes must be exactly ' + ', '.join(MODE_NAMES)
                          + (' (missing: ' + ', '.join(missing) + ')' if missing else '')
                          + (' (unknown: ' + ', '.join(unknown) + ')' if unknown else ''))
     for name, body in modes.items():
         if not isinstance(body, dict) or body.get('base') not in BASE_MODES:
-            raise ValueError('fleet_modes.yaml: modes.' + name + '.base must be one of ' + ', '.join(BASE_MODES))
+            raise ValueError('fleet.yaml#lifecycle_modes: modes.' + name + '.base must be one of ' + ', '.join(BASE_MODES))
         bases = body.get('bases', [body['base']])
         if not isinstance(bases, list) or body['base'] not in bases or any(b not in BASE_MODES for b in bases):
-            raise ValueError('fleet_modes.yaml: modes.' + name + '.bases must be a list of ' + ', '.join(BASE_MODES)
+            raise ValueError('fleet.yaml#lifecycle_modes: modes.' + name + '.bases must be a list of ' + ', '.join(BASE_MODES)
                              + ' that includes its base')
     if not isinstance(table.get('common', {}), dict):
-        raise ValueError('fleet_modes.yaml: common must be a mapping')
+        raise ValueError('fleet.yaml#lifecycle_modes: common must be a mapping')
     return table
 
 
 def load_modes(path=None):
     """The mode table, re-read when the file's mtime changes. A broken edit keeps the last good
     table (with a warning on stderr); with no good table yet it raises ValueError."""
-    p = Path(path or DEFAULT_PATH).expanduser().resolve()
+    path = path or DEFAULT_PATH
+    p = Path(path).expanduser().resolve() if path else None
     with _lock:
         cached = _cache.get(p)
         try:
-            mtime = p.stat().st_mtime_ns
+            mtime = fleet_config.stamp(p)
         except OSError as exc:
             if cached:
-                print('fleet_modes.yaml unreadable, keeping last good table: ' + str(exc), file=sys.stderr)
+                print('fleet.yaml#lifecycle_modes unreadable, keeping last good table: ' + str(exc), file=sys.stderr)
                 return copy.deepcopy(cached[1])
-            raise ValueError('fleet_modes.yaml unreadable: ' + str(exc)) from exc
+            raise ValueError('fleet.yaml#lifecycle_modes unreadable: ' + str(exc)) from exc
         if cached and cached[0] == mtime:
             return copy.deepcopy(cached[1])
         try:
-            import yaml
-            table = _validate(yaml.safe_load(p.read_text(encoding='utf-8')))
+            table = _validate(fleet_config.block('lifecycle_modes', p))
         except Exception as exc:
             if cached:
-                print('fleet_modes.yaml rejected, keeping last good table: ' + str(exc), file=sys.stderr)
+                print('fleet.yaml#lifecycle_modes rejected, keeping last good table: ' + str(exc), file=sys.stderr)
                 return copy.deepcopy(cached[1])
             raise ValueError(str(exc)) from exc
         _cache[p] = (mtime, table)

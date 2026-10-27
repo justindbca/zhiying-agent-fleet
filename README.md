@@ -10,7 +10,7 @@ model sessions.
 
 It mixes agent CLIs in one fleet: official **Claude Code**, official **Codex CLI**, **Pi** (Codex models
 and local models) and **opencode**, in any supervisor × worker pairing that has passed a real smoke run
-(`cmux_fleet/config/cli_pairs.yaml`).
+(`cmux_fleet/config/fleet.yaml#cli_pairs`).
 
 [中文说明](README.zh-CN.md) · [Design baseline / 设计基线](docs/design.md)
 
@@ -24,7 +24,10 @@ and local models) and **opencode**, in any supervisor × worker pairing that has
   generation-checked deliveries, so a late callback from a retired session can never act.
 - **Watchdog and brake.** Five-state stall detection per slot; a per-task budget card (calls, rounds,
   hours, per-account quota) and a usage-wall table that downgrades a model tier or pauses resumably.
-  Accounts live in a private pools file (`cmux_fleet/config/pools.example.yaml`), never in code.
+  Accounts live in the `accounts` block of your private copy of the config file, never in code.
+- **One config file.** Every table (CLI pairs, lifecycle modes, walls, watchdog dialogs, model cards,
+  profiles, accounts) is a block of `cmux_fleet/config/fleet.yaml`; a private `~/.cmux-fleet/fleet.yaml`
+  in the same format overrides the blocks an operator may change.
 - **Sub-fleets.** A worker can become the supervisor of its own child fleet.
 - **2,000+ tests** (in-memory Redis, fake cmux, synthetic transcripts; real Redis where it matters).
 
@@ -108,10 +111,10 @@ Nothing else: the fleet creates its own Codex home for the agents and answers Co
 
 Open a cmux terminal, configure your Pi provider/model and replace `local/my-model` below.
 New starts require Redis v2 and an explicit development opt-in. Without `--supervisor-cli` / `--worker-cli`, `start`
-takes the default pair from `cmux_fleet/config/cli_pairs.yaml`: a **Pi supervisor on `openai-codex/gpt-6-astra` (thinking
+takes the default pair from `cmux_fleet/config/fleet.yaml#cli_pairs`: a **Pi supervisor on `openai-codex/gpt-6-astra` (thinking
 high) with official Claude Code workers** (user decision 2026-10-13). That table lists every supported pair and its status
 (see "Redis v2 development runtime"); a pair it does not list is refused. `start` also requires `--lifecycle <mode>`
-(`service`, `dev_task`, `program`, `scheduled`, `review_loop`, `smoke`; see `cmux_fleet/config/fleet_modes.yaml`); an
+(`service`, `dev_task`, `program`, `scheduled`, `review_loop`, `smoke`; see `cmux_fleet/config/fleet.yaml#lifecycle_modes`); an
 `unverified` pair starts only with `--lifecycle smoke`.
 The Codex-specific setup and launch examples below are retained only as legacy v1 reference.
 
@@ -387,7 +390,7 @@ fallback to a personal/cloud default) for every Pi agent that has no model of it
 - Per-agent Pi models. Model, highest first:
   - supervisor: `--supervisor-pi-model` (or the model an old profile maps to, `--supervisor-profile fleet-astra` →
     `openai-codex/gpt-6-astra`, only when `--supervisor-cli` is not given); then an explicit `--pi-model`; then, **only
-    when `--supervisor-cli` is not given** (pi taken from the `cli_pairs.yaml` default), `default.supervisor_pi_model`.
+    when `--supervisor-cli` is not given** (pi taken from the `fleet.yaml#cli_pairs` default), `default.supervisor_pi_model`.
     A flag you typed is never overridden by the table default. An explicit `--supervisor-cli pi` does **not** read the
     table default: give `--supervisor-pi-model` or `--pi-model`. So `start --pi-model X` with no other CLI/model flag
     runs the default Pi supervisor on X; to keep Astra while workers use X, also pass `--supervisor-pi-model`.
@@ -451,7 +454,7 @@ and `--supervisor-cli pi --worker-cli pi`, plus the existing explicit model/perm
 **Default pair (user decision 2026-10-13): Pi supervisor + official Claude Code workers.** Codex models and FlashNext
 run through Pi (ChatGPT login via Pi's `openai-codex` provider); Claude agents only ever run the official `claude` CLI, and
 Pi never uses Claude subscription credentials. With no `--supervisor-cli` the supervisor is Pi on
-`openai-codex/gpt-6-astra`, thinking high (`cli_pairs.yaml` `default.supervisor_pi_model` / `supervisor_pi_thinking`;
+`openai-codex/gpt-6-astra`, thinking high (`fleet.yaml#cli_pairs` `default.supervisor_pi_model` / `supervisor_pi_thinking`;
 `--supervisor-pi-model` / `--supervisor-pi-thinking`, or an explicit `--pi-model` / `--pi-thinking`, override them;
 an explicit `--supervisor-cli pi` skips the table default and needs `--supervisor-pi-model` or `--pi-model`; full order
 under "Pi agents"). No `--pi-model` is needed while
@@ -499,7 +502,7 @@ cmux-fleet task goal.json
 
 Validated locally with `--claude` pointing at the real Claude Code binary; the cmux `claude` shim found
 first on PATH inside cmux was not exercised. Pairs and their status (verified / unverified = `--lifecycle smoke`
-only / refused) live in `cmux_fleet/config/cli_pairs.yaml`; Codex workers (`codex+codex`) are still unverified, and any
+only / refused) live in `cmux_fleet/config/fleet.yaml#cli_pairs`; Codex workers (`codex+codex`) are still unverified, and any
 pair the table does not list is refused with a reason before provisioning or profile retirement.
 New `start` commands now require Redis v2 (the default); `--transport-version 1` is rejected. Existing v1 configs remain readable for draining/status/stop only: do not edit their transport version in place. The file-delivery and native-Codex/Claude startup descriptions above are legacy behavior, not a supported new v2 launch path. Unsupported CLI combinations fail rather than silently falling back to files. The development opt-in is still required.
 
@@ -589,7 +592,7 @@ the verb, confines `js` files to the run directory, paces page actions (`--chrom
 
 - **2,000+ tests** on macOS (Python 3.14): `python -m pytest -q tests` takes about 13 minutes. Tests that
   need `redis-server`, `node`, `tmux` or an installed Pi skip themselves when those are missing.
-- Every supervisor × worker CLI pairing marked `verified` in `cmux_fleet/config/cli_pairs.yaml` passed a
+- Every supervisor × worker CLI pairing marked `verified` in `cmux_fleet/config/fleet.yaml#cli_pairs` passed a
   real smoke run (`scripts/smoke_pair.sh`: 1 supervisor + 2 workers, 4 checks); the run id is recorded
   in the row.
 - The fleet has been run as resident service fleets and scheduled task fleets on three Macs since
@@ -604,6 +607,7 @@ the verb, confines `js` files to the run directory, paces page actions (`--chrom
 | `runtime_v2.py`, `message_bus.py`, `agent_bridge.py` | Transport v2: private Redis message bus and the per-agent bridges |
 | `cmux_manager.py` | cmux tabs and splits; every agent can be closed with the ✕ |
 | `watchdog.py` | Five-state stall detection per slot |
+| `fleet_config.py` | The one config file: shipped blocks plus the private override |
 | `brake.py` | Budget cards, private account pools, usage-wall table |
 | `contracts.py` | Interface contracts between parallel workers |
 | `subfleet.py`, `named_subfleet.py` | Child fleets supervised by a worker |

@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 from cmux_fleet import cli_pairs, cmux_manager, fleet, lifecycle, runtime_v2
+from cmux_fleet import fleet_config
 
 
 class Reached(Exception):
@@ -51,7 +52,7 @@ def test_start_without_cli_flags_uses_pair_table_default(monkeypatch):
 
 
 def test_start_default_follows_an_edited_table(tmp_path, monkeypatch):
-    table = yaml.safe_load(cli_pairs.DEFAULT_PATH.read_text())
+    table = fleet_config.block('cli_pairs')
     table['default'] = {'supervisor_cli': 'pi', 'worker_cli': 'pi', 'mode': 'task'}
     path = tmp_path / 'cli_pairs.yaml'
     path.write_text(yaml.safe_dump(table))
@@ -100,7 +101,7 @@ def test_non_codex_supervisor_gets_no_codex_profile(monkeypatch):
 
 
 def test_default_supervisor_profile_must_be_a_name(tmp_path):
-    table = yaml.safe_load(cli_pairs.DEFAULT_PATH.read_text())
+    table = fleet_config.block('cli_pairs')
     table['default']['supervisor_profile'] = 5
     path = tmp_path / 'cli_pairs.yaml'
     path.write_text(yaml.safe_dump(table))
@@ -120,7 +121,7 @@ def test_smoke_runs_on_task_or_service_base():
 
 
 def test_bases_must_include_base(tmp_path):
-    table = yaml.safe_load(lifecycle.DEFAULT_PATH.read_text())
+    table = fleet_config.block('lifecycle_modes')
     table['modes']['smoke']['bases'] = ['service']
     path = tmp_path / 'fleet_modes.yaml'
     path.write_text(yaml.safe_dump(table))
@@ -131,7 +132,7 @@ def test_bases_must_include_base(tmp_path):
 @pytest.mark.parametrize('sup,wrk', [('codex', 'pi'), ('codex', 'claude'), ('claude', 'pi')])
 def test_unverified_service_pairs_reach_provisioning_only_under_smoke(monkeypatch, tmp_path, sup, wrk):
     # The gate a service pair went through before its real smoke (shipped rows are verified now).
-    table = yaml.safe_load(cli_pairs.DEFAULT_PATH.read_text())
+    table = fleet_config.block('cli_pairs')
     for item in table['pairs']:
         if (item['supervisor_cli'], item['worker_cli'], item['mode']) == (sup, wrk, 'service'):
             item.update(status='unverified', verified_by=None, reason=sup + '+' + wrk + ' service unverified')

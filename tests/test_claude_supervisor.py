@@ -20,6 +20,7 @@ import hook_sim
 from test_fleet import FakeMgr, traffic
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
 from cmux_fleet import cli_pairs, cmux_manager, fleet, pi_adapter, runtime_v2
+from cmux_fleet import fleet_config
 
 WORKERS = ['worker-1', 'worker-2']
 
@@ -54,7 +55,7 @@ def test_start_accepts_claude_supervisor_cli_and_model(monkeypatch):
 
 
 def test_start_refuses_unverified_claude_supervisor_before_provisioning(monkeypatch, tmp_path):
-    table = yaml.safe_load(cli_pairs.DEFAULT_PATH.read_text())
+    table = fleet_config.block('cli_pairs')
     for item in table['pairs']:
         if (item['supervisor_cli'], item['worker_cli']) == ('claude', 'pi'):
             item.update(status='unverified', verified_by=None)

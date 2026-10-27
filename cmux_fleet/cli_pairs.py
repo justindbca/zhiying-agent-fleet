@@ -1,4 +1,4 @@
-"""Transport v2 supervisor/worker CLI pair table (config/cli_pairs.yaml).
+"""Transport v2 supervisor/worker CLI pair table (config/fleet.yaml#cli_pairs).
 
 Every check re-reads the table, so an edit takes effect at the next start. A pair the
 table does not list is refused with its reason, never silently replaced by another
@@ -8,7 +8,9 @@ from pathlib import Path
 
 import yaml
 
-DEFAULT_PATH = Path(__file__).resolve().parent / 'config' / 'cli_pairs.yaml'
+from cmux_fleet import fleet_config
+
+DEFAULT_PATH = None  # None = the cli_pairs block of fleet.yaml; a path = that file (blocks or a bare table)
 CLIS = ('pi', 'codex', 'claude')  # supervisor CLIs
 # opencode runs only as a worker (free OpenCode Zen model through the opencode client itself; brief
 # fleet-opencode-worker-20261016): never a supervisor, so it is not in CLIS.
@@ -67,8 +69,8 @@ class PairTable:
 
 
 def load_pairs(path=None):
-    path = Path(path) if path else DEFAULT_PATH
-    return PairTable(yaml.safe_load(path.read_text()), path)
+    path = path or DEFAULT_PATH
+    return PairTable(fleet_config.block('cli_pairs', path), fleet_config.source(path))
 
 
 def legacy_supervisor_profile(profile):

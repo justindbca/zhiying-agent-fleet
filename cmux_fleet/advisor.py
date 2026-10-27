@@ -12,9 +12,10 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from cmux_fleet import fleet_config
+
 HERE = Path(__file__).resolve().parent
 PROMPT = HERE / 'agents' / 'advisor.md'
-MATRIX = HERE / 'agents' / 'models' / 'capability_matrix.yaml'
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')
 DEFAULT_EFFORT = 'medium'
 VERDICTS = ('enough', 'enough_simple', 'not_enough', 'overkill', 'untested', 'reserve')
@@ -42,11 +43,10 @@ class AdviceError(ValueError):
     """The advisor did not produce a usable configuration sheet."""
 
 
-def load_matrix(path=MATRIX):
-    """Capability matrix (data, re-read per consultation). Unreadable -> {} plus the error text."""
+def load_matrix(path=None):
+    """Capability matrix block (data, re-read per consultation). Unreadable -> {} plus the error text."""
     try:
-        import yaml
-        data = yaml.safe_load(Path(path).read_text(encoding='utf-8')) or {}
+        data = fleet_config.block('capability_matrix', path) or {}
     except Exception as exc:
         return {}, str(exc)
     return (data, None) if isinstance(data, dict) else ({}, 'capability matrix must be a mapping')

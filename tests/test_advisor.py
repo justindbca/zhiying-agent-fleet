@@ -738,9 +738,13 @@ def test_advisor_respawn_to_a_card_for_another_host_blocks_the_task(afx, monkeyp
     import shutil
     from cmux_fleet import agent_registry
     reg = tmp_path / 'agents'
-    shutil.copytree(Path(agent_registry.__file__).parent / 'agents', reg)
-    card = json.loads((reg / 'models' / 'opus.json').read_text())
-    (reg / 'models' / 'opus.json').write_text(json.dumps(dict(card, hosts=['studio'])))
+    shutil.copytree(Path(agent_registry.__file__).parent / 'agents', reg)  # role files
+    (reg / 'models').mkdir()
+    from cmux_fleet import fleet_config
+    for key, card in fleet_config.block('profiles').items():
+        (reg / (key + '.json')).write_text(json.dumps(card))
+    for key, card in fleet_config.block('models').items():
+        (reg / 'models' / (key + '.json')).write_text(json.dumps(dict(card, hosts=['studio']) if key == 'opus' else card))
 
     class Reg(agent_registry.AgentRegistry):
         def __init__(self, directory=None):

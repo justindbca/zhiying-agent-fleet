@@ -11,8 +11,8 @@ def done(result, reason):
     sys.exit({"pass": 0, "fail": 1, "defer": 2}[result])
 
 
-need_files = ["cmux_fleet/fleet.py", "cmux_fleet/lifecycle.py", "cmux_fleet/config/fleet_modes.yaml",
-              "cmux_fleet/config/cli_pairs.yaml", "cmux_fleet/config/walls.yaml", "cmux_fleet/agents/supervisor.md"]
+need_files = ["cmux_fleet/fleet.py", "cmux_fleet/lifecycle.py", "cmux_fleet/config/fleet.yaml",
+              "cmux_fleet/agents/supervisor.md"]
 try:
     texts = {f: Path(f).read_text() for f in need_files}
 except OSError as e:
@@ -26,13 +26,14 @@ checks = [
     ("cmux_fleet/fleet.py", "--lifecycle"),
     ("cmux_fleet/fleet.py", "cli_change_ok"),
     ("cmux_fleet/fleet.py", "AskUserQuestion"),
-    ("cmux_fleet/config/fleet_modes.yaml", "hard_timeout_min: 150"),
+    ("cmux_fleet/config/fleet.yaml", "hard_timeout_min: 150"),
     ("cmux_fleet/agents/supervisor.md", "Parallel by default"),
 ]
 miss = ["%s 缺 %s" % (f, m) for f, m in checks if m not in texts[f]]
-walls_rules = "\n".join(ln for ln in texts["cmux_fleet/config/walls.yaml"].splitlines() if not ln.lstrip().startswith("#"))
+import yaml  # noqa: E402
+walls_rules = "\n".join(str(v) for v in (yaml.safe_load(texts["cmux_fleet/config/fleet.yaml"])["walls"] or {}).values())
 if "rate limited" in walls_rules.lower():
-    miss.append("walls.yaml 仍含通用 rate limited 模式")
+    miss.append("fleet.yaml#walls 仍含通用 rate limited 模式")
 if miss:
     done("fail", "；".join(miss))
 done("pass", "集成版文件齐、语法过、lifecycle / 夜间换 CLI / 禁弹框 / 150 分钟 / 并发派活 / 墙表收窄 均在位")

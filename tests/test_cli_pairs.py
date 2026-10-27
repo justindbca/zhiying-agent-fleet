@@ -1,10 +1,11 @@
-"""Transport v2 CLI pair table: config/cli_pairs.yaml decides who may run."""
+"""Transport v2 CLI pair table: the cli_pairs block of config/fleet.yaml decides who may run."""
 from pathlib import Path
 
 import pytest
 import yaml
 
 from cmux_fleet import cli_pairs, runtime_v2, transport_inventory
+from cmux_fleet import fleet_config
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -140,4 +141,4 @@ def test_yaml_ships_as_package_data():
     data = tomllib.loads((ROOT / 'pyproject.toml').read_text())
     globs = data['tool']['setuptools']['package-data']['cmux_fleet']
     shipped = {p for g in globs for p in (ROOT / 'cmux_fleet').glob(g)}
-    assert cli_pairs.DEFAULT_PATH in shipped
+    assert fleet_config.SHIPPED in shipped

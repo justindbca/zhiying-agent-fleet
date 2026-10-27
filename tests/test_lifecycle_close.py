@@ -13,10 +13,12 @@ import time
 from pathlib import Path
 
 import pytest
+import yaml
 
 from test_message_bus_v2 import private_redis_v2  # noqa: F401  (fixture)
 from test_runtime_v2 import event, fx, receive, req, session, settle  # noqa: F401  (fx fixture)
 from cmux_fleet import fleet, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, subfleet
+from cmux_fleet import fleet_config
 
 
 # ------------------------------------------------------------------ fixtures
@@ -24,7 +26,7 @@ from cmux_fleet import fleet, lifecycle, lifecycle_close, lifecycle_deliver, lif
 def table(tmp_path, monkeypatch):
     """A private copy of the mode table that the daemon reads (hot reload is exercised on it)."""
     path = tmp_path / 'fleet_modes.yaml'
-    shutil.copy(lifecycle.DEFAULT_PATH, path)
+    path.write_text(fleet_config.SHIPPED.read_text())  # blocks format; edits keep the shipped wording
     monkeypatch.setattr(lifecycle, 'DEFAULT_PATH', path)
     return path
 

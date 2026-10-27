@@ -7,12 +7,12 @@
 上下文快满的会话会自动写交接单并换新会话接力，一个任务可以跨很多个模型会话跑几个小时。
 
 同一个 fleet 里可以混用官方 **Claude Code**、官方 **Codex CLI**、**Pi**（Codex 模型与本地模型）和 **opencode**；
-哪些「监工 × worker」组合可用，以真跑冒烟验过的为准（`cmux_fleet/config/cli_pairs.yaml`）。
+哪些「监工 × worker」组合可用，以真跑冒烟验过的为准（`cmux_fleet/config/fleet.yaml#cli_pairs`）。
 
 [English](README.md) · **[设计基线](docs/design.md)**
 
 要点：字面验收（产物不在 / 内容不对就不算完成）；上下文换代接力；每个 run 一个私有 Redis（只走 Unix socket）；
-卡死看门与预算刹车（账号写在私有号池文件里，格式见 `cmux_fleet/config/pools.example.yaml`，不进代码）；
+卡死看门与预算刹车（账号写在私有配置文件的 `accounts` 块里，不进代码）；**只有一个配置文件** `cmux_fleet/config/fleet.yaml`，一张表一个块，私有的 `~/.cmux-fleet/fleet.yaml` 同格式覆盖允许改的块；
 子 fleet；**2,000+ 个测试**。
 
 ## 为什么这样做
@@ -58,7 +58,7 @@ model = "gpt-5.5"
 
 ## 用法
 
-在 cmux 终端里先配置好 Pi provider/model，并替换下面的 `local/my-model`。新启动只允许 Redis v2，需要显式开发许可。不带 `--supervisor-cli` / `--worker-cli` 时，`start` 取 `cmux_fleet/config/cli_pairs.yaml` 的缺省组合：**pi 监工（`openai-codex/gpt-6-astra`，thinking high）+ 官方 Claude Code worker**（用户 2026-10-13 定）。支持的组合及状态以该表为准（见下文「Redis v2 开发接线」），表里没有的组合直接拒绝。`start` 还必须带 `--lifecycle <模式>`（`service`、`dev_task`、`program`、`scheduled`、`review_loop`、`smoke`，见 `cmux_fleet/config/fleet_modes.yaml`）；`unverified` 组合只能 `--lifecycle smoke` 启动。
+在 cmux 终端里先配置好 Pi provider/model，并替换下面的 `local/my-model`。新启动只允许 Redis v2，需要显式开发许可。不带 `--supervisor-cli` / `--worker-cli` 时，`start` 取 `cmux_fleet/config/fleet.yaml#cli_pairs` 的缺省组合：**pi 监工（`openai-codex/gpt-6-astra`，thinking high）+ 官方 Claude Code worker**（用户 2026-10-13 定）。支持的组合及状态以该表为准（见下文「Redis v2 开发接线」），表里没有的组合直接拒绝。`start` 还必须带 `--lifecycle <模式>`（`service`、`dev_task`、`program`、`scheduled`、`review_loop`、`smoke`，见 `cmux_fleet/config/fleet.yaml#lifecycle_modes`）；`unverified` 组合只能 `--lifecycle smoke` 启动。
 
 ```bash
 cmux-fleet start --workers 2 --supervisor-cli pi --worker-cli pi --lifecycle <模式> \
@@ -138,7 +138,7 @@ cmux-fleet start --lifecycle service --workers 2 \
 - pi ≥ 1.1.0；`--pi` 指定真实 CLI 路径。先在 pi 的 `models.json` 配好 `local/my-model`，替换示例模型名。
 - `--pi-model` 是所有没有自己模型的 pi agent 的兜底，缺了就拒绝，不隐式回退到云模型。若 worker 也用本地 pi，改 `--worker-cli pi`；全 pi 无需 Codex binary/profile。
 - 分 agent 指定 pi 模型，优先级从高到低：
-  - 监工：`--supervisor-pi-model`（或未给 `--supervisor-cli` 时旧配置档映射，`--supervisor-profile fleet-astra` → `openai-codex/gpt-6-astra`）> 显式 `--pi-model` >（**仅未给 `--supervisor-cli`**，pi 取自 `cli_pairs.yaml` 缺省）`default.supervisor_pi_model`。手敲的旗标永不被组合表缺省盖过。显式 `--supervisor-cli pi` **不读**组合表缺省，须给 `--supervisor-pi-model` 或 `--pi-model`。所以只给 `start --pi-model X` 时缺省 pi 监工跑 X；想监工保持 Astra、worker 用 X，须另给 `--supervisor-pi-model`。
+  - 监工：`--supervisor-pi-model`（或未给 `--supervisor-cli` 时旧配置档映射，`--supervisor-profile fleet-astra` → `openai-codex/gpt-6-astra`）> 显式 `--pi-model` >（**仅未给 `--supervisor-cli`**，pi 取自 `fleet.yaml#cli_pairs` 缺省）`default.supervisor_pi_model`。手敲的旗标永不被组合表缺省盖过。显式 `--supervisor-cli pi` **不读**组合表缺省，须给 `--supervisor-pi-model` 或 `--pi-model`。所以只给 `start --pi-model X` 时缺省 pi 监工跑 X；想监工保持 Astra、worker 用 X，须另给 `--supervisor-pi-model`。
   - worker：live 档案卡的 `model` > 名单行 `pi_model:`（仅 pi worker，不能与 `profile:` 同行）> `--pi-model`。
   - thinking 与模型分开解析、同一规则：监工 = `--supervisor-pi-thinking`（或映射档位）> 显式 `--pi-thinking` > `default.supervisor_pi_thinking`（仅缺省监工）> `off`；worker = 档案卡 > 名单 `pi_thinking:` > `--pi-thinking` > `off`。例：只给 `--pi-model X` → 缺省监工 X / high；再加 `--pi-thinking low` → X / low。
   - 任一 pi agent 解析不出模型 → 拒绝启动：`--pi-model provider/model is required for pi agents (or --supervisor-pi-model / roster pi_model); no model for: ...`。
@@ -168,7 +168,7 @@ task 报告仍另送监工判断，产物仍独立验收。
 
 2026-10-13 用户定：**除 Claude Code 外，Codex 与 FlashNext 一律走 pi；Claude 只走官方 `claude` CLI**，pi 不接 Claude 订阅、不拿 Claude 凭证。
 
-- **缺省组合**：pi 监工 `openai-codex/gpt-6-astra`、thinking high（ChatGPT 订阅经 pi 的 `openai-codex` provider 登录）+ 官方 Claude Code worker。来自 `cli_pairs.yaml` 的 `default.supervisor_pi_model` / `supervisor_pi_thinking`，可用 `--supervisor-pi-model` / `--supervisor-pi-thinking` 或显式 `--pi-model` / `--pi-thinking` 覆盖（显式 `--supervisor-cli pi` 不读这两个缺省键，须自给 `--supervisor-pi-model` 或 `--pi-model`；完整优先级见上文 pi 段）；worker 是 Claude 时不需要 `--pi-model`；仍须 `--allow-unsandboxed-pi`。`pi+claude` task/service 两行已 `verified`（真实 `scripts/smoke_pair.sh pi claude task|service` 4/4 通过，run `fleet-20261013-115145-828661b9` / `fleet-20261013-115347-7e61f9af`，2026-10-13，未提交分支树）：
+- **缺省组合**：pi 监工 `openai-codex/gpt-6-astra`、thinking high（ChatGPT 订阅经 pi 的 `openai-codex` provider 登录）+ 官方 Claude Code worker。来自 `fleet.yaml#cli_pairs` 的 `default.supervisor_pi_model` / `supervisor_pi_thinking`，可用 `--supervisor-pi-model` / `--supervisor-pi-thinking` 或显式 `--pi-model` / `--pi-thinking` 覆盖（显式 `--supervisor-cli pi` 不读这两个缺省键，须自给 `--supervisor-pi-model` 或 `--pi-model`；完整优先级见上文 pi 段）；worker 是 Claude 时不需要 `--pi-model`；仍须 `--allow-unsandboxed-pi`。`pi+claude` task/service 两行已 `verified`（真实 `scripts/smoke_pair.sh pi claude task|service` 4/4 通过，run `fleet-20261013-115145-828661b9` / `fleet-20261013-115347-7e61f9af`，2026-10-13，未提交分支树）：
 
   ```bash
   cmux-fleet start --worker-model sonnet --workers 2 --lifecycle <模式> \
@@ -188,7 +188,7 @@ task 报告仍另送监工判断，产物仍独立验收。
   cmux-fleet start --supervisor-cli codex --supervisor-profile fleet-astra \
     --worker-cli claude --worker-model sonnet --workers 6 --lifecycle <模式> --allow-development-v2
   ```
-- 各组合状态（verified / unverified = 只能 `--lifecycle smoke` / 拒绝）以 `cmux_fleet/config/cli_pairs.yaml` 为准；Codex worker（`codex+codex`）仍为 unverified，表里没有的组合在 provisioning/退役前带原因拒绝。
+- 各组合状态（verified / unverified = 只能 `--lifecycle smoke` / 拒绝）以 `cmux_fleet/config/fleet.yaml#cli_pairs` 为准；Codex worker（`codex+codex`）仍为 unverified，表里没有的组合在 provisioning/退役前带原因拒绝。
 
 timeout/中止/通信失联保留槽位和 PEL，未确认停止不重新派活。daemon 同 run 重启先 held/paused，不重起 agents、不因异常关闭 Redis。
 显式 v2 stop 确认各 runtime 退役后才关 Redis。AOF everysec 仍有约 1 秒主机崩溃丢失窗口。`logs --config ... --request ... --json --follow` 为只读详情导出。
