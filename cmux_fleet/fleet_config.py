@@ -22,11 +22,32 @@ BLOCKS = ('cli_pairs', 'lifecycle_modes', 'walls', 'watchdog_prompts', 'capabili
           'profiles', 'accounts', 'tools', 'pi_context')
 USER_BLOCKS = ('accounts', 'tools', 'walls', 'lifecycle_modes', 'pi_context')
 
+NONE = 'none'  # recorded when there is no private file
+
 _lock = threading.Lock()
 _cache = {}
+_pinned = None  # the run's private file (config.json `private_config`): absolute path or NONE; None = not pinned
+
+
+def pin(value):
+    """Read ``value`` as the private file from now on in this process: an absolute path, NONE (no private
+    file), or None (back to the environment). Set from config.json so every process of a run reads the same
+    file as ``start`` did, whatever environment cmux gave it."""
+    global _pinned
+    _pinned = value
+
+
+def from_env():
+    """The private file the environment names ($CMUX_FLEET_CONFIG, else the default), as config.json records
+    it: its absolute path, or NONE when no such file exists. Ignores any pin (``start`` resolves it here)."""
+    path = Path(os.environ.get(USER_ENV) or USER_FILE).expanduser()
+    return str(path.resolve()) if path.is_file() else NONE
 
 
 def user_path():
+    """The private file this process reads, or None when the run recorded that it has none."""
+    if _pinned is not None:
+        return None if _pinned == NONE else Path(_pinned)
     return Path(os.environ.get(USER_ENV) or USER_FILE).expanduser()
 
 
@@ -41,7 +62,7 @@ def stamp(path=None):
         return _stat(Path(path).expanduser())
     user = user_path()
     try:
-        user_stamp = _stat(user)
+        user_stamp = None if user is None else _stat(user)
     except OSError:
         user_stamp = None
     return _stat(SHIPPED), str(user), user_stamp
@@ -96,4 +117,4 @@ def block(name, path=None):
 
 def source(path=None):
     """Where a block came from, for messages."""
-    return str(path) if path is not None else str(SHIPPED) + ' (+ ' + str(user_path()) + ')'
+    return str(path) if path is not None else str(SHIPPED) + ' (+ ' + str(user_path() or 'no private file') + ')'

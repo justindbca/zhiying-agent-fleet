@@ -27,6 +27,7 @@ from cmux_fleet import fleet_config  # noqa: E402
 def no_private_config(monkeypatch, tmp_path_factory):
     """The operator's ~/.cmux-fleet/fleet.yaml never leaks into a test; a test sets its own."""
     monkeypatch.setenv(fleet_config.USER_ENV, str(tmp_path_factory.getbasetemp() / 'no-private-fleet.yaml'))
+    monkeypatch.setattr(fleet_config, '_pinned', None)  # nor a run's pin (start / pin_paths) from an earlier test
 
 
 @pytest.fixture(autouse=True)

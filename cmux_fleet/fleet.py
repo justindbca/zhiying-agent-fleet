@@ -69,9 +69,12 @@ def pin_paths(cfg):
     """Apply the locations a run pinned in its config; the config wins over the environment.
 
     cmux starts the daemon, actors and hooks in fresh login shells that need not inherit the
-    caller's CMUX_FLEET_HOME / CMUX_FLEET_STATE / CMUX_BIN, so `start` writes them into config.json."""
+    caller's CMUX_FLEET_HOME / CMUX_FLEET_STATE / CMUX_BIN / CMUX_FLEET_CONFIG, so `start` writes them into
+    config.json (the private config file as `private_config`: an absolute path or 'none')."""
     global HOME, LATEST
     from cmux_fleet import cmux_manager
+    if 'private_config' in cfg:
+        fleet_config.pin(cfg['private_config'])
     if cfg.get('fleet_home'):
         HOME = Path(cfg['fleet_home'])
         LATEST = HOME / 'latest.json'
@@ -6563,6 +6566,10 @@ def start(args):
             return
     if args.transport_version != 2:
         raise SystemExit('new fleet instances require Redis transport v2; v1 is only readable for existing runs')
+    # The private config file is resolved once, here, before the first block read; config.json records it
+    # and every process of the run reads that file (pin_paths), not whatever its environment says.
+    private_config = fleet_config.from_env()
+    fleet_config.pin(private_config)
     # A new run without an explicit CLI takes the pair table's default combination (pi supervisor on
     # the table's model, e.g. openai-codex/gpt-6-astra thinking high, + official Claude workers); the
     # config written below always names both CLIs, so the codex fallback in pair_problem only serves
@@ -6731,6 +6738,7 @@ def start(args):
            'backend': backend,  # decided once here; the daemon, actors, --resume and sub-fleets read it
            'cmux_state_dir': str(mgr.meta_path.parent),
            'fleet_home': str(HOME.expanduser().resolve()), 'cmux_bin': cmux_manager.CMUX,
+           'private_config': private_config,
            'workers': workers, 'mode': args.mode, 'lifecycle': args.lifecycle, 'roles': args.roles,
            'max_busy': OPENCODE_MAX_BUSY if args.max_busy is None and args.worker_cli == 'opencode'
                        else DEFAULTS['max_busy'] if args.max_busy is None else args.max_busy,
