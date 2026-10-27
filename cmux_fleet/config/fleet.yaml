@@ -17,6 +17,7 @@
 #   profiles           agent profiles (CLI + model card + role file), keyed by profile id     (agent_registry.py)
 #   accounts           account pools for budget cards (empty here; fill in the private file)  (brake.py)
 #   tools              tool pools reached through thin MCP servers (empty here)
+#   pi_context         context window written into each run's pi models.json            (pi_adapter.py)
 
 cli_pairs:
   # Transport v2 supervisor_cli x worker_cli x mode table (read by cmux_fleet/cli_pairs.py).
@@ -589,3 +590,16 @@ accounts: []
 
 # tools: tool pools (Tavily keys, X accounts, ...) behind thin MCP servers; filled in the private file.
 tools: {}
+
+pi_context:
+  # Context window of pi models in every run (user 2026-10-27: default 400K, with a place to change it).
+  # start writes <run>/pi-home/models.json as a copy of the source models.json with these applied
+  # (no block, or neither key set: the source file is linked as before).
+  #   default_window: custom models (providers.*.models[]) that set no contextWindow get this value.
+  #                   Models that set their own window keep it (e.g. a local model capped by memory).
+  #   per_model:      "<provider>/<model id>" -> window, set even when the model has its own value;
+  #                   a built-in model (not in the source file) goes to providers.<p>.modelOverrides.
+  # The fleet's handoff thresholds read the window pi reports, so fleet and pi always agree.
+  # Override the whole block in the private file (~/.cmux-fleet/fleet.yaml).
+  default_window: 400000
+  per_model: {}

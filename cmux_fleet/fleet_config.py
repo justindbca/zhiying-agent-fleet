@@ -19,8 +19,8 @@ SHIPPED = HERE / 'config' / 'fleet.yaml'
 USER_ENV = 'CMUX_FLEET_CONFIG'
 USER_FILE = Path.home() / '.cmux-fleet' / 'fleet.yaml'
 BLOCKS = ('cli_pairs', 'lifecycle_modes', 'walls', 'watchdog_prompts', 'capability_matrix', 'models',
-          'profiles', 'accounts', 'tools')
-USER_BLOCKS = ('accounts', 'tools', 'walls', 'lifecycle_modes')
+          'profiles', 'accounts', 'tools', 'pi_context')
+USER_BLOCKS = ('accounts', 'tools', 'walls', 'lifecycle_modes', 'pi_context')
 
 _lock = threading.Lock()
 _cache = {}

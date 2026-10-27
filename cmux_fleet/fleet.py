@@ -50,7 +50,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
-from cmux_fleet import advisor, brake, claude_hook, cli_pairs, codex_queue, contracts, handoff, history, kit as kitmod, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, named_subfleet, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, tabs, watchdog  # noqa: E402
+from cmux_fleet import advisor, brake, claude_hook, cli_pairs, codex_queue, contracts, fleet_config, handoff, history, kit as kitmod, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, named_subfleet, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, tabs, watchdog  # noqa: E402
 from cmux_fleet import clear_after_result, midturn, opencode_adapter  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
@@ -2014,7 +2014,8 @@ class Fleet:
                 raise ValueError('pi >= 1.1.0 required; found: ' + version)
             if not self.cfg.get('pi_home'):
                 home = pi_adapter.prepare_home(self.run_dir / 'pi-home',
-                                              cfg.get('pi_agent_dir') or str(Path.home() / '.pi/agent'))
+                                              cfg.get('pi_agent_dir') or str(Path.home() / '.pi/agent'),
+                                              fleet_config.block('pi_context'))
                 self.cfg['pi_home'] = str(home)
             if not Path(self.cfg['pi_home']).is_dir():
                 raise ValueError('configured isolated pi_home does not exist')
@@ -6647,7 +6648,7 @@ def start(args):
         cfg['kit_fleet'] = {'name': kit_fleet, 'kit': str(Path(args.worker_kit).expanduser().resolve()),
                             'roster_md5': hashlib.md5(kit_roster.read_bytes()).hexdigest()}
     if 'pi' in clis:
-        cfg['pi_home'] = str(pi_adapter.prepare_home(run / 'pi-home', args.pi_agent_dir))
+        cfg['pi_home'] = str(pi_adapter.prepare_home(run / 'pi-home', args.pi_agent_dir, fleet_config.block('pi_context')))
     save(run / 'config.json', cfg)
     start_redis(cfg)
     command = [cfg['python'], str(Path(__file__).resolve()), 'daemon', str(run / 'config.json')]

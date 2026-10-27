@@ -25,17 +25,47 @@ def for_agent(cfg, name, overrides=None):
     return out
 
 
-def prepare_home(home, source):
+def context_models(data, pi_context):
+    """models.json ``data`` with fleet.yaml#pi_context applied (a new dict; ``data`` is not changed)."""
+    data = json.loads(json.dumps(data or {}))
+    default = (pi_context or {}).get('default_window')
+    per_model = dict((pi_context or {}).get('per_model') or {})
+    for value in [default] + list(per_model.values()):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+            raise ValueError('pi_context windows must be positive integers')
+    providers = data.setdefault('providers', {})
+    for provider, entry in providers.items():
+        for model in entry.get('models') or []:
+            key = provider + '/' + str(model.get('id'))
+            if key in per_model:
+                model['contextWindow'] = per_model.pop(key)
+            elif default and 'contextWindow' not in model:
+                model['contextWindow'] = default
+    for key, window in per_model.items():  # built-in / extension models: providers.<p>.modelOverrides
+        provider, sep, model_id = key.partition('/')
+        if not sep or not provider or not model_id:
+            raise ValueError('pi_context per_model keys are <provider>/<model id>: ' + key)
+        override = providers.setdefault(provider, {}).setdefault('modelOverrides', {}).setdefault(model_id, {})
+        override['contextWindow'] = window
+    return data
+
+
+def prepare_home(home, source, pi_context=None):
     """A fresh per-run Pi home: share only authentication and model definitions.
 
     Do not copy the operator's settings, extensions, MCP, skills or context files.
     A new directory is required so stale executable configuration cannot leak in.
+    With fleet.yaml#pi_context set, models.json is written as a copy with its windows applied.
     """
     home, source = Path(home), Path(source).expanduser()
     home.mkdir(parents=True, exist_ok=False)
+    applies = bool(pi_context) and (pi_context.get('default_window') is not None or bool(pi_context.get('per_model')))
     for name in ('auth.json', 'models.json'):
         src = source / name
-        if src.is_file():
+        if name == 'models.json' and applies:
+            data = json.loads(src.read_text()) if src.is_file() else {}
+            (home / name).write_text(json.dumps(context_models(data, pi_context), ensure_ascii=False, indent=2) + '\n')
+        elif src.is_file():
             (home / name).symlink_to(src.resolve())
     (home / 'settings.json').write_text(json.dumps({
         'quietStartup': True, 'compaction': {'enabled': True},
