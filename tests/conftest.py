@@ -81,3 +81,17 @@ def _no_machine_wide_redis_sweep(monkeypatch):
     (tests/test_orphan_redis.py calls reap_orphan_redis directly, scoped to its own root)."""
     from cmux_fleet import fleet
     monkeypatch.setattr(fleet, 'sweep_orphan_redis', lambda keep=None: None)
+
+
+@pytest.fixture(autouse=True)
+def _start_resolves_its_default_backend_as_on_a_mac_with_cmux(monkeypatch):
+    """The suite's `start` tests were written where no --backend means cmux (a Mac with cmux installed)
+    and stub cmux's probe. Pin that host for backend selection only, so they take the same path on any
+    machine: CI's Mac has no cmux binary, and Linux defaults to WezTerm (design §5). The default rule
+    itself is tested with explicit platforms and its own `cmux_installed` / `unavailable_reason` stubs
+    (test_backend_selection, test_backend_interface, test_wezterm_fleet_wiring)."""
+    from cmux_fleet.backends import base
+    real = fleet.resolve_backend
+    monkeypatch.setattr(fleet, 'resolve_backend',
+                        lambda requested=None, platform=None: real(requested, 'darwin' if platform is None else platform))
+    monkeypatch.setattr(base, 'cmux_installed', lambda: True)

@@ -49,7 +49,7 @@ def test_default_platform_is_the_running_one():
     if sys.platform == 'darwin':
         assert prefix == ['/usr/bin/caffeinate', '-i'] or prefix == []
     else:
-        assert prefix == [] or prefix[1:3] == ['--what=idle:sleep']
+        assert prefix == [] or prefix[1:] == ['--what=idle:sleep', '--why=cmux-fleet']
 
 
 def test_the_three_caffeinate_sites_call_the_seam():

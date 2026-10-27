@@ -162,9 +162,11 @@ def clients(w, session):
 
 
 def claude_pids(w):
-    """This test's fake CLI processes (the bash wrapper around it does not count)."""
-    p = subprocess.run(['ps', '-axo', 'pid=,comm='], capture_output=True, text=True)
-    return [line.split(None, 1)[0] for line in p.stdout.splitlines() if line.split(None, 1)[-1].strip() == w.claude]
+    """This test's fake CLI processes (the bash wrapper around it does not count). Matched on argv[0]:
+    Linux's comm is only the executable's basename, cut to 15 characters."""
+    p = subprocess.run(['ps', '-axww', '-o', 'pid=,args='], capture_output=True, text=True)
+    rows = [line.split() for line in p.stdout.splitlines()]
+    return [row[0] for row in rows if len(row) > 1 and row[1] == w.claude]
 
 
 def wait(check, timeout=5.0):

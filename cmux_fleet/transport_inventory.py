@@ -20,7 +20,7 @@ def inventory():
     configs = set()
     warnings = []
     process_rows = []
-    process_result = subprocess.run(['ps', '-axo', 'pid=,ppid=,args='], capture_output=True, text=True)
+    process_result = subprocess.run(['ps', '-axww', '-o', 'pid=,ppid=,args='], capture_output=True, text=True)
     if process_result.returncode:
         warnings.append('process enumeration unavailable')
     for line in process_result.stdout.splitlines():

@@ -44,6 +44,7 @@ def test_unusable_flag_reports_the_reason(monkeypatch):
 
 
 def test_no_flag_follows_design_5(monkeypatch):
+    monkeypatch.setattr(base, 'cmux_installed', lambda: True)  # this host's cmux binary must not decide it
     monkeypatch.setattr(base, 'unavailable_reason', lambda name: None)
     assert fleet.resolve_backend(None, platform='darwin') == ('cmux', None)
     monkeypatch.setattr(base, 'unavailable_reason', lambda name: 'no cmux' if name == 'cmux' else None)

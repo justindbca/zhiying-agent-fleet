@@ -6267,7 +6267,7 @@ ORPHAN_REDIS_GRACE = 120  # seconds between start_redis and the daemon taking it
 def _own_processes():
     """(pid, command line) of this user's processes; [] when ps fails."""
     try:
-        out = subprocess.run(['ps', '-x', '-o', 'pid=,command='], capture_output=True, text=True, timeout=10).stdout
+        out = subprocess.run(['ps', '-xww', '-o', 'pid=,command='], capture_output=True, text=True, timeout=10).stdout
     except (OSError, subprocess.SubprocessError):
         return []
     rows = []

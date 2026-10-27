@@ -280,7 +280,7 @@ class WezTermSessionManager:
         if pid is None or not self.mux_config:
             return None
         try:
-            p = subprocess.run(['ps', '-p', str(pid), '-o', 'command='], capture_output=True, text=True, timeout=10)
+            p = subprocess.run(['ps', '-ww', '-p', str(pid), '-o', 'command='], capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
             return None
         own = re.compile(r'(?:^|\s)--config-file\s+' + re.escape(self.mux_config) + r'(?:\s|$)')
@@ -709,7 +709,7 @@ class WezTermSessionManager:
         if not tty:
             return []
         try:
-            p = subprocess.run(['ps', '-t', os.path.basename(tty), '-o', fmt],
+            p = subprocess.run(['ps', '-ww', '-t', os.path.basename(tty), '-o', fmt],
                                capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
             return []
