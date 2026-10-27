@@ -1,12 +1,9 @@
 # cmux-fleet dependency manifest. Check it on the target machine before every release:
 #   PATH=<dir of codex/pi>:$PATH <release>/.venv/bin/python scripts/check_deps.py
 # A missing or too-old item blocks the release. Raise a minimum in the same commit as the code needing it.
-#
-# `when:` gates an item on the terminal backend chosen for the run (design §6): the fleet runs on
-# exactly one backend, so `cmux` is only required for backend=cmux and `wezterm` only for
-# backend=wezterm. Items without `when:` are required for every backend. Choose the backend with
-# `--backend`, or with CMUX_FLEET_BACKEND=cmux|wezterm; with no choice only the backend that is
-# actually available here is required (see scripts/check_deps.py).
+# `when:` gates an item on the terminal backend of the run (design §6): cmux is required only for
+# backend=cmux, wezterm (plus its mux server, design §4.4) only for backend=wezterm. Items without
+# `when:` are required for every backend. Pick the backend with `--backend` or CMUX_FLEET_BACKEND.
 python:
   min: "3.14"                # the release .venv interpreter (tests run on 3.14)
 python_packages: requirements.txt
@@ -18,6 +15,7 @@ programs:
   opencode: {cmd: [opencode, --version], min: "2.0.29", why: "opencode workers: v2 plugin API (setup ctx.tool/event/session/permission), --standalone"}
   cmux: {cmd: [cmux, --version], min: "0.65.0", when: cmux, why: "paste-buffer --bracketed (0.64.25 ignores it: multi-line pastes lose Enter); backend=cmux only"}
   wezterm: {cmd: [wezterm, --version], min: "20240203", when: wezterm, why: "mux server + cli (spawn / split-pane / get-text / send-text); backend=wezterm only"}
+  wezterm-mux-server: {cmd: [wezterm-mux-server, --version], min: "20240203", when: wezterm, why: "each run's private mux server (design §4.1 / §4.4); backend=wezterm only"}
   node: {cmd: [node, --version], min: "22.0.0", why: "pi runtime"}
   tmux: {cmd: [tmux, -V], min: "3.6", why: "named sub-fleet: one session shown in two tabs"}
   git: {cmd: [git, --version], min: "2.30", why: "delivery gate fast-forward"}
