@@ -165,7 +165,7 @@ def test_role_change_applies_at_next_generation_without_respawn(hot):
     ('workers:\n  - name: worker-1\nhandoff: {claude: {ratio: 0}}\n', 'handoff[claude]: ratio must be a number'),
     ('workers:\n  - name: worker-1\nhandoff: {claude:opus: {window: 1.5}}\n', 'handoff[claude:opus]: window must be'),
     ('workers:\n  - name: worker-1\nhandoff: {gemini: {window: 10}}\n', 'handoff[gemini]: key must be'),
-    ('workers:\n  - name: worker-1\nhandoff: {codex: {limit: 10}}\n', '"window" and/or "ratio" only'),
+    ('workers:\n  - name: worker-1\nhandoff: {codex: {limit: 10}}\n', '"window", "ratio" and/or "midturn_ratio" only'),
     ('workers:\n  - {name: worker-1, profile: Bad_Id}\n', 'profile must be an agent card id'),
     ('workers:\n  - {name: worker-1, profile: no-such-card}\n', 'worker-1: unknown agent profile no-such-card'),
     ('agents: []\n', 'only a "workers" list'),
