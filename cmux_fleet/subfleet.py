@@ -39,6 +39,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from cmux_fleet import codex_queue, handoff
+from cmux_fleet.platform import keep_awake_prefix
 
 LIMITS = {'max_depth': 2, 'max_children': 3, 'max_agents_total': 12, 'child_workers_max': 3}
 ACTIVE = ('starting', 'running', 'stopping')
@@ -608,9 +609,7 @@ def deliver_back(f, rec, child_cfg):
 def default_launch(child_cfg_path, child_cfg, mgr):
     fleet = _fleet()
     command = [child_cfg['python'], str(Path(fleet.__file__).resolve()), 'daemon', str(child_cfg_path)]
-    caffeinate = shutil.which('caffeinate')
-    if caffeinate:
-        command = [caffeinate, '-i'] + command
+    command = keep_awake_prefix() + command  # keep_awake_prefix: caffeinate / systemd-inhibit / nothing
     return mgr.spawn_window('control', shlex.join(command), metadata={'type': 'daemon'},
                             start_directory=str(child_cfg['run']))
 

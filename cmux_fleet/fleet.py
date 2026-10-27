@@ -51,6 +51,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
 from cmux_fleet import advisor, brake, claude_hook, cli_pairs, codex_queue, contracts, handoff, history, kit as kitmod, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, named_subfleet, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, tabs, watchdog  # noqa: E402
+from cmux_fleet.platform import keep_awake_prefix  # noqa: E402
 from cmux_fleet import clear_after_result, opencode_adapter  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
@@ -6149,9 +6150,7 @@ def resume(run, args):
     save(path, cfg)
     mgr = manager_for(cfg)
     command = [cfg['python'], str(Path(__file__).resolve()), 'daemon', str(path), '--resume']
-    caffeinate = shutil.which('caffeinate')
-    if caffeinate:
-        command = [caffeinate, '-i'] + command
+    command = keep_awake_prefix() + command  # keep_awake_prefix: caffeinate / systemd-inhibit / nothing
     result = mgr.spawn_window('control', shlex.join(command), metadata={'type': 'daemon'}, start_directory=str(run))
     if not result.success:
         raise SystemExit(result.error)  # Redis stays up: start --resume can be retried
@@ -6470,9 +6469,7 @@ def start(args):
     save(run / 'config.json', cfg)
     start_redis(cfg)
     command = [cfg['python'], str(Path(__file__).resolve()), 'daemon', str(run / 'config.json')]
-    caffeinate = shutil.which('caffeinate')
-    if caffeinate:
-        command = [caffeinate, '-i'] + command
+    command = keep_awake_prefix() + command  # keep_awake_prefix: caffeinate / systemd-inhibit / nothing
     result = mgr.spawn_window('control', shlex.join(command), metadata={'type': 'daemon'}, start_directory=str(run))
     if not result.success:
         connect(cfg).shutdown()
