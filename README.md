@@ -2,15 +2,31 @@
 
 The CLI command and Python package keep the name `cmux-fleet` / `cmux_fleet` (the fleet runs on [cmux](https://cmux.dev)).
 
-One **supervisor** and N **worker** sessions (new Redis-v2 runs: Pi; legacy v1: Codex/Pi/Claude Code), each in its
-own [cmux](https://cmux.dev) tab, coordinated by a small daemon. The supervisor only judges and
-dispatches; workers only execute. Sessions whose context fills up are rotated automatically with a
-written handoff note, so a task can run for hours across many model sessions.
+A daemon that runs **one supervisor and N worker coding agents** as visible terminal sessions, each in its
+own [cmux](https://cmux.dev) tab. The supervisor only judges and dispatches; workers only execute; the
+daemon checks the results itself instead of trusting what the models say. Sessions whose context fills
+up are rotated automatically with a written handoff note, so one task can run for hours across many
+model sessions.
 
-[中文说明](README.zh-CN.md) · [Design baseline / 已确认设计基线](docs/design.md)
+It mixes agent CLIs in one fleet: official **Claude Code**, official **Codex CLI**, **Pi** (Codex models
+and local models) and **opencode**, in any supervisor × worker pairing that has passed a real smoke run
+(`cmux_fleet/config/cli_pairs.yaml`).
 
-The design baseline preserves the original supervisor/worker roles, naming, handoff and protocols.
-**Local integration is not production deployment or Redis-v2 runtime acceptance.**
+[中文说明](README.zh-CN.md) · [Design baseline / 设计基线](docs/design.md)
+
+**Highlights**
+
+- **Literal acceptance.** A task ends only when declared artifacts exist and contain what they must;
+  false `COMPLETED` claims are counted and block the task.
+- **Context rotation.** At a configurable share of the context window the session writes a handoff note
+  and a successor (`worker-1` → `worker-1.1`) continues in the same tab.
+- **Private Redis per run** (Unix socket only, no TCP) carrying a bounded message bus with
+  generation-checked deliveries, so a late callback from a retired session can never act.
+- **Watchdog and brake.** Five-state stall detection per slot; a per-task budget card (calls, rounds,
+  hours, per-account quota) and a usage-wall table that downgrades a model tier or pauses resumably.
+  Accounts live in a private pools file (`cmux_fleet/config/pools.example.yaml`), never in code.
+- **Sub-fleets.** A worker can become the supervisor of its own child fleet.
+- **2,070 tests** (in-memory Redis, fake cmux, synthetic transcripts; real Redis where it matters).
 
 ```
  cmux workspace "Fleet agents" (one page)
@@ -61,7 +77,8 @@ What the daemon enforces, independently of what the models claim:
 - `redis-server` on PATH (`brew install redis`). Each run starts its own private instance under the
   checkout's `.runtime/redis/<token>/` (socket, PID, log and data); TCP is disabled and it never
   touches `localhost:6379`. The binary is still an external dependency, not bundled.
-- Python ≥ 3.9 and the `redis` package.
+- Python 3.14 (the version the test suite runs on; `deps.yaml` lists every external program and its
+  minimum version) and the packages in `requirements.txt`.
 - Any model Codex can talk to: OpenAI API, ChatGPT login, or a local OpenAI-compatible server. The
   daemon reads the context window from the rollout, so no window size has to be configured.
 - Agents run in an **isolated Codex home** (`--codex-home`, default `~/.cmux-fleet/codex-home`):
@@ -570,20 +587,30 @@ the verb, confines `js` files to the run directory, paces page actions (`--chrom
 
 ## Test status
 
-- **End-to-end on a clean second Mac (macOS 26.2, cmux 0.64.25, codex-cli 0.156.1, GPT-6-Sol via a
-  ChatGPT login):** `start` → both agents READY in 7 s → a one-step task completed with the artifact
-  check in 40 s → a two-step task during which the supervisor hit the handoff ratio, wrote its own
-  handoff note, was retired into a read-only record pane and replaced by a successor that finished
-  the task. Rotation, artifact verification, the update-dialog suppression and the isolated Codex home
-  were all exercised live.
-- Historical Pi-adapter suite (before dynamic routing and Redis-v2 foundations): **91 passed** locally, including the actual TypeScript bridge contract;
-  isolated target tests: **90 passed, 1 skipped** because Node was not on that test process's PATH.
-- Real Pi + Flash Next + cmux 0.65 validation covered READY, request/result, both-role handoff and
-  history. A real supervisor TUI instruction to ask a worker to reply OK completed end-to-end.
-  Control/history share a pane without restarting the daemon. See [design status](docs/design.md#10-验证与交付状态截至本次固化).
-- A real Pi-supervisor / official-Claude-worker task has **not** been exercised; only that mixed CLI
-  dispatch path is unit-tested. Development validation does not waive the review/deployment gate.
-- Not exercised live yet: the stall watchdog (unit-tested only) and the browser broker.
+- **2,070 tests** on macOS (Python 3.14): `python -m pytest -q tests` takes about 13 minutes. Tests that
+  need `redis-server`, `node`, `tmux` or an installed Pi skip themselves when those are missing.
+- Every supervisor × worker CLI pairing marked `verified` in `cmux_fleet/config/cli_pairs.yaml` passed a
+  real smoke run (`scripts/smoke_pair.sh`: 1 supervisor + 2 workers, 4 checks); the run id is recorded
+  in the row.
+- The fleet has been run as resident service fleets and scheduled task fleets on three Macs since
+  October 2026; the incidents those runs found are pinned as regression tests (search the tests for
+  the dated comments).
+
+## Module map
+
+| Module | Role |
+|---|---|
+| `fleet.py` | CLI entry point and the daemon: dispatch, acceptance, rotation, brake hooks (large; split by concern is planned) |
+| `runtime_v2.py`, `message_bus.py`, `agent_bridge.py` | Transport v2: private Redis message bus and the per-agent bridges |
+| `cmux_manager.py` | cmux tabs and splits; every agent can be closed with the ✕ |
+| `watchdog.py` | Five-state stall detection per slot |
+| `brake.py` | Budget cards, private account pools, usage-wall table |
+| `contracts.py` | Interface contracts between parallel workers |
+| `subfleet.py`, `named_subfleet.py` | Child fleets supervised by a worker |
+| `roster.py`, `router.py`, `agent_registry.py`, `model_usage.py` | Worker roster, profile routing, model cards |
+| `codex_queue.py`, `opencode_adapter.py`, `pi_extension_v2.ts` | CLI-specific delivery adapters |
+| `control_view.py`, `history.py`, `presentation.py` | Read-only control page and the history of retired sessions |
+| `lifecycle.py` | Lifecycle modes: what "done" means for a run |
 
 ## What the live run taught us (already fixed)
 
