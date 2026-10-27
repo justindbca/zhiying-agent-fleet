@@ -1,0 +1,186 @@
+"""The terminal-backend interface of a fleet (docs/design.md「终端后端」).
+
+fleet reaches the terminal exclusively through ``fleet.manager_for(cfg)``; that one object must
+offer every method listed here. Two implementations ship: the original cmux one
+(``backends/cmux.py``, moved there unchanged) and the WezTerm one (``backends/wezterm.py``).
+
+The signatures below are exactly ``CmuxSessionManager``'s (measured from the cmux implementation
+plus the fakes in tests/, which are the de facto contract): changing one is a change to both
+backends and to fleet. ``METHODS`` is the same list as data, so the interface-completeness test
+(design §7.1) can check both classes without repeating the names.
+
+Two capability flags, and nothing else, let fleet degrade a layout per backend (design §4.3):
+
+* ``supports_browser`` — a real embedded browser surface for the history page (cmux yes;
+  WezTerm no: the run's ``history.html`` is printed and opened with the system opener).
+* ``nested_tabs`` — tabs inside a split, i.e. worker tabs beside the supervisor in one page
+  (cmux yes; WezTerm no: one tab per worker).
+"""
+from __future__ import annotations
+
+import sys
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Protocol, Tuple, runtime_checkable
+
+MISSING = object()  # sentinel of default_backend(): no backend could be picked
+
+
+@dataclass
+class SpawnResult:
+    success: bool
+    pane_id: Optional[str] = None
+    window_name: Optional[str] = None
+    error: Optional[str] = None
+
+
+@dataclass
+class PaneStatus:
+    pane_id: str
+    window_name: str
+    alive: bool
+    exit_code: Optional[int] = None
+    metadata: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Capabilities:
+    """What a backend can render (design §2). Read by fleet's layout and history code only."""
+    browser: bool = True
+    nested_tabs: bool = True
+
+
+# Filled by the two implementation modules (they import this module), so the test can assert that
+# every name below exists on both classes with the same signature.
+METHODS = (
+    # session
+    'available', 'session_exists', 'get_or_create_session', 'claim_run', 'workspace_id',
+    'select_workspace', 'keep_windows_open', 'owns', 'close_all',
+    # spawning
+    'spawn_window', 'spawn_interactive_cli',
+    # reading / writing
+    'send_prompt_to_idle', 'send_key', 'capture_output', 'capture_to',
+    # state
+    'get_pane_status', 'has_cli_process', 'process_states', 'process_cpu',
+    # label / focus
+    'rename', 'focus', 'kill_pane',
+    # layout
+    'arrange', 'dock_tab', 'dock_control', 'place_right_of', 'place_after', 'tab_into', 'tab_panes',
+    # browser cell
+    'browser_goto', 'browser_url', 'reload_browser',
+    # handover between fleets
+    'release', 'adopt',
+    # tmux views (named sub-fleets)
+    'tmux_view_info', 'attach_view', 'tmux_session_alive', 'reattach_client', 'detach_view',
+)
+
+# (session_name, agents_title, control_title, state_dir) — both implementations accept these.
+INIT_PARAMS = ('session_name', 'agents_title', 'control_title', 'state_dir')
+
+BACKENDS = ('cmux', 'wezterm')
+
+
+@runtime_checkable
+class TerminalBackend(Protocol):
+    """Typed view of :data:`METHODS`; ``isinstance(mgr, TerminalBackend)`` is a duck check only,
+    the completeness test compares signatures against the cmux implementation."""
+
+    supports_browser: bool
+    nested_tabs: bool
+
+    def session_exists(self) -> bool: ...
+    def get_or_create_session(self) -> bool: ...
+    def claim_run(self, run: str) -> None: ...
+    def workspace_id(self) -> Optional[str]: ...
+    def select_workspace(self, workspace: str) -> bool: ...
+    def keep_windows_open(self, ours: List[str]) -> bool: ...
+    def owns(self, sid: str) -> bool: ...
+    def close_all(self) -> bool: ...
+    def spawn_window(self, window_name: str, command: str, metadata: Optional[Dict[str, str]] = None,
+                     start_directory: Optional[str] = None) -> SpawnResult: ...
+    def spawn_interactive_cli(self, window_name: str, cli_command: str, prompt_file: Optional[str] = None,
+                              output_file: Optional[str] = None, metadata: Optional[Dict[str, str]] = None,
+                              start_directory: Optional[str] = None, **kwargs) -> SpawnResult: ...
+    def send_prompt_to_idle(self, pane_id: str, text: str, bracketed: bool = False) -> bool: ...
+    def send_key(self, pane_id: str, key: str) -> bool: ...
+    def capture_output(self, pane_id: str, lines: int = 2000) -> str: ...
+    def capture_to(self, pane_id: str, path: str) -> None: ...
+    def get_pane_status(self, pane_id: str) -> Optional[PaneStatus]: ...
+    def has_cli_process(self, pane_id: str, names: Tuple[str, ...] = ('codex',)) -> bool: ...
+    def process_states(self, pane_id: str) -> List[str]: ...
+    def process_cpu(self, pane_id: str) -> Optional[float]: ...
+    def rename(self, pane_id: str, label: str) -> None: ...
+    def focus(self, pane_id: str) -> bool: ...
+    def kill_pane(self, pane_id: str) -> bool: ...
+    def arrange(self, supervisor: str, workers: List[str], history_url: str) -> Optional[str]: ...
+    def dock_tab(self, sid: str, history_surface: str, after: Optional[str] = None) -> bool: ...
+    def dock_control(self, history_surface: str) -> bool: ...
+    def place_right_of(self, pane_id: str, peer: str) -> bool: ...
+    def place_after(self, workspace: Optional[str]) -> bool: ...
+    def tab_into(self, pane_id: str, peer: str, before: bool = True) -> bool: ...
+    def tab_panes(self) -> Dict[str, str]: ...
+    def browser_goto(self, surface: str, url: str) -> bool: ...
+    def browser_url(self, surface: str) -> Optional[str]: ...
+    def reload_browser(self, surface: str) -> bool: ...
+    def release(self, pane_id: str) -> Optional[Dict]: ...
+    def adopt(self, pane_id: str, peer: str, info: Dict) -> bool: ...
+    def tmux_view_info(self, sid: str) -> Optional[Dict[str, str]]: ...
+    def attach_view(self, info: Dict[str, str], peer: str) -> Optional[str]: ...
+    def tmux_session_alive(self, sid: str) -> Optional[bool]: ...
+    def reattach_client(self, sid: str, peer: str) -> Optional[str]: ...
+    def detach_view(self, sid: str) -> bool: ...
+
+
+class InterfaceError(ValueError):
+    """A backend name that is not one of :data:`BACKENDS`, or a backend that cannot be used here."""
+
+
+def normalize_backend(name) -> Optional[str]:
+    """'cmux' / 'wezterm' as given (configured names win); None stays None (let the default decide)."""
+    if name is None:
+        return None
+    value = str(name).strip().lower()
+    if not value:
+        return None
+    if value not in BACKENDS:
+        raise InterfaceError('unknown backend ' + repr(name) + ': choose one of ' + ', '.join(BACKENDS))
+    return value
+
+
+def unavailable_reason(name: str) -> Optional[str]:
+    """Why ``name`` cannot run here (None: it can). Each backend explains itself (design §4.4)."""
+    name = normalize_backend(name) or 'cmux'
+    if name == 'cmux':
+        from cmux_fleet.backends.cmux import cmux_available
+        return None if cmux_available() else (
+            'cmux not available: run this inside a cmux terminal (cmux only accepts processes started '
+            'in its windows)')
+    from cmux_fleet.backends.wezterm import availability_problem
+    return availability_problem()
+
+
+def default_backend(platform: Optional[str] = None) -> str:
+    """No ``--backend``: cmux on macOS when cmux is usable, otherwise WezTerm (design §5)."""
+    platform = sys.platform if platform is None else platform
+    if platform == 'darwin':
+        try:
+            if unavailable_reason('cmux') is None:
+                return 'cmux'
+        except Exception:  # a broken cmux binary is a reason for WezTerm, never a crash
+            pass
+    return 'wezterm'
+
+
+def check_backend(name: str) -> str:
+    """The backend to run with: refuse an unknown or unusable one with the reason (design §5)."""
+    name = normalize_backend(name) or default_backend()
+    problem = unavailable_reason(name)
+    if problem:
+        raise InterfaceError(problem)
+    return name
+
+
+def capabilities(name: str) -> Capabilities:
+    name = normalize_backend(name) or default_backend()
+    if name == 'wezterm':
+        return Capabilities(browser=False, nested_tabs=False)
+    return Capabilities(browser=True, nested_tabs=True)
