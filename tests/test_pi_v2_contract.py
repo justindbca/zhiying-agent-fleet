@@ -41,7 +41,7 @@ for line in sys.stdin:
  if d['kind']=='fixture':
   if d['event']=='ui': frame={'kind':'ui','event_id':d['event_id'],'card':{'render':d['render']}}
   elif d['event']=='completed': frame={'kind':'completed','message_id':d['message_id']}
-  else: frame={'kind':'delivery','delivery':{'run_id':'test-run','slot':'worker-1','generation':0,'session_id':'session-test',
+  else: frame={'kind':'delivery','delivery':{'run_id':'test-run','slot':d.get('slot','worker-1'),'generation':0,'session_id':'session-test',
    'message_id':d['message_id'],'delivery_id':'d-test','stream_id':'1-0','fence':1,
    'body':{'text':'业务 JSON {"amount":2} /tmp/report.md https://example.org','title':'派工任务','mode':'service','purpose':'worker','reply':{'required':['reply'],'allowed':['reply']}}}}
   print(json.dumps(frame),flush=True)

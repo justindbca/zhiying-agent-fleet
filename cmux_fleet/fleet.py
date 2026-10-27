@@ -51,7 +51,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))  # runnable as a script (actor/notify argv point at this file)
 from cmux_fleet import advisor, brake, claude_hook, cli_pairs, codex_queue, contracts, handoff, history, kit as kitmod, lifecycle, lifecycle_close, lifecycle_deliver, lifecycle_hold, model_usage, named_subfleet, night, peer, pi_adapter, profile_runtime, profile_launch, roster, runtime_v2, redis_runtime, subfleet, tabs, watchdog  # noqa: E402
-from cmux_fleet import clear_after_result, opencode_adapter  # noqa: E402
+from cmux_fleet import clear_after_result, midturn, opencode_adapter  # noqa: E402
 from cmux_fleet.agent_registry import AgentRegistry, AgentRegistryError  # noqa: E402
 from cmux_fleet.assignment import assign_profiles  # noqa: E402
 from cmux_fleet.handoff import read_usage  # noqa: E402
@@ -112,7 +112,7 @@ DEFAULTS = {'handoff_ratio': .6, 'handoff_timeout': 900, 'window': 100000, 'stal
             'claude_window': 200000, 'mode': 'task', 'max_busy': 0, 'request_timeout': 900,
             'apply_profiles_live': False, 'allow_profile_live_switch': False, 'profile_ready_timeout': 180,
             'transport_version': 1, 'allow_development_v2': False, 'max_attempts': 2,
-            'clear_after_result': False, 'clear_timeout': 20}
+            'clear_after_result': False, 'clear_timeout': 20, **midturn.DEFAULTS}
 CLAUDE_JSON = Path.home() / '.claude.json'
 # opencode workers: the free OpenCode Zen tier serves a 200K context (paid: 1M); the model name itself comes only
 # from config (--opencode-model). Concurrency of the free tier is untested: max_busy defaults to 2.
@@ -360,22 +360,8 @@ def install_kit(kit, cwd):
 
 
 def claude_transcript_usage(path, window):
-    """Context used by a Claude Code session: the last main-thread assistant usage in its transcript."""
-    try:
-        lines = _tail(Path(path), 524288)
-    except OSError:
-        return 0, window
-    for line in reversed(lines):
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        usage = (row.get('message') or {}).get('usage') if row.get('type') == 'assistant' else None
-        if usage and not row.get('isSidechain'):
-            used = sum(int(usage.get(k) or 0) for k in
-                       ('input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens', 'output_tokens'))
-            return used, window
-    return 0, window
+    """File-only reader shared by idle checks and the daemon probe thread."""
+    return midturn.claude_transcript_usage(path, window)
 
 
 CLAUDE_1M = ('[1m]', 'opus', 'fable', 'sonnet')  # built-in: Claude models with a native 1,000,000-token window (code.claude.com/docs/en/model-config)
@@ -1346,6 +1332,8 @@ def claude_prompt(cfg_path, name, generation, raw, wait=PROMPT_WAIT):
             if runtime_v2.turn_answers(first, [prompt]):
                 return None
             return 'Fleet 尚未 READY，输入未受理；请先检查启动状态。'
+        if prompt == midturn.registered_prompt(info, generation) and data.get('session_id') == info.get('thread'):
+            return None
         lease = r.hgetall(bus.lease_key(name))
         if lease.get('status') == 'received' and lease.get('message_id'):
             msg = bus.message(lease['message_id'])
@@ -1761,6 +1749,7 @@ class Fleet:
         # queued work, then retire; until then they still count as busy but take no new work.
         self.desired = list(self.workers)
         self.roster_stamp = self.roster_digest = None
+        self.midturn_probe = midturn.Probe()
         self.handoff_table, self.worker_handoff = {}, {}  # roster `handoff:` / per-worker overrides (§22)
         self.roster_followed = None  # day or night roster file (night.json picks it)
         self.tab_specs, self.tabs_opened = None, False  # roster `tabs:` (§31): opened once per daemon start
@@ -3750,7 +3739,7 @@ class Fleet:
                 self.r.lrem(REQQ, 0, rid)
                 continue
             limit = json.loads(req['spec']).get('timeout_s') or float(self.cfg['request_timeout'])
-            if now - float(req['created']) >= limit:
+            if midturn.effective_age(req, now) >= limit:
                 self.publish(rid, 'timeout', worker=req.get('worker') or 'supervisor',
                              error='no valid answer within ' + str(int(limit)) + ' s (' + req.get('status', '') + ')')
 
@@ -3808,6 +3797,182 @@ class Fleet:
             return  # deliver() defers it again at the next message
         self.start_rotation(name, used, window)
 
+    def midturn_settings(self, name):
+        cfg = self.runtime_cfg(name)
+        cli = agent_cli(cfg, name)
+        return midturn.resolve_settings(cli, str(cfg.get(MODEL_KEYS[cli]) or ''), self.cfg,
+                                        self.handoff_table)[0]
+
+    def midturn_guard(self, name, info):
+        """Same ownership/profile/clear boundaries as normal rotation; dialogs are hands-off."""
+        owns = getattr(self.mgr, 'owns', None)
+        return (name not in self.names or name == ADVISOR or self.paused()
+                or subfleet.adopted(self.cfg, name, info.get('generation'))
+                or info.get('state') in ('delegated', 'clearing') or info.get('clear_required') == '1'
+                or info.get('prompt_wait') or info.get('profile_state') == 'switching'
+                or name in self.profile_swaps() or not info.get('pane')
+                or owns is not None and not owns(info['pane']))
+
+    def midturn_targets(self):
+        """Only the main loop touches Redis; the file thread receives plain snapshots."""
+        targets = {}
+        for name in self.names:
+            info = self.agent(name)
+            if name == ADVISOR or info.get('state') != 'busy':
+                continue
+            lease = self.r.hgetall(self.v2.bus.lease_key(name))
+            if lease.get('status') != 'received' or not lease.get('message_id'):
+                continue
+            msg = self.v2.bus.message(lease['message_id'])
+            if msg['body'].get('purpose') == 'handoff':
+                continue
+            cfg = self.runtime_cfg(name)
+            cli = agent_cli(cfg, name)
+            override = self.handoff_limits(name)[0]
+            targets[name] = dict(cli=cli, generation=int(info.get('generation') or 0),
+                message_id=lease['message_id'], thread=info.get('thread') or '',
+                path=info.get('transcript') if cli == 'claude' else '',
+                directory=str(self.run_dir / 'pi-sessions' / name / ('g' + str(info.get('generation') or 0)))
+                    if cli == 'pi' else str(self.sessions),
+                window=override or int(info.get('ctx_window') or (self.cfg['window'] if cli == 'codex' else 0)),
+                override=override)
+        return targets
+
+    def midturn_apply(self):
+        """Apply file results and type prompts on the daemon thread, outside event transactions."""
+        if not self.v2:
+            return
+        targets = self.midturn_targets()
+        self.midturn_probe.update(targets)
+        for name, result in self.midturn_probe.take().items():
+            target = targets.get(name)
+            if not target or any(target[k] != result[k] for k in ('generation', 'message_id')):
+                continue
+            info = self.agent(name)
+            if result['used'] is None:
+                if result['cli'] == 'opencode' and info.get('midturn_no_usage_g') != str(result['generation']):
+                    self.v2.transaction('midturn-no-usage-' + uuid.uuid4().hex,
+                        lambda name=name, result=result: self.v2.midturn_no_usage(name, result['generation']))
+                continue
+            used, window = result['used'], result['window']
+            settings = self.midturn_settings(name)
+            self.setf(name, ctx_used=used, ctx_window=window, midturn_ratio=settings['midturn_ratio'],
+                      midturn_line=settings['midturn_ratio'] * window)
+            # control's audit renderer includes status on its event line; keep the live numbers there
+            # without changing its schema or the separate control_view module (outside M1's file scope).
+            self.v2.audit('midturn.usage', slot=name,
+                          status='ctx=' + str(used) + '/' + str(window) + ' mid=' + str(int(settings['midturn_ratio'] * window)))
+            if self.midturn_guard(name, info) or info.get('midturn_typed_g') == str(result['generation']):
+                continue
+            msg = self.v2.bus.message(result['message_id'])
+            splits = self.v2.midturn_splits(msg)
+            action = midturn.decide(used, window, midturn_splits=splits, **settings)
+            if action == 'blocked':
+                self.v2.transaction('midturn-limit-' + result['message_id'],
+                    lambda name=name, msg=msg: self.v2.midturn_blocked(name, msg))
+            elif action == 'steer':
+                self.midturn_order(name, msg, used, window, settings)
+        self.midturn_timeouts()
+
+    def midturn_order(self, name, msg, used, window, settings):
+        now = time.time()
+        if msg['deadline_at'] <= int(now * 1000):
+            return
+        if self.service:
+            req = self.r.hgetall(REQ + msg['request_id'])
+            if req and midturn.effective_age(req, now) >= float(json.loads(req['spec']).get('timeout_s') or self.cfg['request_timeout']):
+                return
+        hid = 'fx-' + uuid.uuid4().hex[:16]
+        draft = agent_cwd(self.cfg, name) / '.handoff' / ('draft-' + hid + '.md')
+        # Single-line paste even for a run directory containing control characters.
+        if any(c in str(draft) for c in '\n\r\t'):
+            self.v2.audit('midturn.type_failed', slot=name, level='error', error='handoff path contains a control character')
+            return
+        draft.parent.mkdir(parents=True, exist_ok=True)
+        draft.write_text(handoff.partial_template())
+        prompt = midturn.MIDTURN_PROMPT.format(midturn_id=hid, used=used, window=window, path=draft)
+        def order():
+            fields = midturn.pause_message(msg, int(now * 1000), midturn_retry=settings['midturn_retry'],
+                                           profile_ready_timeout=float(self.cfg['profile_ready_timeout']))
+            fields = {k: fields[k] for k in ('deadline_at', 'deadline_remaining_ms', 'clock_paused_at')}
+            fields.update(midturn_id=hid, midturn_at=now, midturn_used=used)
+            self.v2.context['authorization'] = {
+                self.v2.bus.msg_key(msg['message_id']): {'status': 'received', 'generation': str(msg['generation']),
+                    'delivery_id': msg['delivery_id'], 'session_id': msg['session_id']},
+                self.v2.bus.lease_key(name): {'status': 'received', 'message_id': msg['message_id'],
+                    'current_delivery': msg['delivery_id'], 'generation': str(msg['generation'])}}
+            self.r.hset(self.v2.bus.msg_key(msg['message_id']), mapping=fields)
+            self.setf(name, midturn_id=hid, midturn_draft=draft, midturn_mtime=draft.stat().st_mtime_ns,
+                      midturn_typed_g=msg['generation'], midturn_deadline=now + settings['midturn_retry'],
+                      midturn_tries=1, midturn_prompt=prompt, midturn_send_pending=1, midturn_type_attempts=0,
+                      midturn_request=msg['request_id'], midturn_message=msg['message_id'],
+                      midturn_instruction=msg.get('midturn_instruction') or msg['body']['text'], midturn_wait_at='')
+            self.v2.midturn_pause_request(msg['request_id'], now)
+            self.v2.audit('midturn.ordered', slot=name, message_id=msg['message_id'], detail=fields)
+            self.v2.midturn_card(name, self.label(name) + ' 上下文 ' + str(used) + '/' + str(window) + '，已发中途交接指令')
+        self.v2.transaction('midturn-order-' + hid, order)
+
+    def midturn_type(self, name):
+        info = self.agent(name)
+        prompt = midturn.registered_prompt(info, info['generation'])
+        if not prompt or self.midturn_guard(name, info):
+            return
+        attempts = int(info.get('midturn_type_attempts') or 0) + 1
+        # Record before typing: a crash never silently replays a possibly accepted paste.
+        self.setf(name, midturn_type_attempts=attempts, midturn_send_pending=0)
+        try:
+            ok = self.mgr.send_prompt_to_idle(info['pane'], prompt,
+                                             bracketed=is_claude(self.runtime_cfg(name), name))
+        except Exception as exc:
+            ok = False
+            self.v2.audit('midturn.type_failed', slot=name, level='error', error=str(exc))
+        if not ok:
+            self.setf(name, midturn_send_pending=int(attempts < 2))
+            self.v2.audit('midturn.type_failed', slot=name, level='error', detail={'attempt': attempts})
+
+    def midturn_timeouts(self):
+        now = time.time()
+        for name in self.names:
+            info = self.agent(name)
+            if not info.get('midturn_id') or info.get('state') != 'busy':
+                continue
+            lease = self.r.hgetall(self.v2.bus.lease_key(name))
+            if lease.get('status') != 'received' or lease.get('message_id') != info.get('midturn_message'):
+                continue
+            if info.get('midturn_wait_at'):
+                elapsed = max(0, now - float(info['midturn_wait_at']))
+                def unfreeze():
+                    self.setf(name, midturn_wait_at=now if info.get('prompt_wait') else '',
+                              midturn_deadline=float(info['midturn_deadline']) + elapsed)
+                    key_ = self.v2.bus.msg_key(lease['message_id'])
+                    self.r.hset(key_, mapping={'deadline_at': int(self.r.hget(key_, 'deadline_at')) + round(elapsed * 1000)})
+                # Extend throughout the wait, so bridge lease renewals also see a live message deadline.
+                self.v2.transaction('midturn-wait-' + uuid.uuid4().hex, unfreeze)
+                info = self.agent(name)
+            if info.get('prompt_wait'):
+                if not info.get('midturn_wait_at'):
+                    self.setf(name, midturn_wait_at=now)
+                continue  # dialog protection precedes even a paused-fleet timeout
+            if now >= float(info['midturn_deadline']):
+                if self.midturn_guard(name, info):
+                    self.v2.transaction('midturn-held-' + uuid.uuid4().hex,
+                        lambda name=name: self.v2.hold(name, 'midturn timeout; rotation guarded'))
+                    continue
+                if int(info.get('midturn_tries') or 1) < 2:
+                    retry = self.midturn_settings(name)['midturn_retry']
+                    self.setf(name, midturn_tries=2, midturn_deadline=now + retry,
+                              midturn_send_pending=1, midturn_type_attempts=0)
+                    self.v2.audit('midturn.retry', slot=name)
+                else:
+                    try:
+                        screen = self.mgr.capture_output(info['pane']) or ''
+                    except Exception:
+                        screen = ''
+                    self.v2.watchdog.rotate(name, 'midturn timeout', screen, reason='midturn')
+                    continue
+            if self.agent(name).get('midturn_send_pending') == '1':
+                self.midturn_type(name)
+
     def handoff_limits(self, name):
         """(window or None = measured, ratio, source) for this agent's current runtime model."""
         cfg = self.runtime_cfg(name)
@@ -3833,6 +3998,8 @@ class Fleet:
             if not path:
                 return 0, 0
             used, window = claude_transcript_usage(path, override)
+            if used is None:
+                return int(self.agent(name).get('ctx_used') or 0), window
             self.setf(name, ctx_used=used, ctx_window=window)
             return used, window
         if not is_codex(self.runtime_cfg(name), name):
@@ -3843,6 +4010,8 @@ class Fleet:
             return 0, 0
         used, window = read_usage(str(paths[0]), int(self.cfg['window']))
         window = override or window
+        if used is None:
+            return int(self.agent(name).get('ctx_used') or 0), window
         self.setf(name, ctx_used=used, ctx_window=window)
         return used, window
 
@@ -3895,7 +4064,10 @@ class Fleet:
         info = self.agent(name)
         if info.get('state') != 'idle':
             return
-        if name != 'supervisor' and info.get('roster_swap_deferred') != '1' and name in self.profile_swaps():
+        pending_ids = self.v2.bus.pending(name, 1) if self.v2 else []
+        next_msg = self.v2.bus.message(pending_ids[0]) if pending_ids else {}
+        continuing = next_msg.get('kind') == 'continuation'
+        if not continuing and name != 'supervisor' and info.get('roster_swap_deferred') != '1' and name in self.profile_swaps():
             return  # the next generation (new profile) takes this queue once READY (a deferred swap keeps working)
         if self.v2 and not runtime_v2.tui_slot(self.runtime_cfg(name), name) and info.get('bridge_available') != '1':
             return
@@ -3915,7 +4087,7 @@ class Fleet:
                     return
                 head = SUPERVISOR_INSTRUCTION_HEAD.search('[Supervisor instruction ' + msg['request_id'] + '] ' + text)
                 text = '[Supervisor instruction ' + msg['request_id'] + '] ' + text
-            if head:
+            if head and not continuing:
                 if head.group(1) != self.task().get('id'):
                     self.finish('blocked', 'stale task instruction for ' + name)
                     return
@@ -3959,6 +4131,11 @@ class Fleet:
         # Leave the original message queued across handoff; READY triggers another
         # idle-boundary validation. This daemon remains the sole inbox consumer.
         used, window = self.usage(name)
+        if (continuing and int(info.get('delivered') or 0) == 0 and window
+                and used >= self.midturn_settings(name)['midturn_ratio'] * window):
+            self.v2.transaction('midturn-impossible-' + next_msg['message_id'],
+                                lambda: self.v2.midturn_blocked(name, next_msg, impossible=True))
+            return
         ratio = float(self.agent(name).get('handoff_ratio') or self.cfg['handoff_ratio'])  # set by usage()
         if subfleet.adopted(self.cfg, name, info.get('generation')):
             window = 0  # an adopted pane goes back to its parent fleet: never replace it with a successor
@@ -5028,7 +5205,8 @@ class Fleet:
                  else 'resident service: answer each request as role ' + name) if self.service
                 else '(no task yet, standing by)'),
             done_lines=facts + ['recent reply: ' + ' '.join(x.split())[:600] for x in replies],
-            inprogress='none (handoff happens at an idle boundary)',
+            inprogress=(handoff.midturn_progress(info.get('midturn_message', ''), info['midturn_instruction'])
+                        if info.get('midturn_instruction') else 'none (handoff happens at an idle boundary)'),
             next_lines=['read this note, reply READY, then wait for the daemon to deliver the next message'
                         + (' (pending: ' + ' '.join(pending[0].split())[:300] + ')' if pending else '')],
             pending=open_ids, task=t.get('id', ''), hop=int(info['generation']) + 1,
@@ -5087,10 +5265,13 @@ class Fleet:
             if self.v2:
                 self.setf(name, state='dead', launch_ready=0, retired_pane=old,
                           retired_launch=info.get('runtime_launch') or '')  # the old pane's launch (before rescue_launch)
+            if self.v2:
+                self.v2.transaction('midturn-rotate-failed-' + uuid.uuid4().hex, lambda: self.v2.midturn_clear(name))
             self.finish('blocked', 'could not close the old session ' + prev + '; two sessions hold slot ' + name)
             return
         if self.v2:
             self.v2.confirm_retired(name)
+            self.v2.transaction('midturn-rotated-' + uuid.uuid4().hex, lambda: self.v2.midturn_clear(name, resume=False))
             self.setf(name, launch_ready=1, retired_pane='', retired_launch='')
         self.refresh_history()
         self.log('rotate.done', agent=name, label=label, prev=prev, generation=generation + 1,

@@ -62,7 +62,7 @@ Fleet agents（一个工作区）
 
 ## 4. 交接与历史沿用原实现
 
-1. daemon 在空闲投递边界读取用量（§32 起：回合结束、空闲且无待投消息时也读一次，不必等下一条消息）。
+1. daemon 在空闲投递边界读取用量（§32 起：回合结束、空闲且无待投消息时也读一次，不必等下一条消息）；回合中途（投递边界 / 空闲之外）由 §33 的探针另外判，不等空闲。
 2. 达到 `handoff_ratio` 后，请旧代填写三节交接草稿。
 3. 把模型内容并入机器骨架；模型未写或失败时用骨架，不因缺交接文本阻塞换代。
 4. 保存旧屏幕和交接单；在原 pane/tab 位置启动新一代。
@@ -71,7 +71,7 @@ Fleet agents（一个工作区）
 
 - 正常默认阈值 **0.6（60%）**。1%/5% 仅作显式换代测试，结束后恢复正常值。
 - 新会话仅 READY 就已超阈值时，不反复重开；保留原 `rotate.impossible` 防循环机制。
-- pi 自动压缩只作长回合保险，不替换 fleet 的跨会话交接和历史。
+- pi 自动压缩只作长回合保险，不替换 fleet 的跨会话交接和历史；回合中途的强制换代见 §33。
 - 保留原关闭失败/投递失败处理；不能把“机器骨架可用”夸大成任何窗口/进程故障下都保证换代成功。
 
 ## 5. supervisor 手工派活必须形成闭环
@@ -742,6 +742,23 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - **路由消息带工人状态**（`Fleet.worker_board`，接在 `route()` 原 `Workers:` 行后，原行保留）：每个可派 worker 一行 `- <label>: <state>[, N queued][, has request <id>…][, role: <角色文件首个非空行，≤120 字>]`。在途请求按 `fx:req:*` 的 `status=dispatched` + `worker` 反查（v1 / v2 通用）。状态是入队时的快照；监工提示词补一句「前一回合派过、尚未回报的 worker 算忙」。
 - **service 监工提示词**（`service_supervisor.md` / `_v2` / `_tui_v2` 同加两条禁令）：有空闲 worker 时不许把请求排到忙的 worker 后面，只有请求明确接续该 worker 自己未完成的请求才可以，并在 `reason` 写明；复核 / 验收请求有带 reviewer 角色的 worker 时不许派给别人，永不派给被复核工作的作者。角色由名单 `role` 文件给（§16），本节不加新名单字段。
 - **空闲即换代**（`Fleet.idle_rotate`，`pump()` 里空闲且信箱空的监工 / worker）：每个（代数, delivered）只读一次用量，过阈值即 `start_rotation`；与 `deliver()` 同样的守卫（profile 换卡中、v2 非 TUI 槽未 `bridge_available`、子 fleet 收编槽、Codex 原生子 agent 在跑）；刚起的会话（delivered=0）不在这里判，`rotate.impossible` 仍归投递时。受 `max_busy` 与暂停约束（handoff 计入忙）。顾问槽不走这条（§27 自管）。
-- **已知边界**：长回合中途仍不换代（只在回合之间），pi 自压缩仍是长回合保险（§4）；请求超时被 `held` 的槽迟到结算后仍是 `held`（`settle.late` 只记审计），不会空闲即换代，要人工 / 看门处理——10-16 的 85k 事故正是这一情形，本节不覆盖。
+- **已知边界**：长回合中途换代已由 §33 覆盖（daemon 探针 + 强制 prompt）；请求超时被 `held` 的槽迟到结算后仍是 `held`（`settle.late` 只记审计），不会空闲即换代，要人工 / 看门处理——10-16 的 85k 事故正是这一情形，本节不覆盖。
 
 **验证**：`tests/test_fleet.py` 新增空闲过阈值即换代（delivered 1 换、0 不换）、同（代数, delivered）只读一次、路由消息含状态 / 队列 / 在途请求 / 角色；`test_rotated_worker_gets_next_name_and_old_name_still_routes` 按新时序把 `handoff_timeout=0` 前移（换代提前到空闲那一拍）。
+
+## 33. 回合中途换代（daemon 探针 + 强制 auto-handoff prompt）（2026-10-27 用户新要求，分支 feat/midturn-handoff）
+
+用户原话：「修吧，开分支做回合中途换代，这个问题纠缠了N次了，不论哪种模式都要能auto handoff啊，这是最基本的功能啊，怎么基本功能都丢失啊」「你不用搞那么复杂，就让daemon自动做一个探针就行吧，所有的会话的窗口都由daemon去控制。针对不同worker，像claude code、codex、pi之类的都强制它执行auto handoff的prompt」。据此推翻 `pi_extension_v2.ts` 首行原则「agent_settled only reports; it never requests continuation」与 §32 末尾「已知边界：长回合中途仍不换代」——这两条此前都假定换代只能发生在回合之间，本节起回合进行中 daemon 也强制换代。
+
+- **探针**：daemon 内一条独立线程，循环间隔 = max(1 秒, 本轮查完所有忙槽的耗时)，单线程顺序执行、不重叠不堆积；只看忙槽（busy、租约已 received、在途消息不是 handoff 投递本身），空闲槽仍归 §32 `idle_rotate`。每轮先 `stat` 该槽本代会话文件（mtime, size），未变跳过；变了只读尾部（≤64KB），不读全文件。
+- **用量口径**：pi 槽按 pi 自己的算法取数——`calculateContextTokens` 加尾随未计入模型调用的消息按 `ceil(chars/4)`（按 UTF-16 长度计）估算，探针照抄这套口径、不另造一套；compaction 发生后、下一次模型响应产生前，用量视为未知（不当 0，沿用上一次读到的值）。Claude 槽用现有 `claude_transcript_usage`，Codex 槽用现有 `handoff.read_usage`。
+- **中途线**：`midturn_ratio` 缺省 0.8（用户定）。用量 ≥ 0.8 × window、本代还没打过 → daemon 绕开投递闸，直接把固定单行 prompt 粘贴进该槽窗口并回车；prompt 带 `fx-<16hex>` 编号（即 `midturn_id`），每代只打一次。
+- **回合结算**：该回合结束时消息带中途标记、没有合格正式回报 → 记 `handoff_split`：不算完成、不判 BLOCKED、不计 attempt；续做消息排队首（FIFO 头），照原 §4 流程换代（草稿被模型改过走模型版，否则走骨架），接班代续做同一条派工。
+- **兜底**：打 prompt 后 300 秒回合未结束 → 再打一次；再 300 秒仍未结束 → 交现有 `Watchdog.rotate` 杀窗，走机器骨架交接 + 原位起新一代 + 续做。
+- **上限**：同一条派工最多拆 3 次（`midturn_splits` 计数在消息上）；过线不再拆，转 BLOCKED「请拆小」交监工 / service 处理。
+- **时钟**：service 的请求超时时钟在中途换代期间暂停，拆分链结束（结算、转 BLOCKED、取消）后把暂停时长累进恢复；task 整体 `hours` 预算不受影响，硬预算不暂停（§17 / §23）。
+- **三处放行**：这套机制要绕开三处原本会拦掉中途输入的闸——pi 扩展 `input` 钩子对带 `fx-` 前缀的中途 prompt 放行（原本会吞掉或转成 operator_input）；Claude 监工的 `UserPromptSubmit` 钩子对登记过的中途 prompt 放行；Codex `codex_queue.bound` 放宽成「第二条用户消息等于登记的中途 prompt 也算本代」。
+
+**已知边界**：探针能看到已追加、尚未发给模型的工具结果（pi 口径按 ceil(chars/4) 估算），但 CLI 在追加工具结果后几毫秒内就检查是否自压缩，快于 1 秒轮询——单批大工具结果可能一步把用量从中途线以下直接顶过 CLI 自压缩点，探针来不及打 prompt。200k 窗口（pi DeepSeek）下 0.8 的中途线到自压缩点只剩 23,616 token 余量，不保证能在压缩前交接完；用户 2026-10-27 知悉并定不调低 0.8（是否对 200k 及以下窗口单独调低留给用户另定）。pi 的 WorkBuddy DeepSeek 已改声明 400k 窗口，实测经网关可到 1M、单请求 612,564 token 通过；OpenCode 免费 DeepSeek 实测 185k 通过、260k 被拒，真实上限约 200k（其中 32k 留给输出），pi 扩展声明的 168k（= 200k − 32k）是对的，不改。
+
+**验证**：设计稿 `docs/midturn-handoff-design.md`（r3）§7 列了完整单测与端到端冒烟计划（新文件 `tests/test_midturn_v2.py` + `scripts/smoke_midturn.sh`），尚未实现、未跑、未复核、未合进在役分支、未部署。

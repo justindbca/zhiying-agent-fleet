@@ -686,13 +686,15 @@ class Watchdog:
             self.rotate(slot, why, screen)
 
     # ------------------------------------------------------------ frozen: kill + next generation
-    def rotate(self, slot, why, screen):
+    def rotate(self, slot, why, screen, reason=None):
         """Kill this fleet's own frozen session and start the next generation in its place."""
         from cmux_fleet import history, subfleet
         from cmux_fleet.fleet import NAMES, SUPERVISOR_LABEL
         f, rt = self.f, self.rt
         info = f.agent(slot)
         pane, generation = info['pane'], int(info.get('generation') or 0)
+        if info.get('prompt_wait'):
+            return False  # a confirmation dialog never authorizes a kill, including mid-turn fallback
         path = self.save_screen(slot, info, screen, 'frozen')
         if f.paused():
             # Nothing is (re)started while the run is paused (closed market, operator hold).
@@ -718,10 +720,24 @@ class Watchdog:
             return f.agent(slot).get('state') == 'starting'
         lease = f.r.hgetall(rt.bus.lease_key(slot))
         msg = rt.bus.message(lease['message_id']) if lease.get('message_id') else {}
-        hid = 'frozen-' + uuid.uuid4().hex[:8]
+        is_midturn = bool(msg.get('midturn_id'))
+        if reason == 'midturn' and not is_midturn:
+            return False  # stale timeout; never turn it into an ordinary frozen kill
+        hid = msg['midturn_id'] if is_midturn else 'frozen-' + uuid.uuid4().hex[:8]
         note = f.run_dir / 'handoffs' / (slot + '-g' + str(generation) + '-' + hid + '.md')
         note.parent.mkdir(parents=True, exist_ok=True)
-        note.write_text(f.skeleton(slot, dict(info, handoff_id=hid)))
+        base = f.skeleton(slot, dict(info, handoff_id=hid))
+        if is_midturn:
+            from cmux_fleet import handoff
+            draft = Path(info.get('midturn_draft') or '')
+            if draft.is_file() and draft.stat().st_mtime_ns > int(info.get('midturn_mtime') or 0):
+                note.write_text(handoff.merge_partial(base, draft.read_text()))
+                if not handoff.validate(str(note))[0]:
+                    note.write_text(base)
+            else:
+                note.write_text(base)
+        else:
+            note.write_text(base)
         snapshot = note.with_suffix('.terminal.txt')
         f.mgr.capture_to(pane, str(snapshot))
         prev = f.label(slot)
@@ -749,14 +765,18 @@ class Watchdog:
         if not f.mgr.kill_pane(pane) or f.mgr.get_pane_status(pane) is not None:
             return self.abort_rotation(slot, info, label, new, path, 'the frozen session ' + prev + ' did not exit')
         rt.confirm_retired(slot)  # the process tree is gone: its delivery is cancelled, execution stopped
+        if is_midturn:
+            rt.transaction('midturn-kill-' + msg['midturn_id'], lambda: rt.midturn_split(
+                slot, msg, msg, retired=True, note=str(note), previous=prev))
         f.setf(slot, launch_ready=1, retired_pane='')
         history.record(f.run_dir, slot=slot, label=prev, generation=generation, handoff=str(note),
-                       snapshot=str(snapshot), source='frozen', timed_out=True)
+                       snapshot=str(snapshot), source='midturn' if is_midturn else 'frozen', timed_out=True)
         f.refresh_history()
         self.audit('watch.frozen_restarted', slot=slot, level='error', prev=prev, label=label, reason=why,
                    screen=path, handoff=str(note), message_id=msg.get('message_id', ''))
         self.next_check.pop(slot, None)
-        self.tell(slot, prev, label, why, msg)
+        if not is_midturn:
+            self.tell(slot, prev, label, why, msg)
         return True
 
     def abort_rotation(self, slot, old, label, new, screen, why):
@@ -806,7 +826,7 @@ class Watchdog:
                 rt.transaction('watch-publish-' + uuid.uuid4().hex, lambda: rt.publish(
                     rid, 'stalled', worker=label, error=prev + ' froze (' + why + '); restarted, the request was not re-run'))
             return
-        if msg.get('kind') != 'worker':
+        if msg.get('kind') not in ('worker', 'continuation'):
             return
         f.queue('supervisor', '[' + label + ' report (took over from ' + prev + ')]\nFROZEN: ' + prev + ' stopped '
                 'responding (' + why + '). The watchdog killed its session and started ' + label + ' from a '

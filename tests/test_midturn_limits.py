@@ -1,273 +1,68 @@
-"""T1 policy, bounded usage readers and fail-open hooks; no CLI or Redis server needed."""
-import io
+"""r3 policy, bounded readers and clocks. No CLI hooks or A/B capability policy."""
 import json
-import subprocess
-import sys
-import time
-
 import pytest
-
-from cmux_fleet import midturn
-
-
-def test_example_pi_deepseek_200k_default_batch():
-    l1, l2, c, t, r, source = midturn.limits('pi', 200000, .6, layer='A')
-    assert l1 == 120000
-    assert c == 183616
-    assert t == 17000
-    assert r == 17000 * 4 * 1 + 8000 == 76000
-    assert c - r == 107616
-    assert l2 == l1 == 120000
-    assert 'midturn.clamped' in source
-    assert 'no safe interval' in source
+from cmux_fleet import midturn, roster
 
 
-def test_example_pi_deepseek_200k_measured_single_tool():
-    l1, l2, c, t, r, source = midturn.limits('pi', 200000, .6, layer='A', k=1)
-    assert l1 == 120000
-    assert c == 183616
-    assert t == 17000
-    assert r == 17000 * 1 * 1 + 8000 == 25000
-    assert c - r == 158616
-    assert l2 == 150000
-    assert l1 <= l2 <= c - r
-    assert 'midturn.clamped' not in source
+def test_defaults_never_clamp_the_200k_window():
+    settings, sources = midturn.resolve_settings('pi', 'deepseek', {'handoff_timeout': 900})
+    assert settings == {'midturn_ratio': .8, 'midturn_retry': 300, 'midturn_max_splits': 3}
+    assert sources['midturn_ratio'] == 'default'
+    assert midturn.decide(159999, 200000) == 'none'
+    assert midturn.decide(160000, 200000) == 'steer'
 
 
-def test_example_claude_opus_sonnet_1m():
-    l1, l2, c, t, r, source = midturn.limits('claude', 1000000, .6, layer='A')
-    assert l1 == 600000
-    assert c == 967000
-    assert t == 30000
-    assert r == 30000 * 4 * 1 + 8000 == 128000
-    assert c - r == 839000
-    assert l2 == 750000
-    assert l1 <= l2 <= c - r
-    assert '2.1.247' in source
+@pytest.mark.parametrize('cli,window', [('pi', 200000), ('claude', 1000000), ('codex', 400000), ('opencode', 200000)])
+def test_all_clis_use_same_ratio_and_one_retry(cli, window):
+    settings, _ = midturn.resolve_settings(cli, '', {})
+    assert midturn.decide(int(window * .8), window, **settings) == 'steer'
+    assert midturn.decide(None, window, ordered=True, elapsed=299) == 'none'
+    assert midturn.decide(1, window, ordered=True, elapsed=300) == 'retry'
+    assert midturn.decide(1, window, ordered=True, elapsed=300, tries=2) == 'kill'
+    assert midturn.decide(window, window, ordered=True, elapsed=999, guarded=True) == 'none'
 
 
-def test_example_claude_haiku_200k():
-    l1, l2, c, t, r, source = midturn.limits('claude', 200000, .6, layer='A')
-    assert l1 == 120000
-    assert c == 167000
-    assert t == 30000
-    assert r == 30000 * 4 * 1 + 8000 == 128000
-    assert c - r == 39000
-    assert l2 == l1 == 120000
-    assert 'assumption pending P5' in source
-    assert 'midturn.clamped' in source
+def test_exact_model_roster_overrides_then_cli_config_and_default():
+    cfg = {'midturn_ratio': .9, 'handoff': {'pi': {'midturn_ratio': .85}}}
+    table = {'pi:deepseek': {'midturn_ratio': .7}, 'pi': {'midturn_ratio': .75}}
+    assert midturn.resolve_settings('pi', 'deepseek', cfg, table)[0]['midturn_ratio'] == .7
+    assert midturn.resolve_settings('pi', 'other', cfg, table)[0]['midturn_ratio'] == .75
+    assert midturn.resolve_settings('pi', 'other', cfg)[0]['midturn_ratio'] == .85
+    assert midturn.resolve_settings('claude', 'opus', cfg)[0]['midturn_ratio'] == .9
+    assert not roster.handoff_errors({'handoff': table})
 
 
-def test_example_codex_400k():
-    l1, l2, c, t, r, source = midturn.limits('codex', 400000, .6, layer='A')
-    assert l1 == 240000
-    assert c == 360000
-    assert t == 10000
-    assert r == 10000 * 4 * 1 + 8000 == 48000
-    assert c - r == 312000
-    assert l2 == 300000
-    assert l1 <= l2 <= c - r
-    assert 'fleet-pinned model_auto_compact_token_limit=0.9W' in source
-
-
-def test_example_flashnext_100k_card_ratio():
-    l1, l2, c, t, r, source = midturn.limits('pi', 100000, .5, layer='A')
-    assert l1 == 50000
-    assert c == 83616
-    assert t == 17000
-    assert r == 17000 * 4 * 1 + 8000 == 76000
-    assert c - r == 7616
-    assert l2 == l1 == 50000
-    assert 'midturn.clamped' in source
-
-
-def test_b_layer_and_opencode_assumptions():
-    a = midturn.limits('opencode', 400000, .6, layer='A')
-    b = midturn.limits('opencode', 400000, .6)
-    assert a[2:5] == (360000, 30000, 128000)
-    assert b[2:5] == (360000, 30000, 248000)
-    assert a[1] == b[1] == 240000
-    assert 'assumption pending P6' in b[5]
-    assert 'layer B' in b[5]
-    assert all(value is False for value in midturn.MIDTURN_INJECT.values())
-
-
-def test_default_clamps_to_ceiling_or_l1_and_keeps_resolved_source():
-    result = midturn.limits('codex', 400000, .6, source='window: measured; ratio: card astra')
-    assert result[:5] == (240000, 272000, 360000, 10000, 88000)
-    assert result[5].startswith('window: measured; ratio: card astra;')
-    assert 'midturn.clamped' in result[5]
-    assert 'no safe interval' not in result[5]
-    assert midturn.limits('claude', 1000000, .8, layer='A')[1] == 800000
-    # Same numeric value, explicitly supplied: refuse rather than silently clamp it.
-    with pytest.raises(ValueError, match='L1 <= L2 <= C - R'):
-        midturn.limits('codex', 400000, .6, .75)
-    assert midturn.limits('codex', 400000, .6, .75, explicit=False)[1] == 272000
-
-
-@pytest.mark.parametrize('ratio', [.5, .9])
-def test_explicit_inequality_is_rejected(ratio):
-    with pytest.raises(ValueError, match='midturn_ratio violates'):
-        midturn.limits('claude', 1000000, .6, ratio, layer='A')
-
-
-def test_explicit_empty_interval_is_rejected_and_boundaries_are_legal():
-    with pytest.raises(ValueError, match='midturn_ratio violates'):
-        midturn.limits('pi', 200000, .6, .6, layer='A')
-    assert midturn.limits('claude', 1000000, .6, .6, layer='A')[1] == 600000
-    assert midturn.limits('claude', 1000000, .6, .839, layer='A')[1] == 839000
-
-
-def test_measured_reserve_compact_and_margin_parameters():
-    result = midturn.limits('pi', 200000, .6, layer='A', reserve_tokens=10000, k=1, b=3, h=1000)
-    assert result[:5] == (120000, 138000, 190000, 17000, 52000)
-    assert 'R=17000*1*3+1000=52000' in result[5]
-    assert midturn.limits('codex', 400000, .6, compact_limit=350000)[2] == 350000
-    assert 'explicit compact_limit' in midturn.limits('claude', 200000, .6, compact_limit=180000)[5]
-
-
-@pytest.mark.parametrize('key,value', [
-    ('midturn_ratio', True), ('midturn_ratio', '0.75'), ('midturn_ratio', None),
-    ('midturn_ratio', 0), ('midturn_ratio', 1), ('midturn_ratio', float('nan')),
-    ('midturn_ratio', float('inf')), ('midturn_max_splits', True),
-    ('midturn_max_splits', 1.5), ('midturn_max_splits', -1),
-    ('midturn_timeout', float('inf')), ('midturn_b_wait', -1), ('midturn_nudge', '180'),
-])
-def test_invalid_new_settings(key, value):
+@pytest.mark.parametrize('bad', [True, 0, 1, -1, '0.8', float('nan'), float('inf')])
+def test_bad_ratio_rejected(bad):
     with pytest.raises(ValueError):
-        midturn.validate_settings({key: value})
+        midturn.validate_settings({'midturn_ratio': bad})
+    assert roster.handoff_errors({'handoff': {'pi:model': {'midturn_ratio': bad}}})
 
 
-@pytest.mark.parametrize('options', [
-    {'window': True}, {'window': 0}, {'window': 2.5}, {'handoff_ratio': True},
-    {'handoff_ratio': 1}, {'k': 0}, {'k': True}, {'b': 0}, {'b': 1.5},
-    {'h': -1}, {'compact_limit': 0}, {'reserve_tokens': -1}, {'layer': 'C'}, {'cli': 'unknown'},
-])
-def test_invalid_limit_inputs(options):
-    args = dict(cli='pi', window=200000, handoff_ratio=.6)
-    args.update(options)
+@pytest.mark.parametrize('bad', [True, -1, '3', 1.5])
+def test_bad_split_cap_rejected(bad):
     with pytest.raises(ValueError):
-        midturn.limits(**args)
+        midturn.validate_settings({'midturn_max_splits': bad})
 
 
-def test_five_layer_resolution_each_key_independently():
-    cfg = {'midturn_ratio': .61, 'handoff_timeout': 333,
-           'handoff': {'pi': {'midturn_ratio': .63}, 'pi:model': {'midturn_ratio': .64}}}
-    table = {'pi': {'midturn_ratio': .65}, 'pi:model': {'midturn_ratio': .66}}
-    worker = {'midturn_ratio': .67, 'midturn_max_splits': 2}
-    card = ('card-id', {'midturn_ratio': .62, 'midturn_nudge': 40})
-    values, sources = midturn.resolve_settings('pi', 'model', cfg, table, worker, card)
-    assert values['midturn_ratio'] == .67 and sources['midturn_ratio'] == 'worker'
-    assert values['midturn_max_splits'] == 2
-    assert values['midturn_nudge'] == 40 and sources['midturn_nudge'] == 'card card-id'
-    assert values['midturn_timeout'] == 333 and sources['midturn_timeout'] == 'handoff_timeout'
-    assert values['midturn_b_wait'] == 60
-    assert midturn.resolve_settings('pi', 'model', cfg, table, card=card)[0]['midturn_ratio'] == .66
-    assert midturn.resolve_settings('pi', 'other', cfg, table, card=card)[0]['midturn_ratio'] == .65
-    assert midturn.resolve_settings('pi', 'model', cfg, card=card)[0]['midturn_ratio'] == .64
-    assert midturn.resolve_settings('pi', 'other', cfg, card=card)[0]['midturn_ratio'] == .63
-    flags = {'midturn_ratio': .61}
-    assert midturn.resolve_settings('pi', 'model', flags, card=card)[0]['midturn_ratio'] == .62
-    assert midturn.resolve_settings('pi', 'model', flags)[0]['midturn_ratio'] == .61
-    assert midturn.resolve_settings('pi', 'model', flags)[1]['midturn_ratio'] == '--midturn-ratio'
-    assert midturn.resolve_settings('pi', 'model', {})[0] == midturn.DEFAULTS
-    assert midturn.resolve_settings('pi', 'model', {})[1]['midturn_ratio'] == 'default'
-    assert worker == {'midturn_ratio': .67, 'midturn_max_splits': 2}
+def test_unknown_idle_cap_and_successor_ready():
+    assert midturn.decide(None, 200000) == 'none'
+    assert midturn.decide(160000, 0) == 'none'
+    assert midturn.decide(160000, 200000, busy=False) == 'none'
+    assert midturn.decide(160000, 200000, midturn_splits=2) == 'steer'
+    assert midturn.decide(160000, 200000, midturn_splits=3) == 'blocked'
+    assert midturn.decide(160000, 200000, busy=False, ready=True) == 'blocked'
 
 
-def test_invalid_shadowed_setting_still_refuses_entry():
-    with pytest.raises(ValueError):
-        midturn.resolve_settings('pi', '', {'midturn_ratio': False}, worker={'midturn_ratio': .7})
-
-
-def test_invalid_capability_and_settings_container_cannot_enable_a():
-    with pytest.raises(ValueError, match='mapping'):
-        midturn.validate_settings([])
-    with pytest.raises(ValueError, match='a_available'):
-        midturn.decide(750000, 1000000, 'claude', a_available='false')
-    with pytest.raises(ValueError, match='explicit'):
-        midturn.limits('claude', 1000000, .6, explicit='false')
-
-
-@pytest.mark.parametrize('cli,window,used', [
-    ('pi', 200000, 120000), ('claude', 1000000, 750000),
-    ('codex', 400000, 300000), ('opencode', 1000000, 750000),
-])
-def test_all_clis_a_or_b_and_threshold_boundary(cli, window, used):
-    assert midturn.decide(used - 1, window, cli, a_available=True) == 'none'
-    assert midturn.decide(used, window, cli, a_available=True) == 'steer'
-    assert midturn.decide(used, window, cli, a_available=False) == 'kill'
-    assert midturn.decide(used, window, cli) == 'kill'  # no unproven A capability
-
-
-@pytest.mark.parametrize('guard', ['prompt_wait', 'prompt_route', 'adopted', 'clearing',
-                                  'clear_required', 'paused', 'profile_switching', 'advisor', 'expired'])
-@pytest.mark.parametrize('ordered', [False, True])
-def test_guards_precede_steering_killing_and_blocking(guard, ordered):
-    assert midturn.decide(999999, 1000000, 'claude', ordered=ordered, elapsed=9999,
-                           ready=True, midturn_splits=3, **{guard: True}) == 'none'
-
-
-def test_no_delivery_no_usage_and_unregistered_slot():
-    assert midturn.decide(800000, 1000000, 'claude', busy=False) == 'none'
-    assert midturn.decide(800000, 1000000, 'claude', registered=False) == 'none'
-    assert midturn.decide(None, 1000000, 'claude') == 'none'
-    assert midturn.decide(800000, None, 'claude') == 'none'
-    assert midturn.decide(800000, 0, 'claude') == 'none'
-
-
-def test_split_limit_and_successor_ready_are_blocked_only_when_over_line():
-    assert midturn.decide(750000, 1000000, 'claude', a_available=True, midturn_splits=2) == 'steer'
-    assert midturn.decide(750000, 1000000, 'claude', a_available=True, midturn_splits=3) == 'blocked'
-    assert midturn.decide(749999, 1000000, 'claude', a_available=True, midturn_splits=3) == 'none'
-    assert midturn.decide(750000, 1000000, 'claude', midturn_max_splits=0) == 'blocked'
-    assert midturn.decide(750000, 1000000, 'claude', a_available=True, busy=False, ready=True) == 'blocked'
-    assert midturn.decide(749999, 1000000, 'claude', a_available=True, busy=False, ready=True) == 'none'
-
-
-def test_a_timeout_b_wait_gap_and_emergency_boundaries():
-    args = dict(used=750000, window=1000000, cli='claude', a_available=True, ordered=True)
-    assert midturn.decide(**args, elapsed=899) == 'none'  # no duplicate A0
-    assert midturn.decide(**args, elapsed=900) == 'kill'
-    assert midturn.decide(**args, elapsed=900, tools_running=True, b_waited=59.99) == 'none'
-    assert midturn.decide(**args, elapsed=900, tools_running=True, b_waited=60) == 'kill'
-    args.update(used=936999, tools_running=True)
-    assert midturn.decide(**args) == 'none'
-    args['used'] = 937000  # C - T; no wait, even before A's timeout
-    assert midturn.decide(**args) == 'kill'
-    assert midturn.decide(937000, 1000000, 'claude', a_available=True, tools_running=True) == 'kill'
-
-
-def test_b_unavailable_a_waits_for_tools_but_never_forever():
-    args = dict(used=750000, window=1000000, cli='claude', a_available=False, tools_running=True)
-    assert midturn.decide(**args, b_waited=59) == 'none'
-    assert midturn.decide(**args, b_waited=60) == 'kill'
-    assert midturn.decide(**args, midturn_b_wait=0) == 'kill'
-    args['tools_running'] = False
-    assert midturn.decide(**args) == 'kill'
-
-
-def test_order_survives_a_usage_drop_after_unexpected_compaction():
-    assert midturn.decide(1000, 1000000, 'claude', ordered=True, elapsed=900, a_available=True) == 'kill'
-    assert midturn.decide(1000, 1000000, 'claude', ordered=False, a_available=True) == 'none'
-    assert midturn.decide(None, 1000000, 'claude', ordered=True, elapsed=899, a_available=True) == 'none'
-    assert midturn.decide(None, 1000000, 'claude', ordered=True, elapsed=900, a_available=True) == 'kill'
-
-
-def test_zero_waits_and_zero_split_limit_are_valid_config():
-    values = {'midturn_max_splits': 0, 'midturn_timeout': 0, 'midturn_b_wait': 0, 'midturn_nudge': 0}
-    midturn.validate_settings(values)
-    assert midturn.resolve_settings('pi', '', values)[0]['midturn_max_splits'] == 0
-
-
-def test_business_text_preserves_labels_instruction_and_existing_report_contract():
-    instruction = 'Original "quoted" task\n\t下一行 {untouched}'
-    text = midturn.continuation('worker-1.1', 'worker-1', '/handoffs/note.md', instruction)
-    assert text.startswith('[Continuation] You are worker-1.1; worker-1 stopped')
-    assert text.endswith(instruction)
-    assert 're-check the step marked in progress' in text
-    assert '已拆 3 次' in midturn.blocked_text(3)
-    assert 'Done / Evidence / Not done / Blocked' in midturn.blocked_prompt(3)
+def test_prompt_and_continuation_preserve_identity_and_original_text():
+    prompt = midturn.MIDTURN_PROMPT.format(midturn_id='fx-' + 'a' * 16, used=160000, window=200000, path='/tmp/draft.md')
+    assert len(prompt.splitlines()) == 1 and 'fleet_result/fleet_decision' in prompt
+    info = dict(midturn_id='fx-' + 'a' * 16, midturn_typed_g='2', midturn_prompt=prompt)
+    assert midturn.registered_prompt(info, 2) == prompt
+    assert midturn.registered_prompt(info, 3) == ''
+    original = 'Original "quoted" task\n\t下一行 {untouched}'
+    assert midturn.continuation('worker-1.1', 'worker-1', '/note', original).endswith(original)
+    assert midturn.blocked_text(3) == '这条派工一个会话装不下（已续做 3 次），请拆小'
 
 
 def write_rows(path, rows):
@@ -330,8 +125,8 @@ def test_missing_or_invalid_measurement_is_unknown_not_file_size(tmp_path, reade
 
 
 @pytest.mark.parametrize('reader,row,size', [
-    (midturn.claude_transcript_usage, claude_row, 524288),
-    (midturn.codex_rollout_usage, codex_row, 131072),
+    (midturn.claude_transcript_usage, claude_row, 65536),
+    (midturn.codex_rollout_usage, codex_row, 65536),
 ])
 def test_reader_only_reads_bounded_suffix_and_ignores_cut_first_row(tmp_path, monkeypatch, reader, row, size):
     path = tmp_path / 'large.jsonl'
@@ -363,42 +158,6 @@ def test_reader_only_reads_bounded_suffix_and_ignores_cut_first_row(tmp_path, mo
     monkeypatch.setattr(midturn, 'open', lambda *args: TailOnly(), raising=False)
     assert reader(path, 400000) == (42, 400000)
     assert reads == [size]
-
-
-@pytest.mark.parametrize('cli', ['pi', 'opencode'])
-def test_usage_frame_binding_and_overshoot(cli):
-    frame = {'kind': 'usage', 'generation': 2, 'message_id': 'm-1', 'ctx_used': 200001,
-             'ctx_window': 200000, 'slot': 'worker-1', 'session_id': 'session', 'cli': cli}
-    args = dict(cli=cli, generation=2, message_id='m-1', slot='worker-1', session_id='session')
-    assert midturn.parse_usage_frame(frame, **args) == (200001, 200000)
-    assert midturn.parse_usage_frame(json.dumps(frame), **args) == (200001, 200000)
-    assert midturn.parse_usage_frame(dict(frame, ctx_used=0), **args) == (0, 200000)
-    for change in ({'generation': 1}, {'generation': True}, {'message_id': 'old'},
-                   {'slot': 'worker-2'}, {'session_id': 'old'}, {'phase': 'manual'}, {'cli': 'claude'}):
-        assert midturn.parse_usage_frame(dict(frame, **change), **args) is None
-
-
-@pytest.mark.parametrize('change', [
-    {'ctx_used': None}, {'ctx_used': True}, {'ctx_used': '4'}, {'ctx_used': -1},
-    {'ctx_used': 1.5}, {'ctx_used': float('nan')}, {'ctx_window': 0}, {'ctx_window': -1},
-    {'ctx_window': '200000'}, {'ctx_window': True}, {'kind': 'settled'}, {'message_id': None},
-])
-def test_invalid_usage_frame_preserves_previous_measurement(change):
-    frame = dict(kind='usage', generation=0, message_id='m', ctx_used=4, ctx_window=200000)
-    assert midturn.parse_usage_frame(dict(frame, **change), cli='pi', generation=0, message_id='m') is None
-
-
-def test_usage_frame_missing_fields_and_invalid_envelope():
-    args = dict(cli='pi', generation=0, message_id='m')
-    frame = dict(kind='usage', generation=0, message_id='m', ctx_used=4, ctx_window=200000)
-    for key in frame:
-        partial = {k: v for k, v in frame.items() if k != key}
-        assert midturn.parse_usage_frame(partial, **args) is None
-    for bad in ('{', '[]', None, 3, b'\xff'):
-        assert midturn.parse_usage_frame(bad, **args) is None
-    assert midturn.parse_usage_frame(frame, **dict(args, message_id='')) is None
-    assert midturn.parse_usage_frame(frame, **dict(args, generation=True)) is None
-    assert midturn.parse_usage_frame(frame, **dict(args, cli='claude')) is None
 
 
 def test_effective_age_freezes_accumulates_and_resumes_without_mutation():
@@ -433,7 +192,7 @@ def test_pause_at_zero_redis_strings_and_clock_backwards():
 def test_message_deadline_pause_resume_and_no_double_extension():
     message = {'deadline_at': '200000', 'midturn_splits': '2', 'replay': '1'}
     paused = midturn.pause_message(message, 150000)
-    assert paused['deadline_at'] == 1160000  # original + (900 + 60) seconds
+    assert paused['deadline_at'] == 980000  # original + (2 * 300 + 180) seconds
     assert paused['deadline_remaining_ms'] == 50000
     assert paused['clock_paused_at'] == 150
     assert midturn.pause_message(paused, 180000) == paused
@@ -465,160 +224,104 @@ def test_every_noncontinuation_exit_can_restore_clock(exit_reason):
     assert resumed['clock_paused_ms'] == 5000
     assert midturn.effective_age(resumed, 120) == 15
 
-
-class FakeRedis:
-    """Only the hook's HGET + atomic notice claim; no server or retries."""
-    def __init__(self, record=None):
-        self.key = midturn.order_key('private-run', 'worker-1', 2)
-        self.order = json.dumps(record) if record is not None else None
-        self.calls = []
-        self.hid, self.tools, self.last = None, 0, 0
-        self.replace_on_eval = False
-
-    def hget(self, key, field):
-        self.calls.append(('hget', key, field))
-        return self.order if key == self.key else None
-
-    def eval(self, script, count, key, raw, hid, now):
-        self.calls.append(('eval', key))
-        assert script == midturn.LUA_NOTICE and count == 1
-        if self.replace_on_eval:
-            self.order = None
-        if self.order != raw or key != self.key:
-            return 0
-        if self.hid == hid:
-            self.tools += 1
-        if self.hid != hid or self.tools >= 3 or now - self.last >= 120:
-            self.hid, self.tools, self.last = hid, 0, now
-            return 1
-        return 0
+def pi_row(tokens=100, **message):
+    return {'type': 'message', 'message': dict(role='assistant', stopReason='stop',
+            usage={'totalTokens': tokens, 'input': 999}, content=[], **message)}
 
 
-def hook_order(**changes):
-    record = midturn.order_record('worker-1', 2, 'session-2', 'm-2', 'h-2',
-                                  '/handoffs/中文 "note".md', 750000, 1000000, 2000,
-                                  transcript='/sessions/main.jsonl')
-    return dict(record, **changes)
+def test_pi_tool_result_append_without_another_assistant(tmp_path):
+    path = tmp_path / 'pi.jsonl'
+    write_rows(path, [pi_row(1234)])
+    assert midturn.pi_session_usage(path, 200000) == (1234, 200000)
+    with path.open('a') as stream:
+        stream.write(json.dumps({'type': 'message', 'message': {'role': 'toolResult',
+            'content': [{'type': 'text', 'text': '😀中文abc'}]}}, ensure_ascii=False) + '\n')
+    # 7 UTF-16 code units: ceil(7/4), not Python's len(string).
+    assert midturn.pi_session_usage(path, 200000) == (1236, 200000)
 
 
-def hook_data(**changes):
-    return dict(hook_event_name='PostToolUse', session_id='session-2',
-                transcript_path='/sessions/main.jsonl', **changes)
+def test_pi_valid_assistant_sum_fallback_errors_and_each_message_rounding(tmp_path):
+    path = tmp_path / 'pi.jsonl'
+    row = pi_row(0)
+    row['message']['usage'] = {'totalTokens': 0, 'input': 10, 'output': 20, 'cacheRead': 30, 'cacheWrite': 40}
+    bad = pi_row(99999)
+    bad['message'].update(stopReason='error', content=[{'type': 'thinking', 'thinking': '😀😀😀'},
+        {'type': 'toolCall', 'name': 'read', 'arguments': {'p': '😀'}}])
+    write_rows(path, [row, bad, {'type': 'message', 'message': {'role': 'user', 'content': 'x'}},
+                     {'type': 'message', 'message': {'role': 'custom', 'content': [{'type': 'text', 'text': 'x'}]}}])
+    assert midturn.pi_estimate(bad['message']) == 5  # 6 + 4 + 10 UTF-16 units
+    assert midturn.pi_session_usage(path, 200000) == (107, 200000)
 
 
-def run_hook(r, data=None, now=1000, generation=2):
-    return midturn.posttool_hook(r, 'private-run', 'worker-1', generation,
-                                 hook_data() if data is None else data, now=now)
+def test_pi_compaction_unknown_until_a_new_valid_assistant(tmp_path):
+    path = tmp_path / 'pi.jsonl'
+    rows = [pi_row(180000), {'type': 'compaction'}, pi_row(0)]
+    rows[-1]['message']['usage'] = {'totalTokens': 0}
+    write_rows(path, rows)
+    assert midturn.pi_session_usage(path, 200000) == (None, 200000)
+    write_rows(path, rows + [pi_row(500)])
+    assert midturn.pi_session_usage(path, 200000) == (500, 200000)
 
 
-def test_hook_miss_is_one_hget_under_200ms_and_exit_zero():
-    r, output = FakeRedis(), io.StringIO()
-    start = time.perf_counter()
-    assert midturn.posttool_main(r, 'private-run', 'worker-1', 2, hook_data(), output=output) == 0
-    assert time.perf_counter() - start < .2
-    assert output.getvalue() == ''
-    assert r.calls == [('hget', 'private-run:midturn:worker-1:g2', 'order')]
+def test_probe_stat_skip_and_generation_message_result(tmp_path, monkeypatch):
+    path = tmp_path / 'pi.jsonl'
+    write_rows(path, [pi_row(160000)])
+    probe = midturn.Probe()
+    target = dict(cli='pi', generation=2, message_id='m2', directory=str(tmp_path), window=200000)
+    probe.update({'worker-1': target})
+    probe.poll()
+    result = probe.take()['worker-1']
+    assert result['used'] == 160000 and result['generation'] == 2 and result['message_id'] == 'm2'
+    monkeypatch.setattr(midturn, 'pi_session_usage', lambda *a: pytest.fail('unchanged stat read again'))
+    probe.poll()
+    assert probe.take() == {}
 
 
-@pytest.mark.parametrize('failure', [ConnectionError, TimeoutError, OSError, ValueError])
-def test_hook_unavailable_redis_is_silent_exit_zero(failure):
-    class Unavailable:
-        def hget(self, *args):
-            raise failure('unavailable')
-
-    output = io.StringIO()
-    assert midturn.posttool_main(Unavailable(), 'private-run', 'worker-1', 2,
-                                 hook_data(), output=output) == 0
-    assert output.getvalue() == ''
-
-
-def test_hook_emits_exact_additional_context_json_and_exit_zero():
-    r, output = FakeRedis(hook_order()), io.StringIO()
-    assert midturn.posttool_main(r, 'private-run', 'worker-1', 2, json.dumps(hook_data()),
-                                 now=1000, output=output) == 0
-    result = json.loads(output.getvalue())
-    assert result == {'hookSpecificOutput': {'hookEventName': 'PostToolUse',
-        'additionalContext': midturn.MIDTURN_PROMPT.format(
-            used=750000, window=1000000, path='/handoffs/中文 "note".md')}}
-    assert 'fleet_result / fleet_decision' in output.getvalue()
+@pytest.mark.parametrize('duration,delay', [(.25, .75), (1, 0), (2.75, 0)])
+def test_probe_cycle_is_max_one_second_or_scan_time(monkeypatch, duration, delay):
+    probe = midturn.Probe()
+    ticks = iter([10, 10 + duration])
+    monkeypatch.setattr(midturn.time, 'monotonic', lambda: next(ticks))
+    waits = []
+    def wait(seconds):
+        waits.append(seconds)
+        probe.stop.set()
+    monkeypatch.setattr(probe.stop, 'wait', wait)
+    probe.run()
+    assert waits == [delay]
 
 
-@pytest.mark.parametrize('change', [
-    {'session_id': 'other'}, {'transcript_path': '/sessions/subagents/a.jsonl'},
-    {'transcript_path': None}, {'hook_event_name': 'Stop'}, {'agent_id': 'child'},
-    {'agentId': 'child'}, {'parent_agent_id': 'parent'}, {'isSidechain': True},
-    {'is_sidechain': True}, {'subagent_id': 'child'}, {'message_id': 'other'},
-])
-def test_hook_rejects_unbound_or_child_session(change):
-    r = FakeRedis(hook_order())
-    assert run_hook(r, dict(hook_data(), **change)) == ''
-    assert len(r.calls) == 1
+def test_pi_cached_anchor_survives_beyond_tail_but_not_compaction_or_a_gap(tmp_path):
+    path = tmp_path / 'pi.jsonl'
+    write_rows(path, [pi_row(1000)])
+    state = {}
+    assert midturn.pi_session_usage(path, 200000, state)[0] == 1000
+    row = {'type':'message', 'message':{'role':'toolResult', 'content':[{'type':'text', 'text':'x'*40000}]}}
+    for n in range(1, 4):
+        with path.open('a') as stream:
+            stream.write(json.dumps(row) + '\n')
+        assert midturn.pi_session_usage(path, 200000, state)[0] == 1000 + n*10000
+    with path.open('a') as stream:
+        stream.write(json.dumps({'type':'compaction'}) + '\n')
+    assert midturn.pi_session_usage(path, 200000, state)[0] is None
+    write_rows(path, [pi_row(2000)])
+    state = {}
+    assert midturn.pi_session_usage(path, 200000, state)[0] == 2000
+    with path.open('a') as stream:
+        stream.write(json.dumps(row) + '\n' + json.dumps(row) + '\n')
+    assert midturn.pi_session_usage(path, 200000, state)[0] is None  # more than 64KB arrived between scans
 
 
-@pytest.mark.parametrize('change', [
-    {'generation': 1}, {'generation': True}, {'slot': 'worker-2'}, {'thread': 'other'},
-    {'midturn_layer': 'B'}, {'midturn_deadline': 999}, {'midturn_deadline': 1000},
-    {'midturn_draft': ''}, {'window': True}, {'message_id': ''}, {'suspended': True},
-])
-def test_hook_rejects_stale_invalid_or_suspended_order(change):
-    r = FakeRedis(hook_order(**change))
-    assert run_hook(r) == ''
-    assert len(r.calls) == 1
-
-
-def test_hook_generation_key_wrong_prefix_and_atomic_cancellation():
-    r = FakeRedis(hook_order())
-    assert run_hook(r, generation=1) == ''
-    assert midturn.posttool_hook(r, 'another-run', 'worker-1', 2, hook_data(), now=1000) == ''
-    r.replace_on_eval = True
-    assert run_hook(r) == ''
-    assert r.order is None
-
-
-def test_hook_reminds_after_three_more_tools_or_120_seconds():
-    r = FakeRedis(hook_order())
-    assert run_hook(r, now=1000)
-    assert run_hook(r, now=1001) == ''
-    assert run_hook(r, now=1002) == ''
-    assert run_hook(r, now=1003)
-    assert run_hook(r, now=1122.999) == ''
-    assert run_hook(r, now=1123)
-    r.order = json.dumps(hook_order(midturn_hid='new-order'))
-    assert run_hook(r, now=1124)  # a new order is never throttled by the previous one
-
-
-@pytest.mark.parametrize('raw', ['{', '[]', 'null', '{}', b'\xff'])
-def test_hook_malformed_order_fails_open(raw):
-    r = FakeRedis()
-    r.order = raw
-    assert run_hook(r) == ''
-
-
-def test_hook_malformed_input_and_notice_write_failure_are_silent():
-    for raw in ('{', '[]', 'null', '{}', b'\xff'):
-        assert run_hook(FakeRedis(hook_order()), raw) == ''
-
-    class WriteFailure(FakeRedis):
-        def eval(self, *args):
-            raise TimeoutError('Redis read timed out')
-
-    output = io.StringIO()
-    assert midturn.posttool_main(WriteFailure(hook_order()), 'private-run', 'worker-1', 2,
-                                 hook_data(), now=1000, output=output) == 0
-    assert output.getvalue() == ''
-
-
-def test_module_standalone_import_and_hook_do_not_load_fleet_or_redis():
-    script = '''
-import sys
-from cmux_fleet import midturn
-class Missing:
-    def hget(self, *args): return None
-assert midturn.posttool_main(Missing(), 'private-run', 'worker-1', 0, '{}') == 0
-assert 'cmux_fleet.fleet' not in sys.modules
-assert 'cmux_fleet.runtime_v2' not in sys.modules
-assert 'redis' not in sys.modules
-'''
-    result = subprocess.run([sys.executable, '-B', '-c', script], capture_output=True, text=True, timeout=5)
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == ''
+def test_pi_partial_append_is_counted_exactly_once(tmp_path):
+    path = tmp_path / 'pi.jsonl'
+    write_rows(path, [pi_row(100)])
+    state = {}
+    assert midturn.pi_session_usage(path, 200000, state)[0] == 100
+    text = json.dumps({'type':'message', 'message':{'role':'toolResult', 'content':'abcdefghi'}})
+    with path.open('a') as stream:
+        stream.write(text[:30])
+    assert midturn.pi_session_usage(path, 200000, state)[0] == 100
+    with path.open('a') as stream:
+        stream.write(text[30:] + '\n')
+    assert midturn.pi_session_usage(path, 200000, state)[0] == 103
+    assert midturn.pi_session_usage(path, 200000, state)[0] == 103

@@ -1,30 +1,25 @@
-"""Mid-turn handoff policy and small adapters (midturn-handoff-design.md §§3–5).
+"""Daemon mid-turn handoff: bounded file readers, policy and clock arithmetic.
 
-The daemon owns ordering, settlement and rotation. This module neither imports Fleet nor
-dispatches work. Pass the window / handoff ratio already resolved by design.md §22.
-Times are seconds unless a name ends in _ms; bus message deadlines are milliseconds.
+No Redis, CLI hooks or transport here. The probe consumes immutable snapshots supplied by
+Fleet's main loop; only that loop may order, settle or rotate a delivery (design r3).
 """
 import json
 import math
+import threading
 import time
+from decimal import Decimal
+from pathlib import Path
 
-
-DEFAULTS = {'midturn_ratio': .75, 'midturn_max_splits': 3, 'midturn_timeout': 900,
-            'midturn_nudge': 180, 'midturn_b_wait': 60}
-# No A capability is enabled until its version-matched probe passes (P1–P6).
-MIDTURN_INJECT = {'pi': False, 'claude': False, 'codex': False, 'opencode': False}
-TOOL_LIMITS = {'pi': 17000, 'claude': 30000, 'codex': 10000, 'opencode': 30000}
-TOOL_SOURCES = {'pi': '50KB / 3 bytes per token (estimate)',
-                'claude': '2.1.280 tool caps (allow_large needs P7b on newer versions)',
-                'codex': 'fleet-pinned tool_output_token_limit',
-                'opencode': 'Claude cap (assumption pending P6)'}
+TAIL_BYTES = 65536
+DEFAULTS = {'midturn_ratio': .8, 'midturn_retry': 300, 'midturn_max_splits': 3}
+PREFIX = '[FLEET MID-TURN HANDOFF fx-'
 MIDTURN_PROMPT = (
-    '[FLEET MID-TURN HANDOFF] Context is {used}/{window}. Stop the current work at this point. '
-    'Do not start any new step. Only edit the handoff note {path} (three `## ` sections, '
-    'same rules as always; in `## In progress` write exactly where you stopped inside the '
-    'current instruction, in `## Next steps` what remains of it). Do not send your final '
-    'report or call fleet_result / fleet_decision. Then end your turn with the single word '
-    'HANDOFF. Your successor continues this same instruction from the note.'
+    '[FLEET MID-TURN HANDOFF {midturn_id}] Context is {used}/{window}. Stop now; start no new step. '
+    'Edit only the handoff note {path}: keep its three ## headings '
+    '(Done (facts) / In progress / Next steps (in order)), at most 10 lines each; '
+    'under In progress write exactly where you stopped inside the current instruction, '
+    'under Next steps what remains of it. Do not send your final report or call '
+    'fleet_result/fleet_decision. Then end your turn with the single word HANDOFF.'
 )
 CONTINUATION_PROMPT = (
     '[Continuation] You are {label}; {prev} stopped this same instruction midway (context full). '
@@ -55,8 +50,7 @@ def _ratio(value, name):
 def validate_settings(settings):
     """Validate the new keys in a config/card/roster entry; leave existing keys to §22.
 
-    Cross-field inequalities require the resolved window and are checked by limits().
-    Zero splits disables splitting; zero wait/nudge/timeout requests immediate escalation.
+    Zero splits disables splitting; retry must be positive.
     """
     if not isinstance(settings, dict):
         raise ValueError('midturn settings must be a mapping')
@@ -66,7 +60,7 @@ def validate_settings(settings):
         elif name == 'midturn_max_splits':
             _integer(settings[name], name)
         else:
-            _number(settings[name], name)
+            _number(settings[name], name, .001)
 
 
 def resolve_settings(cli, model, cfg, table=None, worker=None, card=None):
@@ -74,7 +68,6 @@ def resolve_settings(cli, model, cfg, table=None, worker=None, card=None):
 
     Tables use exact ``cli:model`` then ``cli`` keys, as in §22. ``card`` is
     (profile id, mapping of new keys). This resolves no window or handoff_ratio.
-    A default midturn_ratio has source 'default'; pass explicit=False to limits() for it.
     """
     layers = [('worker', worker or {})]
     for where, tab in (('roster', table or {}), ('config', cfg.get('handoff') or {})):
@@ -92,113 +85,22 @@ def resolve_settings(cli, model, cfg, table=None, worker=None, card=None):
     for key, default in DEFAULTS.items():
         if key not in values:
             values[key], sources[key] = default, 'default'
-    if sources['midturn_timeout'] == 'default' and 'handoff_timeout' in cfg:
-        values['midturn_timeout'] = _number(cfg['handoff_timeout'], 'handoff_timeout')
-        sources['midturn_timeout'] = 'handoff_timeout'
     return values, sources
 
 
-def limits(cli, window, handoff_ratio, midturn_ratio=None, *, layer='B', k=4, b=None,
-           h=8000, reserve_tokens=16384, compact_limit=None, explicit=None, source=''):
-    """Return (L1, L2, C, T, R, source); inputs are §22's already resolved values.
-
-    None means the default .75, which may be clamped. Explicit ratios violating either
-    bound are rejected, including an empty interval. Default empty intervals fall back to
-    L1 per §4.1; source explicitly records that C-R cannot be respected in that case.
-    b defaults to 1 for A, 2 for B. k/h overrides are probe measurements supplied by caller.
-    """
-    if cli not in TOOL_LIMITS or layer not in ('A', 'B'):
-        raise ValueError('unknown CLI or midturn layer')
-    _integer(window, 'window', 1)
-    _ratio(handoff_ratio, 'handoff_ratio')
-    if explicit is None:
-        explicit = midturn_ratio is not None
-    if type(explicit) is not bool:
-        raise ValueError('explicit must be boolean')
-    ratio = DEFAULTS['midturn_ratio'] if midturn_ratio is None else midturn_ratio
-    _ratio(ratio, 'midturn_ratio')
-    _integer(k, 'k', 1)
-    b = (1 if layer == 'A' else 2) if b is None else b
-    _integer(b, 'b', 1)
-    _integer(h, 'h')
-    if compact_limit is not None:
-        c = _integer(compact_limit, 'compact_limit', 1)
-        csrc = 'explicit compact_limit'
-    elif cli == 'pi':
-        c = window - _integer(reserve_tokens, 'reserve_tokens')
-        csrc = 'window - reserveTokens=' + str(reserve_tokens)
-    elif cli == 'claude':
-        c = window - 33000
-        csrc = ('~967000 (1M, CHANGELOG 2.1.247)' if window == 1000000
-                else 'window - 33000 (assumption pending P5)')
-    else:
-        c = math.floor(.9 * window)
-        csrc = ('fleet-pinned model_auto_compact_token_limit=0.9W' if cli == 'codex'
-                else '0.9W (assumption pending P6)')
-    t = TOOL_LIMITS[cli]
-    r = t * k * b + h
-    l1, wanted = handoff_ratio * window, ratio * window
-    ceiling = c - r
-    if explicit and not l1 <= wanted <= ceiling:
-        raise ValueError('midturn_ratio violates L1 <= L2 <= C - R: '
-                         + str((l1, wanted, ceiling)))
-    l2 = max(l1, min(wanted, ceiling))
-    details = [source] if source else []
-    details += ['midturn_ratio: ' + str(ratio) + (' explicit' if explicit else ' default'),
-                'C=' + str(c) + ': ' + csrc, 'T=' + str(t) + ': ' + TOOL_SOURCES[cli],
-                f'R={t}*{k}*{b}+{h}={r} (k: supplied/default 4; b: layer {layer}; '
-                'H: supplied/default 8000)']
-    if l2 != wanted or ceiling < l1:
-        details.append('midturn.clamped: L2=' + str(l2))
-    if ceiling < l1:
-        details.append('no safe interval: C-R < L1; fallback L2=L1')
-    return l1, l2, c, t, r, '; '.join(details)
-
-
-def decide(used, window, cli, handoff_ratio=.6, midturn_ratio=None, *, busy=True,
-           tools_running=False, prompt_wait=False, prompt_route=False, adopted=False,
-           clearing=False, clear_required=False, paused=False, profile_switching=False,
-           registered=True, advisor=False, ready=False, expired=False, midturn_splits=0,
-           midturn_max_splits=3, a_available=None, ordered=False, elapsed=0, b_waited=0,
-           midturn_timeout=900, midturn_b_wait=60, **limit_options):
-    """Return none / steer / kill / blocked; the caller performs all effects.
-
-    ready means *successor READY before continuation*, not a generally ready busy slot.
-    ordered suppresses duplicate A0 steers. elapsed / b_waited exclude prompt-wait time;
-    b_waited starts on entering B, including after A times out. A1/A2 remain daemon policy.
-    An existing order stays active even if a CLI compaction lowers its reported usage or
-    the next usage read fails. Keep passing the window captured when that order was made.
-    """
-    if (prompt_wait or prompt_route or adopted or clearing or clear_required or paused
-            or profile_switching or not registered or advisor or expired):
+def decide(used, window, *, midturn_ratio=.8, busy=True, ready=False, guarded=False,
+           midturn_splits=0, midturn_max_splits=3, ordered=False, elapsed=0,
+           tries=1, midturn_retry=300):
+    """Return none / steer / retry / kill / blocked; never clamp the user's ratio."""
+    if guarded or not (busy or ready):
         return 'none'
-    if not busy and not ready:
+    if ordered:
+        return ('retry' if tries < 2 else 'kill') if elapsed >= midturn_retry else 'none'
+    if used is None or not window or used < midturn_ratio * window:
         return 'none'
-    _integer(midturn_splits, 'midturn_splits')
-    _integer(midturn_max_splits, 'midturn_max_splits')
-    for name, value in (('elapsed', elapsed), ('b_waited', b_waited),
-                        ('midturn_timeout', midturn_timeout), ('midturn_b_wait', midturn_b_wait)):
-        _number(value, name)
-    if (used is None and not ordered) or window is None or window == 0:
-        return 'none'
-    if used is not None:
-        _integer(used, 'used')
-    available = MIDTURN_INJECT.get(cli, False) if a_available is None else a_available
-    if type(available) is not bool:
-        raise ValueError('a_available must be boolean')
-    _, l2, c, t, _, _ = limits(cli, window, handoff_ratio, midturn_ratio,
-                               layer='A' if available else 'B', **limit_options)
-    over = used is not None and used >= l2
-    if over and (ready or midturn_splits >= midturn_max_splits):
+    if ready or midturn_splits >= midturn_max_splits:
         return 'blocked'
-    if not busy or (not over and not ordered):
-        return 'none'
-    urgent = used is not None and used >= c - t
-    if available and not urgent and (not ordered or elapsed < midturn_timeout):
-        return 'none' if ordered else 'steer'
-    if urgent or not tools_running or b_waited >= midturn_b_wait:
-        return 'kill'
-    return 'none'
+    return 'steer'
 
 
 def continuation(label, prev, note, instruction):
@@ -206,25 +108,36 @@ def continuation(label, prev, note, instruction):
 
 
 def blocked_text(splits):
-    _integer(splits, 'midturn_splits')
-    return '这条派工一个会话装不下，请拆小（已拆 ' + str(splits) + ' 次）'
+    return '这条派工一个会话装不下（已续做 ' + str(splits) + ' 次），请拆小'
 
 
-def blocked_prompt(splits):
-    return ('Stop work immediately. Report Done / Evidence / Not done / Blocked; '
-            'in Blocked write: ' + blocked_text(splits))
+def registered_prompt(info, generation):
+    """Only the exact prompt registered for this generation may bypass an input gate."""
+    hid = info.get('midturn_id') or ''
+    prompt = info.get('midturn_prompt') or ''
+    if (info.get('midturn_typed_g') == str(generation) and hid
+            and prompt.startswith('[FLEET MID-TURN HANDOFF ' + hid + '] ')):
+        return prompt
+    return ''
+
+
+def _read_tail(path, size):
+    with open(path, 'rb') as stream:
+        stream.seek(0, 2)
+        start = max(0, stream.tell() - size)
+        stream.seek(start)
+        tail = stream.read(size)
+    if start:
+        first, sep, rest = tail.partition(b'\n')
+        start += len(first) + len(sep)
+        tail = rest
+    return start, tail
 
 
 def _tail_rows(path, size):
     """Read a bounded suffix, dropping a cut first line and malformed/unfinished JSON."""
     try:
-        with open(path, 'rb') as stream:
-            stream.seek(0, 2)
-            start = max(0, stream.tell() - size)
-            stream.seek(start)
-            tail = stream.read(size)
-        if start:
-            tail = tail.partition(b'\n')[2]
+        _, tail = _read_tail(path, size)
         for line in reversed(tail.splitlines()):
             try:
                 row = json.loads(line)
@@ -237,13 +150,13 @@ def _tail_rows(path, size):
 
 
 def claude_transcript_usage(path, window):
-    """Latest main-thread usage in at most 512KB; missing usage is (None, window).
+    """Latest main-thread usage in at most 64KB; missing usage is (None, window).
 
     A missing measurement must not masquerade as zero or a file-size estimate. No glob,
     transcript discovery, Redis access or writes: caller supplies this generation's file.
     """
     fields = ('input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens', 'output_tokens')
-    for row in _tail_rows(path, 524288):
+    for row in _tail_rows(path, TAIL_BYTES):
         if row.get('type') != 'assistant' or row.get('isSidechain') or row.get('agentId'):
             continue
         message = row.get('message')
@@ -257,8 +170,8 @@ def claude_transcript_usage(path, window):
 
 
 def codex_rollout_usage(path, window):
-    """Latest token_count.last_token_usage in at most 128KB; never cumulative totals."""
-    for row in _tail_rows(path, 131072):
+    """Latest token_count.last_token_usage in at most 64KB; never cumulative totals."""
+    for row in _tail_rows(path, TAIL_BYTES):
         payload = row.get('payload')
         if (row.get('type') != 'event_msg' or not isinstance(payload, dict)
                 or payload.get('type') != 'token_count'):
@@ -279,36 +192,178 @@ def codex_rollout_usage(path, window):
     return None, window
 
 
-def parse_usage_frame(frame, *, cli, generation, message_id, slot=None, session_id=None):
-    """Validate a flat pi/opencode usage event; return (used, window) or None.
+def js_length(text):
+    return len(str(text).encode('utf-16-le', errors='surrogatepass')) // 2
 
-    The bridge adds generation/message_id from its active delivery before forwarding.
-    Missing/null tokens, manual turns, stale bindings and non-integral numbers are ignored,
-    preserving the daemon's previous measurement. Optional slot/session checks tighten the
-    binding when available. Used may exceed window: an overshoot must still trigger policy.
+
+def js_json(value):
+    """Compact JSON.stringify spelling, including JS's fixed/exponent number boundary."""
+    if value is None or isinstance(value, (bool, str)):
+        text = json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+        # Well-formed JSON.stringify escapes lone surrogates; astral characters stay intact.
+        return ''.join('\\u%04x' % ord(c) if 0xD800 <= ord(c) <= 0xDFFF else c for c in text)
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            return 'null'
+        if value == 0:
+            return '0'
+        if isinstance(value, int) and abs(value) < 10**21:
+            return str(value)
+        text = repr(float(value)).lower()
+        if 1e-6 <= abs(value) < 1e21:
+            fixed = format(Decimal(text), 'f')
+            return fixed.rstrip('0').rstrip('.') if '.' in fixed else fixed
+        mantissa, _, exponent = text.partition('e')
+        mantissa = mantissa.removesuffix('.0')
+        return mantissa + ('e' + ('+' if int(exponent) >= 0 else '-') + str(abs(int(exponent))) if exponent else '')
+    if isinstance(value, list):
+        return '[' + ','.join(js_json(item) for item in value) + ']'
+    return '{' + ','.join(js_json(str(k)) + ':' + js_json(v) for k, v in value.items()) + '}'
+
+
+def pi_estimate(message):
+    """Pi 1.3 estimateTokens: round each message separately, using JS string lengths."""
+    content, chars = message.get('content') or [], 0
+    if isinstance(content, str):
+        chars = js_length(content)
+    else:
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = block.get('type')
+            if kind == 'text':
+                chars += js_length(block.get('text', ''))
+            elif message.get('role') == 'assistant':
+                if kind == 'thinking':
+                    chars += js_length(block.get('thinking', ''))
+                elif kind == 'toolCall':
+                    chars += js_length(block.get('name', '')) + js_length(js_json(block.get('arguments')))
+    return math.ceil(chars / 4)
+
+
+def pi_session_usage(path, window, state=None):
+    """Pi's last valid usage + later messages; a compaction resets usage to unknown.
+
+    The optional file-thread cache retains the anchor when it leaves the 64KB suffix.
+    Only a contiguous suffix may extend it: gaps, truncation, or a new file require a
+    fresh valid assistant. An incomplete last JSON line is retried on the next scan.
     """
-    if isinstance(frame, (str, bytes)):
+    state = {} if state is None else state
+    try:
+        start, tail = _read_tail(path, TAIL_BYTES)
+    except (OSError, TypeError, ValueError):
+        return None, window
+    offset = state.get('offset', -1)
+    used = None
+    if state.get('path') == str(path) and start <= offset <= start + len(tail):
+        used = state.get('used')
+        tail, start = tail[offset - start:], offset
+    for line in tail.splitlines(keepends=True):
         try:
-            frame = json.loads(frame)
+            row = json.loads(line)
         except (ValueError, UnicodeError):
-            return None
-    if (cli not in ('pi', 'opencode') or not isinstance(frame, dict)
-            or frame.get('kind') != 'usage' or frame.get('phase') == 'manual'
-            or type(generation) is not int or generation < 0
-            or not isinstance(message_id, str) or not message_id
-            or type(frame.get('generation')) is not int or frame['generation'] != generation
-            or frame.get('message_id') != message_id):
-        return None
-    if 'cli' in frame and frame['cli'] != cli:
-        return None
-    if slot is not None and frame.get('slot') != slot:
-        return None
-    if session_id is not None and frame.get('session_id') != session_id:
-        return None
-    used, window = frame.get('ctx_used'), frame.get('ctx_window')
-    if type(used) is not int or used < 0 or type(window) is not int or window <= 0:
-        return None
+            if not line.endswith(b'\n'):
+                break
+            start += len(line)
+            continue
+        start += len(line)
+        if not isinstance(row, dict):
+            continue
+        if row.get('type') == 'compaction':
+            used = None
+            continue
+        message = row.get('message')
+        if row.get('type') != 'message' or not isinstance(message, dict):
+            continue
+        total = 0
+        if message.get('role') == 'assistant' and message.get('stopReason') not in ('aborted', 'error'):
+            usage = message.get('usage') or {}
+            if isinstance(usage, dict):
+                values = [usage.get(k, 0) for k in ('input', 'output', 'cacheRead', 'cacheWrite')]
+                total = usage.get('totalTokens') or (sum(values) if all(type(v) is int and v >= 0 for v in values) else 0)
+        if type(total) is int and total > 0:
+            used = total
+        elif used is not None:
+            used += pi_estimate(message)
+    state.update(path=str(path), used=used, offset=start)
     return used, window
+
+
+class Probe:
+    """One sequential file-only thread, with a locked snapshot/result mailbox.
+
+    Main-loop snapshots contain no live Fleet/Redis references. A slow scan delays only
+    this thread. Every changed file costs at most TAIL_BYTES; unchanged stats cost no read.
+    """
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.targets, self.results, self.stamps, self.pi_states = {}, {}, {}, {}
+        self.stop = threading.Event()
+        self.thread = None
+
+    def update(self, targets):
+        with self.lock:
+            self.targets = {slot: dict(target) for slot, target in targets.items()}
+
+    def take(self):
+        with self.lock:
+            results, self.results = self.results, {}
+        return results
+
+    def poll(self):
+        with self.lock:
+            targets = dict(self.targets)
+        for slot, target in targets.items():
+            result = dict(target, used=None, path='', stamp=None)
+            identity = (slot, target['generation'], target['message_id'])
+            try:
+                cli = target['cli']
+                path = Path(target['path']) if target.get('path') else None
+                if cli == 'pi':
+                    paths = list(Path(target['directory']).glob('*.jsonl'))
+                    path = max(paths, key=lambda p: p.stat().st_mtime_ns) if paths else None
+                elif cli == 'codex' and not path and target.get('thread'):
+                    paths = list(Path(target['directory']).rglob('*' + target['thread'] + '*.jsonl'))
+                    path = max(paths, key=lambda p: p.stat().st_mtime_ns) if paths else None
+                if path:
+                    stat = path.stat()
+                    stamp = (str(path), stat.st_mtime_ns, stat.st_size, stat.st_ino)
+                    if self.stamps.get(identity) == stamp:
+                        continue
+                    previous = self.stamps.get(identity)
+                    if previous and (previous[0] != stamp[0] or previous[3] != stamp[3] or previous[2] > stamp[2]):
+                        self.pi_states.pop(identity, None)
+                    self.stamps[identity] = stamp
+                    reader = {'pi': pi_session_usage, 'claude': claude_transcript_usage,
+                              'codex': codex_rollout_usage}.get(cli)
+                    if reader:
+                        used, window = (reader(path, target['window'], self.pi_states.setdefault(identity, {}))
+                                        if cli == 'pi' else reader(path, target['window']))
+                        result.update(used=used, window=target.get('override') or window,
+                                      path=str(path), stamp=stamp)
+            except (OSError, ValueError, TypeError) as exc:
+                result['error'] = str(exc)
+            with self.lock:
+                self.results[slot] = result
+        live = {(s, t['generation'], t['message_id']) for s, t in targets.items()}
+        self.stamps = {k: v for k, v in self.stamps.items() if k in live}
+        self.pi_states = {k: v for k, v in self.pi_states.items() if k in live}
+
+    def run(self):
+        while not self.stop.is_set():
+            started = time.monotonic()
+            self.poll()
+            self.stop.wait(max(0, 1 - (time.monotonic() - started)))
+
+    def start(self):
+        if self.thread is None:
+            self.thread = threading.Thread(target=self.run, name='fleet-midturn', daemon=True)
+            self.thread.start()
+
+    def close(self):
+        self.stop.set()
+        if self.thread:
+            self.thread.join(timeout=1)
 
 
 def _stored_number(record, key, default=0):
@@ -327,7 +382,7 @@ def _paused_at(record):
 
 
 def effective_age(req, now):
-    """Service request age in seconds, excluding completed and current pauses (§5.4).
+    """Service request age in seconds, excluding completed and current pauses (r3 §2.5).
 
     This is not the task hours budget: that hard budget continues to use wall time.
     """
@@ -359,14 +414,14 @@ def resume_clock(record, now):
     return result
 
 
-def pause_message(message, now_ms, *, midturn_timeout=900, midturn_b_wait=60):
+def pause_message(message, now_ms, *, midturn_retry=300, profile_ready_timeout=180):
     """Snapshot remaining bus deadline and protect the old delivery during handoff.
 
     Only the daemon renews the lease. The returned fields belong in the ordering transaction.
     """
     _integer(now_ms, 'now_ms')
-    _number(midturn_timeout, 'midturn_timeout')
-    _number(midturn_b_wait, 'midturn_b_wait')
+    _number(midturn_retry, 'midturn_retry')
+    _number(profile_ready_timeout, 'profile_ready_timeout')
     result = dict(message)
     if _paused_at(message) is not None:
         return result
@@ -375,7 +430,7 @@ def pause_message(message, now_ms, *, midturn_timeout=900, midturn_b_wait=60):
         raise ValueError('message deadline already expired; cannot order midturn handoff')
     result = pause_clock(message, now_ms / 1000)
     result['deadline_remaining_ms'] = round(deadline - now_ms)
-    result['deadline_at'] = round(deadline + (midturn_timeout + midturn_b_wait) * 1000)
+    result['deadline_at'] = round(deadline + (2 * midturn_retry + profile_ready_timeout) * 1000)
     return result
 
 
@@ -388,113 +443,3 @@ def resume_message(message, now_ms):
             raise ValueError('paused message lacks deadline_remaining_ms')
         result['deadline_at'] = now_ms + round(_stored_number(message, 'deadline_remaining_ms'))
     return result
-
-
-ORDER_FIELD = 'order'
-HOOK_IO_TIMEOUT = .05  # caller's Redis connect/read timeout, no retries; never use the Stop reader
-HOOK_TIMEOUT = 5  # CLI hook declaration timeout, not a blocking Redis timeout
-
-
-def order_key(prefix, slot, generation):
-    _integer(generation, 'generation')
-    return prefix + ':midturn:' + slot + ':g' + str(generation)
-
-
-def order_record(slot, generation, thread, message_id, hid, draft, used, window,
-                 deadline, *, transcript, layer='A'):
-    """JSON record stored as hash field 'order' at order_key(), by the daemon transaction.
-
-    thread/transcript are the bound *main* session, never discovered by the hook. The daemon
-    removes this field on settlement/retirement and while prompt-wait guards suspend injection.
-    All expiry times here are seconds. Throttle fields live beside this immutable order.
-    """
-    _integer(generation, 'generation')
-    _integer(used, 'used')
-    _integer(window, 'window', 1)
-    _number(deadline, 'deadline')
-    for value in (slot, thread, message_id, hid, draft, transcript):
-        if not isinstance(value, str) or not value:
-            raise ValueError('order identity, draft and main transcript must be nonempty strings')
-    if layer not in ('A', 'B'):
-        raise ValueError('invalid midturn layer')
-    return {'slot': slot, 'generation': generation, 'thread': thread, 'message_id': message_id,
-            'midturn_hid': hid, 'midturn_draft': draft, 'midturn_used': used, 'window': window,
-            'midturn_deadline': deadline, 'midturn_layer': layer, 'transcript': transcript}
-
-
-# A hit costs one extra round trip, atomically fencing cancellation/replacement and simultaneous
-# PostToolUse processes. Never recreate a deleted order or overwrite daemon-owned order fields.
-LUA_NOTICE = """
-if redis.call('HGET', KEYS[1], 'order') ~= ARGV[1] then return 0 end
-local hid, now = ARGV[2], tonumber(ARGV[3])
-local previous = redis.call('HGET', KEYS[1], 'notice_hid')
-local tools = 0
-if previous == hid then tools = redis.call('HINCRBY', KEYS[1], 'notice_tools', 1) end
-local last = tonumber(redis.call('HGET', KEYS[1], 'notice_at') or '0')
-if previous ~= hid or tools >= 3 or now - last >= 120 then
-  redis.call('HSET', KEYS[1], 'notice_hid', hid, 'notice_tools', 0, 'notice_at', ARGV[3])
-  return 1
-end
-return 0
-"""
-
-
-def posttool_hook(r, prefix, slot, generation, data, *, now=None):
-    """Return additionalContext JSON or ''; fail open on all input / Redis errors.
-
-    Inject a short-timeout Redis client (HOOK_IO_TIMEOUT, no retries). No client creation,
-    config reads, transcript reads, polling or usage calculation happens here. A miss is one
-    HGET. Claude and a probe-enabled Codex PostToolUse adapter can share this entry point.
-    Unknown provenance is skipped: require the exact bound main transcript and session,
-    and reject subagent markers even when they reuse their parent's session_id.
-    """
-    try:
-        key = order_key(prefix, slot, generation)
-        raw = r.hget(key, ORDER_FIELD)
-        if not raw:
-            return ''
-        record = json.loads(raw)
-        if isinstance(data, (str, bytes)):
-            data = json.loads(data)
-        if not isinstance(record, dict) or not isinstance(data, dict):
-            return ''
-        if any(data.get(name) for name in ('agent_id', 'agentId', 'parent_agent_id',
-                                            'isSidechain', 'is_sidechain', 'subagent_id')):
-            return ''
-        if data.get('hook_event_name') != 'PostToolUse':
-            return ''
-        # Validate the stored schema too; malformed/unbound orders must never reach a model.
-        checked = order_record(record['slot'], record['generation'], record['thread'],
-                               record['message_id'], record['midturn_hid'], record['midturn_draft'],
-                               record['midturn_used'], record['window'], record['midturn_deadline'],
-                               transcript=record['transcript'], layer=record['midturn_layer'])
-        if (checked['slot'] != slot or checked['generation'] != generation
-                or checked['midturn_layer'] != 'A' or record.get('suspended')
-                or checked['thread'] != data.get('session_id')
-                or checked['transcript'] != data.get('transcript_path')):
-            return ''
-        # Some adapters can also supply the active message; never accept a mismatch.
-        if 'message_id' in data and data['message_id'] != checked['message_id']:
-            return ''
-        at = time.time() if now is None else _number(now, 'now')
-        if at >= checked['midturn_deadline']:
-            return ''
-        text = MIDTURN_PROMPT.format(used=checked['midturn_used'], window=checked['window'],
-                                     path=checked['midturn_draft'])
-        if r.eval(LUA_NOTICE, 1, key, raw, checked['midturn_hid'], at) != 1:
-            return ''
-        return json.dumps({'hookSpecificOutput': {'hookEventName': 'PostToolUse',
-                                                  'additionalContext': text}}, ensure_ascii=False)
-    except Exception:  # fail-open is deliberate: a diagnostic hook cannot stall every tool call
-        return ''
-
-
-def posttool_main(r, prefix, slot, generation, data, *, now=None, output=None):
-    """Hook command body: stdout empty on miss/failure, exit status always zero."""
-    text = posttool_hook(r, prefix, slot, generation, data, now=now)
-    if text:
-        if output is None:
-            import sys
-            output = sys.stdout
-        output.write(text + '\n')
-    return 0

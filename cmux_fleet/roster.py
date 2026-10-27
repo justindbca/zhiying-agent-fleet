@@ -152,11 +152,13 @@ def handoff_errors(data):
         where = 'handoff[' + str(k) + ']'
         if not isinstance(k, str) or k.split(':', 1)[0] not in CLIS or k.endswith(':'):
             errors.append(where + ': key must be one of ' + ', '.join(CLIS) + ' or "<cli>:<model>"')
-        elif not isinstance(v, dict) or not v or not set(v) <= {'window', 'ratio'}:
-            errors.append(where + ': must be a mapping with "window" and/or "ratio" only')
+        elif not isinstance(v, dict) or not v or not set(v) <= {'window', 'ratio', 'midturn_ratio'}:
+            errors.append(where + ': must be a mapping with "window", "ratio" and/or "midturn_ratio" only')
         else:
             errors += [where + ': window must be a positive integer'] * ('window' in v and _bad_window(v['window']))
             errors += [where + ': ratio must be a number between 0 and 1'] * ('ratio' in v and _bad_ratio(v['ratio']))
+            errors += [where + ': midturn_ratio must be a number between 0 and 1'] * (
+                'midturn_ratio' in v and _bad_ratio(v['midturn_ratio']))
     for i, item in enumerate(data.get('workers') or []):
         if isinstance(item, dict):
             where = 'workers[' + str(i) + ']'

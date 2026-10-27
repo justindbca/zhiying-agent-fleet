@@ -7,7 +7,8 @@ records each such turn with turn_attribution.turn_trigger "queue" and its user m
 Binding uses a delivery token that the daemon creates and persists *before* the CLI runs: the
 queued text ends with a line `(fleet delivery <token>)`, and the record (cq_*) on the agent hash
 holds that exact text. A turn settles the delivery only if the rollout shows a queue-triggered
-turn whose one user message is exactly that text. Nothing else is used: not the CLI's queued id
+turn whose first user message is exactly that text; any later input must be the registered
+mid-turn handoff prompt for this generation. Nothing else is used: not the CLI's queued id
 (it never reaches the rollout), not Codex's private queue table (neither read nor written), not
 the cumulative notify `input-messages`, not timing. Queueing or starting a turn is never
 completion: only the turn end (notify / rollout task_complete) settles. Any failure leaves the
@@ -201,12 +202,13 @@ def token_turn(thread, token, sessions):
 
 
 def record(info):
-    return {k: info.get(k, '') for k in FIELDS}
+    return {k: info.get(k, '') for k in FIELDS + ('midturn_id', 'midturn_prompt', 'midturn_typed_g')}
 
 
 def bound(rec, thread, turn, sessions, generation=None):
     """(True, '') only if the rollout proves `turn` was started by the delivery in `rec`: same thread,
-    same generation (when the caller knows it), a queue-triggered turn whose only input is this token's text."""
+    same generation (when known), a queue-triggered turn starting with this token's text;
+    later messages may only repeat this generation's registered mid-turn handoff prompt."""
     if not rec.get('cq_delivery') or not rec.get('cq_token') or rec.get('cq_state') in ('', 'abandoned'):
         return False, 'no live queued delivery (state ' + (rec.get('cq_state') or 'none') + ')'
     if thread != rec.get('cq_thread'):
@@ -225,8 +227,10 @@ def bound(rec, thread, turn, sessions, generation=None):
         return False, 'rollout records no turn_attribution (codex-cli too old for the queue channel)'
     if facts['trigger'] != 'queue':
         return False, 'turn was not started by the queue (trigger ' + (facts['trigger'] or 'none') + ')'
-    if len(facts['users']) != 1:
-        return False, 'turn has ' + str(len(facts['users'])) + ' user messages'
+    from cmux_fleet.midturn import registered_prompt
+    prompt = registered_prompt(rec, rec.get('cq_generation'))
+    if not facts['users'] or any(not prompt or item['text'] != prompt for item in facts['users'][1:]):
+        return False, 'turn has unregistered extra user messages'
     if facts['users'][0]['text'] != rec.get('cq_text') or MARK.format(rec['cq_token']) not in facts['users'][0]['text']:
         return False, 'turn input is not this delivery (token ' + rec['cq_token'] + ')'
     return True, ''

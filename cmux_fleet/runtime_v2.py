@@ -21,7 +21,7 @@ from cmux_fleet import fleet_config, opencode_adapter, pi_adapter
 from cmux_fleet.message_bus import BusError, MessageBus, LUA_REBIND_CHECK, _json, _short, _request_id
 from cmux_fleet.presentation import mask_secrets, result_card, routing_card, sanitize_text
 from cmux_fleet import codex_queue, lifecycle_close, named_subfleet, subfleet, tui_cards
-from cmux_fleet import watchdog
+from cmux_fleet import midturn, watchdog
 
 
 def v2_cli_problem(cfg):
@@ -34,6 +34,7 @@ def v2_cli_problem(cfg):
 
 def validate_config(cfg):
     clear_after_result.validate(cfg)
+    midturn.validate_settings(cfg)
     version = cfg.get('transport_version', 1)
     if type(version) is not int or version not in (1, 2):
         raise ValueError('transport_version must be 1 or 2')
@@ -449,8 +450,9 @@ class RuntimeV2:
             req = self.f.r.hgetall(REQ + request_id)
             if req:
                 spec = json.loads(req['spec'])
-                deadline_at = int((float(req['created']) + float(spec.get('timeout_s')
-                    or self.f.cfg['request_timeout'])) * 1000)
+                now = time.time()
+                remaining = float(spec.get('timeout_s') or self.f.cfg['request_timeout']) - midturn.effective_age(req, now)
+                deadline_at = int((now + max(0, remaining)) * 1000)
         elif text.startswith('[New task '):
             end = text.index(']')
             request_id = text[len('[New task '):end]
@@ -837,6 +839,129 @@ class RuntimeV2:
         self.audit('committed', slot=env['slot'], message_id=env['message_id'],
                    delivery_id=env['delivery_id'], request_id=env['request_id'], detail=result)
 
+    def midturn_card(self, slot, text):
+        card = routing_card(text, kind='notice', slot=self.f.label(slot))
+        card['metadata']['event_id'] = 'ui-midturn-' + digest(self.context['intent_id'] + ':' + slot)[:32]
+        self.ui(slot, card)
+        if slot != 'supervisor':
+            self.ui('supervisor', card)
+
+    def midturn_no_usage(self, slot, generation):
+        self.f.setf(slot, midturn_no_usage_g=generation)
+        self.audit('midturn.no_usage', slot=slot, level='error', error='opencode session usage source is unverified')
+        self.midturn_card(slot, self.f.label(slot) + ' 中途用量未知（opencode 会话来源未核实），无法触发中途交接。')
+
+    def midturn_splits(self, msg):
+        count = int(msg.get('midturn_splits') or 0)
+        if self.f.service:
+            count = max(count, int(self.f.r.hget('fx:req:' + msg['request_id'], 'midturn_splits') or 0))
+        return count
+
+    def midturn_pause_request(self, rid, now):
+        key = 'fx:req:' + rid
+        req = self.f.r.hgetall(key) if self.f.service else {}
+        if req:
+            self.f.r.hset(key, mapping={'clock_paused_at': midturn.pause_clock(req, now)['clock_paused_at']})
+
+    def midturn_resume_request(self, rid):
+        key = 'fx:req:' + rid
+        req = self.f.r.hgetall(key) if self.f.service else {}
+        if req and req.get('clock_paused_at'):
+            fields = midturn.resume_clock(req, time.time())
+            self.f.r.hset(key, mapping={k: fields[k] for k in ('clock_paused_at', 'clock_paused_ms')})
+
+    def midturn_clear(self, slot, resume=True):
+        info = self.f.agent(slot)
+        if resume and info.get('midturn_request'):
+            self.midturn_resume_request(info['midturn_request'])
+        # Keep the generation stamp: even a successful report permits only one order per generation.
+        fields = {k: '' for k in info if k.startswith('midturn_') and k not in
+                  ('midturn_typed_g', 'midturn_no_usage_g', 'midturn_ratio', 'midturn_line')}
+        if fields:
+            self.f.setf(slot, **fields)
+
+    def midturn_blocked(self, slot, msg, impossible=False):
+        """No new handoff or kill at the split cap. A still-running delivery remains held."""
+        reason = midturn.blocked_text(self.midturn_splits(msg))
+        state = self.f.r.hgetall(self.bus.lease_key(slot))
+        if state.get('message_id') == msg['message_id'] and state.get('current_delivery'):
+            self.hold(slot, reason, pause=False)
+        elif msg.get('status') == 'queued':
+            self.cancel_queued(slot, msg, reason)
+        self.midturn_resume_request(msg['request_id'])
+        self.midturn_clear(slot)
+        self.audit('midturn.impossible' if impossible else 'midturn.limit', slot=slot, level='error',
+                   message_id=msg['message_id'], error=reason)
+        if slot == 'supervisor':
+            if self.f.service:
+                self.f.pause(reason)
+            else:
+                self.f.finish('blocked', reason)
+        elif self.f.service:
+            self.f.service_blocked_intake(slot, msg['request_id'], reason)
+        else:
+            key, note = self.f.blocked_intake(slot, self.f.report_item(slot), reason)
+            mid = self.queue('supervisor', '[blocked] ' + self.f.label(slot) + ': ' + reason + note,
+                             request_id=msg['request_id'])
+            escalations = self.f.escalation_state()
+            escalations[key]['message_id'] = mid
+            self.f.save_escalations(escalations)
+        self.midturn_card(slot, self.f.label(slot) + '：' + reason)
+
+    def midturn_split(self, slot, env, msg, *, retired=False, note=None, previous=None):
+        """One intent: release/ACK the stopped turn, prepend its continuation, retain ownership.
+
+        retired is used only by Watchdog.rotate after kill + confirm_retired; that path
+        has already drained the old lease and must not reset the successor's startup state.
+        """
+        from cmux_fleet.fleet import slot_base
+        info = self.f.agent(slot)
+        hid = msg['midturn_id']
+        generation = int(msg['generation'])
+        prev = previous or self.f.label(slot)
+        label = slot_base(slot) + '.' + str(generation + 1)
+        note = note or str(self.f.run_dir / 'handoffs' / (slot + '-g' + str(generation) + '-' + hid + '.md'))
+        splits = self.midturn_splits(msg) + 1
+        if not retired:
+            self.release(env, {'midturn': 'split'}, outcome='handoff_split')
+        else:
+            self.f.r.hset(self.bus.msg_key(msg['message_id']), mapping={'status': 'committed',
+                'outcome': 'handoff_split', 'result': _json({'midturn': 'split'}), 'committed_at': int(time.time()*1000)})
+        original = msg.get('midturn_instruction') or msg['body']['text']
+        body = dict(msg['body'], purpose='continuation',
+                    text=midturn.continuation(label, prev, note, original))
+        self.queue_index += 1
+        mid = 'm-' + digest(self.context['intent_id'] + ':' + str(self.queue_index))[:32]
+        self.effects.hset(self.bus.msg_key(mid), dict(run_id=self.bus.run_id, slot=slot, message_id=mid,
+            body=_json(body), request_id=msg['request_id'], kind='continuation', status='queued',
+            deadline_at=msg['deadline_at'], created_at=int(time.time()*1000), attempt=0,
+            continues=msg['message_id'], midturn_splits=splits, replay=msg.get('replay') or 1,
+            midturn_instruction=original, original_kind=msg.get('original_kind') or msg.get('kind') or '',
+            clock_paused_at=msg.get('clock_paused_at') or time.time(),
+            deadline_remaining_ms=msg.get('deadline_remaining_ms') or 1))
+        self.effects.lpush(self.bus.pending_key(slot), mid)  # same FIFO head operation as offer_handoff
+        if self.f.service and self.f.r.hgetall('fx:req:' + msg['request_id']):
+            self.f.r.hset('fx:req:' + msg['request_id'], mapping={'midturn_splits': splits, 'continues': msg['message_id']})
+        if not retired:
+            self.f.setf(slot, state='handoff', handoff_id=hid, handoff_draft=info['midturn_draft'],
+                        handoff_mtime=info['midturn_mtime'], handoff_deadline=time.time() + float(self.f.cfg['handoff_timeout']))
+            self.rotation_pending.add(slot)
+        else:
+            self.midturn_clear(slot, resume=False)
+        self.audit('midturn.killed' if retired else 'midturn.split', slot=slot, message_id=msg['message_id'],
+                   detail={'continues': mid, 'midturn_splits': splits, 'note': note})
+        self.midturn_card(slot, prev + ' 中途交接 → ' + label + ' 续做（第 ' + str(splits) + ' 次）')
+        return mid
+
+    def midturn_result(self, slot, env, msg, error):
+        if not msg.get('midturn_id'):
+            return False
+        if error:
+            self.midturn_split(slot, env, msg)
+            return True
+        self.midturn_clear(slot)
+        return False
+
     def wall_settle(self, slot, ev, env, msg):
         """E: the turn ended on a usage wall (short official-CLI text, or a Pi model error for this delivery).
         The turn is over, so execution has stopped: commit the delivery as `walled` (result not applied, never
@@ -851,6 +976,7 @@ class RuntimeV2:
             return False
         record = self.f.on_wall(slot, text, 'turn')
         self.release(env, {'wall': record['wall']}, 'walled')
+        self.midturn_clear(slot)
         self.f.setf(slot, wall_error='')
         body = msg['body'].get('text') or ''
         if body:  # same request / kind / deadline / reply spec as the walled delivery: only the text gains a note
@@ -861,6 +987,10 @@ class RuntimeV2:
                 body=_json(again), request_id=msg['request_id'], kind=msg.get('kind') or again.get('purpose') or '',
                 status='queued', deadline_at=msg['deadline_at'], created_at=int(time.time()*1000), attempt=0,
                 wall_of=env['message_id']))
+            retained = {k: msg[k] for k in ('midturn_splits', 'continues', 'midturn_instruction', 'original_kind', 'replay')
+                        if k in msg}
+            if retained:
+                self.effects.hset(self.bus.msg_key(mid), retained)
             self.effects.rpush(self.bus.pending_key(slot), mid)
             self.audit('queued', slot=slot, message_id=mid, request_id=msg['request_id'], detail=again)
         self.audit('brake.wall_requeued', slot=slot, message_id=env['message_id'], delivery_id=env['delivery_id'],
@@ -1014,6 +1144,8 @@ class RuntimeV2:
                         legacy.parse_decision(text, self.f.dispatch_targets(), self.f.others_active())
                 except (ValueError, TypeError, KeyError) as exc:
                     error = str(exc)
+            if self.midturn_result(slot, env, msg, error):
+                return
             if error:
                 self.audit('candidate.invalid', slot=slot, error=error, detail=candidates)
             self.release(env, value, 'failed' if error else 'completed')
@@ -1042,6 +1174,7 @@ class RuntimeV2:
                 return
             blocked = '' if error else legacy.service_blocked(value, json.loads(req['spec'])['reply'])
             if blocked:
+                self.midturn_clear(slot)
                 # Plan F' 8.4 (service): not an answer. The delivery ends, the request stays dispatched, and the
                 # supervisor rules; its ruling goes back to this worker as the same request.
                 self.release(env, value)
@@ -1052,6 +1185,8 @@ class RuntimeV2:
                     legacy.parse_reply(text, json.loads(req['spec'])['reply'])
                 except ValueError as exc:
                     error = str(exc)
+            if self.midturn_result(slot, env, msg, error):
+                return
             # Schema failure is a terminal invalid result; no automatic repeat of tools.
             self.release(env, value, 'failed' if error else 'completed')
             if not error:
@@ -1063,6 +1198,8 @@ class RuntimeV2:
                     and all(isinstance(item, str) for item in value[k]) for k in ('done', 'evidence'))
                     or not all(isinstance(value.get(k), str) for k in ('not_done', 'blocked'))):
                 error = 'task result requires done/evidence lists and not_done/blocked text'
+            if self.midturn_result(slot, env, msg, error):
+                return
             self.release(env, value, 'failed' if error else 'completed')
             retries = int(info.get('report_retries') or 0)
             if error and tui_slot(self.slot_cfg(slot), slot) and retries < TUI_REPORT_RETRIES:
@@ -1418,8 +1555,10 @@ class RuntimeV2:
                 self.f.save_escalations({k: v for k, v in esc.items() if k not in moot})
                 self.audit('blocked.moot', request_id=rid, detail={'tasks': moot, 'status': status})
         now = time.time()
+        req = midturn.resume_clock(req, now)
         rec = dict(id=rid, status=status, at=now,
-                   elapsed_s=round(now-float(req.get('created') or now), 1), **fields)
+                   elapsed_s=round(midturn.effective_age(req, now), 1),
+                   clock_paused_ms=int(req.get('clock_paused_ms') or 0), **fields)
         raw = dumps(rec)
         self.f.r.set(tombstone, raw)
         self.f.r.set(legacy.RESULT + rid, raw, ex=legacy.RESULT_TTL)
@@ -1456,6 +1595,7 @@ class RuntimeV2:
         r = self.effects or self.bus.r
         state = r.hgetall(self.bus.lease_key(slot))
         mid = state.get('message_id')
+        self.midturn_clear(slot)
         self.f.setf(slot, state='held', idle_confirmed=0, bridge_available=0)
         if mid:
             r.hset(self.bus.lease_key(slot), mapping={'status': 'uncertain'})
@@ -1486,6 +1626,8 @@ class RuntimeV2:
 
         Not a hold: the lease, the message and the slot state stay as they are (busy / received, or
         starting), so once a human answers in the pane the turn ends and settles normally."""
+        if self.f.agent(slot).get('midturn_id') and not self.f.agent(slot).get('midturn_wait_at'):
+            self.f.setf(slot, midturn_wait_at=time.time())
         self.f.setf(slot, prompt_wait=scope, prompt_wait_at=time.time(), prompt_route='user', watch_state='prompting')
         self.audit('execution.prompt_wait', slot=slot, level='error', error=reason,
                    detail={'scope': scope, 'screen': screen, 'route': 'user', 'dialog_class': kind or 'unread'})
@@ -1501,6 +1643,8 @@ class RuntimeV2:
         """A non-delete dialog goes to the supervisor to rule on (plan F' 8.3): mark the slot, record the
         escalation, queue the [dialog] question. No pause, no key; the lease stays received."""
         from cmux_fleet.fleet import DIALOG_KEY
+        if self.f.agent(slot).get('midturn_id') and not self.f.agent(slot).get('midturn_wait_at'):
+            self.f.setf(slot, midturn_wait_at=time.time())
         key = DIALOG_KEY + slot + ':g' + str(rec['generation'])
         label = self.f.label(slot)
         self.f.setf(slot, prompt_wait=rec['scope'], prompt_wait_at=time.time(), prompt_route='supervisor',
@@ -1652,7 +1796,7 @@ class RuntimeV2:
             mids = ([state['message_id']] if state.get('current_delivery') else []) + self.bus.pending(slot)
             for mid in mids:
                 msg = self.bus.message(mid)
-                if msg.get('kind') == 'worker' and msg.get('request_id') == task['id']:
+                if msg.get('kind') in ('worker', 'continuation') and msg.get('request_id') == task['id']:
                     lost.append(msg)
         return lost
 
@@ -1791,7 +1935,8 @@ class RuntimeV2:
         done = []
         for key in self.bus.r.scan_iter(match=self.prefix + ':message:*'):
             msg = self.bus.message(key.rsplit(':', 1)[1])
-            if (msg.get('kind') == 'worker' and msg.get('request_id') == task['id']
+            if (msg.get('kind') in ('worker', 'continuation') and msg.get('slot') in self.f.workers
+                    and msg.get('request_id') == task['id']
                     and msg.get('status') == 'committed' and msg.get('outcome') == 'completed'):
                 done.append((msg['committed_at'], '- ' + msg['slot'] + ': ' + head(msg['body']['text'])
                              + '\n  report: ' + dumps(msg.get('result') or {})[:600]))
@@ -1849,7 +1994,12 @@ class RuntimeV2:
         for msg in lost:
             attempt = int(msg.get('replay') or 1) + 1
             mid = self.f.queue(msg['slot'], '[Supervisor instruction ' + task['id'] + '] ' + msg['body']['text'])
-            self.effects.hset(self.bus.msg_key(mid), {'replay': attempt})
+            retained = {k: msg[k] for k in ('midturn_splits', 'continues', 'midturn_instruction', 'original_kind') if k in msg}
+            if msg.get('kind') == 'continuation':
+                retained['kind'] = 'continuation'
+                body = json.loads(self.effects.hget(self.bus.msg_key(mid), 'body'))
+                retained['body'] = _json(dict(body, purpose='continuation'))
+            self.effects.hset(self.bus.msg_key(mid), dict(retained, replay=attempt))
             requeued.append('- ' + self.f.label(msg['slot']) + ' (attempt ' + str(attempt) + ' of ' + str(cap)
                             + '): ' + head(msg['body']['text']))
         return requeued
@@ -1884,8 +2034,10 @@ class RuntimeV2:
                          + ' attempt(s) used (max-attempts ' + str(cap) + ')')
         else:
             # A fresh timeout window: the downtime does not count against the replay.
+            resumed = midturn.resume_clock(req, time.time())
+            paused_ms = int(resumed.get('clock_paused_ms') or 0)
             self.f.r.hset(REQ + rid, mapping={'replay': attempt, 'status': 'routing', 'worker': '',
-                                              'created': time.time()})
+                'created': time.time() - paused_ms / 1000, 'clock_paused_at': '', 'clock_paused_ms': paused_ms})
             self.f.route(rid, spec)
             self.audit('request.replayed', request_id=rid, attempt=attempt)
 
@@ -1911,6 +2063,13 @@ class RuntimeV2:
                 and not self.f.r.hgetall(named_subfleet.OP + msg['request_id'])):  # §29: an open sub-fleet op
             self.transaction('drop-' + msg['message_id'], lambda: self.cancel_queued(slot, msg, 'already terminal'))
             return
+        if msg.get('kind') == 'continuation':
+            def resume():
+                fields = midturn.resume_message(msg, int(time.time() * 1000))
+                self.f.r.hset(self.bus.msg_key(msg['message_id']), mapping={k: fields[k] for k in
+                    ('deadline_at', 'clock_paused_at', 'clock_paused_ms') if k in fields})
+                self.midturn_resume_request(msg['request_id'])
+            self.transaction('midturn-offer-' + msg['message_id'], resume)
         env = self.bus.offer(slot, mids[0])
         if env:
             # Offer + lease is durable before updating legacy display state. Crash
@@ -2011,6 +2170,9 @@ class RuntimeV2:
 
     def cancel_queued(self, slot, msg, reason):
         r = self.effects or self.bus.r
+        raw = r.hgetall(self.bus.msg_key(msg['message_id']))
+        if raw.get('kind') == 'continuation':
+            self.midturn_resume_request(raw['request_id'])
         r.hset(self.bus.msg_key(msg['message_id']), mapping={'status': 'committed',
             'outcome': 'cancelled', 'result': '{}', 'committed_at': int(time.time()*1000), 'cancel_reason': reason})
         r.lrem(self.bus.pending_key(slot), 0, msg['message_id'])
@@ -2228,7 +2390,7 @@ class RuntimeV2:
                     if not req:
                         continue
                     limit = float(json.loads(req['spec']).get('timeout_s') or self.f.cfg['request_timeout'])
-                    if now-float(req['created']) >= limit:
+                    if midturn.effective_age(req, now) >= limit:
                         for slot in self.f.names:
                             state = self.f.r.hgetall(self.bus.lease_key(slot))
                             if state.get('message_id') and self.f.r.hget(
@@ -2257,6 +2419,8 @@ class RuntimeV2:
                 elif state.get('current_delivery') and state.get('status') not in ('uncertain', 'expired'):
                     mid = state['message_id']
                     deadline = int(self.f.r.hget(self.bus.msg_key(mid), 'deadline_at'))
+                    if info.get('midturn_id') and info.get('prompt_wait'):
+                        deadline = max(deadline, int(now * 1000) + 1000)
                     if int(now*1000) >= min(deadline, int(state['lease_until'])):
                         self.hold(slot, 'lease/delivery deadline expired; execution stop unconfirmed', public_status='timeout')
                     # Stalls are the watchdog's (docs/design.md §24): Escape ladder, then kill + next generation.
@@ -2294,9 +2458,11 @@ class RuntimeV2:
                 self.resume_run()  # explicit start --resume: reconcile, respawn, replay once
             else:
                 self.recover()  # no start_all, no Redis shutdown
+            self.f.midturn_probe.start()
             while not self.f.stopping:
                 self.bus.r.set('fx:daemon:beat', str(time.time()))
                 self.step()
+                self.f.midturn_apply()
                 self.f.pump()
                 self.f.tick()  # Fleet.tick: roster reload, result.json, sub-fleets, then this tick
             if self.f.explicit_stop:
@@ -2316,6 +2482,7 @@ class RuntimeV2:
                     self.audit('stop.unconfirmed', level='error')
                 lifecycle_close.finalize(self.f, all_stopped)  # closed_by/closed_at, notifications
         finally:
+            self.f.midturn_probe.close()
             if control:
                 try:
                     control.stop(timeout=1.0)

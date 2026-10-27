@@ -11,7 +11,6 @@ asks a session to write its handoff.
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 from typing import Dict, List, Optional, Tuple
@@ -56,35 +55,16 @@ SUBFLEET_RETURN_PROMPT = DUMP_PROMPT.replace(
     'over as the main fleet\'s worker. Write what it needs to know about that sub-fleet. ')
 
 
-def read_usage(path: str, window_fallback: int) -> Tuple[int, int]:
-    """(tokens used, context window) from the newest token_count event in a rollout.
+def read_usage(path: str, window_fallback: int) -> Tuple[Optional[int], int]:
+    """Latest rollout context usage in a bounded 64KB tail; unknown is never zero."""
+    from cmux_fleet.midturn import codex_rollout_usage
+    return codex_rollout_usage(path, window_fallback)
 
-    The window comes from the rollout itself (``model_context_window``), so this works for
-    any model. ``window_fallback`` is used only when the rollout has not reported one yet.
-    If no usage event exists, the file size / 4 is a rough estimate.
-    """
-    used, window = 0, 0
-    try:
-        with open(path, 'rb') as f:
-            f.seek(max(0, os.path.getsize(path) - 131072))
-            tail = f.read().decode('utf-8', 'replace')
-        for line in reversed(tail.splitlines()):
-            if '"token_count"' not in line:
-                continue
-            try:
-                info = json.loads(line)['payload']['info']
-            except (ValueError, KeyError, TypeError):
-                continue
-            if not info:
-                continue
-            used = info.get('last_token_usage', {}).get('total_tokens', 0)
-            window = info.get('model_context_window') or 0
-            break
-    except OSError:
-        return 0, window_fallback
-    if used <= 0:
-        used = os.path.getsize(path) // 4
-    return used, (window or window_fallback)
+
+def midturn_progress(message_id, instruction):
+    """The machine fallback must identify the unfinished instruction, not claim idle."""
+    return ('Mid-turn continuation of ' + message_id + ': ' + ' '.join(instruction.split())[:1000]
+            + '. Re-check the interrupted step and any partial artifacts before continuing.')
 
 
 def _split_sections(text: str) -> List[Tuple[str, str]]:

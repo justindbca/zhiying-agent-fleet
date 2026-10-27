@@ -1,4 +1,4 @@
-/** Redis v2 Pi adapter. agent_settled only reports; it never requests continuation. */
+// Fleet v2: agent_settled reports; daemon mid-turn prompts steer the active delivery.
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
@@ -188,6 +188,8 @@ export default function (pi: ExtensionAPI) {
     if (ack.status !== "registered") { fault(); throw new Error(ack.reason || "Fleet binding rejected"); }
   });
   pi.on("input", async (event, ctx) => {
+    if (active && event.source === "interactive" && event.text.startsWith("[FLEET MID-TURN HANDOFF fx-"))
+      return { action: "continue" };
     context = ctx;
     if (!ready && phase === "startup" && !startupBegan) return { action: "continue" };
     if (!ready) { ctx.ui.notify("Fleet 尚未 READY，输入未受理；请先检查启动状态。", "error"); return { action: "handled" }; }

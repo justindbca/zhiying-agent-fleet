@@ -48,6 +48,10 @@ assert.ok(!messages[0].msg.content.includes('m-first'));
 assert.equal(messages[0].msg.details.message_id,'m-first');
 assert.deepEqual(messages[0].opts,{triggerTurn:true}); // no hidden followUp/steer queue
 await emit('agent_start');
+const midturnText='[FLEET MID-TURN HANDOFF fx-0123456789abcdef] Context is 8000/10000. HANDOFF.';
+assert.equal((await emit('input',{source:'interactive',text:midturnText})).action,'continue');
+assert.equal((await emit('input',{source:'interactive',text:'ordinary manual worker text'})).action,'handled');
+assert.equal(records().filter(r=>r.kind==='operator_input').length,0);
 const result=tools.get('fleet_result');
 assert.ok(result.renderResult({content:[{type:'text',text:'validation error'}]}).render(80).join('\n').includes('候选未记录'));
 await emit('tool_execution_end',{toolCallId:'rejected-tool',toolName:'fleet_result',isError:true,result:{content:[{type:'text',text:'invalid required key'}]}});
@@ -124,4 +128,24 @@ await wait(()=>entries.some(e=>e.data.event_id==='late-ui'));
 assert.equal(messages.length,count);
 await emit('session_shutdown'); await emit('session_shutdown');
 assert.equal(bridge.exitCode,0);
+// A second actual extension instance proves the prefix check precedes the supervisor input bridge.
+process.env.CMUX_FLEET_PI_SLOT='supervisor';
+const supervisorHandlers=new Map(), supervisorMessages=[];
+register({on:(name,fn)=>supervisorHandlers.set(name,fn),registerTool(){},
+ registerEntryRenderer(){},registerMessageRenderer(){},appendEntry(){},
+ sendMessage:(msg)=>supervisorMessages.push(msg)});
+const sup=async(name,event={})=>supervisorHandlers.get(name)?.(event,ctx);
+await sup('session_start');
+await sup('before_agent_start',{prompt:'startup'});
+await sup('message_end',{message:{role:'assistant',stopReason:'stop',content:[{type:'text',text:'READY'}]}});
+await sup('agent_settled',{aborted:false});
+fixture({event:'delivery',message_id:'m-supervisor',slot:'supervisor'});
+await wait(()=>supervisorMessages.length===1);
+await sup('agent_start');
+const operatorCount=records().filter(r=>r.kind==='operator_input').length;
+assert.equal((await sup('input',{source:'interactive',text:midturnText})).action,'continue');
+assert.equal(records().filter(r=>r.kind==='operator_input').length,operatorCount);
+assert.equal((await sup('input',{source:'interactive',text:'ordinary supervisor instruction'})).action,'handled');
+assert.equal(records().filter(r=>r.kind==='operator_input').length,operatorCount+1);
+await sup('session_shutdown');
 console.log('Pi v2 persistent bridge contract passed (mock Pi API; no real TUI)');
