@@ -746,6 +746,44 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 
 **验证**：`tests/test_fleet.py` 新增空闲过阈值即换代（delivered 1 换、0 不换）、同（代数, delivered）只读一次、路由消息含状态 / 队列 / 在途请求 / 角色；`test_rotated_worker_gets_next_name_and_old_name_still_routes` 按新时序把 `handoff_timeout=0` 前移（换代提前到空闲那一拍）。
 
+## 33. 终端后端：cmux 与 WezTerm 二选一（2026-10-27 用户新要求）
+
+用户 10-27：「我写成两个选择，一个 cmux，另一个是仿照 cmux 写一个替代后端」。目标：macOS 照旧用 cmux；Linux（含 Windows 的 WSL2）用 WezTerm 跑同样的 supervisor + workers。Windows 原生、整体 Rust 重写、Zellij / tmux 无界面后端都**不做**（设计稿 §8）。本节不改任何标识 / 交接 / 版面基线（§3、§4、§2），cmux 后端行为零变化。
+
+### 33.1 接口（只有一处碰终端）
+
+fleet 只通过 `fleet.manager_for(cfg)` 造出的那一个对象碰终端（原 `fleet.py:210`）。该对象的公开方法就是后端接口，写在 `cmux_fleet/backends/base.py`：
+
+- `METHODS`：39 个方法的清单（会话 `available` / `session_exists` / `get_or_create_session` / `claim_run` / `workspace_id` / `select_workspace` / `keep_windows_open` / `owns` / `close_all`；开窗 `spawn_window` / `spawn_interactive_cli`；读写 `send_prompt_to_idle` / `send_key` / `capture_output` / `capture_to`；状态 `get_pane_status` / `has_cli_process` / `process_states` / `process_cpu`；标签焦点 `rename` / `focus` / `kill_pane`；布局 `arrange` / `dock_tab` / `dock_control` / `place_right_of` / `place_after` / `tab_into` / `tab_panes`；浏览器格 `browser_goto` / `browser_url` / `reload_browser`；移交 `release` / `adopt`；tmux 视图 `tmux_view_info` / `attach_view` / `tmux_session_alive` / `reattach_client` / `detach_view`），签名与 `CmuxSessionManager` 完全一致。
+- `TerminalBackend`（`typing.Protocol`）是同一清单的类型视图；`Capabilities(browser, nested_tabs)` 与类属性 `supports_browser` / `nested_tabs` 是 fleet 唯一看的能力位。
+- 构造器统一 `(session_name, agents_title, control_title, state_dir=None)`；`backends.build(name, session, **extra)` 惰性 import 对应模块。
+- 两个后端各自的可用性：`available()`（类方法/静态方法，cmux 就是 `cmux_available()`）、`unavailable_reason(name)`（cmux 由 `cmux_available()` 决定，WezTerm 报缺哪个程序/版本）。
+- `tests/test_backend_interface.py` 逐方法比对两个实现的签名与构造参数，并要求 `METHODS` 不漏、不多；**加后端 = 实现清单 + 过这条测试**，改接口 = 同时改两个实现和 fleet。
+
+### 33.2 两个后端
+
+- **cmux**（`cmux_fleet/backends/cmux.py`）：原 `cmux_manager.py` 原样搬家（行为零变化），`cmux_fleet/cmux_manager.py` 只剩转发（`sys.modules[__name__] = backends.cmux`，两个模块名是同一个模块对象），所以既有 import 与测试对 `cmux_manager._run` / `cmux_available` 的 monkeypatch 全部照旧生效。`supports_browser = True`、`nested_tabs = True`。`/Applications/cmux.app` 这类 macOS 专有路径只出现在这个文件里。
+- **WezTerm**（`cmux_fleet/backends/wezterm.py`）：每个 run 一个私有 `wezterm-mux-server`（短路径 unix socket，写在 run 的 `.runtime/wezterm/<token>/` 最小 `wezterm.lua` 里；所有 CLI 调用都带 `WEZTERM_UNIX_SOCKET` 与 `--no-auto-start`，**绝不**连用户自己的 WezTerm）；`supports_browser = False`、`nested_tabs = False`。方法映射、可用性判定（`wezterm` 与 `wezterm-mux-server` 在 PATH 且版本 ≥ `deps.yaml` 的 20240203）见设计稿 §4。
+
+### 33.3 选择与继承
+
+- `start --backend cmux|wezterm`；不给时：`sys.platform == 'darwin'` 且 cmux 可用 → cmux，否则 wezterm。显式选的后端在这台机器上不可用 → 启前拒开并说明缺什么（`fleet.resolve_backend`，`start` 里在 provisioning 之前）。
+- 选中值写进 run 的 `config.json` 的 `backend`；`manager_for` 只读它，daemon / actor / `--resume` / 子 fleet（子 config 由父 config 复制）一律跟随，不再各自判断。**没有 `backend` 键的旧 config（本次之前起的 run）按 cmux 处理**，等价于原行为。
+- 自动选择在 macOS 上不会把 run 推到 WezTerm：WezTerm 后端不可用（未装或未合入）时答案退回 cmux，报的仍是原来那条「run this inside a cmux terminal」类信息。
+- `fleet.yaml` 不加块：后端是一次运行的选择，不是表。
+
+### 33.4 版面降级（WezTerm）
+
+- cmux 版面（§2）：监工左上、右侧 worker 标签、左下 history/control 标签，依赖「分屏里再分标签」。WezTerm 没有这层：**一个窗口；第 1 个标签 = 监工（左）+ control（右下分屏）；每个 worker 一个标签**；`tab_into` / `dock_*` / `place_*` 降级为「放进对应标签 / 无操作并返回 True」，不报错；`arrange()` 在 `supports_browser = False` 时排好 worker、把 control 放进第 1 个标签（右下分屏，由 WezTerm 后端自己实现）后返回 `None`。
+- 版面与历史是 fleet 仅有的两处读能力位的地方（`Fleet.announce_history_page()` / `subfleet.follow_jump()` 看 `supports_browser`）；其余调用路径一律走原接口，cmux 后端除 `available()` / `supports_browser` / `nested_tabs` 外与搬家前逐行一致。
+- 历史页：`supports_browser = False` 时不建浏览器格；`Fleet.announce_history_page()` 在 control 里打印 `<run>/history.html` 路径，并在有图形环境时用一次系统打开（macOS `open` / Linux `xdg-open`，没有就只打印）；`refresh_history()` 只在有浏览器格时 `reload_browser`；`subfleet.follow_jump()` 在没有页面时直接返回（也不再每拍调 cmux）。cmux 这些分支全部保持原调用不变。
+
+### 33.5 平台小改
+
+`cmux_fleet/platform.py::keep_awake_prefix()`：macOS `caffeinate -i`、Linux 有 `systemd-inhibit` 时 `systemd-inhibit --what=idle:sleep --why=cmux-fleet`、否则空——`fleet.py` 两处、`subfleet.py` 一处原 `caffeinate` 调用改调它。`deps.yaml` 按后端门控（`when: cmux` / `when: wezterm`，后者含 `wezterm-mux-server`，最低 20240203），`scripts/check_deps.py` 用同一条 §33.3 规则挑后端并跳过不属于它的项。
+
+**验证**：`tests/test_backend_interface.py`（接口齐全）、`tests/test_backend_selection.py`（选择 / 继承 / 降级）、`tests/test_platform.py`、`tests/test_check_deps.py`、WezTerm 假 CLI 与真 mux server 测试（impl-wezterm 分支）、`.github/workflows/tests.yml` 的 `ubuntu-latest` 全量任务。真机冒烟（`start --backend wezterm` 起 pi 监工 + worker）留给编排会话，不在本 fleet 内做。
+
 ## 34. 回合中途换代（daemon 探针 + 强制 auto-handoff prompt）（2026-10-27 用户新要求，分支 feat/midturn-handoff）
 
 用户原话：「修吧，开分支做回合中途换代，这个问题纠缠了N次了，不论哪种模式都要能auto handoff啊，这是最基本的功能啊，怎么基本功能都丢失啊」「你不用搞那么复杂，就让daemon自动做一个探针就行吧，所有的会话的窗口都由daemon去控制。针对不同worker，像claude code、codex、pi之类的都强制它执行auto handoff的prompt」。据此推翻 `pi_extension_v2.ts` 首行原则「agent_settled only reports; it never requests continuation」与 §32 末尾「已知边界：长回合中途仍不换代」——这两条此前都假定换代只能发生在回合之间，本节起回合进行中 daemon 也强制换代。
