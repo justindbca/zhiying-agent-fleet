@@ -13,7 +13,7 @@
 
 要点：字面验收（产物不在 / 内容不对就不算完成）；上下文换代接力；每个 run 一个私有 Redis（只走 Unix socket）；
 卡死看门与预算刹车（账号写在私有号池文件里，格式见 `cmux_fleet/config/pools.example.yaml`，不进代码）；
-子 fleet；**2,070 个测试**。
+子 fleet；**2,000+ 个测试**。
 
 ## 为什么这样做
 
@@ -223,7 +223,7 @@ daemon 校验动词、把 `js` 文件限制在本次运行目录、给页面动�
 - **在另一台干净的 Mac 上端到端跑通**（macOS 26.2、cmux 0.64.25、codex-cli 0.156.1、ChatGPT 登录的 GPT-6-Sol）：`start` → 两个 agent 7 秒 READY →
   单步任务 40 秒完成并过产物校验 → 两步任务中监工触到轮换阈值、自己写了交接单、旧标签收成只读记录格、接班者继续把任务做完。
   轮换、产物验收、更新弹窗压制、隔离的 Codex home 都在真盘跑过。
-- 当前版本：macOS + Python 3.14 全套 **2,070 个测试**（约 13 分钟）；缺 redis-server / node / tmux / pi 的测试自动跳过。
+- 当前版本：macOS + Python 3.14 全套 **2,000+ 个测试**（约 13 分钟）；缺 redis-server / node / tmux / pi 的测试自动跳过。
 - 真实 pi + Flash Next + cmux0.65 已验证启动、请求、双角色换代、历史；直接在 supervisor 里要求 worker 回复OK，worker回复及supervisor转告闭环通过；control/history同栏且移动不中断daemon。
 - Claude真实混合任务仍未实测，只验证了官方CLI路由单测；独立复核及生产合并/部署仍未完成。详见[设计基线](docs/design.md)。
 - 还没真盘跑过：卡死看门（只有单测）、浏览器代办。

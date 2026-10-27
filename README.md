@@ -26,7 +26,7 @@ and local models) and **opencode**, in any supervisor × worker pairing that has
   hours, per-account quota) and a usage-wall table that downgrades a model tier or pauses resumably.
   Accounts live in a private pools file (`cmux_fleet/config/pools.example.yaml`), never in code.
 - **Sub-fleets.** A worker can become the supervisor of its own child fleet.
-- **2,070 tests** (in-memory Redis, fake cmux, synthetic transcripts; real Redis where it matters).
+- **2,000+ tests** (in-memory Redis, fake cmux, synthetic transcripts; real Redis where it matters).
 
 ```
  cmux workspace "Fleet agents" (one page)
@@ -587,7 +587,7 @@ the verb, confines `js` files to the run directory, paces page actions (`--chrom
 
 ## Test status
 
-- **2,070 tests** on macOS (Python 3.14): `python -m pytest -q tests` takes about 13 minutes. Tests that
+- **2,000+ tests** on macOS (Python 3.14): `python -m pytest -q tests` takes about 13 minutes. Tests that
   need `redis-server`, `node`, `tmux` or an installed Pi skip themselves when those are missing.
 - Every supervisor × worker CLI pairing marked `verified` in `cmux_fleet/config/cli_pairs.yaml` passed a
   real smoke run (`scripts/smoke_pair.sh`: 1 supervisor + 2 workers, 4 checks); the run id is recorded
