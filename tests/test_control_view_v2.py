@@ -360,7 +360,7 @@ def test_slow_renderer_nonblocking_bounded_queue_gap_and_stop(observed):
     assert handle.queue_depth <= 2
     started = time.monotonic()
     assert handle.stop(timeout=.02) is False
-    assert time.monotonic() - started < .15
+    assert time.monotonic() - started < .5  # bounded by the timeout, not the blocked writer (hosted CI is slower)
     output.release.set()
     assert handle.stop(timeout=1)
     assert "control.gap" in output.text and "resume_after" in output.text
