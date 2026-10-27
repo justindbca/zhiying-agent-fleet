@@ -105,6 +105,28 @@ def test_spawn_send_get_list_kill_roundtrip(live, tmp_path):
     assert not wait_for(lambda: live.owns(pane), timeout=1), 'a killed pane is no longer ours'
 
 
+def test_spawned_pane_sees_the_operators_real_home_not_the_mux_home(live, tmp_path):
+    """The fake HOME isolates the *server's* pid lock only; an agent pane must still see the operator's
+    real HOME, or its credentials/profile (``~/.claude``, ``~/.codex``, ``~/.gitconfig`` ...) vanish.
+    Regression test for the P0 the supervisor caught: ``cli_env`` used to hand every ``wezterm`` call
+    ``HOME=$mux_home``, so spawn inherited it."""
+    operator_home = str(Path.home().resolve())
+    assert os.environ.get('HOME'), 'the test itself needs a real HOME to compare against'
+    res = live.spawn_window('home-probe', '/bin/sh -c "echo HOME-IS=$HOME; exec /bin/sleep 60"',
+                            start_directory=str(tmp_path))
+    assert res.success, res.error
+    pane = res.pane_id
+    try:
+        assert wait_for(lambda: 'HOME-IS=' in (live.capture_output(pane, 80) or '')), 'no HOME line in the pane'
+        out = live.capture_output(pane, 80)
+        line = next(l for l in out.splitlines() if 'HOME-IS=' in l)
+        seen = line.split('HOME-IS=', 1)[1].strip()
+        assert seen == operator_home, 'the pane must run as the operator: %r != %r' % (seen, operator_home)
+        assert seen != str(Path(live.mux_home).resolve()), 'the mux HOME is only for the server pid lock'
+    finally:
+        live.kill_pane(pane)
+
+
 def test_send_key_controls_reach_a_real_foreground_program(live, tmp_path):
     """Esc / Ctrl-C / arrows as keys (the probe's finding, now through the backend on a real mux server).
 

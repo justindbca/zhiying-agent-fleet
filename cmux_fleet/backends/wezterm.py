@@ -172,6 +172,10 @@ class WezTermSessionManager:
         self.mux_pid: Optional[int] = None
         self.mux_pid_file: Optional[str] = None
         self.mux_home: Optional[str] = None
+        # The operator's HOME as it was when this manager was built. Panes (and therefore the agents in
+        # them) must run with it; the fake mux HOME exists only to keep the server's pid lock away from
+        # the user's WezTerm (probe-report §1, P0 fix).
+        self.operator_home: str = str(os.environ.get('HOME') or Path.home())
         self.mux_config: Optional[str] = None
         self.mux_workspace = self._workspace_name()
         self.last_error = ''
@@ -212,13 +216,19 @@ class WezTermSessionManager:
         self.mux_config = str(base / 'wezterm.lua')
         return {'root': self.runtime_root, 'socket': socket}
 
-    def cli_env(self) -> Dict[str, str]:
-        """Environment of every ``wezterm`` call: our socket, our HOME, never the operator's."""
+    def cli_env(self, private_home: bool = False) -> Dict[str, str]:
+        """Environment of every ``wezterm`` call: our socket, nothing that could reach the user's server.
+
+        ``HOME`` stays the operator's real one (``self.operator_home``) so the panes we spawn inherit it —
+        an agent must find ``~/.claude`` / ``~/.codex`` / ``~/.gitconfig`` and its profile. The one caller
+        that needs the fake HOME is the mux-server start itself (``private_home=True``): the server's pid
+        lock lives in ``$HOME/.local/share/wezterm/pid`` (probe-report §1). The fake HOME only ever holds
+        that pid file and our ``wezterm.lua`` pointer is explicit (``--config-file``), so no agent config
+        is read from it and none is copied into it."""
         env = {k: v for k, v in os.environ.items() if k not in ('WEZTERM_PANE',)}
         env['WEZTERM_UNIX_SOCKET'] = self.mux_socket or ''
-        if self.mux_home:
-            env['HOME'] = self.mux_home
-            env.pop('WEZTERM_CONFIG_FILE', None)  # a stale pointer into the operator's config
+        env.pop('WEZTERM_CONFIG_FILE', None)  # a stale pointer into the operator's config
+        env['HOME'] = self.mux_home if (private_home and self.mux_home) else self.operator_home
         env['WEZTERM_LOG'] = 'error'
         return env
 
@@ -275,7 +285,9 @@ class WezTermSessionManager:
             raise WezTermError(_MUX_BIN + ' not found on PATH')
         cmd = [binary, '--config-file', self.mux_config, '--daemonize']
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, env=self.cli_env(), timeout=60)
+            # The only call that gets the fake HOME: the pid lock of the server lives under it.
+            p = subprocess.run(cmd, capture_output=True, text=True, env=self.cli_env(private_home=True),
+                               timeout=60)
         except (OSError, subprocess.SubprocessError) as exc:
             raise WezTermError('could not start the private WezTerm mux server: %s' % exc) from exc
         if p.returncode != 0:
@@ -476,7 +488,9 @@ class WezTermSessionManager:
         if not self.server_running():
             self.last_error = 'private WezTerm mux server is not running'
             return SpawnResult(success=False, error=self.last_error)
-        full = self._launcher(window_name, 'cd ' + shlex.quote(start_directory or '.') + ' && exec ' + command)
+        full = self._launcher(window_name, 'cd ' + shlex.quote(start_directory or '.')
+                              + ' && export HOME=' + shlex.quote(self.operator_home)
+                              + ' && exec ' + command)
         args = ['spawn']
         if new_window:
             args += ['--new-window', '--workspace', self.mux_workspace]
@@ -525,12 +539,6 @@ class WezTermSessionManager:
         """First pane of the run opens the window (in the run's workspace); the rest are tabs in it."""
         new_window = self._any_pane() is None
         return self._spawn(window_name, command, metadata, start_directory, new_window)
-
-    def spawn_window_raise(self, window_name: str, command: str, metadata: Optional[Dict[str, str]] = None,
-                           start_directory: Optional[str] = None):
-        """Same as ``spawn_window`` here: ``wezterm cli spawn`` always runs the command at once, so there
-        is no typing race to work around (that is why cmux refuses this one)."""
-        return self.spawn_window(window_name, command, metadata, start_directory)
 
     def spawn_interactive_cli(self, window_name: str, cli_command: str, prompt_file: Optional[str] = None,
                               output_file: Optional[str] = None, metadata: Optional[Dict[str, str]] = None,
@@ -772,23 +780,6 @@ class WezTermSessionManager:
                 return False
         _ = history_surface
         return True
-
-    def dock_control_alone(self) -> int:
-        """Degraded layout (§4.3): there is no history tab to dock after, so dock below the supervisor.
-        Returns the number of control panes moved."""
-        sup = self._supervisor_pane()
-        controls = [sid for sid, info in (self._meta().get('surfaces') or {}).items()
-                    if info.get('type') == 'daemon' and self._in_run(sid) is not None]
-        if sup is None:
-            return 0
-        moved = 0
-        for sid in controls:
-            row, sup_row = self._in_run(sid), self._in_run(sup)
-            if _same_tab(row, sup_row) and row.get('top_row', 0) > sup_row.get('top_row', 0):
-                continue
-            if self.place_below(sid, sup):
-                moved += 1
-        return moved
 
     def _supervisor_pane(self) -> Optional[str]:
         surfaces = self._meta().get('surfaces') or {}

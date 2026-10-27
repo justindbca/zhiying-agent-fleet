@@ -9,6 +9,7 @@ fake "server" process writes, which is how ``close`` knows to stop only that pid
 """
 import json
 import os
+import shlex
 import sys
 import tempfile
 from pathlib import Path
@@ -127,7 +128,8 @@ def test_default_backend_uses_wezterm_when_cmux_is_missing(monkeypatch):
 
 # -- §4.1 private mux server ----------------------------------------------------------------------------
 def test_private_server_gets_its_own_home_and_short_socket(fake_cli, monkeypatch):
-    """The probe showed the pid lock lives in $HOME/.local/share/wezterm: each run needs its own HOME."""
+    """The probe showed the pid lock lives in $HOME/.local/share/wezterm: the *server* needs its own HOME.
+    That fake HOME must never reach the panes: ``cli_env()`` keeps the operator's real HOME (P0 fix)."""
     seen = {}
 
     m = wz.WezTermSessionManager('wz-home', state_dir=fake_cli['root'])
@@ -150,6 +152,24 @@ def test_private_server_gets_its_own_home_and_short_socket(fake_cli, monkeypatch
     assert '--config-file' in seen['cmd'] and '--daemonize' in seen['cmd']
     conf = Path(seen['cmd'][seen['cmd'].index('--config-file') + 1]).read_text()
     assert 'fleet-wz-home' in conf and m.mux_socket in conf
+    # ... and that is the only call that gets it: the CLI client env keeps the real HOME.
+    assert Path(m.cli_env()['HOME']).resolve() == Path(os.environ['HOME']).resolve()
+    assert Path(m.cli_env()['HOME']).resolve() != Path(m.mux_home).resolve()
+
+
+def test_cli_client_keeps_the_operators_home_so_panes_inherit_it(mgr, fake_cli):
+    """P0 (operator correction): every ``wezterm cli`` call runs with the real HOME, so a spawned pane finds
+    the operator's credentials/profile instead of the empty fake HOME that only isolates the pid lock."""
+    real_home = str(Path.home().resolve())
+    assert mgr.spawn_window('worker-1', 'echo hi', start_directory=str(fake_cli['root'])).success
+    calls = [c for c in argv_log(fake_cli) if 'list' in c['argv'] or 'spawn' in c['argv']]
+    assert calls
+    for call in calls:
+        assert Path(call['home']).resolve() == Path(real_home), 'a CLI call with the fake HOME leaks it into panes'
+        assert Path(call['home']).resolve() != Path(mgr.mux_home).resolve()
+    # the launcher still pins HOME explicitly: the pane cannot inherit a stray HOME from the server
+    launch = list((Path(mgr.meta_path).parent / 'launch').glob('worker-1-*.sh'))
+    assert launch and ('export HOME=' + shlex.quote(mgr.operator_home)) in launch[-1].read_text()
 
 
 def test_socket_path_over_the_limit_fails_without_fallback(tmp_path):

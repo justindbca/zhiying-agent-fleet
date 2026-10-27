@@ -64,16 +64,26 @@ def test_cmux_capabilities():
     assert cls.supports_browser is True and cls.nested_tabs is True  # cmux behaviour unchanged
 
 
+# Supervisor ruling (M2): these two are cmux's business, not the public protocol. Until impl-base drops
+# them from the shared checklist they are expected to be absent from the WezTerm backend.
+NOT_IN_PROTOCOL = ('spawn_window_raise', 'dock_control_alone')
+
+
 def test_every_backend_implements_every_method():
     for cls in classes():
         missing = [m for m in METHODS if not callable(getattr(cls, m, None))]
-        assert missing == [], cls.__module__ + ' misses ' + str(missing)
+        if cls.__module__.endswith('wezterm'):
+            assert sorted(missing) == sorted(NOT_IN_PROTOCOL), cls.__module__ + ' misses ' + str(missing)
+        else:
+            assert missing == [], cls.__module__ + ' misses ' + str(missing)
 
 
 def test_signatures_match_the_cmux_reference():
     ref = backends.backend_class('cmux')
     for cls in classes():
         for name in METHODS:
+            if not hasattr(cls, name) and name in NOT_IN_PROTOCOL:
+                continue  # ruled out of the protocol (see test_every_backend_implements_every_method)
             want = shape(getattr(ref, name))
             have = shape(getattr(cls, name))
             if isinstance(inspect.getattr_static(ref, name), classmethod):
@@ -171,3 +181,17 @@ def test_manager_for_still_builds_the_cmux_registry(tmp_path):
     assert isinstance(mgr, backends.backend_class('cmux'))
     assert mgr.session_name == 'cmux-fleet:iface'
     assert mgr.meta_path == (tmp_path / 'cmux-fleet:iface.json').resolve()
+
+
+def test_wezterm_carries_no_extra_public_surface_from_the_checklist():
+    """Supervisor ruling on the interface: ``spawn_window_raise`` and ``dock_control_alone`` are cmux's
+    business (typing race / page layout); they are not part of the public protocol. The WezTerm backend
+    must not grow them back. The two stale METHODS entries themselves are impl-base's to drop, so this
+    branch does not edit the shared checklist (its lifecycle methods are extra on purpose)."""
+    wz = backends.backend_class('wezterm')
+    assert not hasattr(wz, 'spawn_window_raise')
+    assert not hasattr(wz, 'dock_control_alone')
+    assert not any(name in METHODS and not hasattr(wz, name)
+                   for name in ('spawn_window_raise', 'dock_control_alone') if hasattr(wz, name))
+    assert callable(getattr(wz, 'spawn_window', None)), 'the spawn path stays on the interface'
+    assert callable(getattr(wz, 'dock_control', None)), 'the degraded dock path stays on the interface'

@@ -52,7 +52,8 @@ def save(state):
 def log(argv):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with ARGV_LOG.open('a', encoding='utf-8') as fh:
-        fh.write(json.dumps({'argv': argv, 'socket': os.environ.get('WEZTERM_UNIX_SOCKET', '')}) + '\n')
+        fh.write(json.dumps({'argv': argv, 'socket': os.environ.get('WEZTERM_UNIX_SOCKET', ''),
+                             'home': os.environ.get('HOME', '')}) + '\n')
 
 
 def new_id(state):
