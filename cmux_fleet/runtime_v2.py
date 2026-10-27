@@ -885,6 +885,8 @@ class RuntimeV2:
         reason = midturn.blocked_text(self.midturn_splits(msg))
         state = self.f.r.hgetall(self.bus.lease_key(slot))
         if state.get('message_id') == msg['message_id'] and state.get('current_delivery'):
+            # The bridge reads this to show "split cap" instead of "connection lost" on the pane.
+            (self.effects or self.bus.r).hset(self.bus.msg_key(msg['message_id']), mapping={'midturn_limit': '1'})
             self.hold(slot, reason, pause=False)
         elif msg.get('status') == 'queued':
             self.cancel_queued(slot, msg, reason)

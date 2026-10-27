@@ -16,7 +16,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import redis
-from cmux_fleet import fleet, opencode_adapter, pi_adapter
+from cmux_fleet import fleet, midturn, opencode_adapter, pi_adapter
 from cmux_fleet.message_bus import BusError, _short
 from cmux_fleet.runtime_v2 import bus_for, dumps, post_event, validate_config, wait_reply
 
@@ -239,7 +239,13 @@ class AgentBridge:
             self.faulted = True
             self.idle_event.clear()
             env = self.active
-        self.emit({'kind': 'fault', 'reason': '通信中断，执行状态未确认；等待人工对账。'})
+        text = '通信中断，执行状态未确认；等待人工对账。'
+        try:
+            if env and self.bus.message(env['message_id']).get('midturn_limit'):
+                text = midturn.LIMIT_STATUS
+        except (redis.RedisError, BusError, ValueError, OSError):
+            pass
+        self.emit({'kind': 'fault', 'reason': text})
         try:
             if env:
                 self.bus.mark_uncertain(self.slot, env, reason[:1000])

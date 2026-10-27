@@ -126,6 +126,9 @@ const count=messages.length;
 fixture({event:'ui',event_id:'late-ui',render:'失败，不代表已停止。'});
 await wait(()=>entries.some(e=>e.data.event_id==='late-ui'));
 assert.equal(messages.length,count);
+// A split-cap hold arrives as a fault frame with its own text; it must not read as "connection lost".
+fixture({event:'fault',reason:'已达续做上限，等监工拆小。'});
+await wait(()=>statuses.at(-1)==='已达续做上限，等监工拆小。');
 await emit('session_shutdown'); await emit('session_shutdown');
 assert.equal(bridge.exitCode,0);
 // A second actual extension instance proves the prefix check precedes the supervisor input bridge.

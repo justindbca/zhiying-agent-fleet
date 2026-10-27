@@ -50,9 +50,10 @@ export default function (pi: ExtensionAPI) {
     const label = ctx.sessionManager.getSessionName();
     if (ctx.mode === "tui" && label) ctx.ui.setTitle(label);
   }
-  function fault() {
+  function fault(text?: unknown) {
     unhealthy = true;
-    context?.ui.setStatus("fleet", "通信中断，执行状态未确认；等待对账");
+    // Only a bridge fault frame carries display text; .catch(fault) passes an Error.
+    context?.ui.setStatus("fleet", typeof text === "string" && text ? text : "通信中断，执行状态未确认；等待对账");
     for (const item of pending.values()) { clearTimeout(item.timer); item.reject(new Error("Fleet bridge unavailable")); }
     pending.clear();
   }
@@ -90,7 +91,7 @@ export default function (pi: ExtensionAPI) {
     } else if (frame.kind === "ui") {
       if (frame.event_id && frame.card) entry(frame.event_id, frame.card.render);
     } else if (frame.kind === "fault") {
-      fault();
+      fault(frame.reason);
     } else if (frame.kind === "completed") {
       if (active?.message_id === frame.message_id) { active = undefined; candidates = []; phase = "idle"; ctx.ui.setStatus("fleet", "等待派工"); }
     } else if (frame.kind === "delivery" && frame.delivery) {

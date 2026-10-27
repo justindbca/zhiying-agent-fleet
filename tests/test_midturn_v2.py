@@ -158,6 +158,7 @@ def test_split_cap_routes_to_existing_blocked_intake(plan, task, slot):
     f.pending_notify = []
     rt.midturn_blocked(slot, rt.bus.message('m-test'))
     assert f.agent(slot)['state'] == 'held'
+    assert f.r.hget(rt.bus.msg_key('m-test'), 'midturn_limit') == '1'
     assert not f.mgr.sent and not f.mgr.killed
     assert not f.r.hget(fleet.REQ+'r1', 'clock_paused_at') or task
     if slot != 'supervisor':
@@ -435,3 +436,17 @@ def test_watchdog_midturn_kill_continues_without_frozen_report_and_failure_resum
         assert decoded(f, rt, f.r.lrange(rt.bus.pending_key(SLOT),0,0)[0])['continues'] == 'm-test'
         assert f.mgr.killed == ['pane-old']
         assert 'Mid-turn continuation' in next((f.run_dir/'handoffs').glob('*.md')).read_text()
+
+
+@pytest.mark.parametrize('marked,text', [(True, midturn.LIMIT_STATUS), (False, '通信中断，执行状态未确认；等待人工对账。')])
+def test_bridge_fault_text_names_the_split_cap(marked, text):
+    import threading
+    from cmux_fleet.agent_bridge import AgentBridge
+    frames = []
+    bus = SimpleNamespace(message=lambda mid: {'midturn_limit': '1'} if marked else {},
+                          mark_uncertain=lambda *a: None)
+    me = SimpleNamespace(lock=threading.RLock(), faulted=False, stop_event=threading.Event(),
+                         idle_event=threading.Event(), active={'message_id': 'm-test'}, bus=bus,
+                         emit=frames.append, slot=SLOT, event=lambda *a: None)
+    AgentBridge.fault(me, 'daemon holds execution; stop confirmation required')
+    assert frames == [{'kind': 'fault', 'reason': text}]

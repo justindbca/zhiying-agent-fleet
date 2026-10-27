@@ -108,6 +108,10 @@ def continuation(label, prev, note, instruction):
     return CONTINUATION_PROMPT.format(label=label, prev=prev, note=note, instruction=instruction)
 
 
+# Pane status for a slot held at the split cap (agent_bridge fault frame -> pi status bar).
+LIMIT_STATUS = '已达续做上限，等监工拆小。'
+
+
 def blocked_text(splits):
     return '这条派工一个会话装不下（已续做 ' + str(splits) + ' 次），请拆小'
 
