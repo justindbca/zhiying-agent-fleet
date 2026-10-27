@@ -308,7 +308,7 @@ def test_threshold_types_exactly_once_per_generation_and_updates_control(plan, m
     f.midturn_probe.results[SLOT] = result
     f.midturn_apply()
     if cli == 'claude':
-        # design.md §33: never typed into a Claude pane; the PostToolUse hook takes the pending prompt.
+        # design.md §34: never typed into a Claude pane; the PostToolUse hook takes the pending prompt.
         assert f.mgr.sent == [] and f.agent(SLOT)['midturn_send_pending'] == '1'
         prompt = midturn.registered_prompt(f.agent(SLOT), 0)
         assert prompt.startswith('[FLEET MID-TURN HANDOFF fx-')

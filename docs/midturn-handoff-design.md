@@ -1,7 +1,7 @@
 # 回合中途换代（mid-turn handoff）设计稿 r3：daemon 探针 + 强制打 prompt
 
 > 2026-10-27，分支 `feat/midturn-handoff`（基于在役 `deploy/cmux-fleet@41632170`）。只出设计，未改代码。
-> 落地后并入 `docs/design.md` 为 **§33**。沿用 §4 换代流程、§3 代数命名 slot.N、交接单三节 + 机器骨架、历史页；不另造第二套换代。
+> 落地后并入 `docs/design.md` 为 **§34**。沿用 §4 换代流程、§3 代数命名 slot.N、交接单三节 + 机器骨架、历史页；不另造第二套换代。
 > r1 / r2（A/B 两层、CLI 钩子、用量帧、P1–P8 探针脚本）已被用户叫停，压在 §9「已否决」。
 
 ## 用户原话（2026-10-27，本稿的依据）
@@ -11,7 +11,7 @@
 3. 中途阈值 80%（`midturn_ratio` 缺省 0.8）。
 4. 「这个探针max（1秒，查完所有窗口时间）去执行循环这样可以吗？」（已答可以）
 
-原话 1、2 是推翻 `pi_extension_v2.ts` 首行「agent_settled only reports; it never requests continuation」与 design.md §32「长回合中途仍不换代」的依据，§33 原样引用。
+原话 1、2 是推翻 `pi_extension_v2.ts` 首行「agent_settled only reports; it never requests continuation」与 design.md §32「长回合中途仍不换代」的依据，§34 原样引用。
 
 ---
 
@@ -220,7 +220,7 @@ prompt 固定**单行**（避免多行粘贴在非 bracketed 模式被拆成两�
 |---|---|---|---|
 | **M1 daemon（一块做完）** | `cmux_fleet/midturn.py`（裁剪）、`cmux_fleet/fleet.py`、`cmux_fleet/runtime_v2.py`、`cmux_fleet/watchdog.py`、`cmux_fleet/handoff.py`、`cmux_fleet/codex_queue.py`、`cmux_fleet/roster.py`、`cmux_fleet/pi_extension_v2.ts`（仅 §4c 那条放行）、`tests/test_midturn_limits.py`、`tests/test_midturn_v2.py`（新）、pi 合同测试夹具 | **midturn.py 裁剪**：留用量读取（`claude_transcript_usage`、`codex_rollout_usage`，新增 pi 会话读取，统一 64KB 尾）、阈值（`resolve_settings` / `decide` 去掉 A/B 层参数，`DEFAULTS.midturn_ratio = 0.8`，新增 `midturn_retry = 300`、`midturn_max_splits = 3`）、时钟（`effective_age` / `pause_clock` / `resume_clock` / `pause_message` / `resume_message`）、续做与 BLOCKED 文本（`continuation`、`blocked_text`）、单行 prompt；删 `MIDTURN_INJECT`、`TOOL_LIMITS` / `TOOL_SOURCES`、`limits()` 的 A/B 层 / k / b、`parse_usage_frame`、`order_key` / `order_record` / `LUA_NOTICE` / `posttool_hook` / `posttool_main` / `HOOK_*`、`blocked_prompt`、`midturn_nudge` / `midturn_b_wait`。**fleet.py**：探针线程 + `midturn_apply()`（主循环一步）、强制打字、`deliver` 对 continuation 跳过换卡与顾问、`expire_requests` 按有效时长、Claude 监工 `claude-prompt` 放行、名单 `handoff:` 表接受 `midturn_ratio`（`roster.py:135-169` 一并改）。**runtime_v2.py**：`settle` 的 `handoff_split` 分支、续做入队首、tick expire 按有效时长、兜底计时、`requeue_lost` 抄 `midturn_splits` / `continues`（`runtime_v2.py:1836-1855`）。**watchdog.py**：`rotate(reason='midturn')` 续做变体。**handoff.py**：骨架中途变体（In progress 写原指令头与续做标记）。**codex_queue.py**：`bound` 放宽。**pi_extension_v2.ts**：带前缀放行 3 行 + 首行注释改写 | `tests/test_midturn_limits.py`（裁剪后）与 `tests/test_midturn_v2.py` 全过；全套 `pytest -q tests` 零回归（含 `test_v2_*`、`test_watchdog*`、`test_fleet.py`、`test_handoff_limits.py`、`test_roster.py`、`test_advisor*`、`test_codex_queue*`、pi 合同测试）；control 行显示 `ctx=<used>/<W> mid=<0.8W>` |
 | **M2 端到端冒烟** | `scripts/smoke_midturn.sh`（新） | §7 端到端 | 目标机同版本 CLI 跑通 §7 列的组合；脚本开头打印 pi / claude / codex / opencode 版本并与在役机比对；无写死本机路径 |
-| **M3 文档** | `docs/design.md` | 新增 §33（本稿压缩版，原样引用用户原话 1、2 作为推翻 `agent_settled only reports; it never requests continuation` 与 §32「长回合中途仍不换代」的依据）；§4 第 1 条补「§33 起回合内过 0.8 也换代」；§32 末尾「已知边界」改指向 §33；§7「pi 适配必须满足」补「带中途前缀的输入放行」；§9 落点表加 `midturn.py`；§5 / §11 写 Claude 监工钩子与 Codex 绑定的放宽 | 替代关系逐条写明；§5 阈值风险（200k 档）原样写进，端到端结果与未验收项如实列 |
+| **M3 文档** | `docs/design.md` | 新增 §34（本稿压缩版，原样引用用户原话 1、2 作为推翻 `agent_settled only reports; it never requests continuation` 与 §32「长回合中途仍不换代」的依据）；§4 第 1 条补「§34 起回合内过 0.8 也换代」；§32 末尾「已知边界」改指向 §34；§7「pi 适配必须满足」补「带中途前缀的输入放行」；§9 落点表加 `midturn.py`；§5 / §11 写 Claude 监工钩子与 Codex 绑定的放宽 | 替代关系逐条写明；§5 阈值风险（200k 档）原样写进，端到端结果与未验收项如实列 |
 
 ---
 

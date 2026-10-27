@@ -62,7 +62,7 @@ Fleet agents（一个工作区）
 
 ## 4. 交接与历史沿用原实现
 
-1. daemon 在空闲投递边界读取用量（§32 起：回合结束、空闲且无待投消息时也读一次，不必等下一条消息）；回合中途（投递边界 / 空闲之外）由 §33 的探针另外判，不等空闲。
+1. daemon 在空闲投递边界读取用量（§32 起：回合结束、空闲且无待投消息时也读一次，不必等下一条消息）；回合中途（投递边界 / 空闲之外）由 §34 的探针另外判，不等空闲。
 2. 达到 `handoff_ratio` 后，请旧代填写三节交接草稿。
 3. 把模型内容并入机器骨架；模型未写或失败时用骨架，不因缺交接文本阻塞换代。
 4. 保存旧屏幕和交接单；在原 pane/tab 位置启动新一代。
@@ -71,7 +71,7 @@ Fleet agents（一个工作区）
 
 - 正常默认阈值 **0.6（60%）**。1%/5% 仅作显式换代测试，结束后恢复正常值。
 - 新会话仅 READY 就已超阈值时，不反复重开；保留原 `rotate.impossible` 防循环机制。
-- pi 自动压缩只作长回合保险，不替换 fleet 的跨会话交接和历史；回合中途的强制换代见 §33。
+- pi 自动压缩只作长回合保险，不替换 fleet 的跨会话交接和历史；回合中途的强制换代见 §34。
 - 保留原关闭失败/投递失败处理；不能把“机器骨架可用”夸大成任何窗口/进程故障下都保证换代成功。
 
 ## 5. supervisor 手工派活必须形成闭环
@@ -742,11 +742,11 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - **路由消息带工人状态**（`Fleet.worker_board`，接在 `route()` 原 `Workers:` 行后，原行保留）：每个可派 worker 一行 `- <label>: <state>[, N queued][, has request <id>…][, role: <角色文件首个非空行，≤120 字>]`。在途请求按 `fx:req:*` 的 `status=dispatched` + `worker` 反查（v1 / v2 通用）。状态是入队时的快照；监工提示词补一句「前一回合派过、尚未回报的 worker 算忙」。
 - **service 监工提示词**（`service_supervisor.md` / `_v2` / `_tui_v2` 同加两条禁令）：有空闲 worker 时不许把请求排到忙的 worker 后面，只有请求明确接续该 worker 自己未完成的请求才可以，并在 `reason` 写明；复核 / 验收请求有带 reviewer 角色的 worker 时不许派给别人，永不派给被复核工作的作者。角色由名单 `role` 文件给（§16），本节不加新名单字段。
 - **空闲即换代**（`Fleet.idle_rotate`，`pump()` 里空闲且信箱空的监工 / worker）：每个（代数, delivered）只读一次用量，过阈值即 `start_rotation`；与 `deliver()` 同样的守卫（profile 换卡中、v2 非 TUI 槽未 `bridge_available`、子 fleet 收编槽、Codex 原生子 agent 在跑）；刚起的会话（delivered=0）不在这里判，`rotate.impossible` 仍归投递时。受 `max_busy` 与暂停约束（handoff 计入忙）。顾问槽不走这条（§27 自管）。
-- **已知边界**：长回合中途换代已由 §33 覆盖（daemon 探针 + 强制 prompt）；请求超时被 `held` 的槽迟到结算后仍是 `held`（`settle.late` 只记审计），不会空闲即换代，要人工 / 看门处理——10-16 的 85k 事故正是这一情形，本节不覆盖。
+- **已知边界**：长回合中途换代已由 §34 覆盖（daemon 探针 + 强制 prompt）；请求超时被 `held` 的槽迟到结算后仍是 `held`（`settle.late` 只记审计），不会空闲即换代，要人工 / 看门处理——10-16 的 85k 事故正是这一情形，本节不覆盖。
 
 **验证**：`tests/test_fleet.py` 新增空闲过阈值即换代（delivered 1 换、0 不换）、同（代数, delivered）只读一次、路由消息含状态 / 队列 / 在途请求 / 角色；`test_rotated_worker_gets_next_name_and_old_name_still_routes` 按新时序把 `handoff_timeout=0` 前移（换代提前到空闲那一拍）。
 
-## 33. 回合中途换代（daemon 探针 + 强制 auto-handoff prompt）（2026-10-27 用户新要求，分支 feat/midturn-handoff）
+## 34. 回合中途换代（daemon 探针 + 强制 auto-handoff prompt）（2026-10-27 用户新要求，分支 feat/midturn-handoff）
 
 用户原话：「修吧，开分支做回合中途换代，这个问题纠缠了N次了，不论哪种模式都要能auto handoff啊，这是最基本的功能啊，怎么基本功能都丢失啊」「你不用搞那么复杂，就让daemon自动做一个探针就行吧，所有的会话的窗口都由daemon去控制。针对不同worker，像claude code、codex、pi之类的都强制它执行auto handoff的prompt」。据此推翻 `pi_extension_v2.ts` 首行原则「agent_settled only reports; it never requests continuation」与 §32 末尾「已知边界：长回合中途仍不换代」——这两条此前都假定换代只能发生在回合之间，本节起回合进行中 daemon 也强制换代。
 

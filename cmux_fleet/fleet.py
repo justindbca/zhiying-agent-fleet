@@ -726,7 +726,7 @@ def claude_rewake(cfg_path, name, generation, raw):
 
 
 def claude_posttool(cfg_path, name, generation):
-    """Claude Code PostToolUse hook (design.md §33): the mid-turn handoff prompt the daemon registered for
+    """Claude Code PostToolUse hook (design.md §34): the mid-turn handoff prompt the daemon registered for
     this slot and generation, taken once (midturn_send_pending 1 -> 0); None when there is nothing to send.
     Never raises: any failure (Redis down, stale generation) means no output, so normal work is untouched."""
     try:
@@ -1604,7 +1604,7 @@ def claude_argv(cfg_path, cfg, name, generation, prompt, resume=None):
         hooks['StopFailure'] = [{'hooks': [{'type': 'command', 'timeout': 30, 'command': shlex.join(
             [cfg['python'], str(Path(__file__).resolve()), 'claude-stop-failure', str(cfg_path), name, str(generation)])}]}]
     if name != ADVISOR:
-        # Mid-turn handoff (design.md §33): the daemon never types into a Claude pane; this hook hands the
+        # Mid-turn handoff (design.md §34): the daemon never types into a Claude pane; this hook hands the
         # registered prompt to the model after the next tool call (decision block + reason).
         hooks['PostToolUse'] = [{'hooks': [{'type': 'command', 'timeout': 10, 'command': shlex.join(
             [cfg['python'], str(Path(__file__).resolve()), 'claude-posttool', str(cfg_path), name, str(generation)])}]}]
