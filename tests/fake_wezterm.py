@@ -260,8 +260,8 @@ def cmd_send_text(opts, prog):
     no_paste = '--no-paste' in opts
     if no_paste:
         opts.remove('--no-paste')
-    text = ' '.join(opts)
-    if not opts:
+    text = ' '.join(prog or opts)  # ``send-text [opts] -- TEXT`` or the bare TEXT
+    if not opts and not prog:
         text = sys.stdin.read()
     if pane_id is None:
         if not state['panes']:

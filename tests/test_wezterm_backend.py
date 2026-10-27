@@ -360,7 +360,16 @@ def test_send_text_without_brackets_is_raw_and_enter_is_cr(mgr, fake_cli):
     sends = [c['argv'] for c in argv_log(fake_cli) if 'send-text' in c['argv']]
     assert '--no-paste' in sends[0]
     assert 'plain text' in sends[0]
-    assert sends[-1][sends[-1].index('--no-paste') + 1] == '\r', 'Enter must be its own CR'
+    assert '--no-paste' in sends[-1] and sends[-1][-2:] == ['--', '\r'], 'Enter must be its own CR'
+
+
+def test_send_text_starting_with_a_dash_is_not_an_option(mgr, fake_cli):
+    """Review 2026-10-28: ``- fix X`` was parsed by clap as an option (rc 2); the text follows ``--``."""
+    sup = mgr.spawn_window('supervisor', 'sleep 60', start_directory='/tmp')
+    assert mgr.send_prompt_to_idle(sup.pane_id, '- fix X', bracketed=False) is True
+    first = [c['argv'] for c in argv_log(fake_cli) if 'send-text' in c['argv']][0]
+    assert first[-2:] == ['--', '- fix X']
+    assert cli_state(fake_cli)['buffer'][sup.pane_id].startswith('- fix X')
 
 
 def test_send_text_bracketed_wraps_the_paste(mgr, fake_cli):
