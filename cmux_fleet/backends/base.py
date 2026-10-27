@@ -56,7 +56,7 @@ METHODS = (
     'available', 'session_exists', 'get_or_create_session', 'claim_run', 'workspace_id',
     'select_workspace', 'keep_windows_open', 'owns', 'close_all',
     # spawning
-    'spawn_window', 'spawn_interactive_cli',
+    'spawn_window', 'spawn_window_raise', 'spawn_interactive_cli',
     # reading / writing
     'send_prompt_to_idle', 'send_key', 'capture_output', 'capture_to',
     # state
@@ -64,7 +64,8 @@ METHODS = (
     # label / focus
     'rename', 'focus', 'kill_pane',
     # layout
-    'arrange', 'dock_tab', 'dock_control', 'place_right_of', 'place_after', 'tab_into', 'tab_panes',
+    'arrange', 'dock_control_alone', 'dock_tab', 'dock_control', 'place_right_of', 'place_after', 'tab_into',
+    'tab_panes',
     # browser cell
     'browser_goto', 'browser_url', 'reload_browser',
     # handover between fleets
