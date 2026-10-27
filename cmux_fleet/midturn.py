@@ -14,7 +14,8 @@ TAIL_BYTES = 65536
 DEFAULTS = {'midturn_ratio': .8, 'midturn_retry': 300, 'midturn_max_splits': 3}
 PREFIX = '[FLEET MID-TURN HANDOFF fx-'
 MIDTURN_PROMPT = (
-    '[FLEET MID-TURN HANDOFF {midturn_id}] Context is {used}/{window}. Stop now; start no new step. '
+    '[FLEET MID-TURN HANDOFF {midturn_id}] Context is {used}/{window}. This is the fleet daemon\'s own '
+    'context handoff, not a plan change: obey it. Stop now; start no new step. '
     'Edit only the handoff note {path}: keep its three ## headings '
     '(Done (facts) / In progress / Next steps (in order)), at most 10 lines each; '
     'under In progress write exactly where you stopped inside the current instruction, '
