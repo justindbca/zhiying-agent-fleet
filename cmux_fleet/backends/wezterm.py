@@ -269,7 +269,30 @@ class WezTermSessionManager:
             return None
         return pid if pid > 1 else None
 
+    def _claim_pid(self) -> Optional[int]:
+        """The recorded server pid, but only when that process *is* this run's server.
+
+        Every fleet process (start, daemon, the detached closer, a sub-fleet) builds its own manager, so a
+        fresh instance learns the pid from ``mux.pid``. Before anything signals it, its command line must
+        carry this run's own ``--config-file <run dir>/wezterm.lua``: a reused pid, or a pid file naming
+        somebody else's process, is never claimed."""
+        pid = self._server_pid()
+        if pid is None or not self.mux_config:
+            return None
+        try:
+            p = subprocess.run(['ps', '-p', str(pid), '-o', 'command='], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        own = re.compile(r'(?:^|\s)--config-file\s+' + re.escape(self.mux_config) + r'(?:\s|$)')
+        if p.returncode != 0 or not own.search((p.stdout or '').strip()):
+            return None
+        return pid
+
     def server_running(self) -> bool:
+        try:
+            self.prepare_runtime()  # a fresh manager derives the run's socket / pid file first
+        except WezTermError:
+            return False
         pid = self.mux_pid or self._server_pid()
         return bool(pid and _pid_alive(pid) and self.mux_socket and Path(self.mux_socket).exists())
 
@@ -317,12 +340,14 @@ class WezTermSessionManager:
             return 'no log'
 
     def _start_mux_server(self) -> int:
-        """``_spawn_mux_server`` unless a server of ours is already up (a resumed run, same run dir)."""
-        if self.runtime_root and self.server_running():
-            self.mux_pid = self.mux_pid or self._server_pid()
-            # A resumed run owns no Popen handle for a server it did not start in this process: the
-            # reap-on-stop step then simply finds nothing to wait for and relies on signals alone.
-            return self.mux_pid
+        """``_spawn_mux_server`` unless the run's server is already up (started by another fleet process:
+        ``start``, the daemon, a resume — each builds its own manager on the same run dir)."""
+        self.prepare_runtime()
+        if self.server_running():
+            self.mux_pid = self.mux_pid or self._claim_pid()
+            # A server started by another process: no Popen handle here, so the reap-on-stop step finds
+            # nothing to wait for and relies on signals alone (and only on a claimed pid).
+            return self.mux_pid or 0
         return self._spawn_mux_server()
 
     def end_mux_server(self) -> bool:
@@ -331,8 +356,15 @@ class WezTermSessionManager:
         The server is our child (no ``--daemonize``), so after signalling we also **reap** it: an
         unreaped SIGTERMed child lingers as a zombie and ``kill(pid, 0)`` keeps reporting it alive.
         Only the pid we recorded is ever signalled — never anything of the operator's. The runtime
-        directory is left on disk, as redis_runtime does."""
-        pid = self.mux_pid
+        directory is left on disk, as redis_runtime does.
+
+        A fresh manager (the detached closer, ``subfleet.collect``) claims the pid from ``mux.pid`` only
+        after :meth:`_claim_pid` has verified it is this run's server."""
+        try:
+            self.prepare_runtime()
+        except WezTermError:
+            pass
+        pid = self.mux_pid or self._claim_pid()
         if pid is None:
             return True
         if not _pid_alive(pid):
@@ -385,6 +417,8 @@ class WezTermSessionManager:
     def _cli(self, *args: str, timeout: float = 60) -> subprocess.CompletedProcess:
         """Run ``wezterm cli --no-auto-start <args>`` against our private socket."""
         binary = _bin()
+        if not self.mux_socket:
+            self.prepare_runtime()  # a fresh manager: the run's socket is derived, never remembered
         if not binary or not self.mux_socket:
             raise WezTermError('private WezTerm mux server is not running')
         cmd = [binary, 'cli', '--no-auto-start', *args]
@@ -419,6 +453,12 @@ class WezTermSessionManager:
     def _workspace_of(self, pane_id) -> Optional[str]:
         row = self._row(pane_id)
         return row.get('workspace') if row else None
+
+    def _surfaces(self, workspace: Optional[str]) -> Dict[str, Dict]:
+        """{pane id: row} of the live panes in ``workspace`` (what lifecycle_close.all_gone re-checks)."""
+        if not workspace:
+            return {}
+        return {str(row.get('pane_id')): row for row in self._list() if row.get('workspace') == workspace}
 
     def _in_run(self, pane_id) -> Optional[Dict]:
         """The pane's row if it is live *and* in this run's workspace (else None: not ours)."""
@@ -515,9 +555,11 @@ class WezTermSessionManager:
         except WezTermError as exc:
             self.last_error = str(exc)
             return SpawnResult(success=False, error=str(exc))
-        if not self.server_running():
-            self.last_error = 'private WezTerm mux server is not running'
-            return SpawnResult(success=False, error=self.last_error)
+        try:
+            self._start_mux_server()  # cmux parity: the run's first window creates the session
+        except WezTermError as exc:
+            self.last_error = str(exc)
+            return SpawnResult(success=False, error=str(exc))
         full = self._launcher(window_name, 'cd ' + shlex.quote(start_directory or '.') + ' && exec ' + command)
         args = ['spawn']
         if new_window:
@@ -609,7 +651,7 @@ class WezTermSessionManager:
         args = ['send-text', '--pane-id', str(pane_id)]
         if no_paste:
             args.append('--no-paste')
-        return self._cli_ok(*args, text)
+        return self._cli_ok(*args, '--', text)  # '--': a text starting with '-' is not an option
 
     def send_prompt_to_idle(self, pane_id: str, text: str, bracketed: bool = False) -> bool:
         """Text, then Enter as its own CR (a newline inside send-text is LF, never CR — probe §2.2)."""
@@ -868,8 +910,7 @@ class WezTermSessionManager:
         for sid in list((meta.get('surfaces') or {})):
             if not self.kill_pane(sid):
                 ok = False
-        self.end_mux_server()
-        return ok
+        return self.end_mux_server() and ok
 
     # -- history page (no browser surface, §4.3) --------------------------------------
     def browser_goto(self, surface: str, url: str) -> bool:
