@@ -71,7 +71,24 @@ cmux-fleet status                   # 任务 + 各 agent 状态 / 上下文占�
 cmux-fleet stop                     # 取消任务，确认 runtime 退役后才关闭 Redis
 ```
 
-`start` 参数：`--profile`（Codex 配置档，默认 `fleet`）、`--codex` / `--redis-server`（二进制路径，默认 PATH 里第一个）、
+### 终端后端：cmux 或 WezTerm
+
+fleet 只通过一个可替换的后端碰终端。`start --backend cmux|wezterm` 选它，选择写进该 run 的 `config.json`：
+daemon、actor、`start --resume` 和所有子 fleet 都跟随这个值；这个开关出现之前起的 run 没有这个键，仍按 cmux 跑。
+不给开关时，macOS 上 cmux 可用就用 cmux，否则用 WezTerm；显式指定的后端在这台机器上跑不了时，在 provisioning 之前就拒绝启动并说明缺什么。
+
+```bash
+cmux-fleet start --backend wezterm --workers 2 --supervisor-cli pi --worker-cli pi \
+  --lifecycle <模式> --pi-model local/my-model --allow-unsandboxed-pi --allow-development-v2
+```
+
+* **cmux**（macOS 缺省，即上面「一页布局与历史页」那套）：左上监工、左下 history 浏览器、右边 worker 标签。
+* **WezTerm**（Linux，含 WSL2；要求 PATH 里有 `wezterm` 与 `wezterm-mux-server`，版本 ≥ 20240203）：每个 run 起**自己的私有 mux server**
+  （自己的 socket，绝不连你正在用的 WezTerm）。它没有内嵌浏览器格、也不能在分屏里再分标签，于是版面降级：一个窗口，第 1 个标签左监工、
+  下面分屏放 `control`，每个 worker 一个标签；历史页不内嵌，fleet 在 control 里打印 `<run>/history.html` 路径，有图形环境时用
+  `open` / `xdg-open` 打开一次。具名子 fleet 仍走 tmux。
+
+`start` 参数：`--profile`（Codex 配置档，默认 `fleet`）、`--backend`（`cmux` / `wezterm`，见上）、`--codex` / `--redis-server`（二进制路径，默认 PATH 里第一个）、
 `--redis-runtime-dir`（默认项目 `.runtime/redis`）、`--runs-dir`（默认 `~/.cmux-fleet/runs`）、`--codex-home`（agent 的隔离 Codex home，默认 `~/.cmux-fleet/codex-home`）、`--handoff-ratio`、`--handoff-timeout`、`--stall-timeout`、
 `--window`（rollout 还没报窗口时的兜底值）、`--compact-limit`（Codex 自动压缩阈值，默认交给 Codex 决定）、`--chrome-script`（见下）。
 

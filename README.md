@@ -131,7 +131,30 @@ cmux-fleet status                               # task + per-agent state, contex
 cmux-fleet stop                                 # cancel; confirm runtime retirement before Redis shutdown
 ```
 
-`start` options: `--profile` (Codex profile, default `fleet`), `--codex` / `--redis-server` (binaries,
+### Terminal backend: cmux or WezTerm
+
+fleet talks to the terminal through one pluggable backend. `start --backend cmux|wezterm` picks it, and
+the choice is written into the run's `config.json`: the daemon, the actors, `start --resume` and every
+sub-fleet follow that value, and a run started before this flag existed stays on cmux. Without the flag
+macOS uses cmux when it is usable there and WezTerm otherwise; an explicitly chosen backend that cannot
+run on the machine is refused before anything is provisioned, naming what is missing.
+
+```bash
+cmux-fleet start --backend wezterm --workers 2 --supervisor-cli pi --worker-cli pi \
+  --lifecycle <mode> --pi-model local/my-model --allow-unsandboxed-pi --allow-development-v2
+```
+
+* **cmux** (default on macOS, the layout described above): supervisor top-left, history browser below,
+  workers as tabs on the right.
+* **WezTerm** (Linux, including WSL2; needs `wezterm` and `wezterm-mux-server` ≥ 20240203 on `PATH`):
+  each run starts its **own private mux server** (its own socket, never your WezTerm). There is no
+  browser surface and no tabs inside a split, so the layout degrades: one window, tab 1 with the
+  supervisor on the left and `control` split below it, one tab per worker. The history page is not
+  embedded — fleet prints `<run>/history.html` in `control` and opens it with `open` / `xdg-open` when
+  a desktop is available. Named sub-fleets still work through tmux.
+
+`start` options: `--profile` (Codex profile, default `fleet`), `--backend` (`cmux` / `wezterm`, see
+above), `--codex` / `--redis-server` (binaries,
 default: first on PATH), `--redis-runtime-dir` (default: checkout `.runtime/redis`),
 `--runs-dir` (default `~/.cmux-fleet/runs`), `--codex-home` (the agents'
 isolated Codex home, default `~/.cmux-fleet/codex-home`), `--handoff-ratio`,
