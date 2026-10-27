@@ -32,6 +32,18 @@ def isolated_claude_trust(tmp_path, monkeypatch):
     monkeypatch.setattr(fleet, 'CLAUDE_JSON', tmp_path / 'claude.json')
 
 
+@pytest.fixture(autouse=True)
+def pools_file(tmp_path, monkeypatch):
+    """The operator's private pools file, as config/pools.example.yaml describes it."""
+    path = tmp_path / 'pools.yaml'
+    path.write_text('accounts:\n'
+                    '  - {id: pool-a, aliases: [old-a], meter: usd_equiv}\n'
+                    '  - {id: pool-b, meter: week_pct}\n'
+                    '  - {id: pool-c, meter: usd_equiv, caps: {day_usd: 25, night_usd: 5}}\n')
+    monkeypatch.setenv(brake.POOLS_ENV, str(path))
+    return path
+
+
 def make(tmp_path, spec=None, workers=('worker-1',), **cfg_extra):
     """A v1 fleet with every agent idle and (optionally) one task submitted."""
     run = tmp_path / 'run'
@@ -106,11 +118,11 @@ def test_wall_table_absorbs_cli_tier_map():
 
 # ------------------------------------------------------------------ budget card (pure)
 @pytest.mark.parametrize('raw, error', [
-    ({'pool': 'pool-b', 'max_usd': 10}, 'max_usd applies only to pool pool-a'),
-    ({'max_usd': 10}, 'max_usd applies only to pool pool-a'),
-    ({'pool': 'pool-a', 'max_week_pct': 80}, 'max_week_pct applies only to pool pool-b'),
+    ({'pool': 'pool-b', 'max_usd': 10}, 'max_usd applies only to a pool with meter usd_equiv'),
+    ({'max_usd': 10}, 'max_usd applies only to a pool with meter usd_equiv'),
+    ({'pool': 'pool-a', 'max_week_pct': 80}, 'max_week_pct applies only to a pool with meter week_pct'),
     ({'pool': 'pool-b', 'max_week_pct': 120}, 'at most 100'),
-    ({'pool': 'other'}, 'pool must be one of'),
+    ({'pool': 'other'}, 'is not an account id or alias'),
     ({'max_calls': 0}, 'max_calls must be a positive integer'),
     ({'max_calls': True}, 'max_calls must be a positive integer'),
     ({'max_rounds': 2.5}, 'max_rounds must be a positive integer'),
@@ -199,27 +211,27 @@ def test_budget_max_busy_only_tightens_concurrency(tmp_path):
     assert [f.agent(w)['state'] for w in ('worker-1', 'worker-2')] == ['busy', 'idle']
 
 
-def test_pool-a_pool_watches_equivalent_usd_and_unknown_never_trips(tmp_path):
+def test_usd_equiv_pool_watches_equivalent_usd_and_unknown_never_trips(tmp_path):
     f = make(tmp_path, {'goal': 'x', 'budget': {'pool': 'pool-a', 'max_usd': 40}})
     f.tick()
     assert not f.paused() and f.r.hget(fleet.BRAKE, 'usd_base') == ''  # no quota.json yet: unknown
-    quota(tmp_path, pool-a={'cash_used_usd': 100.0})
+    quota(tmp_path, **{'pool-a': {'cash_used_usd': 100.0}})
     f.tick()  # first known reading is the baseline
     assert not f.paused() and float(f.r.hget(fleet.BRAKE, 'usd_base')) == 100.0
-    quota(tmp_path, pool-a={'cash_used_usd': 139.0})
+    quota(tmp_path, **{'pool-a': {'cash_used_usd': 139.0}})
     f.tick()
     assert not f.paused()
-    quota(tmp_path, pool-a={'cash_used_usd': 140.5})
+    quota(tmp_path, **{'pool-a': {'cash_used_usd': 140.5}})
     f.tick()
     assert f.paused() and 'max_usd 40.5/40' in f.r.hget('fx:service', 'reason')
 
 
-def test_pool-b_pool_watches_weekly_quota_percent(tmp_path):
-    quota(tmp_path, pool-b={'week_used_pct': 70})
+def test_week_pct_pool_watches_weekly_quota_percent(tmp_path):
+    quota(tmp_path, **{'pool-b': {'week_used_pct': 70}})
     f = make(tmp_path, {'goal': 'x', 'budget': {'pool': 'pool-b', 'max_week_pct': 85}})
     f.tick()
     assert not f.paused()
-    quota(tmp_path, pool-b={'week_used_pct': 86})
+    quota(tmp_path, **{'pool-b': {'week_used_pct': 86}})
     f.tick()
     assert f.paused() and 'max_week_pct 86.0/85' in f.r.hget('fx:service', 'reason')
 
@@ -409,7 +421,7 @@ def test_v2_task_budget_pauses_in_a_transaction_and_resume_raises(fx):
 def test_start_budget_flag_is_service_only_and_validated(capsys):
     with pytest.raises(SystemExit, match='--budget is the service budget card'):
         fleet.main(['start', '--budget', '{"max_calls": 1}'])
-    with pytest.raises(SystemExit, match='--budget rejected: budget max_usd applies only to pool pool-a'):
+    with pytest.raises(SystemExit, match='--budget rejected: budget max_usd applies only to a pool with meter usd_equiv'):
         fleet.main(['start', '--mode', 'service', '--budget', '{"max_usd": 1}'])
 
 
@@ -595,7 +607,7 @@ def test_v1_startup_non_wall_failure_still_blocks(tmp_path):
     assert f.task()['status'] == 'blocked' and not f.paused()
 
 
-def test_default_pool-a_cash_cap_day_and_night(tmp_path):
+def test_default_usd_equiv_cash_cap_day_and_night(tmp_path):
     assert brake.effective({'pool': 'pool-a'}) == {'pool': 'pool-a', 'max_usd': 40}
     assert brake.effective({'pool': 'pool-a'}, night=True)['max_usd'] == 10
     assert brake.effective({'pool': 'pool-a', 'max_usd': 5}, night=True)['max_usd'] == 5
@@ -603,8 +615,8 @@ def test_default_pool-a_cash_cap_day_and_night(tmp_path):
     f = make(tmp_path, {'goal': 'x', 'budget': {'pool': 'pool-a'}})
     f.tick()
     assert not f.paused()  # no quota.json: unknown, never trips
-    quota(tmp_path, pool-a={'cash_used_usd': 100}); f.tick()
-    quota(tmp_path, pool-a={'cash_used_usd': 111}); f.r.hset('fx:night', mapping={'brake_card': 'night'}); f.tick()
+    quota(tmp_path, **{'pool-a': {'cash_used_usd': 100}}); f.tick()
+    quota(tmp_path, **{'pool-a': {'cash_used_usd': 111}}); f.r.hset('fx:night', mapping={'brake_card': 'night'}); f.tick()
     assert f.paused() and 'max_usd 11.0/10' in f.r.hget('fx:service', 'reason')
     assert json.loads((f.run_dir / 'brake.json').read_text())['effective_budget']['max_usd'] == 10
 
@@ -780,3 +792,24 @@ def test_pending_downgrade_never_undoes_a_profile_swap(tmp_path):
     f.tick()  # B's night swap got there first
     assert f.agent('worker-1')['generation'] == '0' and f.agent('worker-1')['wall_downgrade'] == ''
     assert any(json.loads(x)['kind'] == 'brake.downgrade_superseded' for x in f.r.lrange(fleet.LOG, 0, -1))
+
+
+def test_pool_names_come_from_the_pools_file(pools_file, tmp_path, monkeypatch):
+    assert brake.validate_budget({'pool': 'old-a', 'max_usd': 3}) == {'pool': 'old-a', 'max_usd': 3}  # alias
+    now = time.time()
+    assert brake.pool_reading({'pools': {'pool-a': {'cash_used_usd': 7, 'at': now}}}, 'old-a', now) == 7.0
+    assert brake.effective({'pool': 'pool-c'}) == {'pool': 'pool-c', 'max_usd': 25}  # the pool's own caps
+    assert brake.effective({'pool': 'pool-c'}, night=True)['max_usd'] == 5
+    monkeypatch.setenv(brake.POOLS_ENV, str(tmp_path / 'missing.yaml'))
+    with pytest.raises(ValueError, match='is not an account id or alias'):
+        brake.validate_budget({'pool': 'pool-a'})
+    assert brake.validate_budget({'max_calls': 2}) == {'max_calls': 2}  # no pool: no pools file needed
+    dup = tmp_path / 'dup.yaml'
+    dup.write_text('accounts:\n  - {id: a, aliases: [b]}\n  - {id: b}\n')
+    with pytest.raises(ValueError, match='used twice'):
+        brake.pool_accounts(dup)
+
+
+def test_shipped_example_pools_file_loads():
+    accounts = brake.pool_accounts(Path(brake.__file__).parent / 'config' / 'pools.example.yaml')
+    assert accounts['pool-a']['meter'] == 'usd_equiv' and accounts['pool-b']['meter'] == 'week_pct'

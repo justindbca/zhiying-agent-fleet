@@ -5569,8 +5569,8 @@ class Fleet:
         if not budget or not self.running() or self.paused():
             return None
         quota = brake.read_quota(self.cfg.get('quota_file'))
-        if budget.get('pool') == 'pool-a' and state.get('usd_base') in (None, ''):
-            base = brake.pool_reading(quota, 'pool-a', now)
+        if brake.pool_meter(budget.get('pool')) == 'usd_equiv' and state.get('usd_base') in (None, ''):
+            base = brake.pool_reading(quota, budget['pool'], now)
             if base is not None:  # the first known reading is the baseline: spend before it is not ours
                 self.r.hset(BRAKE, mapping={'usd_base': base})
                 state['usd_base'] = base
@@ -5580,7 +5580,7 @@ class Fleet:
         return None
 
     def brake_card(self, budget):
-        """The card as evaluated (default pool-a cash cap, day or night per B's fx:night)."""
+        """The card as evaluated (default usd_equiv cash cap, day or night per B's fx:night)."""
         return brake.effective(budget, self.r.hget('fx:night', 'brake_card') == 'night')
 
     def brake_trip(self, kind, reason, **detail):
@@ -6733,7 +6733,8 @@ def main(argv=None):
                    help='at most this many workers working at once (0 = no limit; default 0, '
                    'or 2 for opencode workers: free-tier concurrency is untested)')
     s.add_argument('--budget', help='service mode: budget card JSON, e.g. \'{"pool": "pool-a", "max_usd": 40, '
-                   '"max_calls": 200}\' (tasks put "budget" in the task spec); the daemon pauses at any line')
+                   '"max_calls": 200}\' (pool ids: $CMUX_FLEET_POOLS or ~/.cmux-fleet/pools.yaml; tasks put "budget" '
+                   'in the task spec); the daemon pauses at any line')
     s.add_argument('--brake-notify', help='command run (no shell) with one message argument when the brake pauses '
                    'the fleet, e.g. "/usr/local/bin/tg-send --chat ops"')
     s.add_argument('--request-timeout', type=float, default=DEFAULTS['request_timeout'],
