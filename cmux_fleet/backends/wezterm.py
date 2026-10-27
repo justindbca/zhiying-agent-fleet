@@ -219,7 +219,10 @@ class WezTermSessionManager:
         self.mux_log = str(base / 'mux.log')
         self.mux_config = str(base / 'wezterm.lua')
         # The run directory itself is all we need: no fake HOME, no server pid lock of the operator's.
+        # Owner-only: wezterm-mux-server refuses a runtime dir others can write to, and a plain mkdir
+        # under Ubuntu's default umask (002) gives 0775.
         base.mkdir(parents=True, exist_ok=True)
+        base.chmod(0o700)
         return {'root': self.runtime_root, 'socket': socket}
 
     def cli_env(self) -> Dict[str, str]:

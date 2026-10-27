@@ -10,6 +10,7 @@ fake "server" process writes, which is how ``close`` knows to stop only that pid
 import json
 import os
 import shlex
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -539,3 +540,19 @@ def test_no_session_means_no_cli_calls(mgr, fake_cli, monkeypatch):
     monkeypatch.setenv('FAKE_WZ_FAIL', 'list')
     assert mgr.get_pane_status('1') is None
     monkeypatch.undo()
+
+
+def test_runtime_dir_is_owner_only_under_a_group_writable_umask():
+    """wezterm-mux-server refuses a runtime dir other users can write to; Ubuntu's default umask (002)
+    gives a plain mkdir 0775, so the dir must be made 0700 explicitly — also when it already exists."""
+    root = Path(tempfile.mkdtemp(prefix='wzperm', dir='/tmp'))
+    old = os.umask(0o002)
+    try:
+        info = wz.WezTermSessionManager('perm', state_dir=root / 's').prepare_runtime()
+        assert Path(info['root']).stat().st_mode & 0o777 == 0o700
+        Path(info['root']).chmod(0o775)  # left behind by an earlier run with the old code
+        again = wz.WezTermSessionManager('perm', state_dir=root / 's').prepare_runtime()
+        assert Path(again['root']).stat().st_mode & 0o777 == 0o700
+    finally:
+        os.umask(old)
+        shutil.rmtree(root, ignore_errors=True)
