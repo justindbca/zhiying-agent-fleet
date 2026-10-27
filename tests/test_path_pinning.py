@@ -5,11 +5,12 @@ CMUX_FLEET_HOME / CMUX_FLEET_STATE / CMUX_BIN, so `start` pins them and every en
 import json
 from pathlib import Path
 
-from cmux_fleet import cmux_manager, fleet
+from cmux_fleet import cmux_manager, fleet, fleet_config
 
 
 def pinned(monkeypatch):
-    for mod, name in ((fleet, 'HOME'), (fleet, 'LATEST'), (cmux_manager, 'CMUX'), (cmux_manager, 'STATE_DIR')):
+    for mod, name in ((fleet, 'HOME'), (fleet, 'LATEST'), (cmux_manager, 'CMUX'), (cmux_manager, 'STATE_DIR'),
+                      (fleet_config, '_pinned')):
         monkeypatch.setattr(mod, name, getattr(mod, name))
 
 
