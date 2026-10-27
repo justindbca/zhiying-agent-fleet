@@ -88,8 +88,10 @@ def test_claude_argv_supervisor_model_and_prompt_hook_only_on_supervisor(tmp_pat
     assert prompt_hook['timeout'] == fleet.PROMPT_HOOK_TIMEOUT > fleet.PROMPT_WAIT
     assert 'claude-stop' in hooks['Stop'][0]['hooks'][0]['command']
     worker = fleet.claude_argv(run / 'config.json', cfg, 'worker-1', 0, 'hi')
-    # Claude workers are on the Stop-hook channel: waiting Stop hook + asyncRewake fallback + StopFailure.
-    assert worker[worker.index('--model') + 1] == 'sonnet' and set(hooks_of(worker)) == {'Stop', 'StopFailure'}
+    # Claude workers are on the Stop-hook channel: waiting Stop hook + asyncRewake fallback + StopFailure,
+    # plus the mid-turn handoff PostToolUse hook (design §34); the UserPromptSubmit hook stays supervisor-only.
+    assert 'claude-posttool' in hooks['PostToolUse'][0]['hooks'][0]['command']
+    assert worker[worker.index('--model') + 1] == 'sonnet' and set(hooks_of(worker)) == {'Stop', 'StopFailure', 'PostToolUse'}
     assert [bool(h.get('asyncRewake')) for h in hooks_of(worker)['Stop'][0]['hooks']] == [False, True]
     assert '--append-system-prompt' in worker and '--append-system-prompt' not in sup
     # A §19 adopted pane keeps the parent's hooks; v1 runs have no operator queue.

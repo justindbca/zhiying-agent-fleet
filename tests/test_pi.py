@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -301,6 +302,16 @@ def test_invalid_pi_callback_is_rejected(pfx, change):
     with pytest.raises(ValueError):
         fleet.pi_event(pfx.path, 'supervisor', 0, json.dumps(ev))
     assert not pfx.r.llen(fleet.EVENTS)
+
+
+@pytest.fixture(autouse=True)
+def temp_redis_root(monkeypatch):
+    """start_redis writes owner.json under the default runtime root: never the checkout's .runtime
+    (it would create it 755 and later private-Redis tests refuse it). Short /tmp path: socket length limit."""
+    root = Path(tempfile.mkdtemp(prefix='cfr-', dir='/tmp')).resolve()
+    monkeypatch.setattr(fleet.redis_runtime, 'DEFAULT_ROOT', root / 'redis')
+    yield
+    shutil.rmtree(root, ignore_errors=True)
 
 
 def mock_start(tmp_path, monkeypatch):

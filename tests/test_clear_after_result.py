@@ -157,7 +157,7 @@ def test_switch_off_keeps_hook_channel_settings(tmp_path):
         return json.loads(Path(argv[argv.index('--settings') + 1]).read_text()), argv
     (default, argv_default), (off, argv_off) = settings(cfg), settings(dict(cfg, clear_after_result=False))
     assert default == off and argv_default == argv_off
-    assert set(default['hooks']) == {'Stop', 'StopFailure'} and len(default['hooks']['Stop'][0]['hooks']) == 2
+    assert set(default['hooks']) == {'Stop', 'StopFailure', 'PostToolUse'} and len(default['hooks']['Stop'][0]['hooks']) == 2
 
 
 def test_resume_refuses_clear_with_claude_hook_delivery(tmp_path, monkeypatch):
@@ -184,8 +184,8 @@ def test_worker_only_opt_in_hooks(tmp_path, on, slot):
         for key, verb in [('Stop', 'claude-stop'), ('SessionStart', 'claude-clear'), ('StopFailure', 'claude-stop-failure')]:
             cmd = hooks[key][0]['hooks'][0]['command']
             assert cmd.startswith('exec ') and verb in cmd and cmd.endswith('worker-1 3')
-    else:
-        assert set(hooks) == {'Stop'}
+    else:  # no opt-in clear hooks; the mid-turn PostToolUse hook (design §34) is on every Claude agent
+        assert set(hooks) == {'Stop', 'PostToolUse'}
         assert not hooks['Stop'][0]['hooks'][0]['command'].startswith('exec ')
 
 

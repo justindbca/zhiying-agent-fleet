@@ -37,5 +37,5 @@ an operator instruction, so the plan-change rules above do not apply to it. Obey
 1. Stop: start no new step, tool call or report.
 2. Edit only the handoff note it names: keep its three `##` headings (Done (facts) / In progress / Next steps
    (in order)); write exactly where you stopped and what remains of the current instruction.
-3. Do not call fleet_result / fleet_decision or send a final report; end the turn with the single word HANDOFF.
+3. Do not send your JSON answer; end the turn with the single word HANDOFF.
 The next generation of your slot reads that note and continues the same instruction; nothing is lost or re-assigned.

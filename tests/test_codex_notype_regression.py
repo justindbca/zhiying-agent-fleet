@@ -771,7 +771,7 @@ def test_abandoned_is_not_cancelled_the_item_still_runs_and_never_settles(sup):
     f.r.hset(fleet.key('agent', 'codex-b'), mapping=other)  # another slot's live delivery
     rec = codex_queue.clear(f, 'supervisor', 'test abandon')
     assert rec['cq_text'] == text and cq(f, 'cq_state') == 'abandoned'
-    assert codex_queue.record(f.r.hgetall(fleet.key('agent', 'codex-b'))) == other  # only this slot's delivery
+    assert f.r.hgetall(fleet.key('agent', 'codex-b')) == other  # only this slot's delivery
     out = codex_turn(f, plan(['worker-1']), users=[('', text)])  # Codex runs the queued item anyway
     assert out is False or out['status'] == 'ignored', out
     assert cq(f, 'cq_state') == 'abandoned' and lease(f)['status'] == 'received'
