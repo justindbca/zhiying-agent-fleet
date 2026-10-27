@@ -553,6 +553,7 @@ want 2 && run_case "pi+claude task default pair (worker)"     pi     claude task
 want 3 && run_case "pi+pi service, tight timeout (worker)"    pi     pi     service worker
 want 4 && run_case "pi+codex task, codex worker crosses"      pi     codex  task    worker
 want 5 && run_case "claude+claude task, SUPERVISOR crosses"   claude claude task    supervisor
+want 6 && run_case "codex+claude task, CODEX SUPERVISOR crosses" codex claude task   supervisor
 
 echo
 echo "=== smoke_midturn summary ==="
