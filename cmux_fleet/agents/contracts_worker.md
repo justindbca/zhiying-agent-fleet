@@ -11,6 +11,7 @@ Your instruction names the task id (`[M2]`) and the interfaces you `provide` (wr
 - Do not write a field whose `writers` entry names another task; do not edit an existing file that is not in your instruction's `edits` list (need it: report `Question for supervisor:`).
 - Use the answer in the interface's `decisions` even if you would choose differently; disagree only via `Question for supervisor:`.
 - Code tasks: never use `pytest.importorskip` or hard-coded worktree paths; a test run with any `skipped` is not a pass.
+- Code tasks: run only the tests for what you changed (touched modules' test files + new tests, red → green); never the full suite for an intermediate delivery or a fix — the full suite runs once, at the delivery gate / end of the batch.
 - Do not start real work on any task before the interfaces are frozen; the skeleton run is the only work allowed before that.
 
 ### Command table
