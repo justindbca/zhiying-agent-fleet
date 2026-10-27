@@ -1,5 +1,7 @@
 # zhiying-agent-fleet
 
+[![tests](https://github.com/justindbca/zhiying-agent-fleet/actions/workflows/tests.yml/badge.svg)](https://github.com/justindbca/zhiying-agent-fleet/actions/workflows/tests.yml)
+
 命令行与 Python 包仍叫 `cmux-fleet` / `cmux_fleet`（fleet 跑在 [cmux](https://cmux.dev) 上）。
 
 一个 daemon 把**一个监工（supervisor）加 N 个写代码的 worker** 作为看得见的终端会话跑起来，各占一个

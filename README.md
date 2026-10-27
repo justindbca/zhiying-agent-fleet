@@ -1,5 +1,7 @@
 # zhiying-agent-fleet
 
+[![tests](https://github.com/justindbca/zhiying-agent-fleet/actions/workflows/tests.yml/badge.svg)](https://github.com/justindbca/zhiying-agent-fleet/actions/workflows/tests.yml)
+
 The CLI command and Python package keep the name `cmux-fleet` / `cmux_fleet` (the fleet runs on [cmux](https://cmux.dev)).
 
 A daemon that runs **one supervisor and N worker coding agents** as visible terminal sessions, each in its
