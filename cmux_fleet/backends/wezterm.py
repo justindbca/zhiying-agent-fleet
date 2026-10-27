@@ -8,12 +8,22 @@ runs one, and a second one with the default state directory cannot start: it loc
 
     ERROR wezterm_mux_server > unable to lock pid file ~/.local/share/wezterm/pid
 
-``WEZTERM_RUNTIME_DIR`` does not exist as a knob and ``XDG_DATA_HOME`` is ignored, but **``HOME`` is
-not**: the lock lives under ``$HOME/.local/share/wezterm``. So every run gets its own
-``<runtime>/wezterm/<token>/home`` (verified: two private servers plus the operator's run side by side),
-its own ``wezterm.lua`` (one ``unix_domains`` entry, ``default_domain``) and its own socket, and every
-``wezterm cli`` call carries ``WEZTERM_UNIX_SOCKET=<that socket>`` and ``--no-auto-start`` — it can never
-reach, or start, the operator's WezTerm.
+``WEZTERM_RUNTIME_DIR`` does not exist as a knob and ``XDG_DATA_HOME`` is ignored. Only two things put
+that pid lock anywhere else, and the second one is the truth (M2 second operator correction, which
+retracts the earlier "``HOME`` is the only isolation" conclusion):
+
+* ``HOME=<fake>`` — what the first iteration did. It does move the lock, but it also leaks into every
+  spawned pane, so an agent loses ``~/.claude`` / ``~/.codex`` / ``~/.gitconfig``. **Rejected**.
+* **``--daemonize`` is what takes the operator's pid file at all.** Without ``--daemonize`` the server does
+  not touch ``~/.local/share/wezterm/pid``, so no ``HOME`` override is needed. **This is what the backend
+  does now**: the server is a plain ``Popen`` in a new session, its pid is recorded in ``<run dir>/mux.pid``
+  by us, and only that pid is ever signalled.
+
+So a run needs no ``HOME`` trick: its own ``wezterm.lua`` (one ``unix_domains`` entry, ``default_domain``),
+its own socket, and ``WEZTERM_UNIX_SOCKET=<that socket>`` plus ``--no-auto-start`` on every ``wezterm cli``
+call. That is enough to never reach, or start, the operator's WezTerm (verified: two private servers plus
+the operator's run side by side, ``probe-report.md`` §1). ``HOME`` is inherited untouched, so panes run as
+the operator.
 
 Layout (§4.3)
 -------------
@@ -171,11 +181,8 @@ class WezTermSessionManager:
         self.mux_socket: Optional[str] = None
         self.mux_pid: Optional[int] = None
         self.mux_pid_file: Optional[str] = None
-        self.mux_home: Optional[str] = None
-        # The operator's HOME as it was when this manager was built. Panes (and therefore the agents in
-        # them) must run with it; the fake mux HOME exists only to keep the server's pid lock away from
-        # the user's WezTerm (probe-report §1, P0 fix).
-        self.operator_home: str = str(os.environ.get('HOME') or Path.home())
+        self.mux_log: Optional[str] = None
+        self.mux_proc: Optional[subprocess.Popen] = None
         self.mux_config: Optional[str] = None
         self.mux_workspace = self._workspace_name()
         self.last_error = ''
@@ -206,29 +213,26 @@ class WezTermSessionManager:
             raise WezTermError(
                 'private WezTerm Unix socket path is too long (%d bytes; limit %d): %s — '
                 'choose a shorter fleet state directory; no /tmp fallback' % (size, SOCKET_PATH_LIMIT, socket))
-        home = base / 'home'
-        home.mkdir(parents=True, exist_ok=True)
-        (home / '.local' / 'share' / 'wezterm').mkdir(parents=True, exist_ok=True)
         self.runtime_root = str(base)
         self.mux_socket = socket
-        self.mux_home = str(home)
         self.mux_pid_file = str(base / 'mux.pid')
+        self.mux_log = str(base / 'mux.log')
         self.mux_config = str(base / 'wezterm.lua')
+        # The run directory itself is all we need: no fake HOME, no server pid lock of the operator's.
+        base.mkdir(parents=True, exist_ok=True)
         return {'root': self.runtime_root, 'socket': socket}
 
-    def cli_env(self, private_home: bool = False) -> Dict[str, str]:
-        """Environment of every ``wezterm`` call: our socket, nothing that could reach the user's server.
+    def cli_env(self) -> Dict[str, str]:
+        """The inherited environment plus our private socket — nothing else is rewritten.
 
-        ``HOME`` stays the operator's real one (``self.operator_home``) so the panes we spawn inherit it —
-        an agent must find ``~/.claude`` / ``~/.codex`` / ``~/.gitconfig`` and its profile. The one caller
-        that needs the fake HOME is the mux-server start itself (``private_home=True``): the server's pid
-        lock lives in ``$HOME/.local/share/wezterm/pid`` (probe-report §1). The fake HOME only ever holds
-        that pid file and our ``wezterm.lua`` pointer is explicit (``--config-file``), so no agent config
-        is read from it and none is copied into it."""
+        ``HOME`` is deliberately **not** touched: the operator's real HOME is what panes must inherit
+        (credentials, profile, ``~/.gitconfig``), and no fake HOME is needed any more because the server
+        is not daemonized (see ``_spawn_mux_server``). ``WEZTERM_UNIX_SOCKET`` pins every call to our own
+        socket, and every ``wezterm cli`` call also carries ``--no-auto-start``, so a call can never
+        reach — or start — the operator's WezTerm."""
         env = {k: v for k, v in os.environ.items() if k not in ('WEZTERM_PANE',)}
         env['WEZTERM_UNIX_SOCKET'] = self.mux_socket or ''
         env.pop('WEZTERM_CONFIG_FILE', None)  # a stale pointer into the operator's config
-        env['HOME'] = self.mux_home if (private_home and self.mux_home) else self.operator_home
         env['WEZTERM_LOG'] = 'error'
         return env
 
@@ -251,83 +255,99 @@ class WezTermSessionManager:
 
     # -- private mux server --------------------------------------------------
     def _server_pid(self) -> Optional[int]:
-        """The pid the daemonized server wrote.
+        """The pid of the server this run started, as recorded in our own pid file.
 
-        ``--daemonize`` re-execs with ``--pid-file-fd`` and the server writes its pid to
-        ``$HOME/.local/share/wezterm/pid`` — which is exactly the file ``HOME`` isolation makes ours
-        (probe-report §1), never the operator's. Our own ``mux.pid`` is the fallback for servers started
-        without ``--daemonize``."""
-        for path in ((Path(self.mux_home) / '.local' / 'share' / 'wezterm' / 'pid') if self.mux_home else None,
-                     Path(self.mux_pid_file) if self.mux_pid_file else None):
-            if path is None:
-                continue
-            try:
-                pid = int(path.read_text().strip())
-            except (OSError, ValueError):
-                continue
-            if pid > 1:
-                return pid
-        return None
+        The server is a plain child of ours (``subprocess.Popen``) — not daemonized — so the pid we write
+        is the Popen pid, inside the run directory. There is no ``$HOME`` trick any more: only
+        ``--daemonize`` would take the operator's ``~/.local/share/wezterm/pid``, and we never daemonize.
+        A pid file that does not parse or names a dead process yields ``None``."""
+        if not self.mux_pid_file:
+            return None
+        try:
+            pid = int(Path(self.mux_pid_file).read_text().strip())
+        except (OSError, ValueError):
+            return None
+        return pid if pid > 1 else None
 
     def server_running(self) -> bool:
         pid = self.mux_pid or self._server_pid()
         return bool(pid and _pid_alive(pid) and self.mux_socket and Path(self.mux_socket).exists())
 
     def _spawn_mux_server(self) -> int:
-        """Start ``wezterm-mux-server --config-file <ours> --daemonize`` and return its pid.
+        """Start ``wezterm-mux-server --config-file <ours>`` as a detached child and return its pid.
 
-        ``--daemonize`` re-execs the server with ``--pid-file-fd 3``; the pid written to our pid file is
-        therefore the server, and it is the only process this fleet ever kills."""
+        **No ``--daemonize``**: that re-execs with ``--pid-file-fd`` and takes the pid file under
+        ``$HOME/.local/share/wezterm/`` — which is the operator's own WezTerm lock. Instead the server is a
+        plain ``Popen`` in a new session (``start_new_session=True``) with stdin from ``/dev/null`` and its
+        output appended to ``<run dir>/mux.log``, so it survives the fleet daemon exiting (as a daemonized
+        server did) but its pid is one we created and recorded ourselves. Only that pid is ever signalled."""
         self.prepare_runtime()
         self._write_config()
         binary = _mux()
         if not binary:
             raise WezTermError(_MUX_BIN + ' not found on PATH')
-        cmd = [binary, '--config-file', self.mux_config, '--daemonize']
+        cmd = [binary, '--config-file', self.mux_config]
+        log = open(self.mux_log, 'ab', buffering=0)
         try:
-            # The only call that gets the fake HOME: the pid lock of the server lives under it.
-            p = subprocess.run(cmd, capture_output=True, text=True, env=self.cli_env(private_home=True),
-                               timeout=60)
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                    start_new_session=True, env=self.cli_env(), close_fds=True)
         except (OSError, subprocess.SubprocessError) as exc:
             raise WezTermError('could not start the private WezTerm mux server: %s' % exc) from exc
-        if p.returncode != 0:
-            raise WezTermError('private WezTerm mux server failed to start: ' +
-                               ((p.stderr or p.stdout or '').strip()[:300] or 'no output'))
+        finally:
+            log.close()  # the child keeps its own descriptor
+        self.mux_pid = proc.pid
+        self.mux_proc = proc
+        Path(self.mux_pid_file).write_text(str(proc.pid))
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
-            pid = self._server_pid()
-            if pid and _pid_alive(pid) and Path(self.mux_socket).exists():
-                self.mux_pid = pid
-                return pid
+            if proc.poll() is not None:
+                raise WezTermError('private WezTerm mux server exited with status %s: %s' % (
+                    proc.returncode, self._log_tail()))
+            if Path(self.mux_socket).exists():
+                return proc.pid
             time.sleep(0.1)
-        raise WezTermError('private WezTerm mux server did not come up (no socket at %s)' % self.mux_socket)
+        raise WezTermError('private WezTerm mux server did not come up (no socket at %s): %s' % (
+            self.mux_socket, self._log_tail()))
+
+    def _log_tail(self, limit: int = 300) -> str:
+        """Last lines of this run's server log, for an error message (never another process's log)."""
+        try:
+            return (Path(self.mux_log).read_text(errors='replace').strip()[-limit:]) or 'no output'
+        except OSError:
+            return 'no log'
 
     def _start_mux_server(self) -> int:
-        """``_spawn_mux_server`` unless a server of ours is already up (a resumed run)."""
+        """``_spawn_mux_server`` unless a server of ours is already up (a resumed run, same run dir)."""
         if self.runtime_root and self.server_running():
             self.mux_pid = self.mux_pid or self._server_pid()
+            # A resumed run owns no Popen handle for a server it did not start in this process: the
+            # reap-on-stop step then simply finds nothing to wait for and relies on signals alone.
             return self.mux_pid
         return self._spawn_mux_server()
 
     def end_mux_server(self) -> bool:
         """Stop the mux server this manager started: only its recorded pid, SIGTERM then SIGKILL.
 
-        A stale pid file of somebody else's process is never signalled (the pid must still be alive *and*
-        be the one we recorded at start). The runtime directory is left on disk, as redis_runtime does."""
+        The server is our child (no ``--daemonize``), so after signalling we also **reap** it: an
+        unreaped SIGTERMed child lingers as a zombie and ``kill(pid, 0)`` keeps reporting it alive.
+        Only the pid we recorded is ever signalled — never anything of the operator's. The runtime
+        directory is left on disk, as redis_runtime does."""
         pid = self.mux_pid
         if pid is None:
             return True
         if not _pid_alive(pid):
+            self._reap()
             self.mux_pid = None
             return True
         try:
             os.kill(pid, signal.SIGTERM)
         except (OSError, ProcessLookupError):
+            self._reap()
             self.mux_pid = None
             return True
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            if not _pid_alive(pid):
+            if self._reap() is not None or not _pid_alive(pid):
                 break
             time.sleep(0.05)
         else:
@@ -336,16 +356,26 @@ class WezTermSessionManager:
             except OSError:
                 pass
             time.sleep(0.1)
+            self._reap()
         self.mux_pid = None
+        self.mux_proc = None
         self._clear_server_files()
         return True
 
+    def _reap(self, wait: float = 0.0) -> Optional[int]:
+        """Reap our own child if it has exited (never another process's); return its exit status."""
+        if self.mux_proc is None:
+            return None
+        try:
+            return self.mux_proc.wait(timeout=wait) if wait else self.mux_proc.poll()
+        except subprocess.TimeoutExpired:
+            return None
+        except (OSError, ChildProcessError):
+            return None
+
     def _clear_server_files(self) -> None:
         """Remove this run's own pid files and socket (never a directory)."""
-        paths = [self.mux_pid_file, self.mux_socket]
-        if self.mux_home:
-            paths.append(str(Path(self.mux_home) / '.local' / 'share' / 'wezterm' / 'pid'))
-        for path in paths:
+        for path in (self.mux_pid_file, self.mux_socket):
             try:
                 Path(path).unlink()
             except (OSError, TypeError):
@@ -488,9 +518,7 @@ class WezTermSessionManager:
         if not self.server_running():
             self.last_error = 'private WezTerm mux server is not running'
             return SpawnResult(success=False, error=self.last_error)
-        full = self._launcher(window_name, 'cd ' + shlex.quote(start_directory or '.')
-                              + ' && export HOME=' + shlex.quote(self.operator_home)
-                              + ' && exec ' + command)
+        full = self._launcher(window_name, 'cd ' + shlex.quote(start_directory or '.') + ' && exec ' + command)
         args = ['spawn']
         if new_window:
             args += ['--new-window', '--workspace', self.mux_workspace]

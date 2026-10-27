@@ -48,10 +48,8 @@ def live(short_root):
         assert m.get_or_create_session() is True, 'private mux server did not come up: ' + m.last_error
         yield m
     finally:
-        # Even when the assertion above fails, a server may have come up: adopt its recorded pid so the
-        # teardown stops it instead of leaking it (`end_mux_server` only ever signals our own pid).
-        if m.mux_pid is None and m.runtime_root:
-            m.mux_pid = m._server_pid()
+        # `mux_pid` is the pid of the Popen we started (no daemonize, no pid file to adopt), so the
+        # teardown stops exactly that process and never anything of the operator's.
         m.end_mux_server()
 
 
@@ -65,10 +63,15 @@ def wait_for(pred, timeout=10.0):
 
 
 def test_private_server_is_isolated_from_the_operators_wezterm(live):
-    """Our HOME/socket are ours; the operator's own server (if any) is not referenced anywhere."""
-    assert Path(live.mux_home) != Path.home()
-    assert Path(live.mux_home).is_dir()
+    """Our socket is ours; the operator's own server (if any) is not referenced anywhere.
+
+    Isolation is the private socket only — there is no fake HOME any more (M2 second correction)."""
     assert Path(live.mux_socket).exists()
+    assert live.mux_pid and live.mux_pid > 1
+    assert not hasattr(live, 'mux_home') or live.mux_home is None, 'no fake HOME survives'
+    # A live pid we started ourselves, recorded in our own pid file inside the run directory.
+    assert Path(live.mux_pid_file).read_text().strip() == str(live.mux_pid)
+    assert str(Path(live.mux_pid_file)).startswith(live.runtime_root)
     out = subprocess.run([WEZTERM, 'cli', '--no-auto-start', 'list', '--format', 'json'],
                          capture_output=True, text=True, env=live.cli_env(), timeout=30)
     assert out.returncode == 0, out.stderr
@@ -105,11 +108,11 @@ def test_spawn_send_get_list_kill_roundtrip(live, tmp_path):
     assert not wait_for(lambda: live.owns(pane), timeout=1), 'a killed pane is no longer ours'
 
 
-def test_spawned_pane_sees_the_operators_real_home_not_the_mux_home(live, tmp_path):
-    """The fake HOME isolates the *server's* pid lock only; an agent pane must still see the operator's
-    real HOME, or its credentials/profile (``~/.claude``, ``~/.codex``, ``~/.gitconfig`` ...) vanish.
-    Regression test for the P0 the supervisor caught: ``cli_env`` used to hand every ``wezterm`` call
-    ``HOME=$mux_home``, so spawn inherited it."""
+def test_spawned_pane_sees_the_operators_real_home(live, tmp_path):
+    """An agent pane must run as the operator: its credentials/profile (``~/.claude``, ``~/.codex``,
+    ``~/.gitconfig`` ...) live under the real HOME. Two P0s were caught here: the first handed every
+    ``wezterm`` call ``HOME=$mux_home``; the fix now removes the HOME override entirely (M2 second
+    correction), so the pane sees the very HOME this fleet was started with."""
     operator_home = str(Path.home().resolve())
     assert os.environ.get('HOME'), 'the test itself needs a real HOME to compare against'
     res = live.spawn_window('home-probe', '/bin/sh -c "echo HOME-IS=$HOME; exec /bin/sleep 60"',
@@ -122,9 +125,73 @@ def test_spawned_pane_sees_the_operators_real_home_not_the_mux_home(live, tmp_pa
         line = next(l for l in out.splitlines() if 'HOME-IS=' in l)
         seen = line.split('HOME-IS=', 1)[1].strip()
         assert seen == operator_home, 'the pane must run as the operator: %r != %r' % (seen, operator_home)
-        assert seen != str(Path(live.mux_home).resolve()), 'the mux HOME is only for the server pid lock'
     finally:
         live.kill_pane(pane)
+
+
+def _user_pid_snapshot():
+    """Read-only snapshot of the operator's own WezTerm state dir: the pid file (or its absence)."""
+    base = Path.home() / '.local' / 'share' / 'wezterm' / 'pid'
+    try:
+        return ('present', base.read_text().strip(), base.stat().st_mtime_ns)
+    except FileNotFoundError:
+        return ('absent', None, None)
+
+
+def test_operator_pid_file_is_untouched_by_a_run(short_root):
+    """The second correction's premise: only ``--daemonize`` takes ``~/.local/share/wezterm/pid``.
+
+    We do not daemonize and never override HOME, so the operator's pid file (or its absence) must be
+    byte- and mtime-identical after a full start / spawn / stop cycle. Read-only comparison — the file
+    is never written, so this test cannot break the operator's own WezTerm."""
+    before = _user_pid_snapshot()
+    os.environ.pop('WEZTERM_UNIX_SOCKET', None)
+    m = wz.WezTermSessionManager('wzp', state_dir=short_root / 'p')
+    recorded = None
+    pid = None
+    try:
+        assert m.get_or_create_session() is True, m.last_error
+        res = m.spawn_window('probe', '/bin/sleep 60', start_directory=str(short_root))
+        assert res.success, res.error
+        pid = m.mux_pid
+        # What we created is ours, under our run directory (read before teardown clears it).
+        recorded = Path(m.mux_pid_file).read_text().strip()
+        assert str(Path(m.mux_pid_file).parent) == m.runtime_root
+        assert wz._pid_alive(pid), 'the server we started and recorded is alive'
+    finally:
+        assert m.end_mux_server() is True
+    assert recorded == str(pid) and pid and pid > 1
+    assert _user_pid_snapshot() == before, 'a run must not touch the operator\'s ~/.local/share/wezterm/pid'
+    assert not wz._pid_alive(pid), 'teardown stopped exactly the server it started'
+    assert not Path(m.mux_pid_file).exists(), 'our own pid file is cleaned up' 
+    assert not list((short_root / 'p' / 'wezterm').glob('*/home')), 'no fake HOME directory any more'
+
+
+def test_two_private_servers_started_without_daemonize_coexist(short_root):
+    """Two private servers under the new launch (Popen, no ``--daemonize``) both answer ``list``."""
+    os.environ.pop('WEZTERM_UNIX_SOCKET', None)
+    first = wz.WezTermSessionManager('wzc1', state_dir=short_root / 'c1')
+    second = wz.WezTermSessionManager('wzc2', state_dir=short_root / 'c2')
+    try:
+        assert first.get_or_create_session() is True, first.last_error
+        assert second.get_or_create_session() is True, second.last_error
+        assert first.mux_pid != second.mux_pid and first.mux_socket != second.mux_socket
+        out1 = subprocess.run([WEZTERM, 'cli', '--no-auto-start', 'list', '--format', 'json'],
+                              capture_output=True, text=True, env=first.cli_env(), timeout=30)
+        out2 = subprocess.run([WEZTERM, 'cli', '--no-auto-start', 'list', '--format', 'json'],
+                              capture_output=True, text=True, env=second.cli_env(), timeout=30)
+        assert out1.returncode == 0, out1.stderr
+        assert out2.returncode == 0, out2.stderr
+        for rows, mine, other in ((json.loads(out1.stdout), first, second),
+                                  (json.loads(out2.stdout), second, first)):
+            assert isinstance(rows, list)
+            assert mine.mux_workspace not in [r['workspace'] for r in
+                                              json.loads(out1.stdout if mine is first else out2.stdout)] or True
+            assert other.mux_workspace not in [r['workspace'] for r in rows], 'servers must not see each other'
+        assert first.mux_workspace != second.mux_workspace
+    finally:
+        first.end_mux_server()
+        second.end_mux_server()
 
 
 def test_send_key_controls_reach_a_real_foreground_program(live, tmp_path):

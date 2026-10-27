@@ -84,7 +84,7 @@ def mgr(fake_cli, monkeypatch):
 
 
 def _fake_server(fake_cli, m):
-    """Stand-in for ``wezterm-mux-server --daemonize``: write the socket + pid files the real one leaves."""
+    """Stand-in for the server launch: write what the real (non-daemonized) server leaves behind."""
     m.prepare_runtime()
     socket = Path(m.mux_socket)
     socket.parent.mkdir(parents=True, exist_ok=True)
@@ -127,49 +127,110 @@ def test_default_backend_uses_wezterm_when_cmux_is_missing(monkeypatch):
 
 
 # -- §4.1 private mux server ----------------------------------------------------------------------------
-def test_private_server_gets_its_own_home_and_short_socket(fake_cli, monkeypatch):
-    """The probe showed the pid lock lives in $HOME/.local/share/wezterm: the *server* needs its own HOME.
-    That fake HOME must never reach the panes: ``cli_env()`` keeps the operator's real HOME (P0 fix)."""
+def test_private_server_is_started_without_daemonize_and_never_overrides_home(fake_cli, monkeypatch):
+    """M2 second correction: ``--daemonize`` is what takes ``~/.local/share/wezterm/pid`` off the operator,
+    so we do not daemonize at all. The server is a plain ``Popen`` in a new session, its pid is recorded
+    by us, and no call ever overrides ``HOME`` (the fake HOME is gone)."""
     seen = {}
 
     m = wz.WezTermSessionManager('wz-home', state_dir=fake_cli['root'])
     m.prepare_runtime()
 
-    def run(cmd, **kw):
-        seen['cmd'] = cmd
-        seen['env'] = kw.get('env') or {}
-        from types import SimpleNamespace
-        Path(m.mux_socket).write_text('fake-mux-socket')  # what the daemonized server leaves behind
-        Path(m.mux_pid_file).write_text(str(os.getpid()))
-        return SimpleNamespace(returncode=0, stdout='', stderr='')
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            seen['cmd'] = cmd
+            seen['kwargs'] = kw
+            self.pid = 424242
+            self.returncode = None
 
-    monkeypatch.setattr(wz.subprocess, 'run', run)
+        def poll(self):
+            return self.returncode  # still alive
+
+    def fake_popen(cmd, **kw):
+        seen.setdefault('popen', []).append(cmd)
+        proc = FakePopen(cmd, **kw)
+        Path(m.mux_socket).write_text('fake-mux-socket')  # what the real server leaves behind
+        return proc
+
+    monkeypatch.setattr(wz.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(wz, '_pid_alive', lambda pid: True)
     m._start_mux_server()
-    home = Path(seen['env']['HOME'])
-    assert home == Path(m.mux_home).resolve()
-    assert home != Path.home().resolve(), 'never the operator home: that pid lock is the user\'s WezTerm'
-    assert 'wezterm-mux-server' in seen['cmd'][0]
-    assert '--config-file' in seen['cmd'] and '--daemonize' in seen['cmd']
-    conf = Path(seen['cmd'][seen['cmd'].index('--config-file') + 1]).read_text()
+
+    cmd = seen['cmd']
+    assert cmd[0] == wz._mux() and str(cmd[0]).endswith('wezterm-mux-server')
+    assert '--config-file' in cmd
+    conf = Path(cmd[cmd.index('--config-file') + 1]).read_text()
     assert 'fleet-wz-home' in conf and m.mux_socket in conf
-    # ... and that is the only call that gets it: the CLI client env keeps the real HOME.
-    assert Path(m.cli_env()['HOME']).resolve() == Path(os.environ['HOME']).resolve()
-    assert Path(m.cli_env()['HOME']).resolve() != Path(m.mux_home).resolve()
+    assert '--daemonize' not in cmd, 'daemonize is exactly what steals the operator pid lock'
+    assert '--pid-file-fd' not in ' '.join(cmd)
+
+    # A plain child in its own session: no controlling tty, no stdin, output to a run-owned log.
+    kw = seen['kwargs']
+    assert kw['start_new_session'] is True
+    assert kw['stdin'] == wz.subprocess.DEVNULL
+    for key in ('stdout', 'stderr'):
+        assert kw[key] != wz.subprocess.PIPE and hasattr(kw[key], 'write'), key + ' goes to a file in the run dir'
+
+    # The pid we stop is the one Popen gave us, recorded in our own pid file inside the run directory.
+    assert m.mux_pid == 424242
+    assert Path(m.mux_pid_file).read_text().strip() == '424242'
+    assert str(Path(m.mux_pid_file).parent) == m.runtime_root
+
+    # HOME is never rewritten, on any call: not here, not in the client env.
+    assert kw['env']['HOME'] == os.environ['HOME']
+    assert m.cli_env()['HOME'] == os.environ['HOME']
+    assert not hasattr(m, 'mux_home'), 'the fake HOME concept is gone'
+    assert not (Path(m.runtime_root) / 'home').exists(), 'no fake HOME directory is created'
 
 
-def test_cli_client_keeps_the_operators_home_so_panes_inherit_it(mgr, fake_cli):
-    """P0 (operator correction): every ``wezterm cli`` call runs with the real HOME, so a spawned pane finds
-    the operator's credentials/profile instead of the empty fake HOME that only isolates the pid lock."""
-    real_home = str(Path.home().resolve())
+def test_started_server_log_lands_in_the_run_directory(fake_cli, monkeypatch):
+    """stdout/stderr of the server go to a log file under the run dir, not to the daemon's terminal."""
+    seen = {}
+
+    m = wz.WezTermSessionManager('wz-log', state_dir=fake_cli['root'])
+    m.prepare_runtime()
+
+    class FakePopen:
+        pid = 434343
+        returncode = None
+
+        def poll(self):
+            return None
+
+    def fake_popen(cmd, **kw):
+        seen['out'] = kw['stdout']
+        seen['out_name'] = getattr(kw['stdout'], 'name', None)
+        Path(m.mux_socket).write_text('fake-mux-socket')
+        return FakePopen()
+
+    monkeypatch.setattr(wz.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(wz, '_pid_alive', lambda pid: True)
+    m._start_mux_server()
+    assert str(seen['out_name']).startswith(m.runtime_root), 'the log must stay inside our run directory'
+    assert seen['out'].closed
+
+
+def test_cli_env_only_sets_the_private_socket(fake_cli):
+    """The client env is the inherited one plus our socket — nothing else, and no HOME rewrite."""
+    m = wz.WezTermSessionManager('wz-env', state_dir=fake_cli['root'])
+    m.prepare_runtime()
+    env = m.cli_env()
+    assert env['WEZTERM_UNIX_SOCKET'] == m.mux_socket
+    assert env['HOME'] == os.environ['HOME'], 'the operator HOME is inherited, never overridden'
+    assert 'WEZTERM_PANE' not in env
+    if 'WEZTERM_CONFIG_FILE' in os.environ:
+        assert 'WEZTERM_CONFIG_FILE' not in env
+
+
+def test_spawn_does_not_pin_home_in_the_launcher(mgr, fake_cli):
+    """No launcher-level ``export HOME=`` either: the pane simply inherits the fleet's real environment."""
     assert mgr.spawn_window('worker-1', 'echo hi', start_directory=str(fake_cli['root'])).success
-    calls = [c for c in argv_log(fake_cli) if 'list' in c['argv'] or 'spawn' in c['argv']]
-    assert calls
-    for call in calls:
-        assert Path(call['home']).resolve() == Path(real_home), 'a CLI call with the fake HOME leaks it into panes'
-        assert Path(call['home']).resolve() != Path(mgr.mux_home).resolve()
-    # the launcher still pins HOME explicitly: the pane cannot inherit a stray HOME from the server
     launch = list((Path(mgr.meta_path).parent / 'launch').glob('worker-1-*.sh'))
-    assert launch and ('export HOME=' + shlex.quote(mgr.operator_home)) in launch[-1].read_text()
+    assert launch, 'a launcher script is written per spawn'
+    body = launch[-1].read_text()
+    assert 'export HOME=' not in body
+    for call in (c for c in argv_log(fake_cli) if 'list' in c['argv'] or 'spawn' in c['argv']):
+        assert call['home'] == os.environ['HOME'], 'every CLI call runs with the inherited HOME'
 
 
 def test_socket_path_over_the_limit_fails_without_fallback(tmp_path):
