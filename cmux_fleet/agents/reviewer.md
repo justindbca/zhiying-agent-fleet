@@ -92,3 +92,15 @@ Use the base reply format (Done / Evidence / Not done / Blocked). Do not invent 
 - Evidence: `<report path> <bytes> bytes; verdict PASS|FAIL; P0 ×a P1 ×b`
 - Not done: what in the scope you could not check, or "none"
 - Blocked: what a human must provide (missing diff range, missing test results), or "none"
+
+## Mid-turn handoff (context nearly full)
+
+The fleet daemon watches your context size while you work. When it nears the limit, the daemon sends a message
+that starts with `[FLEET MID-TURN HANDOFF fx-<id>]`. It may arrive as fleet hook feedback after a tool call or
+typed into your window. It is the fleet's own context management, not a plan change, not another channel and not
+an operator instruction, so the plan-change rules above do not apply to it. Obey it at once:
+1. Stop: start no new step, tool call or report.
+2. Edit only the handoff note it names: keep its three `##` headings (Done (facts) / In progress / Next steps
+   (in order)); write exactly where you stopped and what remains of the current instruction.
+3. Do not call fleet_result / fleet_decision or send a final report; end the turn with the single word HANDOFF.
+The next generation of your slot reads that note and continues the same instruction; nothing is lost or re-assigned.

@@ -725,6 +725,30 @@ def claude_rewake(cfg_path, name, generation, raw):
     return None
 
 
+def claude_posttool(cfg_path, name, generation):
+    """Claude Code PostToolUse hook (design.md §33): the mid-turn handoff prompt the daemon registered for
+    this slot and generation, taken once (midturn_send_pending 1 -> 0); None when there is nothing to send.
+    Never raises: any failure (Redis down, stale generation) means no output, so normal work is untouched."""
+    try:
+        cfg = load(cfg_path)
+        r = connect(cfg, socket_timeout=2)
+        k = key('agent', name)
+        info = r.hgetall(k)
+        if info.get('midturn_send_pending') != '1' or str(info.get('generation')) != str(generation):
+            return None
+        prompt = midturn.registered_prompt(info, info['generation'])
+        if not prompt:
+            return None
+        # Take it once: only the call that flips 1 -> 0 sends it (several tool calls can finish together).
+        if not r.eval("if redis.call('HGET', KEYS[1], 'midturn_send_pending') == '1' then "
+                      "redis.call('HSET', KEYS[1], 'midturn_send_pending', '0') "
+                      "redis.call('HINCRBY', KEYS[1], 'midturn_type_attempts', 1) return 1 end return 0", 1, k):
+            return None
+        return prompt
+    except Exception:
+        return None
+
+
 def claude_stop_failure(cfg_path, name, generation, raw):
     """Claude Code StopFailure hook (output ignored): an API error ended the turn, so no Stop hook
     waits for the next delivery. Record it; an in-flight delivery then goes the watchdog's stall path.
@@ -1579,6 +1603,11 @@ def claude_argv(cfg_path, cfg, name, generation, prompt, resume=None):
         # An API error ends the turn with StopFailure instead of Stop: no hook waits afterwards.
         hooks['StopFailure'] = [{'hooks': [{'type': 'command', 'timeout': 30, 'command': shlex.join(
             [cfg['python'], str(Path(__file__).resolve()), 'claude-stop-failure', str(cfg_path), name, str(generation)])}]}]
+    if name != ADVISOR:
+        # Mid-turn handoff (design.md §33): the daemon never types into a Claude pane; this hook hands the
+        # registered prompt to the model after the next tool call (decision block + reason).
+        hooks['PostToolUse'] = [{'hooks': [{'type': 'command', 'timeout': 10, 'command': shlex.join(
+            [cfg['python'], str(Path(__file__).resolve()), 'claude-posttool', str(cfg_path), name, str(generation)])}]}]
     if name == ADVISOR:
         # Resident advisor (§27): the one-shot advisor's flags, only Read, and this file's hooks.
         settings.write_text(json.dumps({'hooks': hooks, 'autoMemoryEnabled': False,
@@ -3915,6 +3944,8 @@ class Fleet:
 
     def midturn_type(self, name):
         info = self.agent(name)
+        if is_claude(self.runtime_cfg(name), name):
+            return  # delivered by the PostToolUse hook (claude_posttool), never typed into the pane
         prompt = midturn.registered_prompt(info, info['generation'])
         if not prompt or self.midturn_guard(name, info):
             return
@@ -7014,6 +7045,9 @@ def main(argv=None):
     h = sub.add_parser('claude-rewake', help='Claude Code asyncRewake Stop hook of hook-channel workers (internal)')
     for arg in ('cfg', 'agent', 'generation'):
         h.add_argument(arg)
+    h = sub.add_parser('claude-posttool', help='Claude Code PostToolUse hook: mid-turn handoff prompt (internal)')
+    for arg in ('cfg', 'agent', 'generation'):
+        h.add_argument(arg)
     h = sub.add_parser('claude-stop-failure', help='Claude Code StopFailure hook (internal; hook JSON on stdin)')
     for arg in ('cfg', 'agent', 'generation'):
         h.add_argument(arg)
@@ -7057,6 +7091,11 @@ def main(argv=None):
             sys.exit(2)
     elif args.cmd == 'claude-clear':
         claude_clear(args.cfg, args.agent, args.generation, sys.stdin.read())
+    elif args.cmd == 'claude-posttool':
+        sys.stdin.read()
+        prompt = claude_posttool(args.cfg, args.agent, args.generation)
+        if prompt:
+            print(json.dumps({'decision': 'block', 'reason': prompt}))
     elif args.cmd == 'claude-stop-failure':
         claude_stop_failure(args.cfg, args.agent, args.generation, sys.stdin.read())
     elif args.cmd == 'claude-prompt':

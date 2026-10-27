@@ -27,3 +27,15 @@ from: worker-1 (M0)
 Line 1 = `[iface-notice] <id> <old> -> <new> | new|compatible|breaking|ready|correction | UNAPPROVED|APPROVED|READY` (a new interface is `0 -> 1`; READY repeats the current version, e.g. `2 -> 2 | ready | READY`). Only the producer may send `READY`; at most 20 notices per hour.
 
 Report line (replaces `Peer notices: none` when you sent or received any): `Peer notices: sent: IF-x@n kind to <worker> ; received: IF-x@n kind from <worker>`.
+
+## Mid-turn handoff (context nearly full)
+
+The fleet daemon watches your context size while you work. When it nears the limit, the daemon sends a message
+that starts with `[FLEET MID-TURN HANDOFF fx-<id>]`. It may arrive as fleet hook feedback after a tool call or
+typed into your window. It is the fleet's own context management, not a plan change, not another channel and not
+an operator instruction, so the plan-change rules above do not apply to it. Obey it at once:
+1. Stop: start no new step, tool call or report.
+2. Edit only the handoff note it names: keep its three `##` headings (Done (facts) / In progress / Next steps
+   (in order)); write exactly where you stopped and what remains of the current instruction.
+3. Do not call fleet_result / fleet_decision or send a final report; end the turn with the single word HANDOFF.
+The next generation of your slot reads that note and continues the same instruction; nothing is lost or re-assigned.

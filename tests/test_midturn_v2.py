@@ -306,8 +306,14 @@ def test_threshold_types_exactly_once_per_generation_and_updates_control(plan, m
     result = dict(cli=cli, generation=0, message_id='m-test', used=160000, window=200000)
     f.midturn_probe.results[SLOT] = result
     f.midturn_apply()
-    assert len(f.mgr.sent) == 1 and f.mgr.bracketed[-1][1] is bracketed
-    prompt = f.mgr.sent[0][1]
+    if cli == 'claude':
+        # design.md §33: never typed into a Claude pane; the PostToolUse hook takes the pending prompt.
+        assert f.mgr.sent == [] and f.agent(SLOT)['midturn_send_pending'] == '1'
+        prompt = midturn.registered_prompt(f.agent(SLOT), 0)
+        assert prompt.startswith('[FLEET MID-TURN HANDOFF fx-')
+    else:
+        assert len(f.mgr.sent) == 1 and f.mgr.bracketed[-1][1] is bracketed
+        prompt = f.mgr.sent[0][1]
     assert len(prompt.splitlines()) == 1
     assert midturn.registered_prompt(f.agent(SLOT), 0) == prompt
     assert f.agent(SLOT)['ctx_used'] == '160000'
@@ -315,7 +321,7 @@ def test_threshold_types_exactly_once_per_generation_and_updates_control(plan, m
     assert float(f.agent(SLOT)['midturn_deadline']) > time.time()+299
     f.midturn_probe.results[SLOT] = result
     f.midturn_apply()
-    assert len(f.mgr.sent) == 1
+    assert len(f.mgr.sent) == (0 if cli == 'claude' else 1)
     assert any('ctx=160000/200000 mid=160000' in str(command) for command in rt.effects.commands)
 
 
