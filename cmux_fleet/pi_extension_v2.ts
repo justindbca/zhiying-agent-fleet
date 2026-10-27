@@ -53,7 +53,7 @@ export default function (pi: ExtensionAPI) {
   function fault(text?: unknown) {
     unhealthy = true;
     // Only a bridge fault frame carries display text; .catch(fault) passes an Error.
-    context?.ui.setStatus("fleet", typeof text === "string" && text ? text : "通信中断，执行状态未确认；等待对账");
+    context?.ui.setStatus("fleet", typeof text === "string" && text ? text : "通信中断；fleet 将自动重启本会话");
     for (const item of pending.values()) { clearTimeout(item.timer); item.reject(new Error("Fleet bridge unavailable")); }
     pending.clear();
   }

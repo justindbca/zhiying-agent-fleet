@@ -104,6 +104,23 @@ def startup_problem(ev):
 
 TUI_REPORT_RETRIES = 2  # corrections for an official-CLI task worker report before blocking
 
+# Bridge faults that only echo a hold the daemon (or the delivery itself) already decided: not a lost link.
+# Any other bridge fault (its own Redis error, child crash, lease not renewed) means the link is gone and
+# the slot is restarted (§35); the pane says which of the two it is.
+BRIDGE_HELD_REASONS = ('daemon holds execution', 'settlement unconfirmed/held', 'recovered PEL may have executed',
+                       'delivery collided with manual input', 'opencode hold')
+LINK_LOST = 'bridge link lost: '
+
+
+def link_fault(reason):
+    return not str(reason or '').startswith(BRIDGE_HELD_REASONS)
+
+
+def heartbeat_key(bus, slot):
+    """Set by the bridge's renew loop (value = its generation, short TTL); gone = the bridge is gone."""
+    return bus.prefix + ':hb:' + slot
+
+
 IDENTITY = ('run_id', 'slot', 'generation', 'session_id', 'message_id', 'delivery_id',
             'stream_id', 'fence', 'consumer', 'request_id')
 
@@ -701,7 +718,13 @@ class RuntimeV2:
             elif kind == 'availability':
                 self.f.setf(slot, bridge_available=int(ev.get('idle') is True))
             elif kind == 'bridge_fault':
-                self.hold(slot, ev.get('reason', 'bridge disconnected'))
+                reason = ev.get('reason', 'bridge disconnected')
+                if link_fault(reason):
+                    self.link_lost(slot, reason)
+                elif info.get('state') == 'held':
+                    self.audit('bridge.fault_on_hold', slot=slot, error=reason)  # the daemon's hold already stands
+                else:
+                    self.hold(slot, reason)
             elif kind == 'turn_ended':
                 self.release_held(slot, ev)
             elif kind == 'permission_request':
@@ -1591,6 +1614,27 @@ class RuntimeV2:
                    message_id=self.context.get('bound_message', ''), delivery_id=self.context.get('bound_delivery', ''),
                    level='info' if status=='ok' else 'error', detail={'public_result': rec, 'request': req})
 
+    def heartbeat_check(self, slot, info):
+        """§35: a bridge slot whose current-generation bridge has beaten once and then stopped lost its link.
+        A bridge that never beat (older code) is never judged by this."""
+        if (info.get('state') not in ('idle', 'busy') or info.get('runtime_ready') != '1'
+                or tui_slot(self.slot_cfg(slot), slot)):
+            return
+        beat = self.bus.r.get(heartbeat_key(self.bus, slot))  # bridge-owned key: read it live, not via effects
+        generation = str(info.get('generation', '0'))
+        if beat == generation:
+            if info.get('bridge_hb_g') != generation:
+                self.f.setf(slot, bridge_hb_g=generation)
+        elif info.get('bridge_hb_g') == generation:
+            self.link_lost(slot, 'bridge heartbeat stopped')
+
+    def link_lost(self, slot, why):
+        """§35: the bridge link is gone. Hold only this slot; the watchdog restarts its session
+        (kill + next generation from a handoff note, capped). The work is never re-run automatically."""
+        self.hold(slot, LINK_LOST + str(why)[:300], pause=False)
+        if slot != advisor.SLOT:  # §27: the advisor's hold already restarts it in place (advisor_tick)
+            self.f.setf(slot, link_lost=1)
+
     def hold(self, slot, reason, public_status=None, pause=True):
         """``pause=False``: only this slot is held (no new work for it); the fleet keeps working."""
         from cmux_fleet import fleet as legacy
@@ -2423,9 +2467,15 @@ class RuntimeV2:
                     deadline = int(self.f.r.hget(self.bus.msg_key(mid), 'deadline_at'))
                     if info.get('midturn_id') and info.get('prompt_wait'):
                         deadline = max(deadline, int(now * 1000) + 1000)
-                    if int(now*1000) >= min(deadline, int(state['lease_until'])):
+                    if (int(state['lease_until']) <= int(now*1000) < deadline
+                            and not tui_slot(self.slot_cfg(slot), slot)):
+                        self.link_lost(slot, 'lease not renewed by the bridge')  # the work's own deadline still runs
+                        continue
+                    elif int(now*1000) >= min(deadline, int(state['lease_until'])):
                         self.hold(slot, 'lease/delivery deadline expired; execution stop unconfirmed', public_status='timeout')
+                        continue
                     # Stalls are the watchdog's (docs/design.md §24): Escape ladder, then kill + next generation.
+                self.heartbeat_check(slot, info)
         self.transaction('tick-' + uuid.uuid4().hex, expire)
         self.resume_fallback()
         self.clear_tick(now)

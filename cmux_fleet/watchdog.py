@@ -50,6 +50,8 @@ SUPERVISOR_AWAY = ('held', 'dead', 'starting', 'retired', 'delegated', 'handoff'
 YES_CURSOR = re.compile(r'❯\s*(?:1\.\s*)?yes\b')
 # Slot states the watchdog never touches: someone else owns the next step.
 HANDS_OFF = ('held', 'dead', 'retired', 'delegated', 'handoff', 'clearing')
+# §35: a slot whose bridge link is lost is restarted at most this many times per window; then held + paused.
+LINK_MAX_RESTARTS, LINK_WINDOW_S = 3, 1800
 
 
 def setting(cfg, name):
@@ -399,6 +401,10 @@ class Watchdog:
         interval = float(setting(self.f.cfg, 'watch_interval'))
         for slot in list(self.f.names):
             info = self.f.agent(slot)
+            if info.get('link_lost') == '1' and info.get('state') == 'held' and info.get('pane'):
+                self.link_restart(slot, info, now)
+        for slot in list(self.f.names):
+            info = self.f.agent(slot)
             state, pane = info.get('state'), info.get('pane')
             if state in HANDS_OFF or info.get('handoff_id') or not pane:
                 if info.get('prompt_wait'):  # held / retired / handed off: the dialog wait is someone else's now
@@ -442,6 +448,27 @@ class Watchdog:
                     self.set_state(slot, info, 'working')
                 info = self.f.agent(slot)
             self.check(slot, info, lease, in_flight, table, now)
+
+    def link_restart(self, slot, info, now):
+        """§35: the bridge link is lost. Restart the session the way a frozen one is (kill + next generation
+        from a handoff note); the cancelled work goes back to the supervisor / caller, never re-run here."""
+        if self.f.paused():
+            return  # nothing is (re)started while the run is paused; retried once it resumes
+        count, first = (info.get('link_restarts') or '0:0').split(':')
+        count, first = (0, now) if now - float(first) > LINK_WINDOW_S else (int(count), float(first))
+        if count >= LINK_MAX_RESTARTS:
+            text = (slot + ': bridge link lost ' + str(count) + ' times within ' + str(LINK_WINDOW_S // 60)
+                    + ' min; not restarted again. Check Redis / the bridge, then resume.')
+            self.f.setf(slot, link_lost='capped')
+            self.audit('link.restart_capped', slot=slot, level='error', error=text)
+            self.rt.transaction('link-capped-' + uuid.uuid4().hex, lambda: self.rt.hold(slot, text))
+            return
+        self.f.setf(slot, link_lost='restarting', link_restarts=str(count + 1) + ':' + str(first))
+        screen = self.capture(slot, info, info['pane']) or ''
+        ok = self.rotate(slot, 'bridge link lost', screen)
+        self.f.setf(slot, link_lost='0' if ok else 'failed')
+        self.audit('link.restarted' if ok else 'link.restart_failed', slot=slot, level='error',
+                   restarts=count + 1, label=self.f.label(slot))
 
     # ------------------------------------------------------------ plan F' 8.3: non-delete dialog -> supervisor
     def dialog_key(self, slot, info):

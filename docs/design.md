@@ -762,3 +762,12 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 **已知边界**：探针能看到已追加、尚未发给模型的工具结果（pi 口径按 ceil(chars/4) 估算），但 CLI 在追加工具结果后几毫秒内就检查是否自压缩，快于 1 秒轮询——单批大工具结果可能一步把用量从中途线以下直接顶过 CLI 自压缩点，探针来不及打 prompt。200k 窗口（pi DeepSeek）下 0.8 的中途线到自压缩点只剩 23,616 token 余量，不保证能在压缩前交接完；用户 2026-10-27 知悉并定不调低 0.8（是否对 200k 及以下窗口单独调低留给用户另定）。pi 的 WorkBuddy DeepSeek 已改声明 400k 窗口，实测经网关可到 1M、单请求 612,564 token 通过；OpenCode 免费 DeepSeek 实测 185k 通过、260k 被拒，真实上限约 200k（其中 32k 留给输出），pi 扩展声明的 168k（= 200k − 32k）是对的，不改。
 
 **验证**：设计稿 `docs/midturn-handoff-design.md`（r3）§7 列了完整单测与端到端冒烟计划（新文件 `tests/test_midturn_v2.py` + `scripts/smoke_midturn.sh`），尚未实现、未跑、未复核、未合进在役分支、未部署。
+
+## 35. 断链即重启会话（2026-10-28 用户新要求，分支 feat/link-loss-restart）
+
+用户原话：「通信中断，执行状态未确认；等待对账，这是一种断联情况，应该是发现断链就根据实际情况重启这个会话。」
+
+- **先分清是不是断链**：bridge 的 fault 分两种。一种只是复述 daemon 已经做的扣槽（`daemon holds execution` / `settlement unconfirmed/held` / `recovered PEL may have executed` / 人工输入撞车 / opencode hold，`runtime_v2.BRIDGE_HELD_REASONS`），pane 显示「已被 fleet 扣下：<daemon 写在消息上的原因>」，续做上限显示「已达续做上限，等监工拆小」；daemon 收到这种 fault 时槽已是 held 就只记审计，不再二次扣槽、不暂停全 fleet。其余一律是断链（bridge 自己的 Redis 错、子进程退出、租约续不上），pane 显示「通信中断；fleet 将自动重启本会话」。10-27 飞书 fleet 两次「通信中断」实为 reviewer 坏回报整 task BLOCKED 的扣槽（缺口 G1），不是断链。
+- **daemon 怎么发现断链**：① 忙槽：租约 `lease_until` 过了而派工 `deadline_at` 没过（bridge 不续租了）→ 断链；两者都过才是原来的超时。② 闲槽：bridge 续租线程每轮写心跳键 `<prefix>:hb:<slot>`（值＝代数，TTL 3 个周期）；本代心跳出现过、之后消失 → 断链。从没写过心跳的 bridge（旧代码）不判。③ bridge 自己报的断链类 fault。三者都走 `link_lost`：只扣本槽（`pause=False`），标 `link_lost=1`。只对 bridge 槽（pi / opencode），Claude / Codex 的租约由 daemon 代续，不在此列；顾问槽仍由 §27 原地重启。
+- **重启**：看门狗每轮先处理 `link_lost=1` 的槽，复用冻结换代 `Watchdog.rotate`：存屏、骨架交接单 + 终端快照、起下一代、杀旧会话、`confirm_retired` 取消原派工。原派工**不自动重跑**（v2 原则不变）：task 模式监工收到「FROZEN … bridge link lost，已取消未重跑，先查工作区再派」，service 模式请求记 stalled；带中途换代标记的派工照 §34 续做。暂停中不重启，恢复后再做。
+- **上限**：同一槽 30 分钟内最多重启 3 次（`watchdog.LINK_MAX_RESTARTS / LINK_WINDOW_S`），再断就扣槽并暂停派工，报「检查 Redis / bridge 后再恢复」；重启失败标 `link_lost=failed`，不每轮重试。

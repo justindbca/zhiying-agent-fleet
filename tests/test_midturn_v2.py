@@ -438,15 +438,20 @@ def test_watchdog_midturn_kill_continues_without_frozen_report_and_failure_resum
         assert 'Mid-turn continuation' in next((f.run_dir/'handoffs').glob('*.md')).read_text()
 
 
-@pytest.mark.parametrize('marked,text', [(True, midturn.LIMIT_STATUS), (False, '通信中断，执行状态未确认；等待人工对账。')])
-def test_bridge_fault_text_names_the_split_cap(marked, text):
+@pytest.mark.parametrize('reason,msg,text', [
+    ('daemon holds execution; stop confirmation required', {'midturn_limit': '1'}, midturn.LIMIT_STATUS),
+    ('daemon holds execution; stop confirmation required', {'uncertain_reason': 'blocked: reviewer: no candidate'},
+     '已被 fleet 扣下：blocked: reviewer: no candidate'),
+    ('lease expired; delivery held', {'midturn_limit': '1'}, '通信中断；fleet 将自动重启本会话。'),
+    ('Error 61 connecting to unix socket', {}, '通信中断；fleet 将自动重启本会话。')])
+def test_bridge_fault_text_says_held_or_link_lost(reason, msg, text):
+    """The pane says "通信中断" only when the link itself is gone; a daemon hold shows the daemon's reason."""
     import threading
     from cmux_fleet.agent_bridge import AgentBridge
     frames = []
-    bus = SimpleNamespace(message=lambda mid: {'midturn_limit': '1'} if marked else {},
-                          mark_uncertain=lambda *a: None)
+    bus = SimpleNamespace(message=lambda mid: msg, mark_uncertain=lambda *a: None)
     me = SimpleNamespace(lock=threading.RLock(), faulted=False, stop_event=threading.Event(),
                          idle_event=threading.Event(), active={'message_id': 'm-test'}, bus=bus,
                          emit=frames.append, slot=SLOT, event=lambda *a: None)
-    AgentBridge.fault(me, 'daemon holds execution; stop confirmation required')
+    AgentBridge.fault(me, reason)
     assert frames == [{'kind': 'fault', 'reason': text}]

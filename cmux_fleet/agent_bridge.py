@@ -18,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import redis
 from cmux_fleet import fleet, midturn, opencode_adapter, pi_adapter
 from cmux_fleet.message_bus import BusError, _short
-from cmux_fleet.runtime_v2 import bus_for, dumps, post_event, validate_config, wait_reply
+from cmux_fleet.runtime_v2 import (bus_for, dumps, heartbeat_key, link_fault, post_event, validate_config,
+                                   wait_reply)
 
 
 class AgentBridge:
@@ -239,12 +240,17 @@ class AgentBridge:
             self.faulted = True
             self.idle_event.clear()
             env = self.active
-        text = '通信中断，执行状态未确认；等待人工对账。'
-        try:
-            if env and self.bus.message(env['message_id']).get('midturn_limit'):
-                text = midturn.LIMIT_STATUS
-        except (redis.RedisError, BusError, ValueError, OSError):
-            pass
+        text = '通信中断；fleet 将自动重启本会话。'
+        if not link_fault(reason):
+            text = '已被 fleet 扣下：' + reason
+            try:
+                msg = self.bus.message(env['message_id']) if env else {}
+                if msg.get('midturn_limit'):
+                    text = midturn.LIMIT_STATUS
+                elif msg.get('uncertain_reason'):
+                    text = '已被 fleet 扣下：' + str(msg['uncertain_reason'])[:200]
+            except (redis.RedisError, BusError, ValueError, OSError):
+                pass
         self.emit({'kind': 'fault', 'reason': text})
         try:
             if env:
@@ -274,10 +280,18 @@ class AgentBridge:
         except (redis.RedisError, BusError, ValueError, OSError) as exc:
             self.fault(str(exc))
 
+    def beat(self, period):
+        self.r.set(heartbeat_key(self.bus, self.slot), str(self.generation), px=int(period * 3000))
+
     def renew_loop(self):
         period = min(10, self.bus.lease_ms/3000)
+        try:
+            self.beat(period)
+        except (redis.RedisError, OSError) as exc:
+            self.fault(str(exc))
         while not self.stop_event.wait(period) and not self.faulted:
             try:
+                self.beat(period)
                 with self.lock:
                     env = self.active
                 if not env:
