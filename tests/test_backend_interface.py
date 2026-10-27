@@ -117,15 +117,19 @@ def test_names_are_normalized():
 def test_default_backend_on_macos_prefers_cmux(monkeypatch):
     monkeypatch.setattr(base, 'unavailable_reason', lambda name: None)
     assert base.default_backend('darwin') == 'cmux'
+    # no cmux and no usable WezTerm either: fall through to cmux, whose own probe then reports why
     monkeypatch.setattr(base, 'unavailable_reason', lambda name: 'no cmux here')
+    assert base.default_backend('darwin') == 'cmux'
+    # no cmux, WezTerm usable: WezTerm
+    monkeypatch.setattr(base, 'unavailable_reason',
+                        lambda name: 'no cmux here' if name == 'cmux' else None)
     assert base.default_backend('darwin') == 'wezterm'
     assert base.default_backend('linux') == 'wezterm'
 
 
 def test_default_backend_survives_a_broken_cmux(monkeypatch):
-    def boom(name):
-        raise OSError('cmux binary exploded')
-    monkeypatch.setattr(base, 'unavailable_reason', boom)
+    monkeypatch.setattr(base, 'unavailable_reason', lambda name: None if name == 'wezterm'
+                        else (_ for _ in ()).throw(OSError('cmux binary exploded')))
     assert base.default_backend('darwin') == 'wezterm'
 
 
