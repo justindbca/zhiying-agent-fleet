@@ -8,12 +8,12 @@ fleet only ever touches the terminal through one object: ``fleet.manager_for(cfg
 from __future__ import annotations
 
 from cmux_fleet.backends.base import (BACKENDS, Capabilities, InterfaceError, MISSING, PaneStatus,
-                                      SpawnResult, TerminalBackend, check_backend, default_backend,
-                                      normalize_backend)
+                                      SpawnResult, TerminalBackend, capabilities, check_backend,
+                                      default_backend, normalize_backend, unavailable_reason)
 
 __all__ = ['BACKENDS', 'Capabilities', 'InterfaceError', 'MISSING', 'PaneStatus', 'SpawnResult',
-           'TerminalBackend', 'backend_class', 'build', 'check_backend', 'default_backend',
-           'normalize_backend']
+           'TerminalBackend', 'backend_class', 'build', 'capabilities', 'check_backend', 'default_backend',
+           'normalize_backend', 'unavailable_reason']
 
 
 def backend_class(name: str):

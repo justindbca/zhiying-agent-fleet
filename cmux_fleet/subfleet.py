@@ -221,6 +221,8 @@ def follow_jump(f, now=None):
         return None  # no links on the page: no cmux call per tick
     if now < getattr(f, 'jump_next', 0) or not hasattr(f.mgr, 'browser_url'):
         return None
+    if not getattr(f.mgr, 'supports_browser', True):
+        return None  # no page on screen (WezTerm, design §4.3): nothing for a page link to click
     f.jump_next = now + JUMP_POLL
     pane = f.r.hget(fleet.SERVICE, 'history_pane')
     url = pane and f.mgr.browser_url(pane)

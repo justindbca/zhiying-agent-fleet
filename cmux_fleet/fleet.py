@@ -202,12 +202,81 @@ def slot_base(name):
 
 
 def manager_for(cfg):
-    """The cmux registry of one fleet: the main fleet is 'cmux-fleet', a sub-fleet 'cmux-fleet:<task id>'."""
-    from cmux_fleet.cmux_manager import CmuxSessionManager
+    """The registry of one fleet: the main fleet is 'cmux-fleet', a sub-fleet 'cmux-fleet:<task id>'.
+
+    Which terminal backend that registry talks to is a property of the run (``config.json``), decided once
+    by ``start`` and followed by the daemon, the actors, ``--resume`` and every sub-fleet (docs/design.md
+    §「终端后端」). A run's config without a backend (started before the choice existed) stays on cmux.
+    """
+    from cmux_fleet import backends
     extra = {k: cfg[k] for k in ('agents_title', 'control_title') if cfg.get(k)}
     if 'cmux_state_dir' in cfg:
         extra['state_dir'] = cfg['cmux_state_dir']
-    return CmuxSessionManager(cfg.get('session') or SESSION, **extra)
+    return backends.build(backends.normalize_backend(cfg.get('backend')) or 'cmux',
+                          cfg.get('session') or SESSION, **extra)
+
+
+def run_backend(cfg):
+    """The backend name of a run (the value fleet's capability checks and layouts branch on)."""
+    from cmux_fleet import backends
+    return backends.normalize_backend(cfg.get('backend')) or 'cmux'
+
+
+def resolve_backend(requested=None, platform=None):
+    """`start --backend`: (name, reason-or-None) -- the backend to write into config.json.
+
+    No flag: cmux on macOS when cmux is usable there, otherwise WezTerm (design §5). An explicit choice
+    that is not usable is refused here, before anything is provisioned, with what is missing.
+    """
+    from cmux_fleet import backends  # bound before any except clause below can run
+    unknown = backends.InterfaceError
+    try:
+        name = backends.normalize_backend(requested)
+    except unknown as exc:  # --backend is validated by argparse; a config is not
+        return str(requested), str(exc)
+    here = sys.platform if platform is None else platform
+    if name is None and here != 'darwin':
+        return backends.default_backend(here), None
+    if name is None:  # no --backend on macOS: cmux when usable, else WezTerm -- unless WezTerm is missing
+        name = backends.default_backend(here)
+        if name == 'wezterm':
+            try:
+                backends.unavailable_reason('wezterm')
+            except unknown:
+                name = 'cmux'  # nothing to fall through to until WezTerm ships: cmux reports why it cannot run
+    try:
+        return backends.check_backend(name), None
+    except unknown as exc:
+        return name, str(exc)
+
+
+def backends_check(name):
+    """Is this run's backend usable right now? cmux asks ``cmux_manager.cmux_available()`` (the probe the
+    operators and tests patch, as `start` always did); any other backend asks its own registry, which
+    falls back to the backend class when the registry is a fake."""
+    from cmux_fleet import backends, cmux_manager
+    if name == 'cmux':  # one probe for both paths: tests (and operators) patch exactly this function
+        try:
+            return bool(cmux_manager.cmux_available())
+        except Exception:
+            return False
+    try:
+        probe = getattr(backends.build(name, SESSION), 'available', None)
+        if probe is not None:  # the real registry (or a test fake that carries the interface method)
+            return bool(probe())
+        return bool(backends.backend_class(name).available())
+    except Exception:
+        return False
+
+
+def unavailable_text(name):
+    """What `start` / `resume` print when the chosen backend cannot run here (design §4.4, §5)."""
+    from cmux_fleet import backends
+    try:
+        why = backends.unavailable_reason(name)
+    except Exception as exc:  # a backend module that cannot even import
+        why = str(exc)
+    return 'backend ' + str(name) + ' cannot run here: ' + (why or 'not available')
 
 
 def codex_home(cfg):
@@ -2328,6 +2397,7 @@ class Fleet:
         self.history_pane = self.mgr.arrange(self.agent('supervisor')['pane'],
                                              [self.agent(w)['pane'] for w in self.workers],
                                              history.page_url(self.run_dir))
+        self.announce_history_page()
         self.r.hset(SERVICE, mapping={'history_pane': self.history_pane or ''})
         if self.advisor_resident() and self.advisor_enabled():
             self.advisor_start()  # its tab next to the supervisor's; the held first workers wait for it
@@ -5102,8 +5172,30 @@ class Fleet:
     def refresh_history(self):
         history.write_page(self.run_dir, self.history_slots(), self.history_links())
         pane = self.r.hget(SERVICE, 'history_pane')
-        if pane:
+        if pane and getattr(self.mgr, 'supports_browser', True):
             self.mgr.reload_browser(pane)
+
+    def announce_history_page(self):
+        """A backend with no browser surface (``supports_browser`` false, design §4.3) does not show
+        ``<run>/history.html``: print its path in the control pane and open it once with the system opener
+        when there is a desktop (macOS ``open`` / Linux ``xdg-open``; otherwise the path is all you get)."""
+        if getattr(self.mgr, 'supports_browser', True):
+            return
+        page = history.page_path(self.run_dir)
+        try:
+            self.log('history.page', page=str(page))
+        except Exception:
+            pass  # logging must never break the layout
+        print('[fleet] history page: ' + str(page) + ' (backend ' + str(self.cfg.get('backend') or 'cmux')
+              + ' has no embedded browser)', flush=True)
+        opener = shutil.which('open' if sys.platform == 'darwin' else 'xdg-open')
+        if not opener:
+            return
+        try:
+            subprocess.Popen([opener, str(page)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError:
+            pass  # no desktop session: the printed path is still there
 
     # -- hot roster (start --roster, or <run>/roster.yaml written by the advisor switch)
     def roster_tick(self):
@@ -6074,22 +6166,30 @@ def resumable(run):
 
 def resume(run, args):
     """start --resume: reattach an unfinished v2 run. False when it turned out finished (auto starts anew)."""
-    from cmux_fleet.cmux_manager import CmuxSessionManager, cmux_available
     path = run / 'config.json'
     cfg = load(path)
     from cmux_fleet import cmux_manager
     pin_paths(cfg)  # a resumed run keeps its own locations; an older config gets the current ones pinned
     cfg.setdefault('fleet_home', str(HOME.expanduser().resolve()))
     cfg.setdefault('cmux_bin', cmux_manager.CMUX)
+    cfg.setdefault('cmux_state_dir', str(cfg.get('cmux_state_dir') or cmux_manager.STATE_DIR))
     if 'codex_queue' not in cfg:  # a run started before the probe: decided once here, kept for the rest of the run
         cfg['codex_queue'], cfg['codex_version'], _ = codex_queue.capability(cfg.get('codex'))
     try:
         runtime_v2.validate_config(cfg)
     except ValueError as exc:
         raise SystemExit('cannot resume ' + str(run) + ': ' + str(exc)) from exc
-    if daemon_running(run):
+    # A resumed run follows its own backend (§5); an older run without one keeps cmux. A run whose
+    # daemon is still alive is returned below before anything is spawned, so its backend is not probed.
+    live_run = daemon_running(run)
+    if live_run:  # an idempotent --resume: nothing to do, and nothing to probe
         print('this run still has a live daemon; nothing to resume:', run)
         return True
+    backend, why = resolve_backend(cfg.get('backend'))
+    if why:  # refused before anything is provisioned: Redis stays as it is
+        raise SystemExit('cannot resume ' + str(run) + ': backend ' + str(cfg.get('backend'))
+                         + ' is not usable here: ' + why)
+    cfg['backend'] = backend
     if args.max_attempts is not None:
         cfg['max_attempts'] = args.max_attempts
     if args.roster:  # applied by the normal hot-reload on the daemon's first tick
@@ -6111,8 +6211,8 @@ def resume(run, args):
                 roster.write_advisor(roster_file_path, True, cfg['workers'])
         except (OSError, ValueError) as exc:
             raise SystemExit('--advisor: roster not written: ' + str(exc)) from exc
-    if not cmux_available():
-        raise SystemExit('run this inside a cmux terminal: cmux only accepts processes started in its windows')
+    if not live_run and not backends_check(backend):  # a live daemon keeps its own backend running
+        raise SystemExit(unavailable_text(backend))
     sweep_orphan_redis(keep=run)
     try:
         r = connect(cfg)  # only the daemon died: its Redis is still up
@@ -6237,7 +6337,6 @@ def resolve_supervisor(args, default):
 
 
 def start(args):
-    from cmux_fleet.cmux_manager import CmuxSessionManager, cmux_available
     if getattr(args, 'max_attempts', None) is not None and args.max_attempts < 1:
         raise SystemExit('--max-attempts must be at least 1')
     kit_fleet = getattr(args, 'kit_fleet', None)
@@ -6343,8 +6442,11 @@ def start(args):
         except (OSError, ValueError) as exc:
             raise SystemExit('--worker-kit rejected: ' + str(exc)) from exc
     worker_domains = parse_worker_domains(getattr(args, 'worker_domains', None), args.worker_kit)
-    if not cmux_available():
-        raise SystemExit('run this inside a cmux terminal: cmux only accepts processes started in its windows')
+    backend, why = resolve_backend(getattr(args, 'backend', None))
+    if why:  # an explicit --backend that this machine cannot run: refuse before provisioning
+        raise SystemExit('--backend ' + str(args.backend) + ' cannot run here: ' + why)
+    if not backends_check(backend):
+        raise SystemExit(unavailable_text(backend))
     clis = {args.supervisor_cli, args.worker_cli} | profile_clis  # night cards need their CLI at start
     codex = args.codex or shutil.which('codex')
     pi = args.pi or shutil.which('pi')
@@ -6380,6 +6482,7 @@ def start(args):
     if getattr(args, 'name', None) is not None and not args.name.strip():
         raise SystemExit('--name must not be empty')
     titles = {'agents_title': 'Fleet ' + args.name.strip()} if getattr(args, 'name', None) else {}
+    titles['backend'] = backend  # the registry this fleet gets; the run's config keeps it for resume (§5)
     state_dir = getattr(args, 'cmux_state_dir', None)
     mgr = manager_for(dict(titles, cmux_state_dir=str(Path(state_dir).expanduser().resolve())) if state_dir else titles)
     if mgr.session_exists():
@@ -6411,8 +6514,9 @@ def start(args):
         kit_roster = roster_path
         roster_path = (copy_kit_fleet(kit_roster.parent, run / 'fleet-config') / 'roster.yaml').resolve()
         workers, worker_roles, worker_profiles = roster.load_entries(roster_path)  # role paths into the copy
-    from cmux_fleet import cmux_manager
+    from cmux_fleet import backends, cmux_manager
     cfg = {'run': str(run), 'python': sys.executable, **redis_cfg,
+           'backend': backend,  # decided once here; the daemon, actors, --resume and sub-fleets read it
            'cmux_state_dir': str(mgr.meta_path.parent),
            'fleet_home': str(HOME.expanduser().resolve()), 'cmux_bin': cmux_manager.CMUX,
            'workers': workers, 'mode': args.mode, 'lifecycle': args.lifecycle, 'roles': args.roles,
@@ -6612,7 +6716,8 @@ def print_inspection(args):
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
-def main(argv=None):
+def cli():
+    """The argument parser (main); split out so a test can parse flags without running a fleet."""
     p = argparse.ArgumentParser(prog='cmux-fleet', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='cmd', required=True)
     s = sub.add_parser('start', help='provision the private redis + cmux control surface (inside cmux)')
@@ -6630,6 +6735,9 @@ def main(argv=None):
                    help='private Redis runtime root (default: project .runtime/redis; no /tmp fallback)')
     s.add_argument('--fleet-home', help='fleet home (latest.json, default runs/codex-home); pinned in config.json'
                    ' (default: $CMUX_FLEET_HOME or ~/.cmux-fleet)')
+    s.add_argument('--backend', choices=('cmux', 'wezterm'),
+                   help='terminal backend of this run, written into config.json and followed by --resume and '
+                        'sub-fleets (default: cmux on macOS when cmux is usable, otherwise wezterm)')
     s.add_argument('--cmux-bin', help='cmux binary; pinned in config.json (default: $CMUX_BIN or the app bundle)')
     s.add_argument('--runs-dir', help='where run directories are created (default: <fleet home>/runs)')
     s.add_argument('--cmux-state-dir', help='cmux registry directory; pinned in config.json'
@@ -6848,6 +6956,11 @@ def main(argv=None):
     for arg in ('cfg', 'agent', 'prompt'):
         a.add_argument(arg)
     a.add_argument('--generation', type=int, help='pinned spawn generation (internal)')
+    return p
+
+
+def main(argv=None):
+    p = cli()
     args = p.parse_args(argv)
     if args.cmd == 'start':
         pin_paths({'fleet_home': args.fleet_home and str(Path(args.fleet_home).expanduser().resolve()),

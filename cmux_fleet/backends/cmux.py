@@ -209,12 +209,11 @@ class CmuxSessionManager:
     supports_browser = True
     nested_tabs = True
 
-    @classmethod
-    def available(cls) -> bool:
-        """Interface method (design §2): can this backend run here? For cmux that is ``cmux_available()``
-        (cmux only accepts commands from processes started inside a cmux window); it re-reads the module
-        function, so monkeypatching either one works."""
-        return cmux_available()
+    # Interface method (design §2): can this backend run here? For cmux that is ``cmux_available()``
+    # (cmux only accepts commands from processes started inside a cmux window). A plain function, not a
+    # classmethod, so ``monkeypatch.setattr(CmuxSessionManager, 'available', ...)`` keeps working like the
+    # module-level function it stands for; ``mgr.available()`` reads the class attribute, not the function.
+    available = staticmethod(cmux_available)
 
     def __init__(self, session_name: str = 'cmux-fleet', agents_title: str = 'Fleet agents',
                  control_title: str = 'Fleet control', state_dir: Optional[Path] = None):

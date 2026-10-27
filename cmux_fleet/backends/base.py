@@ -160,7 +160,12 @@ def unavailable_reason(name: str) -> Optional[str]:
 
 
 def default_backend(platform: Optional[str] = None) -> str:
-    """No ``--backend``: cmux on macOS when cmux is usable, otherwise WezTerm (design §5)."""
+    """No ``--backend``: cmux on macOS when cmux is usable, otherwise WezTerm (design §5).
+
+    Refusing cmux on macOS never *widens* what a fleet runs on: while the WezTerm backend is unusable
+    too, the answer falls through to the cmux probe, which then reports its own reason -- the message
+    a fleet got before the choice existed.
+    """
     platform = sys.platform if platform is None else platform
     if platform == 'darwin':
         try:
@@ -168,6 +173,11 @@ def default_backend(platform: Optional[str] = None) -> str:
                 return 'cmux'
         except Exception:  # a broken cmux binary is a reason for WezTerm, never a crash
             pass
+        try:
+            if unavailable_reason('wezterm') is not None:
+                return 'cmux'
+        except Exception:
+            return 'cmux'
     return 'wezterm'
 
 
