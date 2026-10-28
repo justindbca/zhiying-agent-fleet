@@ -3820,6 +3820,8 @@ class Fleet:
         if fresh:
             self.setf(slot, fresh_pending=1)
             return
+        if info.get('fresh_pending') == '1':
+            return  # a reset is already due before this one
         try:
             ratio = fleet_config.fresh_hint_ratio()
             used, window = self.usage(slot)
@@ -5526,6 +5528,8 @@ class Fleet:
         with no handoff turn, no note and no takeover text; the queued instruction is delivered after READY.
         A successor that cannot start (or take the tab) is removed and the old session keeps the slot."""
         info = self.agent(name)
+        if info.get('state') == 'clearing' or info.get('clear_required') == '1':
+            return  # start_rotation's guard: never while §28 clears the session
         self.setf(name, fresh_pending=0)
         codex_queue.clear(self, name, 'fresh')
         generation, old, prev = int(info.get('generation') or 0), info['pane'], self.label(name)
