@@ -126,12 +126,14 @@ def _roster(tmp):
 
 
 def test_roster_hot_load_with_subfleets_is_rejected_on_wezterm(tmp_path):
-    logged = []
+    logged, told = [], {}
     me = SimpleNamespace(roster_digest=None, cfg={'backend': 'wezterm'}, desired=['worker-1'],
-                         log=lambda kind, **data: logged.append((kind, data)))
+                         log=lambda kind, **data: logged.append((kind, data)),
+                         r=SimpleNamespace(hset=lambda k, mapping: told.update(mapping)))
     fleet.Fleet.reload_roster(me, _roster(tmp_path))
     assert logged and logged[0][0] == 'roster.rejected'
     assert any('wezterm' in e for e in logged[0][1]['errors'])
+    assert 'wezterm' in told.get('rejected', '')  # the supervisor hears of it too (§16)
     assert 'subfleets' not in me.cfg
 
 
