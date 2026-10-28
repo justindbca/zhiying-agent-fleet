@@ -12,4 +12,6 @@ assert.ok(Value.Check(schema,{...base,escalations:[{task:'dialog:worker-1:g0',de
 assert.ok(Value.Check(schema,{...base,escalations:[{task:'blocked:worker-1',decision:'revise',note:'other way'}]}),'blocked answer');
 assert.ok(!Value.Check(schema,{...base,escalations:[{task:'blocked:worker-1',decision:'maybe'}]}),'decision is an enum');
 assert.ok(!Value.Check(schema,{...base,escalations:{task:'blocked:worker-1',decision:'approve'}}),'escalations is a list');
+assert.ok(Value.Check(schema,{...base,dispatch:[{to:'worker-1',instruction:'Judge this fill again',fresh:true}]}),'fresh (design §37)');
+assert.ok(!Value.Check(schema,{...base,dispatch:[{to:'worker-1',instruction:'Judge this fill again',fresh:1}]}),'fresh is a boolean');
 console.log('service decision schema contract passed');

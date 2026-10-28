@@ -19,8 +19,8 @@ SHIPPED = HERE / 'config' / 'fleet.yaml'
 USER_ENV = 'CMUX_FLEET_CONFIG'
 USER_FILE = Path.home() / '.cmux-fleet' / 'fleet.yaml'
 BLOCKS = ('cli_pairs', 'lifecycle_modes', 'walls', 'watchdog_prompts', 'capability_matrix', 'models',
-          'profiles', 'accounts', 'tools', 'pi_context', 'daemon_watch')
-USER_BLOCKS = ('accounts', 'tools', 'walls', 'lifecycle_modes', 'pi_context', 'daemon_watch')
+          'profiles', 'accounts', 'tools', 'pi_context', 'daemon_watch', 'fresh_dispatch')
+USER_BLOCKS = ('accounts', 'tools', 'walls', 'lifecycle_modes', 'pi_context', 'daemon_watch', 'fresh_dispatch')
 
 NONE = 'none'  # recorded when there is no private file
 
@@ -118,3 +118,12 @@ def block(name, path=None):
 def source(path=None):
     """Where a block came from, for messages."""
     return str(path) if path is not None else str(SHIPPED) + ' (+ ' + str(user_path() or 'no private file') + ')'
+
+
+def fresh_hint_ratio():
+    """fresh_dispatch.fresh_hint_ratio (docs/design.md §37): a reused worker above this share of its window
+    earns the supervisor one hint line. A number in (0, 1]; 0.3 without the block."""
+    value = (block('fresh_dispatch') or {}).get('fresh_hint_ratio', 0.3)
+    if type(value) not in (int, float) or not 0 < value <= 1:
+        raise ValueError('fleet.yaml#fresh_dispatch.fresh_hint_ratio must be a number in (0, 1], got ' + repr(value))
+    return value

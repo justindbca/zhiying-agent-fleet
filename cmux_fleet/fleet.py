@@ -157,6 +157,7 @@ BRAKE = 'fx:brake'  # budget card + counters + last trip of the current task / s
 ADVICE, ADVICE_SEQ, ADVICE_PENDING, ADVICE_NOTES = 'fx:advice:', 'fx:advice:seq', 'fx:advice:pending:', 'fx:advice:notes'
 # Mid-task rescue (advisor plan §3.2): supervisor consult items waiting for an idle slot, relays per task+slot.
 RESCUE, RESCUE_RELAYS = 'fx:advice:rescue', 'fx:advice:relays'
+FRESH_HINTS = 'fx:fresh:hints'  # §37 [Hint] / [Fresh failed] lines appended to the supervisor's next message
 # Resident advisor slot (docs/design.md §27, v2 task mode): its tab sits in the supervisor's pane; the first
 # generation is labelled 'advisor', successors advisor-1.1, advisor-1.2 (like supervisor-1.1).
 ADVISOR, ADVISOR_BASE = advisor.SLOT, 'advisor-1'
@@ -1056,6 +1057,8 @@ def parse_decision(text, workers, others_active):
             raise ValueError('every dispatch item needs an id (M<n>, e.g. M0)')
         if 'advise_note' in item and not isinstance(item['advise_note'], str):
             raise ValueError('dispatch.advise_note must be text')
+        if 'fresh' in item and type(item['fresh']) is not bool:
+            raise ValueError('dispatch.fresh must be true or false')
     escalations = validate_escalations(decision)
     if 'advisor' in decision and decision['advisor'] not in ('on', 'off'):
         raise ValueError('advisor must be "on" or "off"')
@@ -1182,6 +1185,8 @@ def parse_service_decision(text, workers):
             raise ValueError('every dispatch item needs the request_id it answers')
         if not isinstance(item.get('instruction'), str) or len(item['instruction'].strip()) < 12:
             raise ValueError('instruction must state the action (>= 12 chars)')
+        if 'fresh' in item and type(item['fresh']) is not bool:
+            raise ValueError('dispatch.fresh must be true or false')
     for item in decision['skip']:
         if not isinstance(item, dict) or not isinstance(item.get('request_id'), str) \
                 or not isinstance(item.get('reason'), str):
@@ -2078,6 +2083,9 @@ class Fleet:
                 # Appended, never sent alone: a lone note forces a no-dispatch RUNNING (same as §16 / §21).
                 text += '\n' + '\n'.join(self.r.lrange(ADVICE_NOTES, 0, -1))
                 self.r.delete(ADVICE_NOTES)
+            if self.r.llen(FRESH_HINTS):  # §37, appended like the advisor notes
+                text += '\n' + '\n'.join(self.r.lrange(FRESH_HINTS, 0, -1))
+                self.r.delete(FRESH_HINTS)
         if self.v2:
             return self.v2.queue(name, text, front=front)
         self.r.rpush(key('inbox', name), text)
@@ -3395,7 +3403,9 @@ class Fleet:
             extra += note
         blocked = report_blocked(text) if not self.service and name in self.workers else ''
         key_, note = self.blocked_intake(name, item, blocked) if blocked else (None, '')
-        mid = self.queue('supervisor', tag + '\n' + text + extra + note + '\n\nReply with the JSON format from AGENTS.md.')
+        mid = self.queue('supervisor', tag + '\n' + text + extra + note
+                         + '\n\nWorker status now (state, queue, context, last task):\n' + self.worker_board()
+                         + '\n\nReply with the JSON format from AGENTS.md.')
         if key_ and mid:  # the supervisor's reply to this very message must answer it (on_supervisor)
             esc = self.escalation_state()
             if key_ in esc:
@@ -3445,6 +3455,8 @@ class Fleet:
             prepared = []
             for item in decision['dispatch'] if decision['status'] == 'RUNNING' else []:
                 slot = self.resolve(item['to'])
+                if item.get('fresh') and self.fresh_refusal(slot):
+                    raise ValueError(self.fresh_refusal(slot))
                 instruction = item['instruction'].strip()
                 prepared.append((slot, instruction, self.prepare_worker_profile(slot, instruction)))
             escalations = self.escalation_decision(decision, state) if decision['status'] == 'RUNNING' else []
@@ -3534,6 +3546,7 @@ class Fleet:
                 row['attempts'] = row.get('attempts', 0) + 1
             if not self.inbox_depth(slot):
                 self.record_worker_profile(slot, application)
+            self.mark_dispatch(slot, item.get('fresh'))
             if state is not None:
                 self.contract_queue(state, slot, row['message'], row['id'])
                 continue
@@ -3772,8 +3785,75 @@ class Fleet:
             if role and role.is_file():
                 first = next((x.strip('# ').strip() for x in role.read_text().splitlines() if x.strip()), '')
                 line += ', role: ' + first[:120]
+            info = self.agent(w)
+            if int(info.get('delivered') or 0):  # §37: what a reuse would carry along (a new session carries nothing)
+                try:
+                    used, window = self.usage(w)
+                except ValueError:
+                    used, window = int(info.get('ctx_used') or 0), int(info.get('ctx_window') or 0)
+                if used and window:
+                    line += ', context used ' + str(round(100 * used / window)) + '% (' + str(round(used / 1000)) + 'k tokens)'
+            task = self.last_task(info)
+            if task:
+                line += ', last task: ' + task
             lines.append(line)
         return '\n'.join(lines)
+
+    def last_task(self, info):
+        """First line (<= 80 chars) of the last message delivered to this generation, '' when none (§37)."""
+        text = info.get('last_msg') or ''
+        if self.v2 and info.get('msg_id'):
+            body = self.v2.bus.message(info['msg_id']).get('body') or {}
+            text = '' if body.get('purpose') == 'handoff' else body.get('text') or ''
+        text = SUPERVISOR_INSTRUCTION_HEAD.sub('', text)
+        return next((' '.join(x.split()) for x in text.splitlines() if x.strip()), '')[:80]
+
+    def mark_dispatch(self, slot, fresh):
+        """§37, as a validated dispatch to ``slot`` is queued: ``fresh`` marks the slot for a clean generation at
+        its delivery (none for a new or §28-cleared session); without it, one [Hint] line when the slot is
+        already over fresh_hint_ratio of its window."""
+        info = self.agent(slot)
+        if not int(info.get('delivered') or 0) or (self.v2 and self.v2.clear_enabled(slot)):
+            if fresh:
+                self.log('dispatch.fresh_skipped', agent=slot, reason='session has no earlier work')
+            return
+        if fresh:
+            self.setf(slot, fresh_pending=1)
+            return
+        try:
+            ratio = fleet_config.fresh_hint_ratio()
+            used, window = self.usage(slot)
+        except ValueError as exc:
+            self.log('dispatch.hint_failed', agent=slot, error=str(exc)[:300])
+            return
+        if not window or used <= ratio * window:
+            return
+        hint = ('[Hint] ' + self.label(slot) + ' was at ' + str(round(100 * used / window)) + '% context when it got '
+                'this dispatch; if the work is unrelated to its last task, add "fresh": true next time.')
+        if hint not in self.r.lrange(FRESH_HINTS, 0, -1):  # two dispatches to one worker: one line
+            self.r.rpush(FRESH_HINTS, hint)
+
+    def fresh_refusal(self, slot):
+        """Why a `"fresh": true` dispatch to ``slot`` is refused (docs/design.md §37), '' when it is taken."""
+        info = self.agent(slot)
+        if not int(info.get('delivered') or 0) or (self.v2 and self.v2.clear_enabled(slot)):
+            return ''  # nothing to drop: no reset, plain delivery
+        if info.get('state') != 'idle':
+            why = 'it is ' + (info.get('state') or 'not ready')
+        elif self.inbox_depth(slot):
+            why = 'it has ' + str(self.inbox_depth(slot)) + ' message(s) queued'
+        elif self.v2 and self.r.hget(self.v2.bus.lease_key(slot), 'current_delivery'):
+            why = 'it has a delivery in flight'
+        elif info.get('clear_required') == '1':
+            why = 'its context is being cleared'
+        elif subfleet.adopted(self.cfg, slot, info.get('generation')):
+            why = 'its session belongs to the parent fleet'
+        elif slot in self.profile_swaps():
+            why = 'its profile is being switched'
+        else:
+            return ''
+        return ('"fresh": true to ' + self.label(slot) + ' refused: ' + why + '. A fresh session only replaces an '
+                'idle worker with nothing queued; send it to an idle worker, or drop "fresh" to queue behind its work')
 
     def assign(self, rid, slot, instruction=None):
         spec = json.loads(self.r.hget(REQ + rid, 'spec'))
@@ -3843,6 +3923,9 @@ class Fleet:
             if invalid:
                 raise ValueError(invalid)
             decision = parse_service_decision(text, self.dispatch_targets())
+            for item in decision['dispatch']:
+                if item.get('fresh') and self.fresh_refusal(self.resolve(item['to'])):
+                    raise ValueError(self.fresh_refusal(self.resolve(item['to'])))
             escalations = self.escalation_decision(decision, None) if decision['status'] == 'RUNNING' else []
             self.escalations_missed(decision)
         except (ValueError, TypeError, KeyError) as exc:
@@ -3862,6 +3945,7 @@ class Fleet:
             if self.r.hget(REQ + item['request_id'], 'status') != 'routing':
                 self.log('dispatch.unknown_request', id=item['request_id'])
                 continue
+            self.mark_dispatch(self.resolve(item['to']), item.get('fresh'))
             self.assign(item['request_id'], self.resolve(item['to']), item['instruction'])
         for item in decision['skip']:
             if self.r.hget(REQ + item['request_id'], 'status') == 'routing':
@@ -3922,6 +4006,8 @@ class Fleet:
         would otherwise keep its full context until the CLI's own compaction. Checked once per
         (generation, delivered), with the same guards as ``deliver``."""
         info = self.agent(name)
+        if info.get('fresh_pending') == '1':
+            self.setf(name, fresh_pending=0)  # §37: its fresh dispatch was cancelled before delivery
         mark = str(info.get('generation') or 0) + ':' + str(info.get('delivered') or 0)
         if int(info.get('delivered') or 0) == 0 or info.get('idle_rotate_mark') == mark:
             return  # a fresh session (READY only) is never rotated here; rotate.impossible stays deliver's
@@ -4279,6 +4365,18 @@ class Fleet:
             self.v2.transaction('midturn-impossible-' + next_msg['message_id'],
                                 lambda: self.v2.midturn_blocked(name, next_msg, impossible=True))
             return
+        if self.agent(name).get('fresh_pending') == '1' and not continuing:
+            # §37: a `fresh` dispatch waits here for a clean generation; a session that has done nothing since
+            # (new after a restart / advisor or profile respawn) or an adopted pane just takes it.
+            if not int(info.get('delivered') or 0) or subfleet.adopted(self.cfg, name, info.get('generation')):
+                self.setf(name, fresh_pending=0)
+                self.log('dispatch.fresh_skipped', agent=name, reason='session has no earlier work or is adopted')
+            elif agent_cli(self.runtime_cfg(name), name) == 'codex' and active_children(info.get('thread'), self.sessions):
+                self.log('rotate.deferred', agent=name, reason='native subagents still running')
+                return
+            else:
+                self.fresh_rotation(name, used, window)
+                return
         ratio = float(self.agent(name).get('handoff_ratio') or self.cfg['handoff_ratio'])  # set by usage()
         if subfleet.adopted(self.cfg, name, info.get('generation')):
             window = 0  # an adopted pane goes back to its parent fleet: never replace it with a successor
@@ -5422,6 +5520,56 @@ class Fleet:
         if info.get('rescue_relay'):
             self.setf(name, rescue_relay='', rescue_hint='')
             self.r.rpush(ADVICE_NOTES, '[advisor] respawn ' + prev + ' → ' + label + ' done')
+
+    def fresh_rotation(self, name, used, window):
+        """§37: the next generation of an idle slot for a `fresh` dispatch, in place, in finish_rotation's order but
+        with no handoff turn, no note and no takeover text; the queued instruction is delivered after READY.
+        A successor that cannot start (or take the tab) is removed and the old session keeps the slot."""
+        info = self.agent(name)
+        self.setf(name, fresh_pending=0)
+        codex_queue.clear(self, name, 'fresh')
+        generation, old, prev = int(info.get('generation') or 0), info['pane'], self.label(name)
+        snapshot = self.run_dir / 'handoffs' / (name + '-g' + str(generation) + '-fresh.terminal.txt')
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        self.mgr.capture_to(old, str(snapshot))
+        label = slot_base(name) + '.' + str(generation + 1)
+        self.setf(name, generation=generation + 1, handoff_id='', label=label)
+        if name in self.workers:
+            self.r.hset(NAMES, mapping={label: name})
+        new, why = None, ''
+        try:
+            new = self.spawn(name, 'You are fleet agent ' + label + '. Read AGENTS.md in the current directory first. '
+                             'Your next instruction arrives after this turn: your final reply must be exactly READY.',
+                             launch_held=bool(self.v2))
+            if self.v2 and not self.mgr.tab_into(new, old):
+                why = 'the new session could not take the old tab'
+        except RuntimeError as exc:
+            new, why = self.agent(name).get('pane'), str(exc)[:300]
+        if why:
+            if new and new != old:
+                self.mgr.kill_pane(new)
+            self.setf(name, **dict(info, fresh_pending=0))
+            self.log('dispatch.fresh_failed', level='error', agent=name, reason=why)
+            self.r.rpush(FRESH_HINTS, '[Fresh failed] ' + prev + ': a clean session did not start (' + why + '); '
+                         'your instruction went to the existing session ' + prev + '.')
+            return
+        if not self.v2:
+            self.mgr.tab_into(new, old)
+        if not self.mgr.kill_pane(old) or (self.v2 and self.mgr.get_pane_status(old) is not None):
+            if self.v2:
+                self.setf(name, state='dead', launch_ready=0, retired_pane=old,
+                          retired_launch=info.get('runtime_launch') or '')
+            self.finish('blocked', 'could not close the old session ' + prev + '; two sessions hold slot ' + name)
+            return
+        if self.v2:
+            self.v2.confirm_retired(name)
+            self.setf(name, launch_ready=1, retired_pane='', retired_launch='')
+        history.record(self.run_dir, slot=name, label=prev, generation=generation, handoff='',
+                       snapshot=str(snapshot), source='fresh', timed_out=False)
+        self.refresh_history()
+        self.log('dispatch.fresh', agent=name, label=label, prev=prev, from_generation=generation,
+                 generation=generation + 1, dropped_tokens=used, window=window,
+                 transcript=info.get('transcript') or info.get('thread') or '')
 
     def refresh_history(self):
         history.write_page(self.run_dir, self.history_slots(), self.history_links())

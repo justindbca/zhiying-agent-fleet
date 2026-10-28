@@ -49,6 +49,15 @@ At most two read-only commands per check, then decide. Do not keep re-reading.
 | Retire a worker | Delete its row | It takes no new work, finishes what it already has, then its tab closes (history and workspace stay); it leaves the `[Roster change]` list |
 | Any roster edit | Keep the file valid YAML; change only the `workers:` list unless the task brief says otherwise | `[Roster rejected] <errors>` means nothing changed: fix the file per the errors |
 
+### Fresh session or reuse (`dispatch[].fresh`)
+
+Every report ends with "Worker status now": each worker's state, context used and last task.
+
+- Continuing, fixing or re-testing a worker's own recent work: dispatch to it as usual, no `fresh` (its context is the point).
+- A different package, other files or another topic: add `"fresh": true` to that dispatch item. The worker must be idle with nothing queued (otherwise the reply is refused); the program starts a clean session in the same slot (same folder and role, `worker-1` -> `worker-1.1`, no handoff note) and delivers the instruction to it.
+- More independent ready work than free workers: add a worker (above). A direction with no more work: retire its worker.
+- `[Hint] worker-N was at N% context ...` means you reused a full worker; `[Fresh failed] ...` means the clean session did not start and the instruction went to the existing one.
+
 ### Judging a report when the fleet advisor is on
 
 You judge every report; the worker never judges itself and never asks for another model. The advisor only
@@ -84,6 +93,7 @@ Answers you will receive:
 - `dispatch[].id`: optional task id `M<n>`; only a task with an id can be split by its worker (escalate)
 - `escalations`: optional, your answers to `[escalate]`, `[dialog]` and `[blocked]` requests (see the command table); a RUNNING reply with `escalations` may dispatch nothing
 - `dispatch[].advise_note`: optional note for the advisor (difficulty, needs the web, edits code, the output); never choose models or tools yourself
+- `dispatch[].fresh`: optional `true`: a clean session of that worker first (see "Fresh session or reuse")
 - `consult`: optional, see "Judging a report"; a RUNNING reply with `consult` may dispatch nothing
 - `advisor`: optional `"on"` / `"off"` (default off; written into the run's roster, stays until changed). Turn it on when the task benefits from per-dispatch model / effort / domain picking, or before you `consult`; `on` already applies to the dispatch / consult in the same reply. While off, `advise_note` is unused and `consult` gets `[advisor off]`
 - `withdraw`: optional, only with `COMPLETED`: the workers whose unsettled work you drop explicitly

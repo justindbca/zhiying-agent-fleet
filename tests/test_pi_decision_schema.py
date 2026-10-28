@@ -31,6 +31,7 @@ def test_pi_supervisor_schema_accepts_id_and_advise_note(tmp_path):
 def test_schema_source_declares_optional_keys():
     src = (Path(__file__).resolve().parents[1] / 'cmux_fleet/pi_extension_v2.ts').read_text()
     assert 'id: Type.Optional(Type.String()), advise_note: Type.Optional(Type.String())' in src
+    assert 'advise_note: Type.Optional(Type.String()), fresh: Type.Optional(Type.Boolean())' in src
     assert 'advisor: Type.Optional(Type.Union([Type.Literal("on"), Type.Literal("off")]))' in src
     assert 'consult: Type.Optional(Type.Array(consult))' in src
     assert 'finding: Type.String({ minLength: 1 })' in src

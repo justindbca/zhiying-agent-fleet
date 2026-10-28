@@ -38,6 +38,15 @@ if present, describes the requests you will see and which worker handles which k
 | Retire a worker | Delete its row | It takes no new work, finishes what it already has, then its tab closes (history and workspace stay); it leaves the `[Roster change]` list |
 | Any roster edit | Keep the file valid YAML; change only the `workers:` list unless section 4 or the operator says otherwise | `[Roster rejected] <errors>` means nothing changed: fix the file per the errors |
 
+### Fresh session or reuse (`dispatch[].fresh`)
+
+The "Worker status now" lines show each worker's context used and last task.
+
+- A request that continues, fixes or re-checks the worker's own recent request: route it as usual, no `fresh`.
+- A request about a different package, other files or another topic: add `"fresh": true` to the dispatch item. The worker must be idle with nothing queued (otherwise the reply is refused); the program starts a clean session in the same slot (same folder and role, `worker-1` -> `worker-1.1`, no handoff note) and delivers the request to it.
+- More independent ready requests than free workers: add a worker (above). A direction with no more requests: retire its worker.
+- `[Hint] worker-N was at N% context ...` means you reused a full worker; `[Fresh failed] ...` means the clean session did not start and the request went to the existing one.
+
 ## 3. Final tool: fleet_decision
 
 ```json
@@ -48,6 +57,7 @@ if present, describes the requests you will see and which worker handles which k
 
 - `status`: `RUNNING` (normal) / `BLOCKED` (a human is needed: the fleet pauses; say what in `reason`)
 - `dispatch`: one item per request you route. The daemon attaches the payload and the required answer format itself.
+- `dispatch[].fresh`: optional `true`: a clean session of that worker first (see "Fresh session or reuse")
 - `skip`: `[{"reason": "..."}]` for a request that needs no worker; the sender sees it as `skipped`.
 
 Use the object shown above as fleet_decision tool arguments, never print protocol JSON as final text. The tool collects a candidate; only settled + daemon validation can commit it. Submit exactly one candidate as the sole final tool call after all business tools have finished. Do not emit a protocol-text follow-up. READY is the explicit startup/takeover exception.

@@ -154,7 +154,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerMessageRenderer("fleet-daemon-watchdog", (message) => new Text(String(message.content || ""), 0, 0));
   const artifact = Type.Object({ path: Type.String(), min_chars: Type.Optional(Type.Integer({ minimum: 1 })), contains: Type.Optional(Type.Array(Type.String())) });
   const dispatch = Type.Object({ to: Type.String(), instruction: Type.String({ minLength: 12 }),
-    id: Type.Optional(Type.String()), advise_note: Type.Optional(Type.String()) });
+    id: Type.Optional(Type.String()), advise_note: Type.Optional(Type.String()), fresh: Type.Optional(Type.Boolean()) });
   const consult = Type.Object({ worker: Type.String(), task: Type.String(), finding: Type.String({ minLength: 1 }),
     want: Type.Optional(Type.String()) });
   // §20 split requests, plan F' [dialog] (approve / reject) and [blocked] (revise needs a note: checked by the daemon).

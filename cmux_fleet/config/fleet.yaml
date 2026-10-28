@@ -18,6 +18,7 @@
 #   accounts           account pools for budget cards (empty here; fill in the private file)  (brake.py)
 #   tools              tool pools reached through thin MCP servers (empty here)
 #   pi_context         context window written into each run's pi models.json            (pi_adapter.py)
+#   fresh_dispatch     when a reused worker earns the supervisor a "fresh" hint               (fleet_config.py)
 
 cli_pairs:
   # Transport v2 supervisor_cli x worker_cli x mode table (read by cmux_fleet/cli_pairs.py).
@@ -613,3 +614,10 @@ daemon_watch:
   check_interval_s: 120
   stale_after_s: 120
   realert_after_s: 600
+
+fresh_dispatch:
+  # docs/design.md §37. A dispatch without "fresh": true to a worker already above this share of its context
+  # window is delivered as usual, and the supervisor's next message gets one [Hint] line suggesting
+  # "fresh": true for unrelated work. Never resets anything by itself. A number in (0, 1].
+  # Override the whole block in the private file (~/.cmux-fleet/fleet.yaml).
+  fresh_hint_ratio: 0.3

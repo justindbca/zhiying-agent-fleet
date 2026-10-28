@@ -248,7 +248,9 @@ def test_task_without_contracts_is_unchanged(cf):
     assert inbox(cf, 'worker-1')[-1].startswith('[Supervisor instruction ')
     report(cf, 'worker-1')
     assert inbox(cf, 'supervisor')[-1] == ('[worker-1 report]\nDone:\n- did it\nEvidence:\n- worker-1/x\nNot done: '
-                                           'none\nBlocked: none\n\n\nReply with the JSON format from AGENTS.md.')
+                                           'none\nBlocked: none\n\n\nWorker status now (state, queue, context, last task):\n'
+                                           '- worker-1: idle, 1 queued\n- worker-2: idle\n- worker-3: idle\n\n'  # §37 board
+                                           'Reply with the JSON format from AGENTS.md.')
     assert not (cf.workspace() / 'contracts.json').exists()
     cf.finish('cancelled', 'next')
     with pytest.raises(ValueError, match='contracts must be a boolean'):
