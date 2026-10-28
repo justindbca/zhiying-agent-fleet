@@ -307,6 +307,22 @@ def test_unparseable_worker_reply_gets_corrections_then_blocks(mixed):
     assert f.task()['status'] == 'blocked'
 
 
+def test_new_task_is_refused_plainly_while_the_supervisor_is_held_from_the_last_one(mixed):
+    # 2026-10-28 run fleet-20261028-112659: BLOCKED held the in-flight pi supervisor; the next task was
+    # "accepted" but the held supervisor could never take it, and nothing said so.
+    f = mixed
+    submit(f)  # the task is in flight at the supervisor
+    f.v2.finish('blocked', 'worker-1: exactly one structured candidate is required')
+    assert f.agent('supervisor')['state'] == 'held'
+    runtime_v2.post_event(f.v2.bus, dict(kind='task', request_id='next-task', spec={'goal': 'continue the run'}),
+                          'next-task')
+    assert f.v2.step(10)
+    answer = runtime_v2.wait_reply(f.v2.bus, 'next-task', timeout=5)
+    assert answer['status'] == 'rejected' and 'supervisor is held' in answer['reason']
+    assert 'exactly one structured candidate' in answer['reason'] and 'new run' in answer['reason']
+    assert f.task()['status'] == 'blocked' and f.r.llen(f.v2.bus.pending_key('supervisor')) == 0
+
+
 def test_corrected_worker_report_settles_and_resets_retries(mixed):
     f = mixed
     dispatch_one(f)

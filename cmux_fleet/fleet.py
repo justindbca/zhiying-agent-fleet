@@ -3558,6 +3558,13 @@ class Fleet:
             raise ValueError('this fleet runs in service mode: submit requests, not tasks')
         if self.running():
             raise ValueError('a task is already running; stop it or wait for it to finish')
+        if self.v2 and self.agent('supervisor').get('state') == 'held':
+            # The last task's end held the supervisor's in-flight delivery (RuntimeV2.finish). A Pi supervisor has
+            # no hold exit (design §24 ⑦-4), so a task accepted now would never be delivered: say so instead.
+            mid = self.r.hget(self.v2.bus.lease_key('supervisor'), 'message_id')
+            why = (self.r.hget(self.v2.bus.msg_key(mid), 'uncertain_reason') if mid else '') or 'execution unconfirmed'
+            raise ValueError('the supervisor is held (' + why[:300] + '); this run cannot take a new task until '
+                             'that delivery is released. Start a new run for it')
         auto_agents = spec.get('auto_agents', False)
         if type(auto_agents) is not bool:
             raise ValueError('auto_agents must be a boolean')

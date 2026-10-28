@@ -438,7 +438,7 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 - **对账**：先重放 prepared intent（有 applying 不明 intent → 退回 `recover()`）；各槽在途解除、排队取消；解除暂停（原暂停原因写进审计 `daemon.resumed`）。task：本任务排队/在途的 worker 派发由 **daemon 自己**按原文重新排队（消息字段 `replay`=第几次），再给新监工一条交底：目标、产出已验/缺、已完成派发（附回报摘要）、已重排派发（明说不要再派）、只补派缺的。设计稿写「它只补派缺的」；由 daemon 而不是监工重派丢失的那条，是为了次数上限能落到确定的那一条上。service：`fx:reqq` 里没有结果的请求重置超时窗口、重新路由；`"replay": false` 的发布 `timeout`（原因「not replayed on resume」）。
 - **时间预算**：停机时间照算进 task 的 `hours`；续跑时已过 deadline 的 task 在第一拍判 `budget_exhausted` 并写 `result.json`。
 - **次数上限**：`--max-attempts`（缺省 2，写进 config，续跑时可覆盖）。超限 task 判 `blocked`（写明哪个 worker、哪条指令），service 记 `timeout` 带原因。
-- **结束标志**：task 进入任一终态时 daemon 写 `<run>/result.json`（状态、原因、task id、产出逐条复验结果，原子写）；同一 run 接受新 task 时删除它。显式 `stop` 成功退役所有 runtime 后也写（service 记 `stopped`），所以 `stop` 等于结束这个 run。续跑时发现 Redis 里 task 已终态但没有 `result.json` → 补写后按已结束处理。
+- **结束标志**：task 进入任一终态时 daemon 写 `<run>/result.json`（状态、原因、task id、产出逐条复验结果，原子写）；同一 run 接受新 task 时删除它；但监工槽仍是 held（上一 task 终态时扣下的在途投递，pi 监工没有 hold 出口，见 §24 已知缺口 ⑦-4）时拒收新 task 并写明原因、提示另起新 run（2026-10-28：此前照收，task 永远投不出去）。显式 `stop` 成功退役所有 runtime 后也写（service 记 `stopped`），所以 `stop` 等于结束这个 run。续跑时发现 Redis 里 task 已终态但没有 `result.json` → 补写后按已结束处理。
 - **名单**：沿用 config.json 已落盘的名单；给了 `--roster` 就写进 config，daemon 第一拍按 §16 热加载对账。
 - **已知边界（P2）**：丢失的「报告格式纠错」消息会原样重排给新一代（新一代没有上下文）；只死 daemon、Redis 未死时，worker 在停机期间做完的回合会被拒、再做一次；Pi 不接回；真实 cmux 下只剩 history 栏的整页重建未实测；`has_cli_process` 按进程判断（§23：可执行文件名去掉 `.exe` 后是 codex / claude，或 `node` 且脚本路径含 CLI 名；裸 shell、无关 node 不算）。
 
