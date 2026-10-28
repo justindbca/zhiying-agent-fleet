@@ -302,8 +302,8 @@ per agent; the control view prints `handoff=<ratio>@<window>`.
 
 `cmux-fleet start --resume <run-dir>` reattaches an unfinished Redis v2 run instead of creating one;
 `--resume auto` takes the run in `~/.cmux-fleet/latest.json` and starts a new run when that one is
-finished (`<run>/result.json` exists) or missing. A live daemon makes it a no-op, so a timer may call
-`start --resume auto` repeatedly.
+finished (`<run>/result.json` exists) or missing. A live daemon makes it a no-op. Keeping the daemon
+alive is the supervisor's job inside the fleet (design §36), not an external timer's.
 
 - Redis restarts from the run's own directory and socket; AOF brings back everything up to the last
   fsync (about 1 s). A Redis that is still up is reused.

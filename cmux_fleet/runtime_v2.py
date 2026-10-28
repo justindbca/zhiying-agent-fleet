@@ -2540,7 +2540,10 @@ class RuntimeV2:
                 if info.get('pane') and self.f.mgr.get_pane_status(info['pane']) is None:
                     self.tab_missing(slot, info)
                 elif slot == 'supervisor' and info.get('pane'):
-                    self.cli_check(info)
+                    try:  # outside the per-part guards: a failing probe must never take the daemon down
+                        self.cli_check(info)
+                    except Exception as exc:
+                        self.audit('cli_check.failed', level='error', error=str(exc)[:300])
 
     def cli_check(self, info):
         """§36: an official-CLI supervisor whose CLI exited leaves a shell in its tab (auto_close=False) and, unlike a
