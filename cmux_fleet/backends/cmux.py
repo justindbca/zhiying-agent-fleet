@@ -49,6 +49,9 @@ from typing import Dict, List, Optional, Tuple
 CMUX = os.environ.get('CMUX_BIN') or '/Applications/cmux.app/Contents/Resources/bin/cmux'
 STATE_DIR = Path(os.environ.get('CMUX_FLEET_STATE') or (Path.home() / '.local/state/cmux-fleet'))
 TMUX = os.environ.get('CMUX_FLEET_TMUX') or shutil.which('tmux') or '/opt/homebrew/bin/tmux'
+# A tmux server exits by itself when its last session ends; a client landing mid-shutdown reads
+# 'server exited unexpectedly'. tmux_session_alive asks again this many times, 0.1 s apart.
+TMUX_SHUTDOWN_RETRIES = 3
 # The fleet's own tmux server (docs/design.md §19 dual display): never the user's ~/.tmux.conf, whose
 # resurrect / continuum plugins would copy the user's sessions into it and overwrite their saves.
 TMUX_CONF = 'set -g window-size latest\nset -g history-limit 50000\n'
@@ -549,10 +552,14 @@ class CmuxSessionManager:
             return None
         if not Path(tm['tmux_socket']).exists():
             return False
-        try:
-            p = _tmux(tm['tmux_socket'], 'list-sessions', '-F', '#{session_name}')
-        except OSError:
-            return None
+        for attempt in range(TMUX_SHUTDOWN_RETRIES + 1):
+            try:
+                p = _tmux(tm['tmux_socket'], 'list-sessions', '-F', '#{session_name}')
+            except OSError:
+                return None
+            if 'server exited unexpectedly' not in p.stderr or attempt == TMUX_SHUTDOWN_RETRIES:
+                break
+            time.sleep(0.1)  # the server is shutting down: its next answer is 'no server running'
         if p.returncode == 0:
             return tm['tmux_session'] in p.stdout.split()
         return False if 'no server running' in p.stderr + p.stdout else None

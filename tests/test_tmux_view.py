@@ -312,6 +312,32 @@ def test_session_probe_proves_a_stop_only_from_tmux_itself(world, monkeypatch):
     assert w.parent.tmux_session_alive(other) is None
 
 
+def test_session_probe_rides_out_a_server_that_is_shutting_down(world, monkeypatch):
+    """A tmux server exits by itself when its last session ends; a probe landing mid-shutdown reads
+    'server exited unexpectedly' (VM: 22 of 300 under load). That is no answer yet: ask again, and the
+    next reply ('no server running') is the proof. Read as None it held the slot (CI 10-28, run 40612068578)."""
+    w = world
+    sid, _ = spawn(w)
+    real = cm._tmux
+    calls = []
+
+    def dying_server(sock, *args):
+        calls.append(args)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(args, 1, '', 'server exited unexpectedly\n')
+        return real(sock, *args)
+
+    tmux(w, 'kill-server')
+    monkeypatch.setattr(cm, '_tmux', dying_server)
+    monkeypatch.setattr(cm.time, 'sleep', lambda s: None)
+    assert w.parent.tmux_session_alive(sid) is False and len(calls) == 2
+
+    calls.clear()
+    monkeypatch.setattr(cm, '_tmux', lambda sock, *a: calls.append(a) or subprocess.CompletedProcess(
+        a, 1, '', 'server exited unexpectedly\n'))  # never settles: still no evidence, and bounded
+    assert w.parent.tmux_session_alive(sid) is None and len(calls) == cm.TMUX_SHUTDOWN_RETRIES + 1
+
+
 def test_closed_client_tab_is_reattached_with_its_registry_entry(world):
     w = world
     sid, out = spawn(w)
