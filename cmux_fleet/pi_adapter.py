@@ -95,12 +95,27 @@ def argv(cfg, name, generation, prompt, cwd, *, label):
             '--session-dir', str(session_dir(cfg, name, generation)), '--', prompt]
 
 
+DAEMON_WATCH = {'check_interval_s': 120, 'stale_after_s': 120, 'realert_after_s': 600}
+
+
+def daemon_watch():
+    """§36 knobs of the supervisor's daemon watchdog: fleet.yaml#daemon_watch over the defaults, seconds > 0."""
+    from cmux_fleet import fleet_config
+    knobs = dict(DAEMON_WATCH, **(fleet_config.block('daemon_watch') or {}))
+    if set(knobs) != set(DAEMON_WATCH) or any(type(v) not in (int, float) or v <= 0 for v in knobs.values()):
+        raise ValueError('fleet.yaml#daemon_watch takes ' + ', '.join(DAEMON_WATCH) + ' as seconds > 0')
+    return knobs
+
+
 def environment(cfg_path, cfg, name, generation):
     if cfg.get('transport_version') == 2:
-        return {'PI_CODING_AGENT_DIR': str(cfg['pi_home']), 'PI_SKIP_VERSION_CHECK': '1',
-                'CMUX_FLEET_PI_BRIDGE': json.dumps([cfg['python'],
-                    str(Path(__file__).with_name('agent_bridge.py')), str(cfg_path), name, str(generation)]),
-                'CMUX_FLEET_PI_SLOT': name, 'CMUX_FLEET_PI_MODE': cfg.get('mode', 'task')}
+        env = {'PI_CODING_AGENT_DIR': str(cfg['pi_home']), 'PI_SKIP_VERSION_CHECK': '1',
+               'CMUX_FLEET_PI_BRIDGE': json.dumps([cfg['python'],
+                   str(Path(__file__).with_name('agent_bridge.py')), str(cfg_path), name, str(generation)]),
+               'CMUX_FLEET_PI_SLOT': name, 'CMUX_FLEET_PI_MODE': cfg.get('mode', 'task')}
+        if name == 'supervisor' and not cfg.get('parent_config'):  # a sub-fleet's daemon is its parent's (§29)
+            env['CMUX_FLEET_DAEMON_WATCH'] = json.dumps(daemon_watch())
+        return env
     return {'PI_CODING_AGENT_DIR': str(cfg['pi_home']),
             'CMUX_FLEET_PI_CALLBACK': json.dumps([
                 cfg['python'], str(Path(__file__).with_name('fleet.py')),

@@ -603,3 +603,13 @@ pi_context:
   # Override the whole block in the private file (~/.cmux-fleet/fleet.yaml).
   default_window: 400000
   per_model: {}
+
+daemon_watch:
+  # The supervisor's daemon watchdog (docs/design.md §36; pi supervisor: fleet's pi extension). Every
+  # check_interval_s it asks its bridge for fx:daemon:beat. Older than stale_after_s, no daemon holding the run's
+  # lock and the run unfinished -> one supervisor turn with the log facts; the supervisor runs the restart command
+  # its AGENTS.md names. No second turn within realert_after_s. Read when a supervisor generation starts.
+  # Override the whole block in the private file (~/.cmux-fleet/fleet.yaml); seconds > 0.
+  check_interval_s: 120
+  stale_after_s: 120
+  realert_after_s: 600

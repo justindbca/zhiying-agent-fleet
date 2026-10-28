@@ -16,7 +16,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import redis
-from cmux_fleet import fleet, midturn, opencode_adapter, pi_adapter
+from cmux_fleet import fleet, midturn, opencode_adapter, pi_adapter, runtime_v2
 from cmux_fleet.message_bus import BusError, _short
 from cmux_fleet.runtime_v2 import (bus_for, dumps, heartbeat_key, link_fault, post_event, validate_config,
                                    wait_reply)
@@ -104,6 +104,8 @@ class AgentBridge:
         if kind == 'shutdown':
             self.stop()
             return {'status': 'stopped'}
+        if kind == 'daemon_beat':
+            return self.daemon_beat(data)
         self.metadata(data)
         if self.faulted:
             raise BusError('communication lost; delivery disabled pending reconciliation')
@@ -162,6 +164,23 @@ class AgentBridge:
             else:
                 self.fault('settlement unconfirmed/held; no execution replay')
         return reply
+
+    def daemon_beat(self, data):
+        """§36 the supervisor's daemon watchdog (pi extension loop): read-only, straight from Redis and the run's
+        daemon.lock, so it answers while the daemon is dead and after this bridge faulted. The lock is probed only
+        once the beat is stale: a probe takes the lock for an instant, and a daemon starting then would fail."""
+        if self.slot != 'supervisor':
+            raise ValueError('daemon_beat is the supervisor watchdog')
+        now, stale = time.time(), float(data.get('stale_after') or 120)
+        beat = float(self.r.get('fx:daemon:beat') or 0)
+        if now - beat <= stale:
+            return {'status': 'ok', 'now': now, 'beat': beat}
+        run = Path(self.cfg['run'])
+        facts = runtime_v2.daemon_outage(self.r, self.bus, self.cfg, now)
+        # Only an unfinished run is restarted from here: no result.json (a lifecycle-held run is the operator's).
+        unfinished = not (run / 'result.json').exists() and (
+            self.cfg.get('mode') == 'service' or (self.r.hget(fleet.TASK, 'status') or 'running') == 'running')
+        return dict(facts, status='ok', daemon_running=fleet.daemon_running(run), unfinished=unfinished)
 
     def permission(self, data):
         """opencode stopped on a permission request. Report it; never answer it here. The class is

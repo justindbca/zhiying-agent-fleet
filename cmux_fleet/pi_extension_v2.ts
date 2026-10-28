@@ -15,6 +15,25 @@ type Candidate = { tool: string; value: Record<string, unknown> };
 type Answer = { status: string; reason?: string };
 type Frame = { kind: string; call_id?: string; answer?: Answer; delivery?: Delivery;
   event_id?: string; card?: { render: string }; reason?: string; message_id?: string };
+// §36 the supervisor's daemon watchdog: the bridge's daemon_beat answer and the fleet.yaml#daemon_watch knobs.
+export type DaemonFacts = { status?: string; now?: number; beat?: number; daemon_running?: boolean; unfinished?: boolean;
+  last_event?: string; last_event_at?: number; pending_events?: number; held?: string[] };
+export type DaemonWatch = { check_interval_s: number; stale_after_s: number; realert_after_s: number };
+
+// The text of one watchdog turn, or null: the beat is stale, no daemon holds the run, the run is unfinished,
+// the session is idle and no watchdog turn started within realert_after_s. One line.
+export function daemonWatchdog(facts: DaemonFacts | undefined, idle: boolean, lastAlertAt: number, now: number,
+  knobs: DaemonWatch): string | null {
+  if (!facts || facts.status !== "ok" || typeof facts.now !== "number" || typeof facts.beat !== "number") return null;
+  const down = facts.now - facts.beat;
+  if (down <= knobs.stale_after_s || facts.daemon_running !== false || facts.unfinished !== true) return null;
+  if (!idle || now - lastAlertAt < knobs.realert_after_s) return null;
+  const at = (s?: number) => (s ? new Date(s * 1000).toTimeString().slice(0, 8) : "never");
+  return `[Daemon watchdog] The fleet daemon is down: last heartbeat ${at(facts.beat)}, ${Math.round(down)} s ago, ` +
+    `and no daemon holds this run. Last daemon audit event: ${facts.last_event || "none"} at ${at(facts.last_event_at)}. ` +
+    `Unprocessed events: ${facts.pending_events ?? "unknown"}. Held/expired deliveries: ${facts.held?.length ? facts.held.join(", ") : "none"}. ` +
+    `Follow "Daemon down" in your AGENTS.md now: check, note it in PROGRESS.md, run the restart command there once, verify the heartbeat.`;
+}
 
 export default function (pi: ExtensionAPI) {
   const command: string[] = JSON.parse(process.env.CMUX_FLEET_PI_BRIDGE || "[]");
@@ -22,6 +41,10 @@ export default function (pi: ExtensionAPI) {
   const slot = process.env.CMUX_FLEET_PI_SLOT || command.at(-2)!;
   const supervisor = slot === "supervisor";
   const service = process.env.CMUX_FLEET_PI_MODE === "service";
+  // Set by the daemon for the main fleet's supervisor only (pi_adapter.environment).
+  const watch: DaemonWatch | null = supervisor ? JSON.parse(process.env.CMUX_FLEET_DAEMON_WATCH || "null") : null;
+  let watchTimer: ReturnType<typeof setInterval> | undefined;
+  let lastAlertAt = 0;
   let child: ChildProcessWithoutNullStreams | undefined;
   let context: ExtensionContext | undefined;
   let binding: string | undefined;
@@ -82,6 +105,19 @@ export default function (pi: ExtensionAPI) {
       }
     });
   }
+  function daemonCheck() {
+    // Through the bridge, which reads Redis and daemon.lock itself: it answers while the daemon is dead.
+    const ctx = context;
+    if (!watch || !ctx || shutdown || !ready || phase === "delivery") return;
+    send("daemon_beat", { stale_after: watch.stale_after_s }, ctx).then((facts) => {
+      const text = daemonWatchdog(facts as DaemonFacts, phase !== "delivery" && ctx.isIdle() && !ctx.hasPendingMessages(),
+        lastAlertAt, Date.now() / 1000, watch);
+      if (!text || shutdown) return;
+      lastAlertAt = Date.now() / 1000;
+      // Before ready / during a delivery no check runs; this turn is a manual run (never a fleet result).
+      pi.sendMessage({ customType: "fleet-daemon-watchdog", content: text, display: true }, { triggerTurn: true });
+    }).catch(() => undefined);
+  }
   function handle(frame: Frame) {
     const ctx = context;
     if (!ctx || shutdown) return;
@@ -115,6 +151,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerEntryRenderer<{ render: string }>("fleet-ui", (entry) => new Text(entry.data?.render || "", 0, 0));
   pi.registerMessageRenderer<{ body: { title: string } }>("fleet-delivery", (message) => new Text(message.details?.body.title || "派工任务", 0, 0));
+  pi.registerMessageRenderer("fleet-daemon-watchdog", (message) => new Text(String(message.content || ""), 0, 0));
   const artifact = Type.Object({ path: Type.String(), min_chars: Type.Optional(Type.Integer({ minimum: 1 })), contains: Type.Optional(Type.Array(Type.String())) });
   const dispatch = Type.Object({ to: Type.String(), instruction: Type.String({ minLength: 12 }),
     id: Type.Optional(Type.String()), advise_note: Type.Optional(Type.String()) });
@@ -252,6 +289,7 @@ export default function (pi: ExtensionAPI) {
     if (phase === "startup") {
       const ack = await send("startup", { text: startupText, failed, aborted: event.aborted, error: lastError }, ctx);
       ready = ack.status === "ready"; phase = ready ? "idle" : "startup";
+      if (ready && watch && !watchTimer) { watchTimer = setInterval(daemonCheck, watch.check_interval_s * 1000); watchTimer.unref?.(); }
       if (!ready) {
         ctx.ui.setStatus("fleet", "启动失败：尚未 READY；详情见 control");
         ctx.ui.notify(ack.reason || "Fleet 启动未获 READY，禁止派工。", "error");
@@ -267,6 +305,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
   pi.on("session_shutdown", async () => {
+    if (watchTimer) { clearInterval(watchTimer); watchTimer = undefined; }
     if (shutdown) return;
     const process = child;
     // Stop is idempotent; stdin EOF also closes Python resources.

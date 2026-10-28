@@ -121,6 +121,35 @@ def heartbeat_key(bus, slot):
     return bus.prefix + ':hb:' + slot
 
 
+def clock(t):
+    return time.strftime('%H:%M:%S', time.localtime(float(t))) if t else 'never'
+
+
+# Audit rows bridges and hooks keep writing while no daemon runs: not the daemon's last word (§36).
+AGENT_AUDITS = ('renewed', 'received', 'slot_', 'turn.', 'hook.')
+
+
+def daemon_outage(r, bus, cfg, now=None):
+    """§36: what the logs say about a daemon outage, read straight from Redis (no daemon needed): its last beat,
+    the last audit record it wrote (at most ~2 s after that beat, agent-side rows skipped), the events it never
+    took (its consumer group's PEL plus everything after last-delivered-id) and the deliveries left held."""
+    now = time.time() if now is None else now
+    beat = float(r.get('fx:daemon:beat') or 0)
+    last, last_at = '', 0.0
+    for sid, row in r.xrevrange(bus.audit_key, max=str(int(beat * 1000) + 2000) if beat else '+', count=200):
+        if not str(row.get('event', '')).startswith(AGENT_AUDITS):
+            last, last_at = row.get('event', ''), int(row.get('at') or sid.split('-')[0]) / 1000
+            break
+    events, pending = bus.prefix + ':events', 0
+    for group in r.xinfo_groups(events) if r.exists(events) else []:
+        if group['name'] == 'daemon':
+            pending = int(group['pending']) + len(r.xrange(events, '(' + group['last-delivered-id'], '+'))
+    held = [s for s in ['supervisor'] + list(cfg.get('workers') or [])
+            if r.hget(bus.lease_key(s), 'status') in ('uncertain', 'expired')]
+    return {'now': now, 'beat': beat, 'down_s': int(now - beat) if beat else None, 'last_event': last,
+            'last_event_at': last_at, 'pending_events': pending, 'held': held}
+
+
 IDENTITY = ('run_id', 'slot', 'generation', 'session_id', 'message_id', 'delivery_id',
             'stream_id', 'fence', 'consumer', 'request_id')
 
@@ -1778,6 +1807,7 @@ class RuntimeV2:
             self.audit('resume.refused', level='error', error='ambiguous effect intent; held like a plain restart')
             return self.recover()
         previous = self.bus.r.hget(SERVICE, 'reason') if self.f.paused() else ''
+        outage = daemon_outage(self.bus.r, self.bus, self.f.cfg)  # before clear_slot and before the loop beats again
         unsettled = self.codex_unsettled()  # read before clear_slot abandons them and releases their leases
         lost = self.lost_dispatches()
         sup = self.f.agent('supervisor').get('pane')
@@ -1804,8 +1834,9 @@ class RuntimeV2:
         if self.f.service:
             self.transaction('resume-requests-' + uuid.uuid4().hex, lambda: self.requeue_requests(ran))
         elif self.f.task().get('status') == 'running':
-            self.transaction('resume-task-' + uuid.uuid4().hex, lambda: self.brief(lost, ran))
-        self.audit('daemon.resumed', level='warn', reattached=reattach, lost=len(lost), previous_pause=previous or '')
+            self.transaction('resume-task-' + uuid.uuid4().hex, lambda: self.brief(lost, ran, outage))
+        self.audit('daemon.resumed', level='warn', reattached=reattach, lost=len(lost), previous_pause=previous or '',
+                   **{k: outage[k] for k in ('down_s', 'last_event', 'pending_events', 'held')})
         subfleet.resume_children(self.f)  # children whose daemon is gone run again (--resume)
 
     def codex_unsettled(self):
@@ -2004,9 +2035,10 @@ class RuntimeV2:
                 + '\nCompleted dispatches (their reports were accepted; do not redo them):\n'
                 + ('\n'.join(x for _, x in sorted(done)) or '- none'))
 
-    def brief(self, lost, ran=None):
+    def brief(self, lost, ran=None, outage=None):
         """Re-queue lost dispatches (attempt-capped) and brief the new supervisor generation. `ran`: worker
-        instructions that ran to completion before the interruption (never re-queued, reported instead)."""
+        instructions that ran to completion before the interruption (never re-queued, reported instead).
+        `outage`: daemon_outage() read before the resume (§36)."""
         task = self.f.task()
         head = lambda text: ' '.join(text.split())[:200]
         requeued = self.requeue_lost(lost)
@@ -2022,6 +2054,12 @@ class RuntimeV2:
                      + '\nGoal: ' + task.get('goal', '')
                      + '\nWorkers you can dispatch to: ' + ', '.join(self.f.labels())
                      + '\nShared output directory: ' + str(self.f.workspace())
+                     + (('\nDaemon outage (from the logs): last heartbeat ' + clock(outage['beat']) + ', down '
+                         + str(outage['down_s']) + ' s until this resume; last daemon audit event '
+                         + (outage['last_event'] or 'none') + ' at ' + clock(outage['last_event_at']) + '; '
+                         + str(outage['pending_events']) + ' events were waiting and are processed now; '
+                         'held/expired deliveries found: ' + (', '.join(outage['held']) or 'none') + '.')
+                        if outage and outage['beat'] else '')
                      + progress
                      + '\nLost dispatches the daemon already re-queued (do NOT dispatch them again):\n'
                      + ('\n'.join(requeued) or '- none')
@@ -2501,6 +2539,28 @@ class RuntimeV2:
                 info = self.f.agent(slot)
                 if info.get('pane') and self.f.mgr.get_pane_status(info['pane']) is None:
                     self.tab_missing(slot, info)
+                elif slot == 'supervisor' and info.get('pane'):
+                    self.cli_check(info)
+
+    def cli_check(self, info):
+        """§36: an official-CLI supervisor whose CLI exited leaves a shell in its tab (auto_close=False) and, unlike a
+        pi bridge, no heartbeat. Two liveness checks in a row (30 s apart) without the CLI process = gone: restarted
+        as a lost link (watchdog.link_restart -> rotate)."""
+        from cmux_fleet.fleet import RESUME_CLIS
+        probe = getattr(self.f.mgr, 'has_cli_process', None)
+        if (probe is None or info.get('state') not in ('idle', 'busy') or info.get('runtime_ready') != '1'
+                or not tui_slot(self.slot_cfg('supervisor'), 'supervisor')
+                or subfleet.adopted(self.f.cfg, 'supervisor', info.get('generation'))):
+            return
+        if probe(info['pane'], RESUME_CLIS):
+            if info.get('cli_missing', '0') != '0':
+                self.f.setf('supervisor', cli_missing=0)
+            return
+        misses = int(info.get('cli_missing') or 0) + 1
+        self.f.setf('supervisor', cli_missing=0 if misses >= 2 else misses)
+        if misses >= 2:
+            self.transaction('cli-gone-' + uuid.uuid4().hex, lambda: self.link_lost(
+                'supervisor', 'supervisor CLI exited; only a shell is left in its tab'))
 
     def run(self):
         marker = self.prefix + ':boot'

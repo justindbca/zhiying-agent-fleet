@@ -317,6 +317,11 @@ finished (`<run>/result.json` exists) or missing. A live daemon makes it a no-op
   at most N times in total; over the cap the task is `blocked` / the request is `timeout`, naming the item.
 - A finished task (any terminal status) or an explicit `stop` writes `<run>/result.json`; such a run is
   never resumed. Without `--resume`, a restarted daemon still holds uncertain work and pauses (no replay).
+- The fleet looks after itself (docs/design.md §36): a Pi supervisor's fleet extension checks the daemon
+  heartbeat every 2 minutes (`fleet.yaml#daemon_watch`); when it is stale and no daemon holds the run, the
+  supervisor gets one `[Daemon watchdog]` turn with the facts from the logs and runs the exact `start --resume`
+  command its AGENTS.md names for this run. The daemon in turn restarts a frozen supervisor or one whose CLI
+  exited, and briefs the next generation from the logs (`supervisor.revived`). No cron or launchd job is needed.
 
 ## Interface contracts (task spec `"contracts": true`)
 

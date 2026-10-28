@@ -2255,6 +2255,8 @@ class Fleet:
                               else pi_adapter.UNSANDBOXED_SCOPE)
         if is_bridge(cfg, name):
             scope += '\n## Runtime permissions\n\n' + pi_adapter.UNSANDBOXED_SCOPE + '\n'
+        if self.v2 and role == 'supervisor' and not self.cfg.get('parent_config'):
+            scope += daemon_down_section(self.cfg, is_pi(cfg, name))
         return scope
 
     # -- actors
@@ -6395,6 +6397,38 @@ def reclaim_minutes(value):
     if not minutes > 0:
         raise argparse.ArgumentTypeError('expected minutes > 0 or off')
     return minutes
+
+
+def daemon_down_section(cfg, watched):
+    """§36: the supervisor's AGENTS.md section with this run's exact restart / status / log commands (the run's
+    pinned locations in front, so a command pasted as-is in any pane acts on this run). ``watched``: a pi supervisor,
+    whose fleet extension checks the heartbeat itself (Claude / Codex supervisors have no such loop)."""
+    env = [k + '=' + str(cfg[c]) for k, c in (('CMUX_FLEET_HOME', 'fleet_home'), ('CMUX_FLEET_STATE', 'cmux_state_dir'),
+                                              ('CMUX_FLEET_CONFIG', 'private_config'), ('CMUX_BIN', 'cmux_bin'))
+           if cfg.get(c) and cfg[c] != fleet_config.NONE]
+    base = (['env'] + env if env else []) + [cfg['python'], str(Path(__file__).resolve())]
+    run, config = str(Path(cfg['run'])), str(Path(cfg['run']) / 'config.json')
+    restart = shlex.join(base + ['start', '--allow-development-v2', '--resume', run])
+    status_cmd = shlex.join(base + ['status', '--config', config])
+    logs = shlex.join(base + ['logs', '--config', config, '--json', '--limit', '100000']) + ' | tail -n 30'
+    return ('\n## Daemon down (the one fleet command you may run)\n\n'
+            'The fleet daemon delivers every message to you and beats about once a second. '
+            + ('Your session checks that heartbeat on its own and starts a turn with a `[Daemon watchdog]` message '
+               '(the facts from the logs) when it is stale and no daemon holds this run. On that message, or when '
+               'the user says the daemon is down:\n\n'
+               if watched else 'Nothing in your session checks that heartbeat. When the user says the daemon is down:\n\n')
+            + '1. Check: `' + logs + '` (the last audit records and their times) and `' + status_cmd + '` '
+            '(`daemon.heartbeat_age_s`: seconds since the last heartbeat).\n'
+            '2. If the heartbeat is fresh again (under 10 s), the daemon is back: stop here.\n'
+            '3. Append one line to PROGRESS.md in your directory: the time, how long the daemon was down, the last '
+            'event, and that you are restarting it. Do this first: the restarted daemon replaces this session with '
+            'a new supervisor generation within seconds and briefs it.\n'
+            '4. Run once: `' + restart + '`. A live daemon makes it print "nothing to resume"; that is fine.\n'
+            '5. Verify with the status command that `daemon.heartbeat_age_s` is small again.\n\n'
+            'Never run the restart command a second time for the same outage, never start a daemon any other way, '
+            'never stop or kill a process, tab or Redis. If the command fails (for example a sandbox refuses it), '
+            'do not retry: say in your reply that the daemon is down and give the command and its error for the '
+            'human. This section is the only exception to "do not call the fleet CLI".\n')
 
 
 def resume_target(value):

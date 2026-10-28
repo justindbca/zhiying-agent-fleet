@@ -750,6 +750,7 @@ class Watchdog:
         is_midturn = bool(msg.get('midturn_id'))
         if reason == 'midturn' and not is_midturn:
             return False  # stale timeout; never turn it into an ordinary frozen kill
+        revive = self.revive_summary(info, msg) if slot == 'supervisor' and not is_midturn else None
         hid = msg['midturn_id'] if is_midturn else 'frozen-' + uuid.uuid4().hex[:8]
         note = f.run_dir / 'handoffs' / (slot + '-g' + str(generation) + '-' + hid + '.md')
         note.parent.mkdir(parents=True, exist_ok=True)
@@ -783,7 +784,8 @@ class Watchdog:
         try:
             new = f.spawn(slot, '[Same-task takeover] You are ' + label + ' (taking over from ' + prev + ', which '
                           'froze and was stopped). Read the handoff note ' + str(note) + '. In this turn only read '
-                          'the note, do no task work, and make your final reply exactly READY.', launch_held=True)
+                          'the note, do no task work, and make your final reply exactly READY.'
+                          + (' ' + revive.pop('text') if revive else ''), launch_held=True)
         except RuntimeError as exc:
             return self.abort_rotation(slot, info, label, f.agent(slot).get('pane'), path,
                                        'the next generation did not start (' + str(exc)[:300] + ')')
@@ -801,10 +803,34 @@ class Watchdog:
         f.refresh_history()
         self.audit('watch.frozen_restarted', slot=slot, level='error', prev=prev, label=label, reason=why,
                    screen=path, handoff=str(note), message_id=msg.get('message_id', ''))
+        if revive:
+            self.audit('supervisor.revived', slot=slot, level='error', prev=prev, label=label, reason=why, **revive)
         self.next_check.pop(slot, None)
         if not is_midturn:
             self.tell(slot, prev, label, why, msg)
         return True
+
+    def revive_summary(self, info, msg):
+        """§36: what the logs say about a supervisor about to be revived, for its successor's first message and the
+        `supervisor.revived` audit: its last sign of activity, the in-flight message and whether it was applied,
+        the last decisions the daemon committed for it."""
+        from cmux_fleet.runtime_v2 import clock
+        since = self.f.last_activity(info)
+        stuck = int(time.time() - since) if since else None
+        rows = self.rt.bus.r.xrevrange(self.rt.bus.audit_key, count=500)
+        decisions = [(int(row.get('at') or sid.split('-')[0]) / 1000, ' '.join(str(row.get('detail', '')).split())[:160])
+                     for sid, row in rows if row.get('event') == 'committed' and row.get('slot') == 'supervisor'][:3]
+        applied = msg.get('status') == 'committed'
+        text = ('[Revive summary] The previous generation was last active at ' + clock(since) + ' ('
+                + str(stuck) + ' s before this restart). '
+                + (('In-flight message ' + msg['message_id'] + ' (' + str(msg.get('kind') or 'message') + ') was '
+                    + ('applied.' if applied else 'NOT applied: it may be partly acted on; check the state before '
+                       'acting on it again.')) if msg.get('message_id') else 'No message was in flight.')
+                + ' Last decisions the daemon applied: '
+                + ('; '.join(clock(at) + ' ' + d for at, d in decisions) or 'none') + '.')
+        return dict(text=text, stuck_since=clock(since), stuck_s=stuck, in_flight=msg.get('message_id', ''),
+                    applied=applied if msg.get('message_id') else None,
+                    decisions=[clock(at) + ' ' + d for at, d in decisions])
 
     def abort_rotation(self, slot, old, label, new, screen, why):
         """Undo a failed rotation: remove the successor, give the slot back to the frozen session, hold it.
