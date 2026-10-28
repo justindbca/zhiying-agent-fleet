@@ -15,10 +15,55 @@ def test_macos_uses_caffeinate_idle_only():
     assert plat.keep_awake_prefix('darwin', lambda name: '/usr/bin/' + name) == ['/usr/bin/caffeinate', '-i']
 
 
+def _probe(returncode=0, raises=None, seen=None):
+    """A stand-in for subprocess.run used by the systemd-inhibit probe (no real systemd needed)."""
+    from types import SimpleNamespace
+
+    def run(cmd, **kw):
+        if seen is not None:
+            seen.append((cmd, kw))
+        if raises is not None:
+            raise raises
+        return SimpleNamespace(returncode=returncode, stdout='', stderr='Failed to inhibit: Access denied')
+    return run
+
+
 def test_linux_uses_systemd_inhibit_when_present():
-    prefix = plat.keep_awake_prefix('linux', lambda name: '/usr/bin/' + name)
+    prefix = plat.keep_awake_prefix('linux', lambda name: '/usr/bin/' + name, run=_probe(0))
     assert prefix[:2] == ['/usr/bin/systemd-inhibit', '--what=idle:sleep']
     assert prefix[2].startswith('--why=')
+
+
+def test_linux_probes_systemd_inhibit_before_using_it():
+    """The probe really runs the tool (a no-op `true` under the same --what), with a short timeout."""
+    seen = []
+    plat.keep_awake_prefix('linux', lambda name: '/usr/bin/' + name, run=_probe(0, seen=seen))
+    assert len(seen) == 1
+    cmd, kw = seen[0]
+    assert cmd[0] == '/usr/bin/systemd-inhibit' and '--what=idle:sleep' in cmd and cmd[-1] == 'true'
+    assert 0 < kw.get('timeout', 0) <= 10
+
+
+def test_linux_systemd_inhibit_denied_adds_no_prefix():
+    """2026-10-28 VM: started from an ssh session, polkit refuses the inhibitor ("Failed to inhibit: Access
+    denied", exit 1). Wrapping the daemon in it killed the daemon at once while `start` printed
+    "fleet started". A tool that does not work is the same as no tool: run the daemon unwrapped."""
+    assert plat.keep_awake_prefix('linux', lambda name: '/usr/bin/' + name, run=_probe(1)) == []
+
+
+def test_linux_systemd_inhibit_probe_hang_or_crash_adds_no_prefix():
+    import subprocess
+    which = lambda name: '/usr/bin/' + name
+    assert plat.keep_awake_prefix('linux', which, run=_probe(raises=subprocess.TimeoutExpired('x', 5))) == []
+    assert plat.keep_awake_prefix('linux', which, run=_probe(raises=OSError('exec format error'))) == []
+
+
+def test_macos_does_not_probe_caffeinate():
+    """macOS behaviour is unchanged: caffeinate is used as found, no probe run."""
+    seen = []
+    assert plat.keep_awake_prefix('darwin', lambda name: '/usr/bin/' + name,
+                                  run=_probe(1, seen=seen)) == ['/usr/bin/caffeinate', '-i']
+    assert seen == []
 
 
 def test_linux_without_systemd_inhibit_adds_no_prefix():
@@ -38,7 +83,7 @@ def test_unknown_platform_adds_no_prefix():
 
 def test_linux_does_not_look_up_caffeinate_and_macos_not_systemd_inhibit():
     asked = []
-    plat.keep_awake_prefix('linux', lambda name: asked.append(name) or '/usr/bin/' + name)
+    plat.keep_awake_prefix('linux', lambda name: asked.append(name) or '/usr/bin/' + name, run=_probe(0))
     plat.keep_awake_prefix('darwin', lambda name: asked.append(name) or '/usr/bin/' + name)
     assert asked == ['systemd-inhibit', 'caffeinate']
 

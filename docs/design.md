@@ -781,7 +781,7 @@ fleet 只通过 `fleet.manager_for(cfg)` 造出的那一个对象碰终端（原
 
 ### 33.5 平台小改
 
-`cmux_fleet/platform.py::keep_awake_prefix()`：macOS `caffeinate -i`、Linux 有 `systemd-inhibit` 时 `systemd-inhibit --what=idle:sleep --why=cmux-fleet`、否则空——`fleet.py` 两处、`subfleet.py` 一处原 `caffeinate` 调用改调它。`deps.yaml` 按后端门控（`when: cmux` / `when: wezterm`，后者含 `wezterm-mux-server`，最低 20240203），`scripts/check_deps.py` 用同一条 §33.3 规则挑后端并跳过不属于它的项。
+`cmux_fleet/platform.py::keep_awake_prefix()`：macOS `caffeinate -i`、Linux 有 `systemd-inhibit` 且先拿 `true` 试跑成功（5 秒超时）时 `systemd-inhibit --what=idle:sleep --why=cmux-fleet`、否则空（从 ssh 会话或无头服务器起，polkit 拒绝抑制器「Failed to inhibit: Access denied」，包上它 daemon 一启动就死）——`fleet.py` 两处、`subfleet.py` 一处原 `caffeinate` 调用改调它。`deps.yaml` 按后端门控（`when: cmux` / `when: wezterm`，后者含 `wezterm-mux-server`，最低 20240203），`scripts/check_deps.py` 用同一条 §33.3 规则挑后端并跳过不属于它的项。
 
 **验证**：`tests/test_backend_interface.py`（接口齐全）、`tests/test_backend_selection.py`（选择 / 继承 / 降级）、`tests/test_platform.py`、`tests/test_check_deps.py`、WezTerm 假 CLI 与真 mux server 测试（impl-wezterm 分支）、`.github/workflows/tests.yml` 的 `ubuntu-latest` 全量任务。真机冒烟（`start --backend wezterm` 起 pi 监工 + worker）留给编排会话，不在本 fleet 内做。
 
