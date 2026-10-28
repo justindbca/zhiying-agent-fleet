@@ -165,6 +165,20 @@ def test_last_json_object_ignores_json_quoted_in_evidence():
     assert set(runtime_v2.tui_candidates('worker-1', 'worker', plain)[0]['value']) == {'done', 'evidence', 'not_done', 'blocked'}
 
 
+@pytest.mark.parametrize('heading', [
+    # 2026-10-28 ci-1 (Opus 5.5): three reports rejected as "exactly one structured candidate is required"
+    'Evidence (`FLEETMUX_GATE=m3`, temporary helper copy in place):',
+    'Evidence (with `FLEETMUX_GATE=m3`):',
+    'Evidence (`FLEETMUX_GATE=m3`):',
+    '**Evidence** (gate m3):',
+])
+def test_a_heading_with_a_parenthetical_qualifier_is_still_the_section(heading):
+    text = 'Done:\n- merged 9e246a51\n' + heading + '\n- 33 tests collected, 0 errors\nNot done: none.\n\nBlocked: none.'
+    value, = [c['value'] for c in runtime_v2.tui_candidates('worker-1', 'worker', text)]
+    assert value['done'] == ['merged 9e246a51'] and value['evidence'] == ['33 tests collected, 0 errors']
+    assert value['not_done'] == 'none.' and value['blocked'] == 'none.'
+
+
 # ------------------------------------------------------------------ fleet wiring (v1 path)
 THREADS = {n: str(i) * 8 + '-1111-1111-1111-111111111111' for i, n in enumerate(['supervisor'] + WORKERS, 1)}
 

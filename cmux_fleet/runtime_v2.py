@@ -146,7 +146,8 @@ def turn_answers(body_text, inputs):
     return bool(head) and any(head in _norm(item) for item in inputs if isinstance(item, str))
 
 
-WORKER_SECTIONS = re.compile(r'^[\s>*#_-]*(done|evidence|not done|blocked)[\s*_]*:[\s*_]*(.*)$', re.I)
+# A heading may carry a parenthetical qualifier before its colon: "Evidence (`FLEETMUX_GATE=m3`):" (2026-10-28 ci-1).
+WORKER_SECTIONS = re.compile(r'^[\s>*#_-]*(done|evidence|not done|blocked)[\s*_]*(?:\([^)\n]*\)[\s*_]*)?:[\s*_]*(.*)$', re.I)
 
 
 def tui_candidates(slot, purpose, text, mode='task'):

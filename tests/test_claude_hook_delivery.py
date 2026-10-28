@@ -422,6 +422,44 @@ def test_ten_consecutive_deliveries_with_stop_hook_active(hooked):
     assert step(f, lambda: reports(f) == 10)
 
 
+# 2026-10-28 run fleet-20261028-112659 (ci-1, Opus 5.5): the follow-up reports wrote "Evidence (<qualifier>):".
+QUALIFIED = ('Done:\n- merged {name}, merge commit 15a20454\nEvidence (`FLEETMUX_GATE=m3`, temporary helper copy in place):\n'
+             '- collect-only on the 3 test files: 33 tests collected, 0 errors\nNot done: none.\n\nBlocked: none.')
+
+
+def follow_ups(f, *names):
+    """Settle the first task, then queue follow-ups the way the live supervisor did: the first while the
+    worker is idle (its hook hands it over), the rest while that one runs. Returns the running lease."""
+    env = f.v2.bus.slot_state('worker-1')
+    hook = stop(f, 'worker-1', REPORT.format(name='part.md'))
+    assert step(f, lambda: status_of(f, env) == 'committed')
+    f.queue('worker-1', '[M7] follow-up ' + names[0])
+    assert 'follow-up ' + names[0] in delivered(f, hook)['reason']
+    for name in names[1:]:
+        f.queue('worker-1', '[M7] follow-up ' + name)
+    return f.v2.bus.slot_state('worker-1')
+
+
+def test_queued_follow_ups_through_the_hook_each_settle_with_their_own_report(hooked):
+    f = hooked
+    handed(f)
+    env = follow_ups(f, 'A', 'B', 'C')
+    for name, nxt in (('A', 'B'), ('B', 'C'), ('C', None)):
+        hook = stop(f, 'worker-1', QUALIFIED.format(name=name))
+        assert step(f, lambda: status_of(f, env) == 'committed'), 'follow-up ' + name + ' never settled'
+        msg = f.v2.bus.message(env['message_id'])
+        assert msg['outcome'] == 'completed', 'follow-up ' + name + ': ' + repr(msg.get('outcome'))
+        assert msg['result']['done'] == ['merged ' + name + ', merge commit 15a20454']
+        assert msg['result']['evidence'] == ['collect-only on the 3 test files: 33 tests collected, 0 errors']
+        if nxt:
+            assert 'follow-up ' + nxt in delivered(f, hook)['reason']
+            env = f.v2.bus.slot_state('worker-1')
+    assert not [e for e in audit(f, 'worker-1') if e.get('event') == 'candidate.invalid']
+    assert f.task()['status'] == 'running' and f.agent('worker-1').get('report_retries', '0') == '0'
+    assert step(f, lambda: reports(f) == 4)
+
+
+
 # ------------------------------------------------------------------ foreign / manual / old turns
 def test_old_generation_hook_never_settles_or_takes_a_delivery(hooked):
     f = hooked
