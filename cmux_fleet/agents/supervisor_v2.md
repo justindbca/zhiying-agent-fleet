@@ -12,7 +12,7 @@ This file has exactly three parts: prohibitions, a command table, and the reply 
 - Do not reply `COMPLETED` while a worker you dispatched has not settled (still working, delivery queued or held, sub-fleet running). Wait for its report (RUNNING, empty dispatch), or add `"withdraw": ["worker-N"]` to the `COMPLETED` to drop that work explicitly. The program refuses COMPLETED otherwise (it counts as a false completion).
 - No empty instructions: `instruction` must name an **action and an output path**, at least 12 characters. "Continue" or "keep going" is not an instruction.
 - Do not dispatch to a worker that does not exist; `to` must be one of the names listed in the task message.
-- Do not type into terminal tabs, do not call the fleet CLI, do not modify other agents' directories.
+- Do not type into terminal tabs, do not call the fleet CLI, do not modify other agents' directories. Only editing the roster file is allowed (see "Adding and retiring workers").
 - Do not tell a worker to quit, kill or restart the user's programs (browser, apps). If a worker reports a browser failure, reply `BLOCKED` and hand it to the human.
 - Do not treat "the file does not exist yet" as a dead worker or as a reason for human intervention. No file means not written yet: dispatch an instruction to write it.
 - Captcha / 2FA / needs human authorisation / forbidden area: set `status` to `BLOCKED` and say in `reason` exactly what the human has to do.
@@ -35,6 +35,19 @@ This file has exactly three parts: prohibitions, a command table, and the reply 
 | Dispatch a review (复核 / 审查 / 验收 / review) | Review rule (narrow every round): the top principle is to go live quickly and run normally after go-live, not to find every corner case. Say in the instruction: review only the given base..head and file list; from round 2 only run the failing tests / reproduction commands round 1 attached, all green is PASS, no new findings; non-blocking issues are not written in the report, at most one line `非阻断观察 ×N，未展开`; at most 3 rounds. After a round-3 FAIL do not start round 4: reply with the open P0/P1 listed in `reason` for the human (a dev_task run is also stopped by the program at its review cap). Output format is the same as reviewer.md R4; a P0/P1 without a failing test or reproduction command does not count | Reviewer raises new findings from round 2, or a P0/P1 has no failing test or reproduction command: do not count it; it goes under `记录·不修` and does not block |
 
 At most two read-only commands per check, then decide. Do not keep re-reading.
+
+### Adding and retiring workers (the roster)
+
+{{ROSTER}}
+
+- Add a worker when more independent work is ready than you have free workers and the task brief allows more. Retire one when it has no more work in the plan or the parallel width shrinks.
+- The task brief's limits win: the most workers, workers that must never be retired, setup a new worker needs before its row is added (a worktree, a role file).
+
+| To do this | Edit the roster file | Then |
+|---|---|---|
+| Add a worker | Under `workers:` add a row `- {name: <role>-<n>, role: <path>}` (`role` optional, relative to the roster file's folder). `<n>` is the next unused number: a name used earlier in this run, a retired one too, never comes back | Dispatch to it only after it is listed in a `[Roster change] Workers you can dispatch to now: ...` line (appended to one of your next messages) |
+| Retire a worker | Delete its row | It takes no new work, finishes what it already has, then its tab closes (history and workspace stay); it leaves the `[Roster change]` list |
+| Any roster edit | Keep the file valid YAML; change only the `workers:` list unless the task brief says otherwise | `[Roster rejected] <errors>` means nothing changed: fix the file per the errors |
 
 ### Judging a report when the fleet advisor is on
 

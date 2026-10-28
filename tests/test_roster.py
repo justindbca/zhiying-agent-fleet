@@ -376,3 +376,78 @@ def test_a_run_with_old_style_names_keeps_them_on_reload_and_only_new_names_are_
     write_roster(f, LEGACY + ['extra-1'])
     f.tick()
     assert f.workers == LEGACY + ['extra-1'] and len(audits(f, 'roster.rejected')) == 1
+
+
+# -- the supervisor grows / shrinks its own worker set (user 2026-10-28: "Supervisor 能够动态地开启 Worker
+# 和关闭 Worker、卸载 Worker"): its prompt names the roster file, a rejected edit is reported back to it.
+SUPERVISOR_PROMPTS = ('supervisor.md', 'supervisor_v2.md', 'service_supervisor.md', 'service_supervisor_v2.md',
+                      'service_supervisor_tui_v2.md')
+
+
+def supervisor_scope(f):
+    return f.role_scope('supervisor', f.runtime_cfg('supervisor'), {})
+
+
+def test_every_supervisor_prompt_explains_adding_and_retiring_workers():
+    agents = fleet.HERE / 'agents'
+    for name in SUPERVISOR_PROMPTS:
+        text = (agents / name).read_text()
+        assert '### Adding and retiring workers (the roster)' in text and '{{ROSTER}}' in text, name
+        assert '[Roster change]' in text and '[Roster rejected]' in text, name
+        assert '- {name: <role>-<n>, role: <path>}' in text, name
+        assert 'editing the roster file is allowed' in text, name
+
+
+def test_supervisor_prompt_names_the_roster_file_when_the_run_has_one(hot):
+    scope = supervisor_scope(hot)
+    assert '{{' not in scope and 'Adding and retiring workers (the roster)' in scope
+    assert 'This run\'s roster file is `' + hot.cfg['roster'] + '`' in scope
+    assert 'not available in this run' not in scope and 'At night' not in scope
+
+
+def test_supervisor_prompt_names_both_files_of_a_day_night_pair(hot):
+    night = hot.run_dir / 'night.yaml'
+    hot.cfg['roster_night'] = str(night)
+    scope = supervisor_scope(hot)
+    assert '`' + hot.cfg['roster'] + '`' in scope and '`' + str(night) + '`' in scope
+    assert 'make the same `workers:` change in both files' in scope
+
+
+def test_supervisor_prompt_without_a_roster_says_adding_is_not_available(mixed):  # noqa: F811
+    assert not mixed.cfg.get('roster')
+    scope = supervisor_scope(mixed)
+    assert '{{' not in scope and 'adding or retiring workers is not available in this run' in scope
+    assert 'roster file is `' not in scope
+
+
+def test_rejected_roster_change_is_told_to_the_supervisor_once(hot, monkeypatch):
+    f = hot
+    write_roster(f, WORKERS + ['fresh'])
+    f.tick()
+    assert f.workers == WORKERS and len(audits(f, 'roster.rejected')) == 1
+    submit(f)
+    prompt = typed(f, 'supervisor')[-1]
+    note = prompt.split('[Roster rejected] ', 1)[1]
+    assert note.startswith('workers[6] (fresh): a worker name must end with -<number>')
+    assert 'the roster in effect is unchanged: ' + ', '.join(WORKERS) in note
+    assert '[Roster change]' not in prompt
+    assert not f.r.hget(fleet.ROSTER, 'rejected')     # delivered: gone
+    f.tick()                                            # the same rejected file: not re-reported
+    assert not f.r.hget(fleet.ROSTER, 'rejected') and len(audits(f, 'roster.rejected')) == 1
+    sent = []
+    monkeypatch.setattr(f.v2, 'queue', lambda name, text, **kw: sent.append(text))
+    f.queue('supervisor', 'next message')
+    assert sent == ['next message']
+
+
+def test_rejection_fixed_before_the_next_message_reports_only_the_change(hot):
+    f = hot
+    write_roster(f, WORKERS + ['fresh'])
+    f.tick()
+    write_roster(f, WORKERS + ['fresh-1'])
+    f.tick()
+    assert f.workers == WORKERS + ['fresh-1']
+    submit(f)
+    prompt = typed(f, 'supervisor')[-1]
+    assert '[Roster rejected]' not in prompt
+    assert '[Roster change] Workers you can dispatch to now: ' in prompt and prompt.rstrip().endswith('fresh-1')

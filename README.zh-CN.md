@@ -126,6 +126,7 @@ workers:
 - **加**：新名字先写进 `config.json`（`latest.json` 指向本 run 时一起写），再用 READY 提示启动，作为标签放到右侧 worker 栏末尾；监工的下一条消息末尾会附上新名单。
 - **卸**：该 worker 不再接新活（派给它会被拒），手上的活做完、队列空了才退役：屏幕存进历史页、关掉标签；工作目录保留。退役前把它写回文件即取消卸载。
 - **只改角色**：在它下一代生效，不重启。
+- **监工也能改**：每份监工 prompt 有「Adding and retiring workers (the roster)」一节，写明本 run 的名单路径（`{{ROSTER}}`；用 `--workers` / `--worker-names` 起的 run 写「不能加 / 卸」）。就绪的活多于空闲 worker 时加一行 `- {name: <role>-<n>, role: <path>}`，某个 worker 没活了就删它那行，都不超出任务说明的上限；新 worker 出现在 `[Roster change]` 名单里才派活。改坏了会在下一条消息末尾收到 `[Roster rejected] <错误>; the roster in effect is unchanged: <当前名单>`（同一份坏文件只报一次）。
 - **整份拒收**（名单不变，原因记在 control 日志 `roster.rejected`）：YAML 错、未知字段、名字不合法或重复、零个 worker、角色文件不存在、本 run 用过的名字（卸掉的名字不能再加回）。变更记为 `roster.changed`。
 - **附带标签**（docs/design.md §31）：可选顶层 `tabs: [{name, command, cwd?, env?}]`（name `^[a-z][a-z0-9-]*$` 且唯一；cwd 相对名单目录、支持 `~`；env 值为字符串），终端程序（不是 agent），开在本 fleet 工作区 control 标签后面，不抢焦点。每次起 fleet（`start`、`--resume`、子 fleet `daemon --resume`）开之前先把命令行与该程序精确相等的进程 SIGTERM（约 5 秒后 SIGKILL）再开，匹配规则见 §31；`stop` / `close_all` 一并关；daemon 活着时标签被关不会自动重开，等下次起 fleet。程序以 fleet 用户身份运行，名单即授权。
 - 跑 daemon 的 Python 需装 PyYAML。

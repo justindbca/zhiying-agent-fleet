@@ -92,7 +92,7 @@ def _pin_from(cfg_path):
         pass  # the entry point itself reports an unreadable config
 USER_CODEX_HOME = Path(os.environ.get('CODEX_HOME') or (Path.home() / '.codex'))
 EVENTS, TASK, LOG, NAMES = 'fx:events', 'fx:task', 'fx:log', 'fx:names'
-ROSTER = 'fx:roster'  # notify=1: tell the supervisor the current workers with its next message
+ROSTER = 'fx:roster'  # notify=1 / rejected=<errors>: told to the supervisor with its next message (§16)
 # Service mode: a resident fleet that handles a stream of requests instead of one goal.
 REQ, REQQ, RESULT, RESULTS, SERVICE = 'fx:req:', 'fx:reqq', 'fx:result:', 'fx:results', 'fx:service'
 REQ_ID_RE = r'[A-Za-z0-9][A-Za-z0-9:._-]{0,127}'
@@ -1010,6 +1010,19 @@ def roster_file(cfg):
     <run>/roster.yaml (created by the advisor switch when absent)."""
     followed = night.roster_for(cfg)
     return Path(followed) if followed else Path(cfg['run']) / 'roster.yaml'
+
+
+def roster_notice(cfg):
+    """{{ROSTER}} in the supervisor prompt: the roster file(s) it may edit to add / retire workers (§16)."""
+    if not cfg.get('roster'):
+        return ('This run has no roster file (it was started with --workers / --worker-names): adding or retiring '
+                'workers is not available in this run; skip the rest of this section.')
+    text = ("This run's roster file is `" + str(cfg['roster']) + '`. You may edit it while the run goes on to add or '
+            'retire your own workers.')
+    if cfg.get('roster_night'):
+        text += (' At night the daemon follows `' + str(cfg['roster_night']) + '` instead: make the same `workers:` '
+                 'change in both files, or the day / night switch is refused.')
+    return text
 
 
 def advisor_rosters(cfg):
@@ -2051,6 +2064,10 @@ class Fleet:
             # Appended, never prepended: the queue parses request/task headers at the start.
             self.r.hset(ROSTER, mapping={'notify': 0})
             text += '\n[Roster change] Workers you can dispatch to now: ' + ', '.join(self.labels())
+        if name == 'supervisor' and self.r.hget(ROSTER, 'rejected'):
+            text += ('\n[Roster rejected] ' + self.r.hget(ROSTER, 'rejected') + '; the roster in effect is unchanged: '
+                     + ', '.join(self.labels()))
+            self.r.hset(ROSTER, mapping={'rejected': ''})
         if name == 'supervisor':
             text += peer.drain(self)  # [peer CC] / unsolicited / violation notes (docs/design.md §21)
             if self.r.llen(ADVICE_NOTES):
@@ -2226,6 +2243,7 @@ class Fleet:
         if role == 'worker':  # every review inside a fleet follows the fleet copy of the review rules
             scope += REVIEW_POINTER
         scope = scope.replace('{{WORKSPACE}}', str(self.workspace())).replace('{{FLEET_CHROME}}', self.fleet_cmd())
+        scope = scope.replace('{{ROSTER}}', roster_notice(self.cfg))
         sandbox_notice = ('You run inside a sandbox. Driving the user\'s browser directly (AppleScript, GUI automation) '
                           'fails there with an error. That error means the sandbox stopped you, not that the browser '
                           'is broken. Browser actions go only through the broker command below, if enabled.')
@@ -5489,7 +5507,9 @@ class Fleet:
         except ValueError as exc:
             self.log('roster.rejected', level='error', path=str(path), errors=str(exc).split('\n'),
                      kept=self.desired)
+            self.r.hset(ROSTER, mapping={'rejected': str(exc)})  # once per rejected content (digest above)
             return
+        self.r.hset(ROSTER, mapping={'rejected': ''})  # fixed before the supervisor heard of it: say nothing
         before, old_roles = list(self.desired), dict(self.cfg.get('worker_roles') or {})
         adds = [n for n in workers if n not in self.workers]
         results = {n: 'retire cancelled' for n in workers if n in self.workers and n not in self.desired}

@@ -249,6 +249,12 @@ whole directory is copied to `<run>/fleet-config/` and the run follows that copy
   and when idle with an empty queue its screen goes to the history page and its tab is closed. Its
   workspace directory stays. Putting it back in the file before that cancels the removal.
 - **Role change** for an existing worker applies at its next generation; it is not restarted.
+- **The supervisor edits it too**: every supervisor prompt has an "Adding and retiring workers (the roster)"
+  section naming this run's roster file (`{{ROSTER}}`; runs started with `--workers` / `--worker-names` say
+  it is not available). It adds a row `- {name: <role>-<n>, role: <path>}` when more work is ready than free
+  workers, deletes one when a worker has no more work, within the limits of its task brief, and dispatches to
+  a new worker only once it is in a `[Roster change]` list. A rejected edit reaches it as
+  `[Roster rejected] <errors>; the roster in effect is unchanged: <workers>` (once per rejected file).
 - **Rejected as a whole** (roster kept, reasons in the control log as `roster.rejected`): invalid YAML,
   unknown keys, bad or duplicate names, zero workers, a missing role file, or a name already used in
   this run (a removed worker's name cannot come back). Changes are logged as `roster.changed`.
