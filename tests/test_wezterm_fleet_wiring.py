@@ -117,7 +117,7 @@ def test_start_adopted_is_blocked_on_wezterm():
 
 def _roster(tmp):
     (tmp / 'sup.md').write_text('sup\n')
-    (tmp / 'child.yaml').write_text('workers:\n  - name: ops-w1\n')
+    (tmp / 'child.yaml').write_text('workers:\n  - name: ops-1\n')
     path = tmp / 'roster.yaml'
     path.write_text('workers:\n  - name: worker-1\n  - name: worker-2\n'
                     'subfleets:\n  - name: ops\n    supervisor_slot: worker-1\n    supervisor_role: sup.md\n'

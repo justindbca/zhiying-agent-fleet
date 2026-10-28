@@ -196,17 +196,20 @@ requests. The supervisor only routes; each worker can have its own prompt; answe
 the daemon, not by a model.
 
 ```bash
-cmux-fleet start --lifecycle service --worker-names exit,reentry,rung --roles ~/my-roles \
+cmux-fleet start --lifecycle service --worker-names exit-1,reentry-1,rung-1 --roles ~/my-roles \
     --supervisor-cli pi --worker-cli pi --pi-model local/my-model \
     --allow-unsandboxed-pi --allow-development-v2 --max-busy 2 --request-timeout 600
-echo '{"id": "cu-1:r7", "to": "exit", "payload": {...},
+echo '{"id": "cu-1:r7", "to": "exit-1", "payload": {...},
        "reply": {"required": ["verdict", "param", "evidence"], "allowed": ["verdict", "param", "evidence", "note"]}}' \
   | cmux-fleet request -
 cmux-fleet results --drain        # one JSON line per finished request
 cmux-fleet pause --reason "market closed"; cmux-fleet resume
 ```
 
-- `--worker-names`: worker slots named by role (lowercase, no dots; dots mark generations).
+- `--worker-names`: worker slots named by role (lowercase, no dots; dots mark generations). Each name ends
+  with `-<number>` (`proto-1`, not `proto`) so its generations read `proto-1` → `proto-1.1` → `proto-1.2`,
+  like `worker-1` → `worker-1.1`; a new run refuses other names. A run started before this rule keeps its
+  names on `--resume`.
 - `--roles DIR`: `DIR/<agent>.md` is appended to that agent's `AGENTS.md` as "Your role". One prompt per worker.
 - `--supervisor-profile` / `--worker-profile`: separate Codex profiles, e.g. a local model for one side.
 - `--max-busy N`: at most N workers work at once (a local model server may reject concurrent large
@@ -230,9 +233,9 @@ and the daemon re-reads it while the fleet runs:
 
 ```yaml
 workers:
-  - name: exit              # same rules as --worker-names
-    role: roles/exit.md     # optional, relative to the yaml; overrides --roles DIR/exit.md
-  - name: reentry
+  - name: exit-1            # same rules as --worker-names (ends with -<number>)
+    role: roles/exit.md     # optional, relative to the yaml; overrides --roles DIR/exit-1.md
+  - name: reentry-1
 ```
 
 `start --worker-kit KIT --kit-fleet NAME` takes the roster template from `KIT/fleets/NAME/` instead: the
@@ -270,7 +273,7 @@ whole directory is copied to `<run>/fleet-config/` and the run follows that copy
 The session is rotated when `used >= ratio × window`. Each agent resolves `window` and `ratio`
 separately, first hit wins, using its **current** runtime CLI and model (after a profile switch too):
 
-1. the roster worker entry: `{name: exit, window: 1000000, handoff_ratio: 0.7}`;
+1. the roster worker entry: `{name: exit-1, window: 1000000, handoff_ratio: 0.7}`;
 2. the roster `handoff:` table, key `<cli>:<model>` (exact model string) then `<cli>`;
 3. the same `handoff:` table in `config.json` (static);
 4. built-in: Claude models whose name contains `[1m]`, `opus`, `fable` or `sonnet` → 1,000,000; other Claude

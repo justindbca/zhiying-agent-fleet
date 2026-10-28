@@ -108,7 +108,7 @@ supervisor 和 worker 一样按「槽位.代数」命名：supervisor-1 → supe
 
 `start --mode service`：没有目标、没有结束，持续处理一串请求。supervisor 只分派；每个 worker 可以有自己的 prompt（`--roles DIR`，
 `DIR/<名字>.md` 追加进它的 AGENTS.md）；回答必须是一个 JSON 对象，由 daemon 按 `reply.required` / `reply.allowed` 字面校验，
-答错一次给一次更正机会，再错发布为 `invalid`。`--worker-names` 按角色给 worker 命名；`--supervisor-profile` / `--worker-profile`
+答错一次给一次更正机会，再错发布为 `invalid`。`--worker-names` 按角色给 worker 命名（名字以 `-<数字>` 结尾，如 `proto-1`，代数读作 `proto-1.1`）；`--supervisor-profile` / `--worker-profile`
 两边可用不同模型（如本地模型）；`--max-busy N` 限同时干活的 worker 数；`pause` / `resume` 由外部（交易日历等）控制，
 暂停时不投递、不换代，请求照常排队并会超时。命令与字段见英文 README「Service mode」。
 
@@ -118,9 +118,9 @@ supervisor 和 worker 一样按「槽位.代数」命名：supervisor-1 → supe
 
 ```yaml
 workers:
-  - name: exit              # 命名规则同 --worker-names
-    role: roles/exit.md     # 可选，相对 yaml 所在目录；优先于 --roles DIR/exit.md
-  - name: reentry
+  - name: exit-1            # 命名规则同 --worker-names（以 -<数字> 结尾）
+    role: roles/exit.md     # 可选，相对 yaml 所在目录；优先于 --roles DIR/exit-1.md
+  - name: reentry-1
 ```
 
 - **加**：新名字先写进 `config.json`（`latest.json` 指向本 run 时一起写），再用 READY 提示启动，作为标签放到右侧 worker 栏末尾；监工的下一条消息末尾会附上新名单。

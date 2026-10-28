@@ -57,6 +57,7 @@ Fleet agents（一个工作区）
 - 不用工作目录名、模型名覆盖标识；不手工另造一套编号；不靠事后 rename 补救。
 - 原 cmux 标签可能保留 `fx-` 装饰前缀；它不是新的逻辑槽位或代数。
 - 默认使用 `worker-1..N`。原 `--worker-names` 功能保留给**明确指定角色槽位的调用方**；演示或通用会话不得擅自换成 `checker` 等名字。
+- **worker 槽名以 `-<数字>` 结尾（2026-10-28 用户定「所有的 worker，以方便识别名字标识后，也应该加上 -1 的标志」）**：按角色起名也要带编号，如 `proto-1`、`term-iface-1`、`reviewer-1`，代数读作 `proto-1` → `proto-1.1` → `proto-1.2`，与上表 `worker-1` → `worker-1.1` 同形。`roster.SLOT_SUFFIX_RE`（`.*-[0-9]+`）只在**新建槽**的地方查，错一条整份拒收，消息点名条目并给改法（`workers[1] (proto): … rename it proto-1`）：`start --roster` / `--kit-fleet` 名单行、`start --worker-names`（均在 provisioning 前）、§16 热载新增的行、`start --resume --roster` 新增的行、具名子 fleet（§29）**新声明或换了 `roster` 文件**的子名单里的 worker（父 `start` 时查全部条目）。**本 run 已有的名字一律不复查**：续跑（§17）、续跑后首拍重读名单、`fleet advisor on|off` 改名单、本 run 早已声明的子 fleet 再次 up，老名字照常工作。不受此条约束：监工 `supervisor`、顾问 `advisor`（显示名本就是 `supervisor-1` / `advisor` → `advisor-1.1`）、子 fleet 名 `subfleets[].name`（是 fleet 名——会话名 `cmux-fleet:<名字>`、`fx:subfleet:<名字>`、`sub/<名字>/`——不是槽、没有代数；它的 `supervisor_slot` 是父 worker，已随父名单查过）。夜间名单与日间同名（`same_slots`），profile / live 切换不改名，§19 的 `M<n>` 子 fleet 用 `worker-1..N`，都不新增名字。已知缺口：子 fleet 处于 down 期间被改过的子名单，下次 up 时直接按新文件起、不再查名字（up 中改的由子 daemon 自己的 §16 热载查）。
 - 角色 prompt、CLI 类型、模型与 agent 身份是不同概念。改变模型不意味着改名。
 - 重新创建整个 fleet 是新 run，不假装继承旧 run 的代数；旧 run 文件保留，不冒称仍属于新历史页。
 
@@ -416,7 +417,7 @@ metadata-only 模式不改变 runtime/current/generation：安全边界接受首
 
 - 入口：`start --roster <yaml>`，与 `--workers/--worker-names` 互斥；schema 为 `workers: [{name, role?, window?, handoff_ratio?}]`（后两项与顶层 `handoff:` 见 §22），`role` 相对 yaml 目录、优先于 `--roles DIR/<name>.md`。启动时文件不合法直接拒绝启动。不带 `--roster` 的 run 行为不变。
 - 检测：daemon 每次 tick 开头比较文件 mtime/大小，再比内容哈希；名单只在这一处改动，不在逐 slot 循环里改。
-- 整份校验：YAML 错、未知字段、名字不合法/重复、零个 worker、角色文件不存在、本 run 已用过的名字（Redis agent 状态或 workspace 目录已存在）→ 整份拒收，保留当前名单，`roster.rejected` 写入审计（control 可见）并列出每条原因。
+- 整份校验：YAML 错、未知字段、名字不合法/重复、新增名字不以 `-<数字>` 结尾（§3，本 run 已有的不查）、零个 worker、角色文件不存在、本 run 已用过的名字（Redis agent 状态或 workspace 目录已存在）→ 整份拒收，保留当前名单，`roster.rejected` 写入审计（control 可见）并列出每条原因。
 - 加：先写 `config.json`（`latest.json` 指向本 run 时同步）再启动——钩子/桥按配置文件校验成员；Redis 字段与 `start_all` 相同，READY 提示相同，标签放进右侧 worker 栏末尾（无 worker 时放 supervisor 右侧），刷新历史页。
 - 卸：标记退役中——不再是派活目标（决策/请求/路由校验、profile 分配都排除），但仍计入 `max_busy` 与“有 worker 在忙”；空闲且队列空、v2 无在途投递时，按换代同样的方式存屏、关闭旧 tab（v2 `retire`），从名单删除并写回配置。工作目录保留，历史页继续可查。退役完成前写回文件即取消。
 - 只改 `role`：下一代生效，不重启。

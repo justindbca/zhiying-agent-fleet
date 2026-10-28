@@ -114,7 +114,7 @@ def test_start_checks_night_roster_before_provisioning(monkeypatch, tmp_path, pa
           ('codex', 'pi', 'task', 'unverified', (), {'reason': 'transport v2 mixed Pi/Codex fleets are unvalidated'}))
     base = ['start', '--lifecycle', 'dev_task', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--allow-development-v2']
     day = tmp_path / 'day.yaml'
-    day.write_text('workers:\n  - name: exit\n')
+    day.write_text('workers:\n  - name: exit-1\n')
     bad = tmp_path / 'bad.yaml'
     bad.write_text('workers:\n  - {name: other, profile: claude-coder}\n')
     with pytest.raises(SystemExit, match='needs --roster'):
@@ -122,7 +122,7 @@ def test_start_checks_night_roster_before_provisioning(monkeypatch, tmp_path, pa
     with pytest.raises(SystemExit, match='same worker names'):
         fleet.main(base + ['--roster', str(day), '--night-roster', str(bad)])
     pi = tmp_path / 'pi.yaml'
-    pi.write_text('workers:\n  - {name: exit, profile: flashnext-coder}\n')
+    pi.write_text('workers:\n  - {name: exit-1, profile: flashnext-coder}\n')
     with pytest.raises(SystemExit, match='mixed Pi/'):
         fleet.main(base + ['--roster', str(day), '--night-roster', str(pi)])
 
@@ -217,13 +217,13 @@ def test_added_worker_starts_on_its_roster_profile_without_a_swap(hot):
     f = hot
     path = f.run_dir / 'roster.yaml'
     path.write_text('workers:\n' + ''.join('  - name: ' + w + '\n' for w in WORKERS)
-                    + '  - {name: extra, profile: claude-coder}\n')
+                    + '  - {name: extra-1, profile: claude-coder}\n')
     os.utime(path, ns=(f.test_stamp + 5, f.test_stamp + 5))
     f.tick()
-    info = f.agent('extra')
-    assert info['label'] == 'extra' and info['roster_profile'] == 'claude-coder' and info['generation'] == '0'
+    info = f.agent('extra-1')
+    assert info['label'] == 'extra-1' and info['roster_profile'] == 'claude-coder' and info['generation'] == '0'
     assert f.mgr.spawned[-1]['metadata']['profile'] == 'opus'
-    assert fleet.load(f.path)['worker_profiles'] == {'extra': 'claude-coder'}
+    assert fleet.load(f.path)['worker_profiles'] == {'extra-1': 'claude-coder'}
     f.tick()
     assert not audits(f, 'roster.profile_switched')
 

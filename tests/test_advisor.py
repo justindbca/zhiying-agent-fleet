@@ -581,9 +581,9 @@ def test_start_advisor_flag_only_writes_the_roster(monkeypatch, tmp_path):
     raw = (Path(latest['run']) / 'roster.yaml').read_bytes()
     assert roster.advisor(raw) is True and roster.parse(raw, Path(latest['run']))[0] == ['worker-1', 'worker-2']
     own = tmp_path / 'team.yaml'
-    own.write_text('# my team\nworkers:\n  - name: exit\n')
+    own.write_text('# my team\nworkers:\n  - name: exit-1\n')
     fleet.main(argv + ['--advisor', '--roster', str(own)])
-    assert own.read_text() == '# my team\nworkers:\n  - name: exit\nadvisor: on\n'  # edited in place, comment kept
+    assert own.read_text() == '# my team\nworkers:\n  - name: exit-1\nadvisor: on\n'  # edited in place, comment kept
     fleet.main(argv)
     assert not (Path(fleet.load(tmp_path / 'latest.json')['run']) / 'roster.yaml').exists()  # not passed: no roster
 

@@ -319,7 +319,7 @@ def test_start_without_profiles_refuses_more_default_slots_than_the_card_allows(
         fleet.main(['start', '--lifecycle', 'dev_task', '--supervisor-cli', 'pi', '--worker-cli', 'pi', '--workers', '3',
                     '--pi-model', REG.model('flashnext').model, '--allow-development-v2'])
     with pytest.raises(SystemExit, match='exceed max_concurrent 1'):
-        fleet.main(['start', '--lifecycle', 'dev_task', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--worker-names', 'a,b',
+        fleet.main(['start', '--lifecycle', 'dev_task', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--worker-names', 'a-1,b-1',
                     '--worker-model', REG.model('fable').model, '--allow-development-v2'])
 
 

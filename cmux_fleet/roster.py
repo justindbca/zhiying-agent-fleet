@@ -1,9 +1,9 @@
 """Worker roster YAML: which worker slots this fleet runs, and their optional role files.
 
     workers:
-      - name: exit            # required; same rules as --worker-names
+      - name: exit-1          # required; same rules as --worker-names (a new slot ends with -<number>)
         role: roles/exit.md   # optional; relative to this file's directory
-      - name: reentry
+      - name: reentry-1
         window: 1000000       # optional handoff overrides for this worker (docs/design.md §22)
         handoff_ratio: 0.7
         profile: flashnext-coder  # optional agent card id: this slot's next generation runs that card
@@ -14,8 +14,8 @@
       claude:opus: {window: 1000000}
       codex: {ratio: 0.6}
     advisor: off              # optional, default off: on = consult the advisor before every dispatch
-    subfleets:                # optional named sub-fleets (docs/design.md §29); worker ``exit`` supervises one
-      - {name: ops, supervisor_slot: exit, supervisor_role: roles/ops-sup.md, roster: ops.yaml, autostart: false}
+    subfleets:                # optional named sub-fleets (docs/design.md §29); worker ``exit-1`` supervises one
+      - {name: ops, supervisor_slot: exit-1, supervisor_role: roles/ops-sup.md, roster: ops.yaml, autostart: false}
     tabs:                     # optional companion tabs (docs/design.md §31): terminal programs (no agents)
       - {name: shell, command: python3 -m http.server 8895, cwd: ., env: {PORT: '8895'}}
                               # opened with this fleet, as tabs after control
@@ -33,6 +33,35 @@ from pathlib import Path
 
 NAME_RE = r'[a-z][a-z0-9-]{0,30}'  # same as fleet.WORKER_NAME_RE: no dots (dots mark generations)
 PROFILE_RE = r'[a-z][a-z0-9-]{0,63}'  # same as agent_registry.AGENT_ID_RE
+# A new worker slot's name ends with -<number> (docs/design.md §3, 2026-10-28): generations read proto-1 ->
+# proto-1.1 like worker-1 -> worker-1.1. Checked only where a slot is first created (start, an added row);
+# names a run already has are never re-checked, so resume and the stored roster keep working.
+SLOT_SUFFIX_RE = r'.*-[0-9]+'
+
+
+def suffix_errors(names, keep=(), where=None):
+    """One message per name in ``names`` (not in ``keep``) without the -<number> suffix. ``where(i, name)``
+    labels the entry (default: the name)."""
+    return [(where(i, n) if where else n) + ': a worker name must end with -<number> so its generations read '
+            + n + '-1, ' + n + '-1.1, ...; rename it ' + n + '-1'
+            for i, n in enumerate(names) if n not in keep and not re.fullmatch(SLOT_SUFFIX_RE, n)]
+
+
+def row_errors(names, keep=()):
+    """suffix_errors for the rows of a roster that passed parse_entries (its order is the file's)."""
+    return suffix_errors(names, keep, lambda i, n: 'workers[' + str(i) + '] (' + n + ')')
+
+
+def subfleet_suffix_errors(entries, known=()):
+    """row_errors of each sub-fleet roster that is new or retargeted (not in ``known``, the entries this run
+    already declared): its workers become slots when it comes up."""
+    seen = {(e['name'], e['roster']) for e in known or ()}
+    errors = []
+    for i, entry in enumerate(entries):
+        if (entry['name'], entry['roster']) not in seen:
+            errors += ['subfleets[' + str(i) + '] (' + entry['name'] + '): sub-fleet roster ' + entry['roster']
+                       + ': ' + e for e in row_errors(load_entries(entry['roster'])[0])]
+    return errors
 
 
 def parse(raw, base):

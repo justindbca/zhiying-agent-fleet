@@ -23,7 +23,7 @@ SUP_ROLE = 'You are the ops sub-fleet supervisor. ROLE-MARKER-OPS.\n'
 
 def write_roster(tmp, autostart=False, declare=True, bump=0):
     (tmp / 'sup.md').write_text(SUP_ROLE)
-    (tmp / 'child.yaml').write_text('workers:\n  - name: ops-w1\n')
+    (tmp / 'child.yaml').write_text('workers:\n  - name: ops-1\n')
     body = 'workers:\n  - name: worker-1\n  - name: worker-2\n'
     if declare:
         body += ('subfleets:\n  - name: ops\n    supervisor_slot: worker-1\n    supervisor_role: sup.md\n'
@@ -302,7 +302,7 @@ def test_hot_added_supervisor_slot_spawns_in_tmux_from_its_first_generation(tmp_
     try:
         f = t.f
         (tmp_path / 'sup.md').write_text(SUP_ROLE)
-        (tmp_path / 'child.yaml').write_text('workers:\n  - name: ops-w1\n')
+        (tmp_path / 'child.yaml').write_text('workers:\n  - name: ops-1\n')
         path = tmp_path / 'roster.yaml'
         path.write_text('workers:\n  - name: worker-1\n  - name: worker-2\n  - name: worker-3\n'
                         'subfleets:\n  - name: ops\n    supervisor_slot: worker-3\n    supervisor_role: sup.md\n'

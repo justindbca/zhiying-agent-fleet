@@ -5464,6 +5464,12 @@ class Fleet:
                     and (self.r.exists(key('agent', n)) or (self.workspace() / n).exists())]
             if used:
                 raise ValueError('\n'.join(used))
+            # An added slot (or a newly declared / retargeted sub-fleet's workers) ends with -<number> (§3);
+            # the run's own names, old style or not, are never re-checked here.
+            problems = roster.row_errors(workers, keep=self.workers) + roster.subfleet_suffix_errors(
+                subfleets, self.cfg.get('subfleets'))
+            if problems:
+                raise ValueError('\n'.join(problems))
             # Added rows without a profile run the fleet default: its model card caps them with the
             # live slots (C). Rows with a profile are counted by night.resolve_launches (B).
             pi_models, pi_thinkings = roster.pi_settings(raw)
@@ -6422,7 +6428,12 @@ def resume(run, args):
     if args.roster:  # applied by the normal hot-reload on the daemon's first tick
         roster_path = Path(args.roster).expanduser().resolve()
         try:
-            roster.load(roster_path)
+            workers = roster.load(roster_path)[0]
+            # Only added slots and newly declared sub-fleets need -<number> (§3): stored names are kept
+            problems = roster.row_errors(workers, keep=cfg.get('workers') or ()) + roster.subfleet_suffix_errors(
+                roster.load_subfleets(roster_path), cfg.get('subfleets'))
+            if problems:
+                raise ValueError('\n'.join(problems))
         except (OSError, ValueError) as exc:
             raise SystemExit('--roster ' + str(roster_path) + ' rejected:\n' + str(exc)) from exc
         cfg['roster'] = str(roster_path)
@@ -6624,6 +6635,10 @@ def start(args):
         probe = dict(DEFAULTS, **{k: v for k, v in vars(args).items() if v is not None})
         try:
             workers, worker_roles, worker_profiles = roster.load_entries(roster_path)
+            # New slots end with -<number> (docs/design.md §3), a declared sub-fleet's workers too
+            problems = roster.row_errors(workers) + roster.subfleet_suffix_errors(roster.load_subfleets(roster_path))
+            if problems:
+                raise ValueError('\n'.join(problems))
             launches = list(night.resolve_launches(probe, worker_profiles, workers).values())
             roster_pi = roster.pi_settings(roster_path.read_bytes())
             problem = roster.pi_cli_problem(*roster_pi, args.worker_cli)
@@ -6644,6 +6659,10 @@ def start(args):
             except (OSError, ValueError) as exc:
                 raise SystemExit('--night-roster: ' + str(exc)) from exc
         profile_clis = {launch['overrides']['worker_cli'] for launch in launches}
+    elif args.worker_names:  # new slots end with -<number> (docs/design.md §3), checked before provisioning
+        problems = roster.suffix_errors(args.worker_names.split(','), where=lambda i, n: '--worker-names: ' + n)
+        if problems:
+            raise SystemExit('\n'.join(problems))
     if lifecycle_problem:
         raise SystemExit(lifecycle_problem)
     gate = lifecycle.clock_gate_problem(args.lifecycle)
@@ -7059,7 +7078,8 @@ def cli():
                    help='this machine for agent-card hosts (e.g. studio); unset = cards are not filtered by host')
     s.add_argument('--mode', choices=('task', 'service'), default=None,
                    help='transport mode, derived from --lifecycle (base); passing a different one is refused')
-    s.add_argument('--worker-names', help='comma-separated worker names (default worker-1..N), e.g. exit,reentry,rung')
+    s.add_argument('--worker-names', help='comma-separated worker names (default worker-1..N), each ending with '
+                   '-<number>, e.g. exit-1,reentry-1,rung-1')
     s.add_argument('--roster', help='worker roster YAML (workers: [{name, role?}]); edits while running add or '
                                     'retire workers. Replaces --workers / --worker-names')
     s.add_argument('--kit-fleet', metavar='NAME',

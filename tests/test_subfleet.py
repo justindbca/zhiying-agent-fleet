@@ -1066,7 +1066,7 @@ SUP_ROLE = 'You are the ops sub-fleet supervisor. ROLE-MARKER-OPS.\n'
 
 def write_roster(t, autostart=False, declare=True, extra=''):
     (t.tmp / 'sup.md').write_text(SUP_ROLE)
-    (t.tmp / 'child.yaml').write_text('workers:\n  - name: ops-w1\n')
+    (t.tmp / 'child.yaml').write_text('workers:\n  - name: ops-1\n')
     body = 'workers:\n  - name: worker-1\n  - name: worker-2\n'
     if declare:
         body += ('subfleets:\n  - name: ops\n    supervisor_slot: worker-1\n    supervisor_role: sup.md\n'
@@ -1248,7 +1248,7 @@ def test_named_child_with_clear_and_typed_delivery_runs_with_its_own_switches(sv
     assert (child_cfg['clear_after_result'], child_cfg['clear_timeout'], child_cfg['claude_hook_delivery']) \
         == (True, 30, False)
     assert runtime_v2.validate_config(child_cfg) == 2
-    assert clear_after_result.enabled(child_cfg, 'ops-w1')
+    assert clear_after_result.enabled(child_cfg, 'ops-1')
     loose = dict(child_cfg, named=None)  # outside a named child, lifecycle None still refuses §28
     with pytest.raises(ValueError):
         clear_after_result.validate(loose)
@@ -1315,7 +1315,7 @@ def test_named_child_roster_has_its_own_advisor_switch_default_off(svc, switch):
     t, f = svc, svc.f
     f.cfg['advisor'] = True  # the parent's own (in-memory) switch is on
     path = write_roster(t)
-    (t.tmp / 'child.yaml').write_text('workers:\n  - name: ops-w1\n' + switch)
+    (t.tmp / 'child.yaml').write_text('workers:\n  - name: ops-1\n' + switch)
     f.cfg['roster'] = str(path)
     f.roster_tick()
     rid, answer = ask(t, 'up')
@@ -1329,7 +1329,7 @@ def test_named_child_roster_has_its_own_advisor_switch_default_off(svc, switch):
     assert cf.advisor_online() is on
     assert (cf.r.hget(fleet.SERVICE, 'advisor') == 'on') is on
     # advisor on: the child's Claude worker starts held for its first configuration sheet (§27)
-    assert (cf.agent('ops-w1').get('launch_ready') == '0') is on
+    assert (cf.agent('ops-1').get('launch_ready') == '0') is on
 
 
 def test_named_child_roster_advisor_value_is_checked_with_the_parent_roster(tmp_path):
@@ -1355,7 +1355,7 @@ def test_external_up_is_gated_approved_and_answered_with_the_child_address(svc):
     assert res['status'] == 'ok' and res['state'] == 'up' and res['redis_socket'] == child_cfg['redis_socket']
     assert res['run_dir'] == str(f.run_dir / 'sub' / 'ops')
     assert f.agent('worker-1')['state'] == 'delegated' and child_cfg['mode'] == 'service'
-    assert child_cfg['lifecycle'] is None and child_cfg['workers'] == ['ops-w1']
+    assert child_cfg['lifecycle'] is None and child_cfg['workers'] == ['ops-1']
     assert 'ROLE-MARKER-OPS' in (fleet.agent_cwd(f.cfg, 'worker-1') / 'AGENTS.md').read_text()
     # up again (new id): answered by the program from state, same address
     again, _ = ask(t, 'up')
@@ -1777,3 +1777,22 @@ def test_child_self_pause_shows_as_paused_in_the_parent_hash(svc):
     cf.resume()
     subfleet.tick(f)
     assert named_subfleet.state(f, 'ops')['state'] == 'up'
+
+
+def test_child_roster_names_need_a_number_when_declared_not_when_already_declared(svc):
+    # docs/design.md §3 (2026-10-28): the child roster's workers become slots when the sub-fleet comes up.
+    # A newly declared entry is checked; an entry the run already declared (stored before the rule) is not.
+    t, f = svc, svc.f
+    (t.tmp / 'legacy.yaml').write_text('workers:\n  - name: analyst\n')
+    ops2 = '  - {name: ops2, supervisor_slot: worker-2, supervisor_role: sup.md, roster: legacy.yaml}\n'
+    path = write_roster(t, extra=ops2)
+    f.roster_tick()
+    rejected = [x for _, x in f.r.xrange(f.v2.bus.audit_key) if x.get('event') == 'roster.rejected']
+    errors = json.loads(rejected[-1]['errors'])
+    assert any(e.startswith('subfleets[1] (ops2): ') and 'workers[0] (analyst)' in e and 'rename it analyst-1' in e
+               for e in errors)
+    assert 'ops2' not in named_subfleet.declared(f) and 'ops' in named_subfleet.declared(f)
+    f.cfg['subfleets'] = roster.load_subfleets(path)  # a run that declared ops2 before the rule
+    f.roster_stamp = f.roster_digest = None  # the daemon's first tick after a resume re-reads the roster
+    f.roster_tick()
+    assert 'ops2' in named_subfleet.declared(f)

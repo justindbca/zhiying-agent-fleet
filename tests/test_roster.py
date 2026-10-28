@@ -56,34 +56,34 @@ def test_yaml_add_spawns_persists_and_takes_v2_delivery(hot, monkeypatch, tmp_pa
     (f.run_dir / 'roles').mkdir()
     (f.run_dir / 'roles' / 'reviewer.md').write_text('Review diffs only.')
     spawned = len(f.mgr.spawned)
-    write_roster(f, WORKERS + [('reviewer', 'roles/reviewer.md')])
+    write_roster(f, WORKERS + [('reviewer-1', 'roles/reviewer.md')])
     f.tick()
-    assert f.workers == WORKERS + ['reviewer'] and f.names[-1] == 'reviewer'
+    assert f.workers == WORKERS + ['reviewer-1'] and f.names[-1] == 'reviewer-1'
     assert len(f.mgr.spawned) == spawned + 1                     # only the new worker starts
     for cfg in (fleet.load(f.path), fleet.load(latest)):         # hooks read membership from disk
-        assert cfg['workers'] == WORKERS + ['reviewer']
-        assert cfg['worker_roles'] == {'reviewer': str((f.run_dir / 'roles' / 'reviewer.md').resolve())}
-    info = f.agent('reviewer')
-    assert info['label'] == 'reviewer' and info['state'] == 'starting' and info['generation'] == '0'
-    assert f.r.hget(fleet.NAMES, 'reviewer') == 'reviewer'
+        assert cfg['workers'] == WORKERS + ['reviewer-1']
+        assert cfg['worker_roles'] == {'reviewer-1': str((f.run_dir / 'roles' / 'reviewer.md').resolve())}
+    info = f.agent('reviewer-1')
+    assert info['label'] == 'reviewer-1' and info['state'] == 'starting' and info['generation'] == '0'
+    assert f.r.hget(fleet.NAMES, 'reviewer-1') == 'reviewer-1'
     new_pane, peer = f.mgr.tabbed[-1]                               # a tab at the end of the worker column
     assert new_pane == info['pane'] and peer in [f.agent(w)['pane'] for w in WORKERS]
-    assert 'Review diffs only.' in (fleet.agent_cwd(f.cfg, 'reviewer') / 'CLAUDE.md').read_text()
-    assert 'reviewer' in control_view.snapshot(fleet.load(f.path))['slots']
+    assert 'Review diffs only.' in (fleet.agent_cwd(f.cfg, 'reviewer-1') / 'CLAUDE.md').read_text()
+    assert 'reviewer-1' in control_view.snapshot(fleet.load(f.path))['slots']
     changed, = audits(f, 'roster.changed')
-    assert json.loads(changed['results']) == {'reviewer': 'added'}
+    assert json.loads(changed['results']) == {'reviewer-1': 'added'}
     # READY through the real Claude Stop hook, then a normal v2 delivery.
-    f.test_threads['reviewer'] = str(uuid.uuid4())
-    assert answer_turn(f, 'reviewer', 'READY', startup=True)['status'] == 'ready'
+    f.test_threads['reviewer-1'] = str(uuid.uuid4())
+    assert answer_turn(f, 'reviewer-1', 'READY', startup=True)['status'] == 'ready'
     submit(f)
     prompt = typed(f, 'supervisor')[-1]
-    assert 'reviewer' in prompt.split('Workers you can dispatch to: ')[1].split('\n')[0]
-    assert '[Roster change] Workers you can dispatch to now: ' in prompt and prompt.rstrip().endswith('reviewer')
-    assert answer_turn(f, 'supervisor', decision(['reviewer']))['status'] == 'committed'
+    assert 'reviewer-1' in prompt.split('Workers you can dispatch to: ')[1].split('\n')[0]
+    assert '[Roster change] Workers you can dispatch to now: ' in prompt and prompt.rstrip().endswith('reviewer-1')
+    assert answer_turn(f, 'supervisor', decision(['reviewer-1']))['status'] == 'committed'
     f.pump()
-    text, = typed(f, 'reviewer')
-    assert 'Write reviewer/part.md' in text and f.v2.bus.slot_state('reviewer')['status'] == 'received'
-    assert answer_turn(f, 'reviewer', REPORT.format(w='reviewer'))['status'] == 'committed'
+    text, = typed(f, 'reviewer-1')
+    assert 'Write reviewer-1/part.md' in text and f.v2.bus.slot_state('reviewer-1')['status'] == 'received'
+    assert answer_turn(f, 'reviewer-1', REPORT.format(w='reviewer-1'))['status'] == 'committed'
 
 
 def test_yaml_remove_waits_for_busy_worker_then_retires(hot):
@@ -186,13 +186,13 @@ def test_invalid_roster_is_rejected_whole_and_roster_kept(hot, text, reason):
 
 def test_previously_used_name_is_rejected(hot):
     f = hot
-    (f.workspace() / 'old-one').mkdir()
-    write_roster(f, WORKERS + ['old-one', 'fresh'])
+    (f.workspace() / 'old-1').mkdir()
+    write_roster(f, WORKERS + ['old-1', 'fresh-1'])
     f.tick()
     rejected, = audits(f, 'roster.rejected')
     errors = json.loads(rejected['errors'])
-    assert len(errors) == 1 and errors[0].startswith('old-one: name was already used')
-    assert f.workers == WORKERS and 'fresh' not in disk_workers(f)  # whole change rejected
+    assert len(errors) == 1 and errors[0].startswith('old-1: name was already used')
+    assert f.workers == WORKERS and 'fresh-1' not in disk_workers(f)  # whole change rejected
 
 
 def test_retired_name_cannot_come_back(hot):
@@ -208,13 +208,13 @@ def test_retired_name_cannot_come_back(hot):
 def test_failed_spawn_then_removal_retires_without_pausing(hot):
     f = hot
     f.mgr.spawn_interactive_cli = lambda **kw: types.SimpleNamespace(success=False, pane_id=None, error='boom')
-    write_roster(f, WORKERS + ['extra'])
+    write_roster(f, WORKERS + ['extra-1'])
     f.tick()
-    assert 'spawn failed' in json.loads(audits(f, 'roster.changed')[-1]['results'])['extra']
-    assert f.agent('extra')['state'] == 'dead'
+    assert 'spawn failed' in json.loads(audits(f, 'roster.changed')[-1]['results'])['extra-1']
+    assert f.agent('extra-1')['state'] == 'dead'
     write_roster(f, WORKERS)
     f.tick()
-    assert 'extra' not in f.workers and f.agent('extra')['state'] == 'retired' and not f.paused()
+    assert 'extra-1' not in f.workers and f.agent('extra-1')['state'] == 'retired' and not f.paused()
 
 
 def test_roster_parse_resolves_role_relative_to_file(tmp_path):
@@ -259,11 +259,11 @@ def test_added_rows_on_a_capped_default_model_are_rejected_whole(hot):
     from cmux_fleet.agent_registry import AgentRegistry
     f = hot
     f.cfg['worker_model'] = AgentRegistry().model('fable').model
-    write_roster(f, WORKERS + ['fresh'])
+    write_roster(f, WORKERS + ['fresh-1'])
     f.tick()
     rejected, = audits(f, 'roster.rejected')
     assert any('exceed max_concurrent 1' in e for e in json.loads(rejected['errors']))
-    assert f.workers == WORKERS and 'fresh' not in disk_workers(f)
+    assert f.workers == WORKERS and 'fresh-1' not in disk_workers(f)
 
 
 def test_rotation_whose_old_tab_survives_records_the_launch_it_ran(hot, monkeypatch):
@@ -281,3 +281,98 @@ def test_rotation_whose_old_tab_survives_records_the_launch_it_ran(hot, monkeypa
     f.finish_rotation('worker-1')
     info = f.agent('worker-1')
     assert info['state'] == 'dead' and info['retired_pane'] == old and info['retired_launch'] == ran
+
+
+# ------------------------------------------------------------------ worker names end with -<number> (§3, 2026-10-28)
+def test_start_rejects_a_roster_worker_name_without_a_number(monkeypatch, tmp_path):
+    no_provisioning(monkeypatch)
+    base = ['start', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--allow-development-v2']
+    bad = tmp_path / 'bad.yaml'
+    bad.write_text('workers:\n  - name: worker-1\n  - name: proto\n  - name: term-iface\n')
+    with pytest.raises(SystemExit) as exc:
+        fleet.main(base + ['--roster', str(bad)])
+    text = str(exc.value)
+    assert 'workers[1] (proto): ' in text and 'rename it proto-1' in text and 'proto-1.1' in text
+    assert 'workers[2] (term-iface): ' in text and 'rename it term-iface-1' in text
+    assert 'worker-1)' not in text  # the default name complies
+
+
+def test_start_rejects_worker_names_without_a_number(monkeypatch):
+    no_provisioning(monkeypatch)
+    base = ['start', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--allow-development-v2']
+    with pytest.raises(SystemExit, match=r'--worker-names: rung: .*rename it rung-1'):
+        fleet.main(base + ['--worker-names', 'exit-1,rung'])
+
+
+def test_start_rejects_a_sub_fleet_roster_worker_without_a_number(monkeypatch, tmp_path):
+    no_provisioning(monkeypatch)
+    (tmp_path / 'sup.md').write_text('x')
+    (tmp_path / 'child.yaml').write_text('workers:\n  - name: analyst\n')
+    path = tmp_path / 'r.yaml'
+    path.write_text('workers:\n  - name: worker-1\nsubfleets:\n'
+                    '  - {name: ops, supervisor_slot: worker-1, supervisor_role: sup.md, roster: child.yaml}\n')
+    base = ['start', '--supervisor-cli', 'codex', '--worker-cli', 'claude', '--allow-development-v2']
+    with pytest.raises(SystemExit, match=r'subfleets\[0\] \(ops\): .*workers\[0\] \(analyst\): .*rename it analyst-1'):
+        fleet.main(base + ['--roster', str(path)])
+
+
+def test_hot_added_worker_without_a_number_is_rejected_whole(hot):
+    f = hot
+    write_roster(f, WORKERS + ['fresh'])
+    f.tick()
+    rejected, = audits(f, 'roster.rejected')
+    errors = json.loads(rejected['errors'])
+    assert errors == [e for e in errors if 'workers[6] (fresh)' in e] and 'rename it fresh-1' in errors[0]
+    assert f.workers == WORKERS and 'fresh' not in disk_workers(f)
+    write_roster(f, WORKERS + ['fresh-1'])
+    f.tick()
+    assert 'fresh-1' in f.workers and 'fresh-1' in disk_workers(f)
+
+
+def test_a_suffixed_roster_name_rotates_to_name_dot_generation(hot):
+    f = hot
+    write_roster(f, WORKERS + ['proto-1'])
+    f.tick()
+    assert f.label('proto-1') == 'proto-1'
+    draft = f.run_dir / 'draft-h1.md'
+    draft.write_text('x')
+    f.setf('proto-1', handoff_id='h1', handoff_draft=str(draft), handoff_mtime=0)
+    f.finish_rotation('proto-1')
+    info = f.agent('proto-1')
+    assert info['generation'] == '1' and info['label'] == 'proto-1.1' and f.label('proto-1') == 'proto-1.1'
+    assert f.r.hget(fleet.NAMES, 'proto-1.1') == 'proto-1'  # the new label routes to the same slot
+
+
+LEGACY = ['proto', 'term-iface']  # a run started before the rule
+
+
+@pytest.fixture
+def legacy_names(monkeypatch):
+    import test_v2_codex_claude
+    monkeypatch.setattr(test_v2_codex_claude, 'WORKERS', LEGACY)
+
+
+@pytest.fixture
+def legacy(legacy_names, mixed):  # noqa: F811
+    f = mixed
+    assert f.workers == LEGACY
+    path = write_roster(f, LEGACY)
+    f.cfg['roster'] = str(path)
+    fleet.save(f.path, dict(fleet.load(f.path), roster=str(path)))
+    return f
+
+
+def test_a_run_with_old_style_names_keeps_them_on_reload_and_only_new_names_are_checked(legacy):
+    f = legacy
+    f.roster_tick()  # the daemon's first tick after a resume re-reads the stored roster
+    assert not audits(f, 'roster.rejected') and f.workers == f.desired == LEGACY
+    roster.write_advisor(f.cfg['roster'], False, f.workers)  # `fleet advisor off` still writes that roster
+    write_roster(f, LEGACY + ['extra'])
+    f.tick()
+    rejected, = audits(f, 'roster.rejected')
+    errors = json.loads(rejected['errors'])
+    assert len(errors) == 1 and errors[0].startswith('workers[2] (extra): ') and 'rename it extra-1' in errors[0]
+    assert f.workers == LEGACY
+    write_roster(f, LEGACY + ['extra-1'])
+    f.tick()
+    assert f.workers == LEGACY + ['extra-1'] and len(audits(f, 'roster.rejected')) == 1
