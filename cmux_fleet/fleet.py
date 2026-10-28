@@ -1649,6 +1649,9 @@ def actor_argv(cfg_path, cfg, name, generation, prompt):
             '-c', 'notify=' + json.dumps(callback),
             '-c', 'developer_instructions=' + json.dumps(
                 'Your role, rules and reply format are in AGENTS.md in the current directory. Follow it.')]
+    if name == 'supervisor' and cfg.get('roster'):  # it edits the roster to add / retire workers (§16)
+        roots = list(dict.fromkeys(str(Path(cfg[k]).parent) for k in ('roster', 'roster_night') if cfg.get(k)))
+        argv += ['-c', 'sandbox_workspace_write.writable_roots=' + json.dumps(roots)]
     if cfg.get('codex_model'):
         argv += ['--model', cfg['codex_model']]
     if cfg.get('compact_limit'):

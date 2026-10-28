@@ -254,7 +254,8 @@ whole directory is copied to `<run>/fleet-config/` and the run follows that copy
   it is not available). It adds a row `- {name: <role>-<n>, role: <path>}` when more work is ready than free
   workers, deletes one when a worker has no more work, within the limits of its task brief, and dispatches to
   a new worker only once it is in a `[Roster change]` list. A rejected edit reaches it as
-  `[Roster rejected] <errors>; the roster in effect is unchanged: <workers>` (once per rejected file).
+  `[Roster rejected] <errors>; the roster in effect is unchanged: <workers>` (once per rejected file). A Codex
+  supervisor's sandbox gets the roster's directory as a writable root.
 - **Rejected as a whole** (roster kept, reasons in the control log as `roster.rejected`): invalid YAML,
   unknown keys, bad or duplicate names, zero workers, a missing role file, or a name already used in
   this run (a removed worker's name cannot come back). Changes are logged as `roster.changed`.

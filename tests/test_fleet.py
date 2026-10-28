@@ -543,6 +543,18 @@ def test_actor_argv_is_configurable_and_pins_notify_generation(tmp_path):
     assert fleet.actor_argv(tmp_path / 'c.json', {'python': 'py'}, 'w', 0, 'x')[:3] == ['codex', '--profile', 'fleet']
 
 
+def test_codex_supervisor_may_write_the_roster_directories_only(tmp_path):
+    """A Codex supervisor edits the roster to add / retire workers (2026-10-28): its sandbox gets the roster's
+    directory (and the night roster's) as writable roots; workers and roster-less runs get none."""
+    day, night = tmp_path / 'cfg' / 'roster.yaml', tmp_path / 'night' / 'night.yaml'
+    cfg = {'python': 'py', 'roster': str(day), 'roster_night': str(night)}
+    roots = [a for a in fleet.actor_argv('c', cfg, 'supervisor', 0, 'p')
+             if a.startswith('sandbox_workspace_write.writable_roots=')]
+    assert roots == ['sandbox_workspace_write.writable_roots=' + json.dumps([str(day.parent), str(night.parent)])]
+    assert not any('writable_roots' in a for a in fleet.actor_argv('c', cfg, 'worker-1', 0, 'p'))
+    assert not any('writable_roots' in a for a in fleet.actor_argv('c', {'python': 'py'}, 'supervisor', 0, 'p'))
+
+
 def test_rotated_worker_gets_next_name_and_old_name_still_routes(fx):
     fx.pump(); fx.handle(turn('supervisor', decision())); fx.pump()
     fx.handle(turn('worker-1', 'Done: step one'))
