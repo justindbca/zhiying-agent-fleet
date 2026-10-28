@@ -93,11 +93,28 @@ def test_a_consult_on_the_worker_answers_it(mixed):
     assert f.task()['bad_replies'] == '0' and KEY not in escalations(f)
 
 
-def test_answer_and_dispatch_together_is_a_bad_reply(mixed):
+def test_answer_and_dispatch_together_the_dispatch_answers_it(mixed):
+    # Was a bad reply; a rotated supervisor did this twice and the strikes blocked a run (2026-10-28).
     f = mixed
     stuck(f)
     ruling(f, 'approve', 'go', dispatch=[{'to': 'worker-1', 'instruction': 'Write worker-1/part2.md please now.'}])
-    assert f.task()['bad_replies'] == '1' and escalations(f)[KEY]['status'] == 'escalated'
+    assert f.task()['bad_replies'] == '0' and KEY not in escalations(f)
+    f.pump()
+    got = typed(f, 'worker-1')[-1]
+    assert 'Write worker-1/part2.md please now.' in got and not got.startswith('[Supervisor ruling]')
+    assert not any('[Supervisor ruling]' in x for x in typed(f, 'worker-1'))
+
+
+def test_correction_goes_before_reports_already_queued_for_the_supervisor(mixed):
+    # Queued behind them it arrived stale, about a reply already replaced (2026-10-28, the third strike).
+    f = mixed
+    stuck(f)
+    f.queue('supervisor', '[worker-2 report] a later report that arrived meanwhile')
+    ruling(f, 'revise')  # revise without a note: a bad reply
+    assert f.task()['bad_replies'] == '1'
+    f.pump()
+    got = typed(f, 'supervisor')[-1]
+    assert 'not a valid decision JSON' in got and 'a later report' not in got
 
 
 def test_unanswered_blocked_is_sent_back_once_without_a_strike_then_counts(mixed):

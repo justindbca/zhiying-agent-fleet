@@ -2062,7 +2062,8 @@ class Fleet:
         self.r.ltrim(LOG, -2000, -1)
         print(time.strftime('%H:%M:%S'), kind, json.dumps(data, ensure_ascii=False)[:180], flush=True)
 
-    def queue(self, name, text):
+    def queue(self, name, text, front=False):
+        """``front`` (v2): deliver before what is already queued (a correction of the reply just given)."""
         if name == 'supervisor' and self.r.hget(ROSTER, 'notify') == '1':
             # Appended, never prepended: the queue parses request/task headers at the start.
             self.r.hset(ROSTER, mapping={'notify': 0})
@@ -2078,7 +2079,7 @@ class Fleet:
                 text += '\n' + '\n'.join(self.r.lrange(ADVICE_NOTES, 0, -1))
                 self.r.delete(ADVICE_NOTES)
         if self.v2:
-            return self.v2.queue(name, text)
+            return self.v2.queue(name, text, front=front)
         self.r.rpush(key('inbox', name), text)
 
     def inbox_depth(self, name):
@@ -2970,8 +2971,12 @@ class Fleet:
                 if item['decision'] == 'revise' and not item.get('note', '').strip():
                     raise ValueError('escalations: revise of ' + item['task'] + ' needs a note saying the other way')
                 if rec['slot'] in busy and not self.service:
-                    raise ValueError('escalations: ' + item['task'] + ' is answered and ' + self.label(rec['slot'])
-                                     + ' is dispatched to in the same reply; do one or the other')
+                    # The new dispatch is the answer (the [blocked] note says so); the ruling is not sent on as a
+                    # second message. Was a bad reply until 2026-10-28: a rotated supervisor did both twice and the
+                    # strikes blocked the fleetmux run.
+                    self.log('escalate.answered_by_dispatch', task=item['task'], decision=item['decision'],
+                             note=item.get('note', '')[:500])
+                    continue
                 out.append((item['task'], rec, item))
                 continue
             if item['task'] in {x.get('id') for x in decision['dispatch']}:
@@ -3452,8 +3457,10 @@ class Fleet:
             if not p0 and bad >= 3:
                 self.finish('blocked', 'supervisor gave no valid decision JSON three times in a row: ' + str(exc))
             else:
+                # Ahead of reports already queued: delivered behind them it arrives stale, about a reply the
+                # supervisor has since replaced (2026-10-28 fleetmux run 2, the third strike).
                 self.queue('supervisor', 'Your reply is not a valid decision JSON (' + str(exc)
-                           + '). Resend one JSON object in the AGENTS.md format, nothing else.')
+                           + '). Resend one JSON object in the AGENTS.md format, nothing else.', front=True)
             return
         artifacts = json.loads(t.get('artifacts') or '[]')
         added = [a for a in decision.get('artifacts', []) if a not in artifacts]
@@ -3845,7 +3852,7 @@ class Fleet:
                 self.pause('supervisor gave no valid decision JSON three times in a row: ' + str(exc))
             else:
                 self.queue('supervisor', 'Your reply is not a valid service decision JSON (' + str(exc)
-                           + '). Resend one JSON object in the AGENTS.md format, nothing else.')
+                           + '). Resend one JSON object in the AGENTS.md format, nothing else.', front=True)
             return
         self.r.hset(SERVICE, mapping={'bad_replies': 0, 'reason': decision.get('reason', '')})
         self.brake_count('rounds')
