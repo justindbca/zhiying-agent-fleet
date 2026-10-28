@@ -459,6 +459,23 @@ def test_queued_follow_ups_through_the_hook_each_settle_with_their_own_report(ho
     assert step(f, lambda: reports(f) == 4)
 
 
+def test_correction_goes_before_follow_ups_already_queued(hooked):
+    f = hooked
+    handed(f)
+    env = follow_ups(f, 'A', 'B', 'C')
+    hook = stop(f, 'worker-1', 'I finished A, it is all in the report file.')
+    assert step(f, lambda: status_of(f, env) == 'committed')
+    assert f.v2.bus.message(env['message_id'])['outcome'] == 'failed'
+    # "Your last report" must reach the worker next, while that report is still its last one.
+    got = delivered(f, hook)['reason']
+    assert 'not in the AGENTS.md reply format' in got and 'follow-up' not in got
+    env = f.v2.bus.slot_state('worker-1')
+    hook = stop(f, 'worker-1', QUALIFIED.format(name='A'))
+    assert step(f, lambda: status_of(f, env) == 'committed')
+    assert f.v2.bus.message(env['message_id'])['outcome'] == 'completed'
+    assert f.agent('worker-1')['report_retries'] == '0' and f.task()['status'] == 'running'
+    assert 'follow-up B' in delivered(f, hook)['reason']
+
 
 # ------------------------------------------------------------------ foreign / manual / old turns
 def test_old_generation_hook_never_settles_or_takes_a_delivery(hooked):
